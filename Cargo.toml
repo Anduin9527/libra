@@ -8,7 +8,7 @@ default = []
 
 [dependencies]
 uuid = { version = "1.20.0", features = ["v4", "v7"] }
-git-internal = "0.6.0"
+git-internal = "0.7.0"
 anyhow = "1.0.100"
 byte-unit = "5.2.0"
 byteorder = "1.5.0"
@@ -55,6 +55,7 @@ tokio = { version = "1.48.0", features = [
     "process"
 ]}
 tokio-util = { version = "0.7.17", features = ["io"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 url = "2.5.7"
