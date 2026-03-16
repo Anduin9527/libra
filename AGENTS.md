@@ -127,3 +127,33 @@ raise as a finding when the issue could plausibly reach production.
 Treat undocumented assumptions as risk.
 Treat untested fixes as incomplete.
 Treat externally visible behavior changes without docs as P1 by default.
+
+## Cursor Cloud specific instructions
+
+### System dependencies
+
+The VM snapshot includes all required system packages (`build-essential`, `cmake`, `clang`, `lld`, `protobuf-compiler`, `libssl-dev`, `libseccomp-dev`, `less`). The `less` pager is required at runtime by the `diff`, `log`, and `reflog` commands (they pipe output through it on Unix); its absence causes those commands and their integration tests to panic.
+
+### Rust toolchains
+
+- **Stable** (1.94+): default toolchain; used for `cargo build`, `cargo clippy`, and `cargo test`.
+- **Nightly**: required only for formatting (`cargo +nightly fmt --all`). The `rustfmt.toml` uses `unstable_features = true`.
+
+Rust edition 2024 requires stable >= 1.85. The update script runs `rustup update stable` to keep the toolchain current.
+
+### Building and running
+
+Standard Cargo commands documented in `CLAUDE.md` and `README.md`. No external services (databases, Docker, etc.) are needed for building or testing — SQLite is embedded via `sea-orm`/`sqlx-sqlite`.
+
+To exercise the CLI, create a temp directory, run `cargo run -- init`, then `add`/`commit`/`status`/`log` etc.
+
+### Testing caveats
+
+- `cargo test --all` is the canonical command. All tests use `tempfile::tempdir()` for isolation.
+- Some tests are `#[serial]`; running the full suite sequentially is safe.
+- The `open` command tests produce harmless dbus errors on headless VMs (Chrome not fully available) — these are noise, not failures.
+- AI agent tests (`ai_agent_test`, `ai_chat_agent_test`, etc.) and cloud storage tests (`cloud_storage_backup_test`, `storage_r2_test`) that require API keys or external credentials are either ignored or use in-memory mocks; they pass without configuration.
+
+### Buck2 (optional for local dev)
+
+Buck2 is required by CI but not installed in the Cloud VM snapshot. Local development uses Cargo exclusively. If you need Buck2, see the install instructions in `README.md`.
