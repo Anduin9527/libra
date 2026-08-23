@@ -112,6 +112,9 @@ pub mod intentspec;
 pub mod libra_vcs;
 // Model Context Protocol server exposing Libra to MCP-aware clients.
 pub mod mcp;
+// Versioned Agent Memory contracts. Storage and compiler implementations stay
+// behind the small crate-private `memory` surface.
+pub(crate) mod memory;
 // Adapter that lets agents participate as nodes in the workflow DAG.
 pub mod node_adapter;
 // Phase 0/1/2 orchestrator: intent -> plan -> execute pipeline.

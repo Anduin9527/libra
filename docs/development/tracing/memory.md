@@ -493,7 +493,7 @@ metrics 不进入上表的权威 namespace：高频遥测会放大 Git 历史、
 - view 解析必须 fail-closed：任何参与层出现未知 policy、watermark 不匹配、principal 不可验证或 scope 编码失败时，该层不得进入 view；安全敏感读取不得静默降级到更宽的 Repo / Global 层。
 - SessionStart 冻结初始 view；branch、worktree 或 principal 改变时必须重新解析并产生新的 `view_hash`。旧 ContextReceipt 继续引用旧 view，不被当前状态覆盖。
 - `memory status` 可按当前状态即时重算 view，并展示每层 source OID、新鲜度和排除原因；session attach / refresh 只进入本地有界 access audit，不推进 memory ref。
-- `ContextReceipt.as_of` 必须包含 `view_hash` 与完整 layer snapshot。selector 不得在一次注入过程中重新读取当前 HEAD 或 wall clock 后偷换 view。
+- `ContextSelectionReceiptV1` 通过 `code_commit` / `full_branch_ref`、`source_heads`、`projection_watermarks` 与 `policy_hash` 记录构成该冻结 view 的输入；debug/status 可按这些字段重算并对照 `view_hash`，回执不另设平行的 `as_of` envelope。selector 不得在一次注入过程中重新读取当前 HEAD 或 wall clock 后偷换 view。
 
 ## 4. 对象模型
 
@@ -519,6 +519,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 | `lifecycle` | enum | `Replacement`（覆盖式）/ `Accretive`（累加式） |
 | `body` | `String` | 被记住的陈述（允许 Markdown，保持简短） |
 | `rationale` | `Option<String>` | 可选的「为何重要」/「从何而来」说明 |
+| `episode` | `Option<EpisodePayloadV1>` | M2 研发历程负载（§4.1.3）；规范 JSON 始终输出该键，无负载时为 `null` |
 | `evidence_refs` | `Vec<EvidenceRef>` | 指向 `Evidence`、`Run`、`Decision`、commit OID 的指针，用以佐证该条记忆 |
 | `links` | `Vec<MemoryLink>` | 显式的 sibling / supports / prerequisite / contradicts / supersedes 链接 |
 | `entities` | `Vec<MemoryEntityMention>` | 可选的结构化实体 mention；用于 alias 消歧与可重建实体索引，不创建第二套实体真源 |
@@ -541,7 +542,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 - `MemoryNote` JSON 必须使用稳定字段名与向后兼容的 serde 策略。新增字段只能 additive，旧 reader 必须忽略未知字段；删除或改变字段语义必须 bump `schema_version` 并提供迁移 / rebuild 逻辑。
 - `revision_oid` 是 `MemoryNote` blob 写入后得到的 Git OID，只存在于 tree path、`MemoryEvent`、返回 envelope 与投影中，**不得**序列化进 `MemoryNote` 正文。否则会出现“正文包含自身哈希”的不可解自引用。
 - canonical JSON 必须固定 UTF-8、字段序、数字与时间格式；`content_digest` 的输入排除该字段本身。读取时同时校验 blob OID 和 `content_digest`，任一不符均视为损坏。
-- **canonical payload 的字段清单（`content_digest` 的唯一规范来源）。** 为消除「digest 不含任何存储 OID」与 `parents` / `evidence_refs` 含 Git OID 之间的冲突，digest 输入被固定为一组**明确列出的内容字段**：`schema_version`、`note_id`、`namespace`、`path`、`kind`、`scope`、`visibility`、`acl_policy_id`、`lifecycle`、`body`、`rationale`、`links`（links 中仅取 `kind` + `target_note_id`，不含 `target_revision_oid`）、`entities`、`tags`、`confidence`、`trust`、`sensitivity`、`valid_from`、`valid_until`、`effective_from_commit`、`effective_until_commit`、`expires_at`、`author`、`created_at`、`compile_record`。**排除**：`content_digest` 自身、`revision_oid`、`evidence_refs`、`parents` 以及任何 Git OID——这些是存储布局 / 引用字段，与正文内容分离，由 blob OID 与事件引用承载完整性。字段清单本身纳入 `schema_version` 的版本化语义：清单变更必须 bump schema 并提供迁移 / rebuild。
+- **canonical payload 的字段清单（`content_digest` 的唯一规范来源）。** digest 输入固定为 `schema_version`、`note_id`、`namespace`、`path`、`kind`、`scope`、`visibility`、`acl_policy_id`、`lifecycle`、`body`、`rationale`、`episode`、`evidence_refs` 的语义投影、`links` 的语义投影、`entities` 的语义投影、`tags`、`confidence`、`trust`、`sensitivity`、`valid_from`、`valid_until`、`effective_from_commit`、`effective_until_commit`、`expires_at`、`author`、`created_at`、`compile_record`。代码适用性 OID（包括 `effective_*_commit`、Episode code anchor 与 `code_range.commit_oid`）属于语义字段并参与 digest。**排除**：`content_digest` 自身、正文中不存在的 `revision_oid`、`parents`、`EvidenceRef.source_ref_oid`、`EvidenceRef.fragment_digest` 与 `MemoryLink.target_revision_oid`；这些字段用于存储定位或完整性复核。EvidenceRef 的 source plane、kind、object ID、locator、visibility、captured time 与可选 code commit 仍参与 digest。canonical writer 固定 UTF-8、对象键 Unicode 码点序、数组顺序、整数与 RFC 3339 时间格式；字段清单或投影规则变化必须 bump `schema_version` 并提供迁移 / rebuild。
 - 一个 `MemoryNote` 快照回答的是**「agent 在这一版本相信什么？」**，且永不被改写。
 - 撤销、取代或遗忘一条记忆都是一个**事件（Event）**，而非对快照的就地编辑；cache prune 不改变 note 生命周期。
 - 对同一 `note_id` 而言，`namespace`、`scope`、`path` 在逻辑上不可变。要移动一条记忆，应写一条新 note 并取代旧的（§10.2）。
@@ -558,7 +559,8 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `origin` | enum | `Explicit` / `PromotedFromAnchor` / `DistilledFromFrame` / `Classifier` / `Consolidation` / `Onboard` / `BranchFork` / `Import` / `Coordinator`（MEM-06 协调写入，additive，见 §19.4） |
+| `schema_version` | `u32` | 编译记录 schema；第一版固定为 `1` |
+| `origin` | enum | `Explicit` / `PromotedFromAnchor` / `DistilledFromFrame` / `Classifier` / `Consolidation` / `Onboard` / `BranchFork` / `Import` / `Coordinator` / `EpisodeCompiler` |
 | `producer` | `String` | 生产者标识与版本，如 `libra-memory/0.19.0` 或 `consolidation-job/1` |
 | `rules_version` | `u32` | 确定性规则集（worthiness 正则、路径验证、redaction 策略）的版本 |
 | `prompt_version` | `Option<String>` | 参与生产的 LLM prompt 模板版本；纯确定性路径为 `None` |
@@ -572,7 +574,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 
 - 写入事务（§4.2.1）第 1 步即校验编译记录完整性：`origin` 与调用入口不符、`input_hashes` 为空或幂等键缺失，一律 fail-closed 拒绝写入。
 - 幂等键去重只作用于**新建**（`Created`）：默认按 `idempotency_scope = Cell` 去重，即同一 `(scope, namespace, path)` cell 内同键重复摄入不产生新 note，直接返回既有 `note_id` 且不追加新事件（与 §4.2 的 event 幂等语义一致）；**不同 path 的目标互不干扰**，调用方显式指定的新路径绝不会被同内容去重静默丢弃（§7.4 纪律）。仅 consolidation / onboard 等聚合入口可显式使用 `idempotency_scope = Namespace`（键不含 path），且必须在编译记录中标注。显式 `revise` / `move` 针对既有 `note_id`，不受其约束。`memory_note_index` 的幂等唯一索引按 §5.2 相应区分两种 scope。
-- LLM 参与生产的 note（`prompt_version` / `model_id` 非空）默认最高只能进入 `Draft`；`trust` 上限沿 §7.3 规则，不因编译记录存在而放宽。
+- LLM 参与生产的普通知识 note（`prompt_version` / `model_id` 非空）默认最高只能进入 `Draft`；`trust` 上限沿 §7.3 规则，不因编译记录存在而放宽。首版 M2 Episode 是单独的全自动研发历程路径：它只消费当前 Agent 已经通过用户启动的任务、仓库身份与现有访问控制获准读取的来源，不要求用户逐条二次确认，也不按任务成功/失败、来源 trust 标签或推断置信度决定是否保留。Writer 在持久化前执行 §4.1.3 的确定性研发历程准入；通过后连续追加 `Created|Revised + Confirmed`，失败则返回有类型错误且不写入 Memory ref。compiler 自报的身份、来源范围或准入结果不生效。
 - 发现某个 producer / prompt / model 版本产出系统性坏记忆时，必须能按编译记录批量定位受影响 note 并 quarantine 或重新编译——这是把编译记录设为硬门槛的直接回报。
 - 编译记录是 note 正文的一部分，随 blob 不可变、可随投影重建；`memory_note_index` 投影为此新增 `origin` 与 `idempotency_key` 列（§5.2），存储创建版本的键以支撑去重与批量召回。
 - 每个 revision 的 producer / prompt / model / policy / input fingerprint 进入 `memory_revision_index` 投影；只在 note 级保存创建 origin 无法定位后续坏 revision，因此不能满足批量 quarantine / recompile 要求。
@@ -582,11 +584,53 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 
 为使授权、provenance 与图扩展可实现，以下 supporting types 必须 versioned，不能留成无约束 JSON：
 
-- `EvidenceRef` 至少包含 `schema_version`、`source_plane`、`kind`、`object_id`、`content_hash`、`visibility`、可选 `captured_at` / `code_commit`。解析或授权失败只会降低 trust / 排除候选，绝不能通过远程 URL 即时抓取来“补齐证据”。
+- `EvidenceRefV1` 包含 `schema_version`、`source_plane`、`kind`、`object_id`、`source_ref_oid`、封闭的 `locator`、脱敏规范片段的 `fragment_digest`、`visibility` 与可选 `captured_at` / `code_commit`。locator 只允许 `object`、`event_seq`、`json_pointer`、`session_fragment`、`tool_call`、`code_range` 六种形态；Session 必须给有界序号区间，工具调用必须指定 invocation/output part，代码必须固定 commit、仓库相对路径和行范围。resolver 在授权和脱敏后重算 fragment digest；解析、授权或 digest 比对失败会隔离/排除候选，不通过网络即时补取来源。
 - `MemoryEntityMention` 至少包含 `schema_version`、`canonical_key`、`display_name`、`aliases`、`role`（subject / object / topic）、`resolution_confidence` 与 evidence 指针。`canonical_key` 是 repository-local 的规范键，不得编码 actor PII；alias 冲突只产生 merge proposal，不自动改写真源。
 - `MemoryLink` 至少包含 `kind`、`target_note_id`、可选 `target_revision_oid`、`evidence_refs` 与可选 `valid_from` / `valid_until`。link 归属于 source `MemoryNote` revision，其变化通过 source note 的新 revision 表达；需要独立 review / revoke / supersede 生命周期的关系必须建模为单独 semantic note，不能把嵌入式 link 扩成第二套事件系统。读取 link 前先对 target 重新执行 scope / ACL / sensitivity 检查；禁止先图扩展后过滤，否则计数、路径和 timing 都会泄露私有节点。
 - `acl_policy_id` 指向 canonical policy snapshot hash。policy 至少定义可读/可写 principal、允许的 namespace/scope、自动确认上限、远端存储许可、retention 与 prompt 注入许可。policy 缺失、未知或 hash 不匹配时，mutating path 与 prompt injection fail-closed。
 - `manifest.json` 固定当前 ref 的 scope、schema version、last_event_seq、policy snapshot hash 与 writer version。它不得携带 secret 或 actor PII；actor ref 使用 principal HMAC / opaque ID。
+
+#### 4.1.3 `EpisodePayloadV1` —— M2 研发历程负载
+
+M2 从现有 Intent / Task / Run / Evidence / Decision / PatchSet / Session 与代码提交编译两级研发历程：
+
+- **任务研发历程摘要（Task Episode Summary）**：汇总一个终态 Task 下的多次 Run、决策、失败尝试、未决项和代码结果。
+- **需求迭代摘要（Intent Iteration Summary）**：汇总一个终态 Intent 下已经固定 revision 的多个 Task Episode；每个贡献 Task 都必须有且只有一个 `kind=Supports` 的 `MemoryLink`，以 Task 的稳定 `note_id + revision_oid` 固定具体版本，后续 Task 修订只会触发新的 Intent revision。
+
+`MemoryWriter` 从受信任触发器和已授权 source window 机械填充身份与边界字段；`EpisodeCompiler` 只提议自然语言内容：
+
+| 字段 | 所有者 | 约束 |
+|---|---|---|
+| `schema_version` | Writer | 固定为 `1` |
+| `root_kind` / `root_id` | Writer | `task \| intent`；编译器回显必须完全一致 |
+| `related_intent_ids` / `related_task_ids` / `related_run_ids` | Writer | 排序、去重、有界；Intent Episode 至少包含一个贡献 Task |
+| `started_at` / `ended_at` | Writer | 从来源事件时间计算，`started_at <= ended_at` |
+| `completion_status` | Writer | `completed \| failed \| cancelled`，来自终态事实 |
+| `code_change_status` | Writer | `changed \| unchanged \| unknown`，与任务成败正交 |
+| `code` | Writer | 可选 base/result commit、完整 branch ref、排序去重后的仓库相对路径 |
+| `goal` | Writer | 从已授权来源机械生成 observation，保持来源目标语义并带 EvidenceRef；compiler 不得输出或覆盖 |
+| `summary` | compiler proposal | 固定为 inference，带置信度与 EvidenceRef |
+| `observations` | compiler proposal | 每项固定为 observation，不带置信度，EvidenceRef 非空 |
+| `inferences` | compiler proposal | 每项固定为 inference，必须带置信度与 EvidenceRef |
+| `decisions` / `failed_attempts` / `unresolved` | compiler proposal | 每项显式标记 observation 或 inference，并带 EvidenceRef |
+| `omissions` | Writer | 记录每个有界集合被裁掉的条目数 |
+
+`EpisodeClaimV1` 固定为 `epistemic_status + claim + confidence? + evidence_refs`。Observation 禁止携带 confidence；Inference 必须携带 confidence。校验只能证明引用存在、可见且定位/digest 匹配，不能把自然语言蕴含声明为形式化证明。
+
+首个仓库切片固定 `kind=Episodic`、`scope=Repo`、`visibility=RepoLocal`、`lifecycle=Accretive`、`namespace=default`，并使用：
+
+```text
+episodic.tasks.r-<lowercase UTF-8 hex(root_id)>
+episodic.intents.r-<lowercase UTF-8 hex(root_id)>
+```
+
+root ID 采用精确 UTF-8 字节，拒绝空值、首尾空白、控制字符和超过 120 bytes 的输入。稳定 `note_id` 使用冻结的 UUIDv5 namespace `f2b4d3a0-1c9e-4f75-8d20-2a6b7c8d9e01` 与 name bytes `<task|intent> + NUL + root_id` 生成，独立于仓库 SHA-1 / SHA-256 object format。存在 result commit 时 `effective_from_commit=result_oid`，否则使用 base OID；`effective_until_commit=None`。`episode` 有值当且仅当 `CompileRecord.origin=EpisodeCompiler`，避免普通 note 冒充自动编译结果或 Episode 丢失编译来源。
+
+解析器在反序列化前执行原始 JSON 字节上限：`CompileRecord <= 32 KiB`、`MemoryNote <= 256 KiB`、`MemoryEvent <= 128 KiB`、`EpisodePayload <= 64 KiB`、`EvidenceRef <= 16 KiB`。结构内上限为：`body <= 16 KiB`、单个自然语言/路径项 `<= 4 KiB`、标识字段 `<= 512 bytes`、每个可变集合 `<= 128` 项、单个 Session fragment `<= 256` 个序号；线性 note 的 `parents <= 1`。超限先按稳定规则裁剪并记录 omissions，仍超限则拒绝写入。
+
+所有 v1 reader 采用同一兼容规则：`MemoryNoteV1`、`MemoryEventV1`、`EpisodePayloadV1`、`EvidenceRefV1` 与 `CompileRecordV1` 在 `schema_version=1` 时忽略 additive unknown fields；未知 schema version、未知 enum、未知 lifecycle/action/state 一律拒绝。
+
+首版 M2 Episode 不定义 `AutoEpisodeTrustGateV1`，也不产生 `confirmed | quarantined | rejected` 三态摄入结果。它采用**授权来源前提**：当前 Agent 可读取的 Task / Intent / Run / Session 等研发来源，已经由用户启动的任务、仓库身份和现有访问控制授权；Memory 不再要求用户逐条批准，也不对成功、失败、取消、未改代码或低置信度推断作价值判断。Writer 仍执行确定性的**研发历程准入**：验证来源属于 pinned ref 与当前仓库/工作区、EvidenceRef locator/digest 可解析、脱敏已经完成、schema/root/code anchor/CompileRecord 合法且 compiler 实现受配置约束。全部有效时机械追加 `Created|Revised + Confirmed`；任一无效时返回稳定的解析、授权、脱敏或合同错误且不写入 Memory ref。`trust` 与 confidence 继续作为 provenance/认识论标签保存，不是 M2 摄入门槛；`Quarantined` 保留给写入后发现对象损坏、来源失效或投毒时的显式处置。
 
 ### 4.2 `MemoryEvent` —— 事件 [E]
 
@@ -975,40 +1019,54 @@ CREATE TABLE memory_embedding_cache (
     created_at            TEXT NOT NULL
 );
 
--- 注入回执账本（§8.6）。注意：这是本地 append-only 审计账本，
+-- 共享上下文选择回执账本（§8.6）。这是本地 append-only 审计账本，
 -- **不是**投影——它记录读取时刻的选择，无法也无须从 Git 历史重建；
 -- rebuild 不触碰它，保留策略负责有界修剪。
-CREATE TABLE memory_context_receipt (
+CREATE TABLE context_selection_receipt (
     receipt_id            TEXT PRIMARY KEY,
-    emitted_at            TEXT NOT NULL,
-    scope_key             TEXT NOT NULL,
-    view_hash             TEXT NOT NULL,
-    source_refs_json      TEXT NOT NULL,
-    projection_watermarks_json TEXT NOT NULL,
-    as_of_commit          TEXT,
+    schema_version        INTEGER NOT NULL,
+    source_kind           TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    digest_key_id         TEXT NOT NULL,
+    principal_hmac        TEXT NOT NULL,
+    query_hmac            TEXT NOT NULL,
     effective_at          TEXT NOT NULL,
+    code_commit           TEXT,
+    full_branch_ref       TEXT,
+    source_heads_json     TEXT NOT NULL,
+    projection_watermarks_json TEXT NOT NULL,
+    policy_hash           TEXT NOT NULL,
     selector_version      TEXT NOT NULL,
-    rules_version         INTEGER NOT NULL,
-    index_version         TEXT NOT NULL,
-    policy_version        TEXT NOT NULL,
-    query_hmac            TEXT,
     token_budget          INTEGER NOT NULL,
-    tokens_used           INTEGER NOT NULL,
     selected_json         TEXT NOT NULL,
-    dropped_json          TEXT NOT NULL,
-    bundle_hash           TEXT NOT NULL
+    omissions_json        TEXT NOT NULL,
+    bundle_hash           TEXT NOT NULL,
+    reproducibility_state TEXT NOT NULL,
+    frame_id              TEXT,
+    recorded_at           TEXT NOT NULL
 );
-CREATE INDEX idx_memory_receipt_time
-    ON memory_context_receipt(emitted_at);
+CREATE INDEX idx_context_selection_receipt_repository_time
+    ON context_selection_receipt(repository_id, recorded_at);
+CREATE INDEX idx_context_selection_receipt_time
+    ON context_selection_receipt(recorded_at);
+
+-- 每仓回执保留水位。ReceiptStore 与回执追加/裁剪在同一短事务更新它；
+-- pruned_before 是已经删除的最晚 recorded_at，用来区分 expired 与 not_found。
+CREATE TABLE context_selection_receipt_retention (
+    repository_id         TEXT PRIMARY KEY,
+    pruned_before         TEXT,
+    last_pruned_at        TEXT,
+    retained_rows         INTEGER NOT NULL DEFAULT 0 CHECK (retained_rows >= 0)
+);
 ```
 
-`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 是可重建投影。`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats` 与 `memory_context_receipt` 是本地有界账本，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
+`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 是可重建投影。`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats`、`context_selection_receipt` 与 `context_selection_receipt_retention` 是本地有界账本及其保留水位，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
 
 查询实现必须始终带上 `scope_key` 与 `namespace`，禁止只按 `path` 做全局查询后在内存中过滤。跨 scope / namespace 的检索只能由显式 `--all-namespaces` 或策略允许的 scope fallback 触发，并且必须在结果中保留原始 `scope` 与 `namespace`，防止 prompt 注入时发生来源混淆。
 
 `list_prefix` 与 `summarize` 不得执行无上限扫描。实现应使用规范化后的 path 前缀范围查询和 keyset pagination，并设置默认 `LIMIT`（建议 100 条 summary、50 条 note）与硬上限。因为 SQL `LIKE` 的转义与 collation 容易引入前缀越界，推荐存储 canonical `path_key` / `parent_path` 后做复合索引范围查询；复杂度表述统一为 O(log n + k)，其中 k 是有界返回量。
 
-在访问模式上还有一条对齐约定值得明确：Memory 的投影表用 SeaORM entity 来访问（与同样可重建的 `ai_index_*` 投影一致），而不采用 `agent_session` / `agent_checkpoint` / `agent_usage_stats` 那种**故意**保持的 raw-SQL、无 entity 风格。原因在于：`agent_*` 那批表是外部捕获的独立账本，而 Memory 的这些表是 git 真源（`refs/libra/memory/...`）的可重建投影，本质与 `ai_index_*` 同类，因而对齐 `ai_index_*` 的 SeaORM 模式。账本例外是 `memory_access_stats` 与 `memory_context_receipt`（§8.6）：二者都不是可重建投影，沿用 raw-SQL 账本模式，不配 entity。
+在访问模式上还有一条对齐约定值得明确：Memory 的投影表用 SeaORM entity 来访问（与同样可重建的 `ai_index_*` 投影一致），而不采用 `agent_session` / `agent_checkpoint` / `agent_usage_stats` 那种**故意**保持的 raw-SQL、无 entity 风格。原因在于：`agent_*` 那批表是外部捕获的独立账本，而 Memory 的这些表是 git 真源（`refs/libra/memory/...`）的可重建投影，本质与 `ai_index_*` 同类，因而对齐 `ai_index_*` 的 SeaORM 模式。账本例外是 `memory_access_stats` 与 `context_selection_receipt`（§8.6）：二者都不是可重建投影，沿用 raw-SQL 账本模式，不配 entity。
 
 ### 5.3 ClientStorage 分层
 
@@ -1239,6 +1297,12 @@ LLM 输出必须按 schema 校验：未知 enum、未知 namespace、非法 path
 
 #### 7.5.1 Trust Gate —— Draft → Confirmed 的显式晋升阶段（A4）
 
+本节适用于 M1 事实、规则、技能和其它需要晋升的普通知识流。首版 M2 Episode
+按 §4.1.3 的“授权来源前提 + 研发历程准入”直接自动确认，不进入
+`pass | fail | needs-human` 三态，也不因为任务失败、来源 trust 标签或推断置信度
+较低而转入 Draft / Quarantined。二者共享脱敏、EvidenceRef、CompileRecord、
+MemoryWriter 和写入后隔离能力，但摄入语义不同。
+
 沿 §0.0.4（fava-trails Trust Gate）与 §0.2，`Draft → Confirmed` 不是自动
 完成，而必须经过一个命名的 **Trust Gate** 阶段，把「确定性规则 + 可选 LLM
 评审」统一为一条可审计的晋升路径：
@@ -1331,29 +1395,33 @@ memory.get(scope, namespace, path) -> Vec<MemoryRecord>
 `scope`、`confidence`、`trust` 以及一个简短的证据指针。agent 被告知：
 记忆只是指引，当前的源文件 / 命令输出会覆盖陈旧的记忆。
 
-### 8.6 注入回执（`ContextReceipt`，Phase C 硬性门槛）
+### 8.6 上下文选择回执（`ContextSelectionReceiptV1`，简称 `ContextReceipt`，Phase C 硬性门槛）
 
-每次 `with_memory(...)` 注入（§8.5）以及引擎内召回（§8.2 / §8.3）完成后，必须产出一份 `ContextReceipt`；写不出完整回执，该次注入 / 召回按失败处理（fail-closed）。直接路径 get（§8.1）与调用方驱动原语（§8.4）是确定性查询、不含引擎侧选择，不产回执。
+每次 `with_memory(...)` 注入（§8.5）以及引擎内召回（§8.2 / §8.3）完成后，必须产出一份共享 `ContextSelectionReceiptV1`；写不出完整回执，该次注入 / 召回按失败处理（fail-closed）。直接路径 get（§8.1）与调用方驱动原语（§8.4）是确定性查询、不含引擎侧选择，不产回执。该类型由 `src/internal/ai/context_budget/receipt.rs` 的共享上下文层拥有，Memory 与 mainline 都写入同一账本；现有 `ContextFrame` wire schema 保持不变。
 
 | 字段 | 含义 |
 |---|---|
-| `receipt_id` | 回执标识 |
-| `emitted_at` | 产出时间 |
+| `receipt_id` | UUIDv7 回执标识 |
+| `schema_version` / `source_kind` | 回执版本与调用来源（Memory / intent / hook 等） |
+| `repository_id` / `digest_key_id` | 规范仓库身份与仓库本地 keyed-digest generation |
+| `principal_hmac` / `query_hmac` | 已认证主体与规范化查询/过滤/K/排序输入的域分离 HMAC；不保存 raw principal/query |
+| `effective_at` | 本次选择冻结的有效时间；重放不得重新读取当前 wall clock |
 | `selected` | 选中的 note `revision_oid` / path summary key 列表，每项附 reason code、稳定 score 分量与顺序 |
-| `dropped` | 因预算 / 门禁被丢弃项及 reason code |
-| `token_budget` / `tokens_used` | 预算与实际用量 |
-| `as_of` | `ResolvedMemoryView.view_hash`、解析时所有参与 scope 的 memory ref OID、各自 projection watermark 与 code commit / full branch ref |
-| `versions` | selector / rules（编译规则集）/ index（投影 schema）/ policy 版本 |
-| `effective_at` | 选择时冻结的时间，用于 TTL / recency；重放不得读取当前 wall clock |
-| `query_hmac` | 可选，本地密钥派生的查询 HMAC；不得保存 raw query 或可跨仓库关联的普通 hash |
+| `omissions` | 因授权、状态、适用性、预算或资源上限被排除项的稳定 reason code 与有界计数 |
+| `token_budget` | 共享上下文层冻结的预算 |
+| `code_commit` / `full_branch_ref` | 本次选择使用的代码锚点 |
+| `source_heads` / `projection_watermarks` | `ResolvedMemoryView` 的各来源 ref OID 与投影水位 |
+| `policy_hash` / `selector_version` | 授权/选择合同版本 |
 | `bundle_hash` | 注入渲染块的规范化哈希 |
+| `reproducibility_state` | `reproducible \| stale \| expired \| non_reproducible` |
+| `recorded_at` / `frame_id?` | 本地记录时间与可选 ContextFrame 关联；均不把 raw frame 写入回执 |
 
 规则（承 §0.0.2 与 §0.0.11）：
 
-- **同输入同选择可验证。** 固定所有参与 scope 的 source ref OID / projection watermark、code anchor、`effective_at`、query HMAC 对应的调用输入、同一版本组与预算，重放必须得到相同 selected IDs、顺序、reason codes 与 `bundle_hash`；`receipt_id`、`emitted_at` 等非确定字段不进入 canonical hash。缺失对象、policy 或 index snapshot 时返回 `stale / non-reproducible`，不静默 fallback。该承诺只覆盖选择和渲染输入，不承诺 provider 输出逐字节一致。
-- **回执是本地审计账本，不是投影。** 存入本地 append-only 表 `memory_context_receipt`（§5.2）；它记录的是读取时刻的选择，无法也无须从 Git 历史重建，因此明确豁免于「删表可 rebuild」条款（§13.1），并按保留策略有界修剪。回执、query hash 与 selected IDs 可能泄露工作意图，默认 local-only、不进团队 ref；任何共享另做 visibility / retention / threat-model 审查。
+- **同输入同选择可验证。** 固定所有参与 scope 的 source ref OID / projection watermark、code anchor、`effective_at`、query HMAC 对应的调用输入、同一版本组与预算，重放必须得到相同 selected IDs、顺序、reason codes 与 `bundle_hash`；`receipt_id`、`recorded_at` 等非确定字段不进入 canonical hash。缺失对象、policy 或 index snapshot 时返回 `stale / non-reproducible`，不静默 fallback。该承诺只覆盖选择和渲染输入，不承诺 provider 输出逐字节一致。
+- **回执是本地审计账本，不是投影。** 存入本地 append-only 表 `context_selection_receipt`（§5.2）；它记录读取时刻的选择，无法也无须从 Git 历史重建，因此明确豁免于「删表可 rebuild」条款（§13.1）。默认每仓保留 30 天且最多 10,000 行，追加时按 `recorded_at` 索引修剪；缺失 UUIDv7 内嵌时间早于 `pruned_before` 返回 `expired`。回执中的 HMAC 与 selected IDs 仍可能暴露工作模式，默认 local-only、不进团队 ref；任何共享另做 visibility / retention / threat-model 审查。
 - **单一 receipt 原语。** Rust 类型与 mainline ML-05 / ML-08 共用同一定义（§0.0.10）；本文与 mainline 各自的注入管线写同一张回执面，不得分叉出两种 schema。
-- `memory inspect-injection` 从回执读取并重放展示，而非从当前投影反推。被预算丢弃的项直接记录在 receipt 的 `dropped` 中，不再为每次读取追加 `PromptTrimmed` 权威事件。
+- `memory inspect-injection` 从回执读取并重放展示，而非从当前投影反推。被预算丢弃的项直接记录在 receipt 的 `omissions` 中，不再为每次读取追加 `PromptTrimmed` 权威事件。
 
 ### 8.7 混合检索通道（Hybrid Retrieval Channels）
 
@@ -1704,7 +1772,7 @@ session JSONL 模型，只有 Draft / Confirmed / Revoked / Superseded。Memory 
 5. 高置信度的 procedural 规则最后才保留，除非其本身就长于整个
    预算；此时它们会被替换为其路径摘要与一条 direct-get 提示。
 
-丢弃行为记录在 `ContextReceipt.dropped` 与本地有界 audit 中，以便审计；它是读取决策，不追加权威 `MemoryEvent`，避免每个 turn 都推进 memory ref。
+丢弃行为记录在 `ContextReceipt.omissions` 与本地有界 audit 中，以便审计；它是读取决策，不追加权威 `MemoryEvent`，避免每个 turn 都推进 memory ref。
 
 ## 12. CLI 命令面
 
@@ -1808,7 +1876,7 @@ MCP stdio 独占 stdin/stdout：在 stdio 模式下，**不得**输出 banner、
 - **无编译记录不落盘。** 任何入口产生的 `MemoryNote` 缺少完整 `CompileRecord`（§4.1.1）必须在写入事务第 1 步被拒绝；同幂等键的重复摄入不得产生第二条 note。这是 Phase A 的硬性退出门槛（§0.2）。
 - **注入必须留回执。** 任何 prompt 注入或引擎内召回若未能写出完整 `ContextReceipt`（§8.6），该次操作按失败处理（fail-closed）；`inspect-injection` 只从回执重放，不从当前投影反推。回执默认 local-only，未经 visibility / retention 审查不得成批越过 MCP 边界。这是 Phase C 的硬性退出门槛（§0.2）。
 - **写入只有一个 seam。** 所有 mutating Adapter 必须通过 `MemoryWriter`；任何绕过 CompileRecord、authorization、事件状态机、CAS 或投影事务而直接写 ref / tree / SQLite 的路径都属于发布阻断。worktree checkout 状态不能充当 writer lock。
-- **session view 必须冻结且可解释。** recall / injection 使用的 `ResolvedMemoryView.view_hash`、source ref OID、watermark、policy 与 code anchor 必须进入 status / receipt；branch、worktree 或 principal 改变后不得继续使用旧 view。
+- **session view 必须冻结且可解释。** `ResolvedMemoryView.view_hash` 进入 status；构成该 view 的 source heads、projection watermarks、policy hash 与 code anchor 进入 receipt，并可供 status/debug 重算对照。branch、worktree 或 principal 改变后不得继续使用旧 view。
 - **OID 不自引用。** `MemoryNote` 正文不含 `revision_oid`；写入后 OID 只出现在 event / envelope / tree path / projection。读取必须同时验证 Git OID 与 canonical `content_digest`。
 - **权威历史线性。** 每个 memory ref 只接受 first-parent 单父 commit 与严格递增 `event_seq`；跨 ref merge/cherry-pick 必须经语义 writer 重新追加，不能直接导入任意 Git merge DAG。
 - **投影不可越权。** prompt 注入、MCP 只读返回与 CLI recall 都必须先解析 actor、repo、branch、worktree 和 namespace policy；`private:<actor-ref>` 只能被同一 actor 或授权 reviewer 读取。
@@ -1844,7 +1912,7 @@ agent 捕获使用的 `2026050303_agent_capture.sql` 迁移属于同一模式，
 - `memory_classifier_cache`（§5.2，可选，带 TTL）
 - `memory_embedding_cache`（§8.7，可选向量通道缓存，可丢弃）
 - `memory_access_stats`（§5.2，本地账本，不参与 rebuild）
-- `memory_context_receipt`（§8.6，账本类：append-only、豁免 rebuild、按保留策略有界修剪）
+- `context_selection_receipt`（§8.6，共享账本：append-only、豁免 rebuild、按保留策略有界修剪）
 
 只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/libra/memory/...` 重建。classifier cache 与 embedding cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
 
@@ -1854,7 +1922,7 @@ agent 捕获使用的 `2026050303_agent_capture.sql` 迁移属于同一模式，
 重建的 `ai_index_*` 投影同模式），而外部捕获的 `agent_session` /
 `agent_checkpoint` / `agent_usage_stats` 是**故意**采用 raw-SQL、不配 entity 的。
 Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身就是 git 真源的
-可重建投影。`memory_access_stats` 与 `memory_context_receipt` 是例外：二者与
+可重建投影。`memory_access_stats` 与 `context_selection_receipt` 是例外：二者与
 `agent_*` 同为本地账本，沿 raw-SQL 账本模式访问（§5.2、§8.6）。
 
 ## 15. 分阶段路线图
@@ -1874,7 +1942,8 @@ Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身
   `materialize` 生成 §5.5 的只读、脱敏 Markdown 投影，`consolidate` 触发一次排期归并（§10.5）。
 - 不引入分类器——调用方必须自行提供 `namespace` 与 `path`。
 - `CompileRecord` 类型与写入侧强制校验（§4.1.1）：所有入口必须携带
-  编译记录，幂等键在 `(scope, namespace)` 内去重。
+  编译记录；默认在 `(scope, namespace, path)` Cell 内去重，只有
+  Consolidation / Onboard 可显式使用 Namespace 级跨路径去重。
 
 退出门槛：所有 Phase A 写入 Adapter 都无法绕过 `MemoryWriter`；路径聚合与 `memory status` 可用；物化投影对同一 `view_hash` 产生相同 manifest / 文件集合，且不可见正文不落盘、raw HTML 默认禁用、frontmatter 与 URL 经转义 / 净化；投影重建在语义行、watermark、排序与 canonical digest 上稳定；OID 无自引用；损坏点阻止对应 scope watermark 前进；**每条已写入 note 都携带完整编译记录，
 缺失即拒绝写入，同幂等键重复摄入不产生新 note——硬性门槛，见 §0.2**；**写路径成本探针**：单条 note 写入（blob + event + commit + ref CAS + 投影表事务）的端到端延迟与新增对象数量有确定预算，并纳入 §16 的确定性探针，防止投影写放大失控。
@@ -1893,9 +1962,12 @@ Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身
   idempotency 当作语义去重。
 - 带「编辑后投影」（redacted projection）语义的 `forget` API。
 
-退出门槛：任何未经评审、形似 secret、外部不可信、或处于隔离（quarantine）
-状态的 note，都不能进入 prompt 注入；entity alias 歧义不能触发静默合并；
-Working 缓冲有 TTL / auto-evict；任何 Draft→Confirmed 都经 Trust Gate（§7.5.1）。
+退出门槛：普通知识流中任何未经评审、形似 secret、外部不可信、或处于隔离
+（quarantine）状态的 note，都不能进入 prompt 注入；entity alias 歧义不能触发
+静默合并；Working 缓冲有 TTL / auto-evict；普通知识的任何 Draft→Confirmed
+都经 Trust Gate（§7.5.1）。M2 Episode 不经过 Draft 晋升：它按 §4.1.3 的授权
+来源前提与确定性研发历程准入自动 Confirmed，trust/confidence 仅作为来源与认识论
+标签保存。
 
 ### Phase C — 分类、召回与注入（2–3 周）
 
@@ -1905,7 +1977,7 @@ Working 缓冲有 TTL / auto-evict；任何 Draft→Confirmed 都经 Trust Gate�
   两跳查询；授权先于图扩展，每个 target 重新鉴权。
 - prompt 期注入（§11.7），使用 `ProjectMemory` 与
   `MemoryAnchor` 预算分段。
-- `ContextReceipt` 产出与 `memory_context_receipt` 账本（§8.6）：
+- `ContextSelectionReceiptV1` 产出与 `context_selection_receipt` 账本（§8.6）：
   注入与引擎内召回写不出完整回执即按失败处理。
 - 用于可观测性的 `libra memory inspect-injection`（从回执重放）与
   **`libra code --debug-memory`（G14，Phase C 硬交付）**：每 turn 逐字打印
@@ -2052,7 +2124,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 - 注入回执：每次注入与引擎内召回都写出 `ContextReceipt`；固定 `as_of`
   快照重放选择得到相同 selected 集合与 bundle hash；缺失快照返回
   stale / non-reproducible；删除全部投影表并 rebuild 后回执账本不受
-  影响、也不被重建；预算丢弃只进入 `ContextReceipt.dropped` 与按
+  影响、也不被重建；预算丢弃只进入 `ContextReceipt.omissions` 与按
   `receipt_id` 互链的本地 audit，不追加 `PromptTrimmed` 权威事件。
 - onboarding：cold、warm 与 meta-only 刷新产出确定性的路径，且不会改写
   无关的 namespace。

@@ -264,7 +264,7 @@ M0 Trace、M1 Fact、M2 Episode、M3 Skill/Profile/Policy 不是本文新增的�
 
 - **目标**：给 agent「编辑前先读相关 sealed intent/decision」的读面——确定性（无 embedding）加性打分器 + 检索态叠加（current/superseded/abandoned/stale）+ 可审计的 ContextBundle / selection receipt。这是 mainline 量化价值集中处（eval CF-IF delta）。作为 `memory.md` recall 在 sealed intent 上的**具体落地**，而非平行系统。
 - **范围**：在本地 sealed + 已验证 team projection 上建读面（query/files/current 三模）；先以 scope、visibility、trust、sensitivity 和 ACL 过滤，再按 `scope.rs` 文件重叠 + subsystem + title/what/why/decision 关键词 + open risk/followup + recency + same-thread + supersession lineage 打分，保持确定性、无 embedding。检索态分类器（stale 由 age/file-churn，superseded 由 lineage）。
-  - 新增 versioned sibling `IntentContextSelectionReceiptV1`，**不扩展**现有带 raw content/attachment、`deny_unknown_fields` 的 ContextFrame wire schema。receipt 默认 local-only，关联可选 frame id，但仅记录 `query_hash`（非 raw query）、as-of、code commit、branch、private AI/team ref head、projection/index watermark、config/publication/redaction policy hash、selector/scorer/weights/render version、selected public/local object id + score/reason/order、omission reason、token budget、bundle hash。`recorded_at` / UUID 不进入 canonical selection hash。
+  - 复用共享上下文层的 `ContextSelectionReceiptV1` 与本地 append-only `context_selection_receipt` 账本，**不扩展**现有带 raw content/attachment、`deny_unknown_fields` 的 ContextFrame wire schema。receipt 默认 local-only，可关联 frame id；固定 envelope 为 schema/source kind、repository/digest key、principal/query HMAC、effective time、code commit/full branch ref、private AI/team source heads、projection watermarks、policy hash、selector version、selected/omissions、token budget、bundle hash、reproducibility state 与 recorded time。raw principal/query/content 不入账；`recorded_at` / UUID 不进入 canonical selection hash。
   - 对同一规范化输入快照，receipt 必须得到相同 selected IDs、顺序、reason codes 和 bundle hash；若 policy/watermark/source object 缺失或 stale，则返回 `non_reproducible` / `stale`，不得静默换用别的对象。它只承诺选择与渲染输入可审计/可重放，不承诺外部 provider 的完整 prompt/输出逐字节一致。
   - CLI 是初始入口。C9 建立真实 default-deny McpAuthorizer、覆盖 tools/list 和所有 calls 前，**不注册** read 或 mutating intent MCP tool；C9 完成后，MCP 才能走 `code.md` C6 的 `libra code --stdio`，仍不用 `memory.md` 提议的 `libra mcp --stdio`。
 - **依赖**：ML-02（有 sealed 记录可检索）；projection（has-current）；**与 memory.md recall/inject 收敛**（§9）。
@@ -508,7 +508,7 @@ flowchart LR
 | Projection | `projection/rebuild.rs` 可从 formal objects 重建线程投影并事务化物化。 | 缺 private/local 与 validated-team publication 分开的 watermark、跨 actor fold、pin/read-model 专用索引。 |
 | Decision | live runtime 有 `ai_final_decision.summary_json` 和 git-internal Decision/MCP；`agent_run::MergeDecision` 是 schema scaffold。 | ML-03 必须改 live Decision 平面，不得建在 `agent_run`。 |
 | Hooks | `hooks/runtime.rs` 当前主责是 capture/ingest；`HookTarget::AgentTraces` 已写 traces。 | ML-08 是反向只读注入，需要独立设计，不应改写捕获语义。 |
-| ContextFrame / ContextSnapshot | 已保存局部选择、来源、token、附件或任意 context data，但无 query/ranking/policy/index receipt；部分载体含 raw content。 | ML-05 应新建 local-only `IntentContextSelectionReceiptV1`，不能扩展/传播 raw ContextFrame。 |
+| ContextFrame / ContextSnapshot | 已保存局部选择、来源、token、附件或任意 context data，但无 query/ranking/policy/index receipt；部分载体含 raw content。 | ML-05 复用 local-only `ContextSelectionReceiptV1`，不能扩展/传播 raw ContextFrame。 |
 | MCP authz | production `authz: None` 时 server allow-all，且部分 ContextFrame call 没有 authz。 | C9 default-deny/全工具覆盖是任何 intent MCP surface 的硬前置；本计划 P0/P1 走 CLI。 |
 
 ### 12.3 可执行最小纵切
@@ -576,7 +576,7 @@ rg -n "ImportActorLog|knownImportedActorEventType|ActorLogAcceptedEvent" /Volume
 - `sealed/` — `IntentSealedEventV1`（内容寻址 blob，文件名即对象 id）。
 - `pin/` — `IntentPinV1`。
 - `decision/` — 已有 `decision` 对象；本计划新增 `DecisionV1` schema version（或扩展现有 schema），必须保证旧 reader 跳过未知字段。
-- `context-receipt/` — local-only `IntentContextSelectionReceiptV1`；它不是 ContextFrame 的 wire 变体，也不属于 `intent-team` publication。
+- `context-receipt/` — local-only `ContextSelectionReceiptV1`；由共享上下文层拥有，不是 ContextFrame 的 wire 变体，也不属于 `intent-team` publication。
 
 `IntentSealedEventV1` 最小字段（对应 mainline `IntentSealedEvent` + v0.3 审计字段）：
 
@@ -739,37 +739,40 @@ TeamIntentRevocationV1 是独立的 team-only tombstone；公开 ref 只携带�
 它只移除 future team read/injection，不能宣称物理删除 remote、existing clone
 或 durable storage tier。
 
-IntentContextSelectionReceiptV1 是 local-only ML-05 audit object。它不包含 raw
-query 或未选中的 sensitive content，也不是 intent-team record。
+ContextSelectionReceiptV1 是 Memory 与 mainline 共用的 local-only selection audit object。以下 envelope
+也是两条读取链路的唯一 JSON 合同；它不包含 raw query、可逆 principal 或未选中的 sensitive content，
+也不是 intent-team record。
 
 ~~~json
 {
-  "schema_version": "libra.intent.context-receipt.v1",
-  "frame_id": "<optional-local-context-frame-id>",
-  "intent_id": "<optional-local-intent-id>",
-  "query": {"mode": "current|files|query", "hash": "sha256:<hash>", "as_of": "<RFC3339>"},
-  "snapshot": {
-    "code_commit": "<oid>",
-    "branch": "<display-only-ref>",
-    "ai_ref_head": "<oid>",
-    "team_ref_head": "<oid>",
-    "projection_built_from": "<oid>",
-    "index_manifest_hash": "sha256:<hash>",
-    "config_policy_hash": "sha256:<hash>"
-  },
-  "selector": {"id": "intent-v1", "version": "1", "weights_hash": "sha256:<hash>"},
+  "receipt_id": "<uuidv7>",
+  "schema_version": 1,
+  "source_kind": "intent",
+  "repository_id": "<canonical-repository-id>",
+  "digest_key_id": "<repository-key-generation-id>",
+  "principal_hmac": "hmac-sha256:<key-id>:<digest>",
+  "query_hmac": "hmac-sha256:<key-id>:<digest>",
+  "effective_at": "<RFC3339>",
+  "code_commit": "<oid>",
+  "full_branch_ref": "refs/heads/<branch>",
+  "source_heads": {"private_ai": "<oid>", "validated_team": "<oid>"},
+  "projection_watermarks": {"private_ai": "<oid>", "validated_team": "<oid>"},
+  "policy_hash": "sha256:<hash>",
+  "selector_version": "intent-v1",
   "selected": [
-    {"object_id": "<id>", "kind": "sealed_intent|decision", "score": 0, "reasons": ["file_overlap"]}
+    {"object_id": "<id>", "revision_oid": "<oid>", "summary_key": "<key>", "order": 0,
+     "reason_codes": ["file_overlap"], "score_components": {"file_overlap": 1}}
   ],
-  "omissions": [{"object_id": "<id>", "reason": "budget|scope|trust|stale"}],
-  "budget": {"limit_tokens": 0, "selected_tokens": 0},
-  "redaction_policy_hash": "sha256:<hash>",
-  "render_version": "1",
-  "bundle_hash": "sha256:<hash>"
+  "omissions": [{"reason_code": "budget|scope|trust|stale", "count": 0}],
+  "token_budget": 0,
+  "bundle_hash": "sha256:<hash>",
+  "reproducibility_state": "reproducible|stale|expired|non_reproducible",
+  "recorded_at": "<RFC3339>",
+  "frame_id": "<optional-local-context-frame-id>"
 }
 ~~~
 
-Canonical receipt/bundle hash 排除 recorded_at 和 generated UUID。引用 missing、
+Canonical receipt/bundle hash 排除 `recorded_at` 和 `receipt_id`。引用 missing、
 untrusted 或 stale source 的 receipt 必须报告该状态，不能静默换用其他 object。
 
 #### 12.6.2 CLI 命令面（新增 `src/command/intent.rs`，在 `src/cli.rs` 注册为 `Commands::Intent`）
@@ -832,7 +835,7 @@ C9 完成后，MCP 面才可在 code.md C6 的 libra code --stdio 上注册，�
 - `ai_intent_coverage` — coverage 状态：commit_sha, coverage_status（local-covered/team-covered/skipped/uncovered）, source_pin_id, publication_record_id, skip_reason, baseline。
 - `ai_intent_team_publication` — 已验证 manifest：remote, publication_id, ref_head, policy_hash, redaction_policy_hash, publisher, received_at, validation_state, built_from。
 - `ai_intent_team_record` — team record / tombstone 的只读投影：record_id, kind, intent_id, content_hash, visibility, review_state, sensitivity, trust, publication_id, revoked_at；未知字段/状态不得落表。
-- `ai_intent_context_receipt` — local-only receipt：receipt_id, query_hash, code_commit, private_ai_ref_head, team_ref_head, projection_built_from, selector_version, policy_hash, bundle_hash, reproducibility_state。
+- `context_selection_receipt` — local-only shared receipt：receipt_id、schema/source kind、repository/digest key、principal/query HMAC、effective time、code commit/full branch ref、source heads、projection watermarks、selector/policy、selected/omissions、token budget、bundle hash、reproducibility state、recorded_at 与可选 frame_id。
 - 扩展 `ai_final_decision` 表或新增 `ai_decision_v1` 投影表，把 `alternatives` 从 JSON 字符串拆成结构化列/表；保留 `summary_json` 作为叠加字段。
 - 扩展 `ai_index_*` 或新增 `ai_intent_retrieval_index` 用于文件/关键词反向索引；必须分别记录 private local 和 validated-team `built_from` watermark / index manifest，不能把 imported team record 混回 AI_REF projection。
 
@@ -1062,7 +1065,7 @@ team projection 已就绪，并且明确拒绝 raw AI history；**不得**宣称
 | 不走 git notes 走 history.rs | N/A（mainline 用 notes） | `notes.rs` SQLite 侧表 + 无 Note ConfigKind | ✅ §5 决策成立 |
 | traces 传输的 lease/tracking 机件可复用 | N/A | `agent/push.rs:30-83` force-with-lease | ✅ 仅复用机件；raw AI_REF mirror 已明确禁止 |
 | AI_REF 不可直接成为团队平面 | N/A | `history.rs` 混合对象 + hook `ai_session/raw_hook_events` | ✅ 新增 intent-team allow-list/redaction/manifest 边界 |
-| ContextFrame 不是可发布 retrieval receipt | N/A | frame 可带 raw content/attachment，缺 policy/ranking/watermark | ✅ 新增 local-only ContextReceiptV1 |
+| ContextFrame 不是可发布 retrieval receipt | N/A | frame 可带 raw content/attachment，缺 policy/ranking/watermark | ✅ 复用 local-only `ContextSelectionReceiptV1` |
 | MCP C6 不等于授权 | N/A | production authz None/allow-all，部分调用无 gate | ✅ C9 设为所有 intent MCP tool 的前置 |
 | 决策缺 alternatives | mainline `IntentSummary.rejected` | `phase4.rs:500-524` 仅 rationale | ✅ ML-03 方向正确 |
 | hook 只捕获 vs SessionStart/TurnStart 只读注入 | `hooks/dispatcher.go:16-22,91-101,296-417` | `hooks/runtime.rs` ingest only | ✅ ML-08 方向正确；本次补充 TurnStart 轻量提醒边界 |
@@ -1080,7 +1083,7 @@ team projection 已就绪，并且明确拒绝 raw AI history；**不得**宣称
 | 无 auto-sync 命令列表 | 各命令新鲜度门禁不一致 | §12.6.9 |
 | 无 mainline→Libra 工作流映射 | 误造 turn/actor-log 平行平面 | §12.6.7 |
 | 原稿把 AI_REF 当 intent-only remote ref | raw Run/tool/context/session 可能被团队复制，lease 不能弥补授权/脱敏缺口 | §5/ML-01/§12.6.1/§12.8 改为 ML-01a safe rail → ML-02 → ML-01b approved publication |
-| 原稿缺 ContextBundle/receipt | 无法解释为何选中这组意图，且 raw ContextFrame 可能泄露 | ML-05 + §12.6.1 增 local-only ContextReceiptV1、重放/缺失 fail-loud 测试 |
+| 原稿缺 ContextBundle/receipt | 无法解释为何选中这组意图，且 raw ContextFrame 可能泄露 | ML-05 + §12.6.1 复用 local-only `ContextSelectionReceiptV1`、重放/缺失 fail-loud 测试 |
 | 原稿把 C6 当 MCP 安全边界 | production authz allow-all，mutating seal/pin tool 可能无授权暴露 | §8/§12.6.3 改为 C9 default-deny/全覆盖前不注册任何 intent MCP tool |
 | 矩阵遗漏 receipt 行 | 静默欠覆盖 | §3 补 ContextBundle/receipt 行，计数改 36 |
 | `check` phase-2 无 schema | Hub `last_check` 无法落地 | §12.6.2 `check` + judgment event 说明 |
