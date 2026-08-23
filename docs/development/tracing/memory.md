@@ -580,6 +580,17 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 - 每个 revision 的 producer / prompt / model / policy / input fingerprint 进入 `memory_revision_index` 投影；只在 note 级保存创建 origin 无法定位后续坏 revision，因此不能满足批量 quarantine / recompile 要求。
 - `input_hashes` 只能基于已经 redacted、canonicalized 的输入。对可能仍具可识别性的用户文本或 secret-like token，使用 repository-local keyed HMAC 并在字段中标明算法/key generation；普通 SHA-256 不能被当作匿名化。
 
+##### 仓库级密钥摘要提供器（Repository Keyed Digest）
+
+Memory 的幂等键、主体摘要、查询摘要和来源输入摘要共用一个仓库级密钥所有者 `RepositoryKeyedDigest`。调用方只能选择 `Idempotency`、`Principal`、`Query`、`SourceInput` 四种封闭用途并提交字节输入；seed、派生 key 和 HKDF label 都不暴露给调用方。
+
+- 固定配置条目为 `memory.keyed_digest.v1`。其中保存 `schema_version=1`、`generation=1`、随机 UUIDv4 `key_id` 与 32-byte seed，经现有 repository vault 加密后写入 repository-local `config_kv`。该条目由 keyed-digest provider 单独管理：`libra config` 可以只读查看其脱敏占位，但 set/add/unset、import、remove-section 与 rename-section 都不能创建、替换、移动或删除它。
+- 生成前必须在同一个 SQLite 写事务中确认 `libra/memory/*` 本地分支和 `context_selection_receipt` 行都不存在。并发首次调用由 SQLite 写锁串行化，只允许一个加密条目成为 winner；一旦出现 Memory ref 或 receipt，缺失条目不得自动补发新 seed。
+- 密码学配方固定为 `HKDF-Extract(SHA-256, salt="libra/memory/keyed-digest/salt/v1", IKM=seed)`，再对所选用途执行 `HKDF-Expand(PRK, info, 32)`，最后计算 `HMAC-SHA-256(input)`。四个 info 依次为 `libra/memory/idempotency/v1`、`libra/memory/principal/v1`、`libra/memory/query/v1`、`libra/memory/source-input/v1`。配方或 label 变化必须引入新的 generation 和迁移，不能静默修改。
+- 返回值固定携带 `version`、`key_id`、`purpose` 与 `digest`。seed、派生 key、raw principal/query 不进入 envelope、Debug、错误、日志、Git 对象、SQLite 明文字段、远端层或 CI artifact。
+- 配置缺失、重复、被明文保存、无法解密、schema/generation 未知、repository vault key 不可用，或已缓存 provider 观察到持久配置被删除/替换时，统一停止新的 digest-bearing 写入，并使用稳定错误 `LBR-MEMORY-001`。恢复方式是修复原加密条目或以独立迁移显式引入新 generation；旧 receipt 在原 key 无法恢复时标记 `non_reproducible`。
+- provider 按 canonical repository DB path 与不可变 repository ID 放入私有有界进程缓存，同一进程每仓至多解密一次。每次重新获取 provider 时读取该配置行并校验密文 SHA-256 指纹；一旦发现持久配置被删除或替换，共享有效性标记会立即毒化同一缓存项此前发出的全部 handle，后续摘要统一返回 `LBR-MEMORY-001`，修复配置后需要重启进程才能重新载入。真正的摘要热路径只执行两次进程内有效性检查与本地 O(input bytes) 的 HMAC，不访问 SQLite 或网络。
+
 #### 4.1.2 引用、链接与 policy 最小契约
 
 为使授权、provenance 与图扩展可实现，以下 supporting types 必须 versioned，不能留成无约束 JSON：

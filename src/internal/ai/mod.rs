@@ -114,6 +114,7 @@ pub mod libra_vcs;
 pub mod mcp;
 // Versioned Agent Memory contracts. Storage and compiler implementations stay
 // behind the small crate-private `memory` surface.
+pub(crate) mod keyed_digest;
 pub(crate) mod memory;
 // Adapter that lets agents participate as nodes in the workflow DAG.
 pub mod node_adapter;

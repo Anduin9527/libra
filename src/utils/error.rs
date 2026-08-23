@@ -194,6 +194,9 @@ pub enum StableErrorCode {
     RepoNotFound,
     RepoCorrupt,
     RepoStateInvalid,
+    /// The repository-local Memory keyed-digest seed is missing, malformed,
+    /// uses an unsupported generation, or cannot be decrypted.
+    MemoryDigestKeyUnavailable,
     /// Global config database schema is newer than this Libra binary supports.
     ConfigSchemaFuture,
     ConflictUnresolved,
@@ -355,6 +358,7 @@ impl StableErrorCode {
             Self::RepoNotFound => "LBR-REPO-001",
             Self::RepoCorrupt => "LBR-REPO-002",
             Self::RepoStateInvalid => "LBR-REPO-003",
+            Self::MemoryDigestKeyUnavailable => "LBR-MEMORY-001",
             Self::ConfigSchemaFuture => "LBR-CONFIG-001",
             Self::ConflictUnresolved => "LBR-CONFLICT-001",
             Self::ConflictOperationBlocked => "LBR-CONFLICT-002",
@@ -420,6 +424,7 @@ impl StableErrorCode {
             Self::RepoNotFound
             | Self::RepoCorrupt
             | Self::RepoStateInvalid
+            | Self::MemoryDigestKeyUnavailable
             | Self::WorktreeCursorInvalid
             | Self::WorktreeScopeCorrupt => CliErrorCategory::Repo,
             Self::ConfigSchemaFuture | Self::UpgradeSettingsInvalid => CliErrorCategory::Config,
@@ -523,6 +528,9 @@ impl StableErrorCode {
             Self::RepoCorrupt => "Repository metadata is missing, incompatible, or corrupt.",
             Self::RepoStateInvalid => {
                 "Repository state prevents the requested operation from proceeding."
+            }
+            Self::MemoryDigestKeyUnavailable => {
+                "Repository Memory digest key is missing, invalid, or cannot be decrypted."
             }
             Self::ConfigSchemaFuture => {
                 "Global config database schema is newer than this Libra binary supports."
@@ -2126,8 +2134,8 @@ mod tests {
     /// would invalidate every downstream pin without tripping any
     /// test until end-to-end JSON harness assertions caught it.
     ///
-    /// Enumerate all 23 non-agent variants so a new addition trips both this
-    /// list and the `as_str` impl's exhaustive match.
+    /// Pin the general-purpose and domain-specific variants alongside the
+    /// agent-code table below; the `as_str` impl remains exhaustive.
     #[test]
     fn stable_error_code_as_str_pins_each_variant() {
         assert_eq!(StableErrorCode::CliUnknownCommand.as_str(), "LBR-CLI-001");
@@ -2136,6 +2144,10 @@ mod tests {
         assert_eq!(StableErrorCode::RepoNotFound.as_str(), "LBR-REPO-001");
         assert_eq!(StableErrorCode::RepoCorrupt.as_str(), "LBR-REPO-002");
         assert_eq!(StableErrorCode::RepoStateInvalid.as_str(), "LBR-REPO-003");
+        assert_eq!(
+            StableErrorCode::MemoryDigestKeyUnavailable.as_str(),
+            "LBR-MEMORY-001",
+        );
         assert_eq!(
             StableErrorCode::ConfigSchemaFuture.as_str(),
             "LBR-CONFIG-001",
@@ -2285,6 +2297,10 @@ mod tests {
         );
         assert_eq!(
             StableErrorCode::RepoStateInvalid.category(),
+            CliErrorCategory::Repo,
+        );
+        assert_eq!(
+            StableErrorCode::MemoryDigestKeyUnavailable.category(),
             CliErrorCategory::Repo,
         );
         // The worktree-doctor pair reuses `repo` deliberately (§C.13) —

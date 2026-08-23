@@ -211,6 +211,7 @@ test_config_list_defaults_to_local_scope_without_global_entries	lane:cwd	changes
 test_config_list_gpg_keys_outputs_configured_key_namespaces	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_name_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_ssh_keys_outputs_configured_public_keys	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_config_memory_keyed_digest_is_owner_managed	lane:cwd	changes cwd and process HOME through the command integration harness
 test_config_null_terminated_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_remove_and_rename_section	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_rename_section_preserves_multivalue_order	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
