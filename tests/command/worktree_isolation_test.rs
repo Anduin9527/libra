@@ -5896,9 +5896,9 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         assert_eq!(
             rolled,
             vec![
-                2026082401, 2026081301, 2026080403, 2026080402, 2026080401, 2026073101, 2026073005,
-                2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901, 2026072502,
-                2026072501, 2026072403, 2026072402, 2026072401
+                2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401, 2026073101,
+                2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+                2026072502, 2026072501, 2026072403, 2026072402, 2026072401
             ]
         );
         conn.close().await.expect("close");
@@ -8556,7 +8556,7 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     let db_url = format!("sqlite://{}?mode=rwc", db.display());
 
     // Use the real down migration rather than deleting its ledger row. The
-    // Memory core migration creates physical tables, so undoing it represents
+    // Memory FTS migration creates physical tables, so undoing it represents
     // a repository that is genuinely one migration behind.
     let conn = Database::connect(&db_url)
         .await
@@ -8564,15 +8564,15 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     assert_eq!(
         builtin_runner()
             .expect("builtin runner")
-            .rollback_to(&conn, 2026081301)
+            .rollback_to(&conn, 2026082401)
             .await
             .expect("roll back newest migration"),
-        vec![2026082401]
+        vec![2026082402]
     );
     conn.close().await.expect("close repository db");
     assert!(
-        sqlite_max_schema_version(&db) < 2026082401,
-        "2026082401 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026082402,
+        "2026082402 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

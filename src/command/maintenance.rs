@@ -3335,6 +3335,17 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         "revision_oid",
         "Rebuildable Episode path lookup keyed by a Memory revision; it accelerates filtering and contributes no reachability authority",
     ),
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "memory_episode_search_doc",
+        column: "revision_oid",
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082402_memory_fts_search rebuildable projection",
+        read_bound: "not read by GC; projection replay rebuilds the search document and FTS postings",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note: "Episode search lookup keyed by an authoritative Memory revision; SQLite search state never owns object reachability",
+    },
     memory_runtime_oid(
         "memory_compile_job",
         "terminal_source_oid",

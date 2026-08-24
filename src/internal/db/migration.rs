@@ -1389,6 +1389,15 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082401_memory_core.sql"),
             include_str!("../../../sql/migrations/2026082401_memory_core_down.sql"),
         ),
+        // M2-02F: a single-copy Episode search document and its
+        // external-content FTS5 postings. Runtime synchronization is owned by
+        // internal::ai::memory::fts_sql; no triggers or fallback scan exist.
+        sql_migration(
+            2026082402,
+            "memory_fts_search",
+            include_str!("../../../sql/migrations/2026082402_memory_fts_search.sql"),
+            include_str!("../../../sql/migrations/2026082402_memory_fts_search_down.sql"),
+        ),
     ]
 }
 
@@ -1836,9 +1845,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 56);
+        assert_eq!(runner.len(), 57);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026082401));
+        assert_eq!(runner.max_registered_version(), Some(2026082402));
     }
 
     #[test]

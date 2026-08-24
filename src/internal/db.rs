@@ -888,6 +888,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn memory_fts_old_reader_rejects_migrated_schema() {
+        assert_eq!(
+            classify_schema_compatibility(Some(2026082402), Some(2026082401)),
+            SchemaCompatibility::UnsupportedFuture {
+                current_version: 2026082402,
+                latest_version: Some(2026082401),
+            }
+        );
+    }
+
     /// TestDbPath is a helper struct create and delete test database file
     struct TestDbPath(String);
     impl Drop for TestDbPath {

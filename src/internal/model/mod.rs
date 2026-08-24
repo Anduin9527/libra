@@ -24,6 +24,7 @@ pub mod config_kv;
 pub mod layer;
 pub mod layer_path;
 pub mod memory_episode_path;
+pub mod memory_episode_search_doc;
 pub mod memory_head;
 pub mod memory_link_index;
 pub mod memory_note_index;

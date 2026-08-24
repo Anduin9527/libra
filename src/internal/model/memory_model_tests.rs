@@ -1,8 +1,8 @@
 use sea_orm::{Iterable, PrimaryKeyTrait};
 
 use super::{
-    memory_episode_path, memory_head, memory_link_index, memory_note_index, memory_path_summary,
-    memory_projection_state, memory_revision_index,
+    memory_episode_path, memory_episode_search_doc, memory_head, memory_link_index,
+    memory_note_index, memory_path_summary, memory_projection_state, memory_revision_index,
 };
 
 fn key_names<P>() -> Vec<String>
@@ -39,6 +39,10 @@ fn memory_entities_expose_expected_primary_keys() {
         key_names::<memory_episode_path::PrimaryKey>(),
         ["NoteId", "RevisionOid", "CodePath"]
     );
+    assert_eq!(
+        key_names::<memory_episode_search_doc::PrimaryKey>(),
+        ["Rowid"]
+    );
 
     assert!(!memory_head::PrimaryKey::auto_increment());
     assert!(!memory_path_summary::PrimaryKey::auto_increment());
@@ -47,4 +51,5 @@ fn memory_entities_expose_expected_primary_keys() {
     assert!(!memory_link_index::PrimaryKey::auto_increment());
     assert!(!memory_projection_state::PrimaryKey::auto_increment());
     assert!(!memory_episode_path::PrimaryKey::auto_increment());
+    assert!(memory_episode_search_doc::PrimaryKey::auto_increment());
 }

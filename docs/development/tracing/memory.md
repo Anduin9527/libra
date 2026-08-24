@@ -850,6 +850,52 @@ source-input fingerprint 拆列保存 `version/key_id/digest`；`purpose=source_
 由不可绕过的 `SourceInputFingerprint` 类型固定，不在表中重复存字符串。
 迁移本身不得初始化、读取或轮换 repository keyed-digest seed。
 
+M2-02F 随后的版本化迁移
+`sql/migrations/2026082402_memory_fts_search.sql` 与对应 down 文件增加
+Episode 搜索投影。这里的「搜索正文表」（search document）指 SQLite 普通表
+`memory_episode_search_doc`；它保存唯一一份可搜索文本。「全文倒排索引」
+（FTS5 index）指 external-content 虚拟表 `memory_episode_fts`；它只保存由正文生成的
+posting，不再复制正文。二者共享稳定的 `INTEGER rowid`，并遵守以下固定合同：
+
+| 存储项 | 字段与约束 | 用途 |
+|---|---|---|
+| `memory_episode_search_doc` 身份 | `rowid` 主键；`(note_id, revision_oid)` 唯一并复合外键到 `memory_revision_index`；父项删除使用 `RESTRICT` | 一条 Episode revision 对应一个稳定搜索文档；先执行受控 FTS 删除，才能删除父 revision |
+| root / 过滤元数据 | `root_kind=task\|intent`、有界 `root_id`、`completion_status`、`code_change_status`、可空 `ended_at` | 在 MATCH 前做 root/状态/时间过滤；尚未结束的来源允许 `ended_at=NULL` |
+| 唯一正文 | `goal`、`summary`、`decisions`、`failed_attempts`、`unresolved` 均非空字符串，合计最多 64 KiB | 保留结局级结构，而非把整个 session/transcript 放进 SQLite |
+| `memory_episode_fts` | 同样的五列与相同顺序；`content='memory_episode_search_doc'`、`content_rowid='rowid'` | 只承载可重建倒排索引 |
+| tokenizer | `unicode61 remove_diacritics 2` | Unicode 分词；例如查询 `cafe` 可命中 `café` |
+| BM25 权重 | `goal=8`、`summary=5`、`decisions=4`、`failed_attempts=3`、`unresolved=2`，分数按升序排列 | M2-11 reader 使用的首版固定排序合同；SQLite `bm25()` 分数越小越相关 |
+
+external-content FTS5 不会替调用方同步普通表。唯一 SQL owner 是 crate-private
+`src/internal/ai/memory/fts_sql.rs`。调用方先取得不可从普通事务构造的
+`MemoryWriteTransaction`；该包装通过现有 `begin_write_transaction` 在任何读取前取得
+SQLite 写锁，再向同一事务暴露普通投影写入接口。这样既能与其它 Memory 投影原子提交，
+也不会在并发写入时发生 deferred transaction 的 read→write upgrade `SQLITE_BUSY`。
+`fts_sql` 不自行提交：
+
+1. 新建时先写 `memory_episode_search_doc`，取得 rowid，再写对应 FTS posting。
+2. 更新时先读取旧五列，用 FTS5 的 `delete` 命令删除旧 posting；随后原位更新
+   同一 rowid 的正文，并写入新 posting。
+3. 删除时同样先用旧五列删除 posting，再删除普通表行。不能依赖 FK cascade，
+   因为虚拟表无法参与普通外键级联。
+4. 任一步失败，调用方回滚整个事务；旧正文和旧 posting 必须同时恢复。
+5. 重建使用 FTS5 `rebuild` 命令，并立即执行 external-content `integrity-check`。
+
+查询入口只接受普通文本。`normalize_plain_text_v1` 先提取连续的 Unicode 字母/数字
+词项，以 ASCII 大小写折叠键去重，再按 FTS literal 引号规则转义并以受控 `OR`
+连接；其它 Unicode 词项按原文去重。空输入、控制字符、超过 4 KiB 的 query、超过
+256 bytes 的词项或超过 32 个去重后词项会明确报错。最终表达式仍通过 `MATCH ?`
+参数绑定执行。这样 `authentication/cache` 会生成两个独立词项，自然语言查询只需
+命中部分有效词项；调用方仍不能直接传 `OR`、`NEAR`、列过滤器或其它 FTS 语法。
+首版不内置特定语言的停用词表；召回质量、多语言分词与多字段权重由 M2-14
+benchmark 校准。
+
+该能力不新增数据库服务或第二套 SQLite。当前 SeaORM/sqlx-sqlite 依赖链已经通过
+`libsqlite3-sys` bundled build 启用 `SQLITE_ENABLE_FTS5`；发布门使用与正式二进制
+相同的 `--release --features keyring`，分别在 Linux amd64/arm64、macOS arm64 和
+Windows amd64 上运行 capability probe。任一平台不能 create/MATCH/`bm25()` 时，
+reader 不得以 `LIKE` 全表扫描代替。
+
 下面以普通 `CREATE TABLE` 形式给出表结构，落地时请置于上述迁移文件中并加上 `IF NOT EXISTS` 幂等保护：
 
 ```sql
@@ -1761,7 +1807,7 @@ query
   -> fail-closed: 无 embedding 配置或 provider 失败 -> 仅 Channel 0
 ```
 
-- **Channel 0（常开）**：路径前缀（§6.2）+ BM25/FTS5 关键词检索；无任何 embedding 配置即可用、可测（memweave 的「零外部服务 + 纯关键词降级」与 agentmemory 的「BM25 always on」为同向证据）。
+- **Channel 0（常开）**：路径前缀（§6.2）+ BM25/FTS5 关键词检索；无任何 embedding 配置即可用、可测（memweave 的「零外部服务 + 纯关键词降级」与 agentmemory 的「BM25 always on」为同向证据）。首版搜索文档、tokenizer、plain-text query normalization、五列权重与事务维护顺序已经在 §5.2 固定；M2-11 只实现结构化过滤、`MATCH ?`、`bm25(..., 8, 5, 4, 3, 2) ASC` 与稳定 tie-break，不能再定义另一套 FTS schema 或接受原始 MATCH 语法。
 - **Channel 1（可选）**：向量相似度。embedding 必须可本地运行（llama.cpp / Ollama 等）；embedding 按内容哈希缓存（`memory_embedding_cache`，§5.2，可整体丢弃）。provider 缺失、失败或超时 → 自动回退 Channel 0；**不得**把不可验证的向量结果注入 prompt。
 - **Channel 2（Phase E）**：§6.4 已定义的实体图有界一跳/两跳查询，只返回候选。
 - **融合与去重**：RRF 融合使用固定 k（起点 k=60，agentmemory 口径）；MMR 或等价去重 + 会话多样化上限（起点 max 3/session），避免同一事实多 chunk 重复注入。
