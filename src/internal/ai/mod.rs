@@ -110,6 +110,8 @@ pub mod intent;
 pub mod intentspec;
 // VCS-side helpers used by tools that touch the repository.
 pub mod libra_vcs;
+// Atomic CAS + companion writes for Libra-owned linear refs.
+pub(crate) mod linear_ref;
 // Model Context Protocol server exposing Libra to MCP-aware clients.
 pub mod mcp;
 // Versioned Agent Memory contracts. Storage and compiler implementations stay

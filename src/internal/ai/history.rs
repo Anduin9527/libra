@@ -54,8 +54,7 @@ use git_internal::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr,
-    EntityTrait, QueryFilter, QueryResult, Set, SqlErr, Statement, TransactionTrait, Value,
-    sea_query::Expr,
+    EntityTrait, QueryFilter, QueryResult, Set, Statement, TransactionTrait, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -67,7 +66,13 @@ use tokio::{
 use crate::utils::storage::tiered::verify_fetched_object;
 use crate::{
     internal::{
-        ai::observed_agents::RedactedBytes,
+        ai::{
+            linear_ref::{
+                LinearRefCompanion, LinearRefDeadlineExceeded, LinearRefTransactionOutcome,
+                OwnedRefSpec, linear_ref_transaction,
+            },
+            observed_agents::RedactedBytes,
+        },
         model::reference::{self, ConfigKind},
     },
     utils::{
@@ -339,20 +344,6 @@ struct TracesWriterFence {
     generation: String,
 }
 
-/// Outcome of a compare-and-swap reference update.
-///
-/// Used by [`HistoryManager::update_ref_if_matches`] to communicate whether
-/// the ref moved successfully (`Updated`) or whether the expected head was
-/// stale and the caller must restart the splice (`HeadChanged`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefUpdateOutcome {
-    /// The ref was atomically advanced to the new commit.
-    Updated,
-    /// Another writer advanced the ref before our CAS — caller should
-    /// re-read the head and rebuild the commit on top of it.
-    HeadChanged,
-}
-
 /// Detect transient SQLite contention that should trigger a retry.
 ///
 /// Functional scope:
@@ -373,16 +364,6 @@ fn anyhow_is_sqlite_busy(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<DbErr>())
         .any(is_sqlite_busy)
-}
-
-/// Detect unique-constraint violations on the `reference` table.
-///
-/// Functional scope:
-/// - Used by the optimistic CAS path: when two writers race to insert the
-///   same ref name, one will see a unique-constraint violation; we treat
-///   that as a `HeadChanged` outcome rather than a hard error.
-fn is_sqlite_unique_violation(err: &DbErr) -> bool {
-    matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
 }
 
 fn read_cleanup_regular_file(
@@ -994,17 +975,16 @@ impl HistoryManager {
         Self::new_with_ref(storage, repo_path, db_conn, AI_REF)
     }
 
-    /// Build a manager bound to an arbitrary ref name.
+    /// Build a manager bound to a named Libra-owned history ref.
     ///
     /// Functional scope:
-    /// - Used by tests and tooling that need to write a parallel AI history
-    ///   under a custom ref (e.g. for staging, comparison, or namespace
-    ///   isolation).
+    /// - Used by traces writers and repair tooling that operate on a parallel
+    ///   Libra-owned history.
     ///
     /// Boundary conditions:
-    /// - The ref name is not validated here; callers must ensure it is a
-    ///   legal Git ref. The CAS path will fail loudly if the database
-    ///   constraint rejects it.
+    /// - Reads and legacy maintenance paths retain the supplied name. The
+    ///   append/checkpoint conditional-CAS path is fail-closed unless the name
+    ///   maps to an [`OwnedRefSpec`].
     pub fn new_with_ref(
         storage: Arc<dyn Storage + Send + Sync>,
         repo_path: PathBuf,
@@ -1137,11 +1117,13 @@ impl HistoryManager {
                 .update_ref_if_matches(&self.ref_name, parent_commit_id, commit_hash)
                 .await?
             {
-                RefUpdateOutcome::Updated => return Ok(()),
-                RefUpdateOutcome::HeadChanged if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES => {
+                LinearRefTransactionOutcome::Updated => return Ok(()),
+                LinearRefTransactionOutcome::HeadChanged
+                    if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES =>
+                {
                     continue;
                 }
-                RefUpdateOutcome::HeadChanged => {
+                LinearRefTransactionOutcome::HeadChanged => {
                     return Err(anyhow!(
                         "history head changed repeatedly while appending {}/{}",
                         object_type,
@@ -2019,7 +2001,7 @@ impl HistoryManager {
         ref_name: &str,
         expected_head: Option<ObjectHash>,
         new_hash: ObjectHash,
-    ) -> Result<RefUpdateOutcome> {
+    ) -> Result<LinearRefTransactionOutcome> {
         self.update_ref_if_matches_with_extra(ref_name, expected_head, new_hash, None, None, None)
             .await
     }
@@ -2039,172 +2021,33 @@ impl HistoryManager {
         extra: Option<(&dyn TracesTxnExtra, &TracesCommitCtx)>,
         deadline: Option<Instant>,
         marker_fence: Option<&TracesWriterFence>,
-    ) -> Result<RefUpdateOutcome> {
-        let expected_commit = expected_head.map(|hash| hash.to_string());
-        let new_commit = new_hash.to_string();
-
-        for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                bail!("checkpoint append exceeded the historical import execution deadline");
-            }
-            let txn: DatabaseTransaction =
-                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
-                    Ok(txn) => txn,
-                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                        sleep(Duration::from_millis(
-                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                        ))
-                        .await;
-                        continue;
-                    }
-                    Err(err) => return Err(err).context("Failed to begin transaction"),
-                };
-
-            // An expired ordinary marker may have been fenced and retired by
-            // crash recovery while this writer was stalled. The marker check
-            // rides the same SQLite writer transaction as the ref/catalog CAS:
-            // cleanup wins first => this writer cannot publish; this writer
-            // wins first => cleanup observes the committed root/catalog.
-            if let Some(marker_fence) = marker_fence {
-                let entry = crate::internal::metadata::MetadataKv::get_with_conn(
-                    &txn,
-                    crate::internal::metadata::MetadataScope::AgentTracesInflight,
-                    &marker_fence.session_id,
-                    &marker_fence.attempt_id,
-                )
-                .await
-                .context("revalidate checkpoint writer marker before ref update")?;
-                let Some(entry) = entry else {
-                    txn.rollback().await.ok();
-                    bail!(
-                        "checkpoint writer marker was fenced before ref update; retry the operation"
-                    );
-                };
-                let marker = decode_and_validate_traces_inflight_marker(
-                    &entry.value,
-                    &entry.target,
-                    &entry.key,
-                )?;
-                if let Err(error) = Self::ensure_marker_matches_fence(&marker, marker_fence) {
-                    txn.rollback().await.ok();
-                    return Err(error.context("revalidate marker generation before ref update"));
-                }
-            }
-
-            let existing = match reference::Entity::find()
-                .filter(reference::Column::Name.eq(ref_name))
-                .filter(reference::Column::Kind.eq(ConfigKind::Branch))
-                .one(&txn)
-                .await
-            {
-                Ok(existing) => existing,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    let _ = txn.rollback().await;
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to query reference"),
-            };
-
-            let write_result = match existing {
-                Some(model) if model.commit != expected_commit => {
-                    let _ = txn.rollback().await;
-                    return Ok(RefUpdateOutcome::HeadChanged);
-                }
-                Some(model) => {
-                    let mut update = reference::Entity::update_many()
-                        .filter(reference::Column::Id.eq(model.id))
-                        .filter(reference::Column::Name.eq(ref_name))
-                        .filter(reference::Column::Kind.eq(ConfigKind::Branch));
-                    update = match expected_commit.as_ref() {
-                        Some(commit) => update.filter(reference::Column::Commit.eq(commit.clone())),
-                        None => update.filter(reference::Column::Commit.is_null()),
-                    };
-
-                    update
-                        .col_expr(
-                            reference::Column::Commit,
-                            Expr::value(Some(new_commit.clone())),
-                        )
-                        .exec(&txn)
-                        .await
-                        .map(Some)
-                }
-                None if expected_commit.is_some() => {
-                    let _ = txn.rollback().await;
-                    return Ok(RefUpdateOutcome::HeadChanged);
-                }
-                None => {
-                    let new_ref = reference::ActiveModel {
-                        name: Set(Some(ref_name.to_string())),
-                        kind: Set(ConfigKind::Branch),
-                        commit: Set(Some(new_commit.clone())),
-                        remote: Set(None),
-                        ..Default::default()
-                    };
-                    match new_ref.insert(&txn).await {
-                        Ok(_) => Ok(None),
-                        Err(err) if is_sqlite_unique_violation(&err) => {
-                            let _ = txn.rollback().await;
-                            return Ok(RefUpdateOutcome::HeadChanged);
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-            };
-
-            let rows_affected = match write_result {
-                Ok(rows_affected) => rows_affected,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    let _ = txn.rollback().await;
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to compare-and-swap history head"),
-            };
-
-            if rows_affected.is_some_and(|result| result.rows_affected != 1) {
-                let _ = txn.rollback().await;
-                return Ok(RefUpdateOutcome::HeadChanged);
-            }
-
-            // ADR-DR-10: companion writes ride the ref transaction. A
-            // failure here must NOT move the ref — roll back and fail
-            // closed (no HeadChanged retry: the failure is a gate/fence
-            // violation or DB fault, not a CAS race).
-            if let Some((extra, ctx)) = extra
-                && let Err(err) = extra.apply(&txn, ctx).await
-            {
-                let _ = txn.rollback().await;
-                return Err(
-                    err.context("transactional companion writes failed; ref update rolled back")
-                );
-            }
-
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                let _ = txn.rollback().await;
-                bail!("checkpoint append exceeded the historical import execution deadline");
-            }
-
-            match txn.commit().await {
-                Ok(()) => return Ok(RefUpdateOutcome::Updated),
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                }
-                Err(err) => return Err(err).context("Failed to commit transaction"),
-            }
+    ) -> Result<LinearRefTransactionOutcome> {
+        let spec = OwnedRefSpec::for_history_storage_name(ref_name)
+            .with_context(|| format!("history ref '{ref_name}' is not a named Libra-owned ref"))?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!("checkpoint append exceeded the historical import execution deadline");
         }
 
-        unreachable!("sqlite busy retry loop must return on success or terminal error")
+        let companion = HistoryLinearRefCompanion {
+            extra,
+            deadline,
+            marker_fence,
+        };
+        let result = linear_ref_transaction(
+            self.db_conn.as_ref(),
+            spec,
+            expected_head,
+            new_hash,
+            deadline,
+            Some(&companion),
+        )
+        .await;
+        match result {
+            Err(error) if error.downcast_ref::<LinearRefDeadlineExceeded>().is_some() => Err(
+                anyhow!("checkpoint append exceeded the historical import execution deadline"),
+            ),
+            result => result,
+        }
     }
 
     /// Append a checkpoint commit to this manager's ref.
@@ -2600,7 +2443,7 @@ impl HistoryManager {
                 )
                 .await?
             {
-                RefUpdateOutcome::Updated => {
+                LinearRefTransactionOutcome::Updated => {
                     if cfg!(debug_assertions)
                         && let Ok(value) =
                             std::env::var("LIBRA_TEST_CHECKPOINT_POST_COMMIT_DELAY_MS")
@@ -2617,10 +2460,12 @@ impl HistoryManager {
                         object_count,
                     });
                 }
-                RefUpdateOutcome::HeadChanged if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES => {
+                LinearRefTransactionOutcome::HeadChanged
+                    if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES =>
+                {
                     continue;
                 }
-                RefUpdateOutcome::HeadChanged => {
+                LinearRefTransactionOutcome::HeadChanged => {
                     return Err(anyhow!(
                         "history head changed repeatedly while appending checkpoint {}",
                         params.checkpoint_id
@@ -3435,7 +3280,7 @@ impl HistoryManager {
                 .await?
             {
                 (
-                    RefUpdateOutcome::Updated,
+                    LinearRefTransactionOutcome::Updated,
                     removed_checkpoints,
                     deleted_object_index_rows,
                     deleted_import_identities,
@@ -3450,12 +3295,12 @@ impl HistoryManager {
                         deleted_import_identities,
                     });
                 }
-                (RefUpdateOutcome::HeadChanged, _, _, _)
+                (LinearRefTransactionOutcome::HeadChanged, _, _, _)
                     if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES =>
                 {
                     continue;
                 }
-                (RefUpdateOutcome::HeadChanged, _, _, _) => {
+                (LinearRefTransactionOutcome::HeadChanged, _, _, _) => {
                     return Err(anyhow!(
                         "traces head changed repeatedly while pruning checkpoints"
                     ));
@@ -4014,7 +3859,7 @@ impl HistoryManager {
         remove_ids: &HashSet<String>,
         unreachable_oids: &[String],
         record_cloud_tombstones: bool,
-    ) -> Result<(RefUpdateOutcome, u64, u64, u64)> {
+    ) -> Result<(LinearRefTransactionOutcome, u64, u64, u64)> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_head.map(|hash| hash.to_string());
         let _object_index_deletion_fence =
@@ -4064,7 +3909,7 @@ impl HistoryManager {
             let write_ref = match existing {
                 Some(model) if model.commit != expected_commit => {
                     let _ = txn.rollback().await;
-                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0, 0));
+                    return Ok((LinearRefTransactionOutcome::HeadChanged, 0, 0, 0));
                 }
                 Some(model) => {
                     let mut active: reference::ActiveModel = model.into();
@@ -4073,7 +3918,7 @@ impl HistoryManager {
                 }
                 None if expected_commit.is_some() => {
                     let _ = txn.rollback().await;
-                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0, 0));
+                    return Ok((LinearRefTransactionOutcome::HeadChanged, 0, 0, 0));
                 }
                 None => {
                     let new_ref = reference::ActiveModel {
@@ -4378,7 +4223,7 @@ impl HistoryManager {
             match txn.commit().await {
                 Ok(()) => {
                     return Ok((
-                        RefUpdateOutcome::Updated,
+                        LinearRefTransactionOutcome::Updated,
                         removed,
                         deleted_object_index_rows,
                         deleted_import_identities,
@@ -4750,6 +4595,55 @@ pub fn rebuild_catalog_row_from_traces_ref(
 #[async_trait::async_trait]
 pub trait TracesTxnExtra: Send + Sync {
     async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()>;
+}
+
+struct HistoryLinearRefCompanion<'a> {
+    extra: Option<(&'a dyn TracesTxnExtra, &'a TracesCommitCtx)>,
+    deadline: Option<Instant>,
+    marker_fence: Option<&'a TracesWriterFence>,
+}
+
+#[async_trait::async_trait]
+impl LinearRefCompanion for HistoryLinearRefCompanion<'_> {
+    async fn apply(&self, txn: &DatabaseTransaction) -> Result<()> {
+        // An expired ordinary marker may have been fenced and retired while
+        // this writer was stalled. Revalidation remains inside the winning
+        // ref transaction.
+        if let Some(marker_fence) = self.marker_fence {
+            let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+                txn,
+                crate::internal::metadata::MetadataScope::AgentTracesInflight,
+                &marker_fence.session_id,
+                &marker_fence.attempt_id,
+            )
+            .await
+            .context("revalidate checkpoint writer marker before ref update")?;
+            let Some(entry) = entry else {
+                bail!("checkpoint writer marker was fenced before ref update; retry the operation");
+            };
+            let marker = decode_and_validate_traces_inflight_marker(
+                &entry.value,
+                &entry.target,
+                &entry.key,
+            )?;
+            HistoryManager::ensure_marker_matches_fence(&marker, marker_fence)
+                .context("revalidate marker generation before ref update")?;
+        }
+
+        if let Some((extra, ctx)) = self.extra {
+            extra
+                .apply(txn, ctx)
+                .await
+                .context("transactional companion writes failed; ref update rolled back")?;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            bail!("checkpoint append exceeded the historical import execution deadline");
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for dyn TracesTxnExtra + '_ {
@@ -7113,7 +7007,7 @@ mod tests {
             .update_ref_if_matches(AI_REF, stale_head, stale_commit)
             .await
             .expect("stale ref update should not error");
-        assert_eq!(outcome, RefUpdateOutcome::HeadChanged);
+        assert_eq!(outcome, LinearRefTransactionOutcome::HeadChanged);
 
         manager.append("plan", "plan-1", plan_hash).await.unwrap();
 
