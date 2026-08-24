@@ -36,6 +36,19 @@ pub(crate) enum OwnedRefTransportPolicy {
     LocalOnly,
 }
 
+/// Behaviour attached to one canonical Libra-owned ref.
+///
+/// This record is deliberately value-only: command adapters can enforce the
+/// same decision without querying SQLite or duplicating name checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnedRefPolicy {
+    pub(crate) visible_to_branch: bool,
+    pub(crate) mutable_by_user: bool,
+    pub(crate) operation_snapshot: bool,
+    pub(crate) gc_root: bool,
+    pub(crate) transport: OwnedRefTransportPolicy,
+}
+
 /// Closed set of refs whose mutation policy is owned by Libra.
 ///
 /// Callers select a variant instead of supplying a name, so a user-controlled
@@ -86,18 +99,76 @@ impl OwnedRefSpec {
         }
     }
 
+    pub(crate) const fn policy(self) -> OwnedRefPolicy {
+        match self {
+            Self::MemoryRepo => OwnedRefPolicy {
+                visible_to_branch: false,
+                mutable_by_user: false,
+                operation_snapshot: false,
+                gc_root: true,
+                transport: OwnedRefTransportPolicy::LocalOnly,
+            },
+            Self::AiHistory => OwnedRefPolicy {
+                visible_to_branch: true,
+                mutable_by_user: false,
+                operation_snapshot: true,
+                gc_root: true,
+                transport: OwnedRefTransportPolicy::Ordinary,
+            },
+            Self::Traces | Self::LegacyTraces => OwnedRefPolicy {
+                visible_to_branch: true,
+                mutable_by_user: false,
+                operation_snapshot: true,
+                gc_root: true,
+                transport: OwnedRefTransportPolicy::DedicatedOnly,
+            },
+        }
+    }
+
+    /// Classify an exact name as stored in the local `reference` table.
+    pub(crate) fn for_storage_name(name: &str) -> Option<Self> {
+        match name {
+            AI_REF => Some(Self::AiHistory),
+            TRACES_BRANCH => Some(Self::Traces),
+            LEGACY_TRACES_BRANCH => Some(Self::LegacyTraces),
+            "libra/memory/repo" => Some(Self::MemoryRepo),
+            _ => None,
+        }
+    }
+
+    /// Classify an exact fully-qualified ref name.
+    pub(crate) fn for_full_ref(name: &str) -> Option<Self> {
+        match name {
+            "refs/heads/libra/intent" => Some(Self::AiHistory),
+            "refs/libra/traces" => Some(Self::Traces),
+            "refs/libra/agent-traces" => Some(Self::LegacyTraces),
+            "refs/heads/libra/memory/repo" => Some(Self::MemoryRepo),
+            _ => None,
+        }
+    }
+
+    /// Classify a transport-visible ref name without broad prefix matching.
+    ///
+    /// Fetch stores remote-tracking rows in fully-qualified form, so transport
+    /// boundaries must also recognize the exact branch suffix after the remote
+    /// component. Lookalike branches remain ordinary.
+    pub(crate) fn for_transport_ref(name: &str) -> Option<Self> {
+        Self::for_storage_name(name)
+            .or_else(|| Self::for_full_ref(name))
+            .or_else(|| {
+                name.strip_prefix("refs/remotes/")
+                    .and_then(|rest| rest.split_once('/'))
+                    .and_then(|(_, branch)| Self::for_storage_name(branch))
+            })
+    }
+
     /// Resolve the exact storage names accepted by `HistoryManager`.
     ///
     /// Full Memory ref classification belongs to M2-05. This conversion is
     /// intentionally narrower: it only admits the two histories that already
     /// use `HistoryManager` today.
     pub(crate) fn for_history_storage_name(name: &str) -> Option<Self> {
-        match name {
-            AI_REF => Some(Self::AiHistory),
-            TRACES_BRANCH => Some(Self::Traces),
-            LEGACY_TRACES_BRANCH => Some(Self::LegacyTraces),
-            _ => None,
-        }
+        Self::for_storage_name(name).filter(|spec| !matches!(spec, Self::MemoryRepo))
     }
 }
 
@@ -394,6 +465,45 @@ mod tests {
         );
         assert_eq!(
             OwnedRefSpec::for_history_storage_name("libra/memory/repo-user"),
+            None
+        );
+    }
+
+    #[test]
+    fn owned_ref_policy_classifies_only_exact_memory_names() {
+        for name in ["libra/memory/repo", "refs/heads/libra/memory/repo"] {
+            let spec = OwnedRefSpec::for_storage_name(name)
+                .or_else(|| OwnedRefSpec::for_full_ref(name))
+                .expect("canonical Memory ref must classify");
+            assert_eq!(spec, OwnedRefSpec::MemoryRepo);
+            assert_eq!(
+                spec.policy(),
+                OwnedRefPolicy {
+                    visible_to_branch: false,
+                    mutable_by_user: false,
+                    operation_snapshot: false,
+                    gc_root: true,
+                    transport: OwnedRefTransportPolicy::LocalOnly,
+                }
+            );
+        }
+
+        for lookalike in [
+            "libra/memory/repo-user",
+            "libra/memory/repo/child",
+            "refs/heads/libra/memory/repo-user",
+            "refs/heads/libra/memory/repo/child",
+            "refs/remotes/origin/libra/memory/repo",
+        ] {
+            assert_eq!(OwnedRefSpec::for_storage_name(lookalike), None);
+            assert_eq!(OwnedRefSpec::for_full_ref(lookalike), None);
+        }
+        assert_eq!(
+            OwnedRefSpec::for_transport_ref("refs/remotes/origin/libra/memory/repo"),
+            Some(OwnedRefSpec::MemoryRepo)
+        );
+        assert_eq!(
+            OwnedRefSpec::for_transport_ref("refs/remotes/origin/libra/memory/repo-user"),
             None
         );
     }

@@ -502,27 +502,33 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+    use serial_test::serial;
 
     use super::*;
-    use crate::internal::{
-        ai::{
-            context_budget::MemoryAnchorConfidence,
-            keyed_digest::RepositoryKeyedDigest,
-            memory::{
-                domain::{
-                    ActorKind, ActorRefV1, CodeChangeStatus, CompileOriginV1, CompileRecordV1,
-                    CompletionStatus, EpisodeClaimV1, EpisodeCodeContextV1, EpisodeOmissionsV1,
-                    EpisodePayloadV1, EpisodeRoot, EpisodeRootKind, EpistemicStatus, EvidenceKind,
-                    EvidenceLocatorV1, EvidenceRefV1, EvidenceSourcePlane, EvidenceVisibility,
-                    IdempotencyScopeV1, MemoryKind, MemoryLifecycle, MemoryNoteV1, MemoryScopeV1,
-                    MemorySensitivity, MemoryTrust, MemoryVisibility,
-                },
-                policy::{
-                    AuthenticatedMemoryContext, DeterministicMemoryProposal, TrustedMemoryTarget,
+    use crate::{
+        internal::{
+            ai::{
+                context_budget::MemoryAnchorConfidence,
+                keyed_digest::RepositoryKeyedDigest,
+                memory::{
+                    domain::{
+                        ActorKind, ActorRefV1, CodeChangeStatus, CompileOriginV1, CompileRecordV1,
+                        CompletionStatus, EpisodeClaimV1, EpisodeCodeContextV1, EpisodeOmissionsV1,
+                        EpisodePayloadV1, EpisodeRoot, EpisodeRootKind, EpistemicStatus,
+                        EvidenceKind, EvidenceLocatorV1, EvidenceRefV1, EvidenceSourcePlane,
+                        EvidenceVisibility, IdempotencyScopeV1, MemoryKind, MemoryLifecycle,
+                        MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust,
+                        MemoryVisibility,
+                    },
+                    policy::{
+                        AuthenticatedMemoryContext, DeterministicMemoryProposal,
+                        TrustedMemoryTarget,
+                    },
                 },
             },
+            db::migration::run_builtin_migrations,
         },
-        db::migration::run_builtin_migrations,
+        utils::{client_storage::ClientStorage, test::ChangeDirGuard},
     };
 
     const REPOSITORY_ID: &str = "memory-writer-test-repository";
@@ -987,6 +993,67 @@ mod tests {
             .expect_err("changed persisted digest key fails closed");
         assert_eq!(error.kind(), MemoryWriterErrorKind::DigestKeyUnavailable);
         assert_eq!(error.stable_code(), "LBR-MEMORY-001");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn memory_authority_is_a_reachable_gc_root() {
+        let temp = tempfile::tempdir().expect("create repository");
+        let storage_path = temp.path().join(".libra");
+        fs::create_dir_all(storage_path.join("objects")).expect("create object store");
+        let database_path = storage_path.join(DATABASE);
+        let database = db::create_database(&database_path.to_string_lossy())
+            .await
+            .expect("create repository database");
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                database.get_database_backend(),
+                "INSERT INTO config_kv(key, value, encrypted) VALUES
+                    ('libra.repoid', ?, 0), ('vault.unsealkey', ?, 0)",
+                [REPOSITORY_ID.into(), hex::encode([0x24_u8; 32]).into()],
+            ))
+            .await
+            .expect("seed repository identity and vault key");
+        database.close().await.expect("close setup connection");
+
+        let writer = MemoryWriter::open(storage_path.clone())
+            .await
+            .expect("open Memory writer");
+        let context = AuthenticatedMemoryContext::new(
+            REPOSITORY_ID,
+            ActorRefV1 {
+                kind: ActorKind::Agent,
+                principal_id: "agent:episode-compiler".to_string(),
+            },
+        )
+        .expect("construct context");
+        let target = TrustedMemoryTarget::episode(
+            EpisodeRoot::task("task-gc-root").expect("construct target"),
+        );
+        let committed = writer
+            .commit(
+                &context,
+                &target,
+                &proposal(&target, writer.digest_provider.key_id(), 1),
+                None,
+            )
+            .await
+            .expect("commit Memory authority");
+
+        let _cwd = ChangeDirGuard::new(temp.path());
+        let storage = ClientStorage::init_local_existing(storage_path.join("objects"));
+        let reachable = crate::command::maintenance::collect_reachable_objects_with_conn(
+            &storage,
+            writer.database.as_ref(),
+        )
+        .await
+        .expect("collect GC roots");
+        assert!(reachable.contains(&committed.commit_oid()));
+        assert!(reachable.contains(&committed.revision_oid()));
+        assert!(
+            reachable.len() >= 6,
+            "Memory commit closure must include commit, tree, event and note objects"
+        );
     }
 
     #[tokio::test]

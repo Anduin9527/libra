@@ -29,8 +29,11 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use git_internal::{
+    errors::GitError,
     hash::{HashKind, ObjectHash, get_hash_kind},
-    internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
+    internal::object::{
+        ObjectTrait, commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType,
+    },
 };
 use sea_orm::EntityTrait;
 use serde::Serialize;
@@ -40,7 +43,7 @@ use sha1::Digest;
 use sha2::Digest as _;
 
 use crate::{
-    command::{fetch::fetch_repository_safe, load_object_raw, log::get_reachable_commits},
+    command::{fetch::fetch_repository_safe, log::get_reachable_commits},
     internal::{
         branch::Branch,
         config::ConfigKv,
@@ -4341,7 +4344,7 @@ fn walk_reachable(
 
     match obj_type {
         ObjectType::Commit => {
-            let commit = load_object_raw::<Commit>(hash).map_err(|error| {
+            let commit = load_reachable_object::<Commit>(storage, hash).map_err(|error| {
                 CliError::fatal(format!(
                     "reachable commit {hash} is corrupt while computing GC roots: {error}"
                 ))
@@ -4358,7 +4361,7 @@ fn walk_reachable(
             }
         }
         ObjectType::Tree => {
-            let tree = load_object_raw::<Tree>(hash).map_err(|error| {
+            let tree = load_reachable_object::<Tree>(storage, hash).map_err(|error| {
                 CliError::fatal(format!(
                     "reachable tree {hash} is corrupt while computing GC roots: {error}"
                 ))
@@ -4369,7 +4372,7 @@ fn walk_reachable(
             }
         }
         ObjectType::Tag => {
-            let tag = load_object_raw::<GitTag>(hash).map_err(|error| {
+            let tag = load_reachable_object::<GitTag>(storage, hash).map_err(|error| {
                 CliError::fatal(format!(
                     "reachable tag {hash} is corrupt while computing GC roots: {error}"
                 ))
@@ -4387,6 +4390,14 @@ fn walk_reachable(
     }
 
     Ok(())
+}
+
+fn load_reachable_object<T: ObjectTrait>(
+    storage: &ClientStorage,
+    hash: &ObjectHash,
+) -> Result<T, GitError> {
+    let data = storage.get(hash)?;
+    T::from_bytes(&data.to_vec(), *hash)
 }
 
 /// List all loose objects in the repository, returning (hash, path) pairs.
@@ -4510,6 +4521,19 @@ fn info_println(output: &OutputConfig, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_ref_policy_remains_a_gc_root() {
+        use crate::internal::ai::linear_ref::OwnedRefSpec;
+
+        let spec = OwnedRefSpec::for_storage_name("libra/memory/repo")
+            .expect("canonical Memory ref classifies");
+        assert!(spec.policy().gc_root);
+        assert_eq!(
+            OwnedRefSpec::for_storage_name("libra/memory/repo-user"),
+            None
+        );
+    }
 
     /// The 4 MiB ledger cap is enforced on the way OUT, not only on the way
     /// in. Checking it only on read lets THIS run write a ledger every later
