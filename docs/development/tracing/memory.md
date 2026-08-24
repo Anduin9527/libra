@@ -1365,9 +1365,9 @@ CREATE TABLE context_selection_receipt (
     recorded_at           TEXT NOT NULL
 );
 CREATE INDEX idx_context_selection_receipt_repository_time
-    ON context_selection_receipt(repository_id, recorded_at);
+    ON context_selection_receipt(repository_id, recorded_at, receipt_id);
 CREATE INDEX idx_context_selection_receipt_time
-    ON context_selection_receipt(recorded_at);
+    ON context_selection_receipt(recorded_at, receipt_id);
 
 -- 每仓回执保留水位。ReceiptStore 与回执追加/裁剪在同一短事务更新它；
 -- pruned_before 是已经删除的最晚 recorded_at，用来区分 expired 与 not_found。
@@ -1375,7 +1375,8 @@ CREATE TABLE context_selection_receipt_retention (
     repository_id         TEXT PRIMARY KEY,
     pruned_before         TEXT,
     last_pruned_at        TEXT,
-    retained_rows         INTEGER NOT NULL DEFAULT 0 CHECK (retained_rows >= 0)
+    retained_rows         INTEGER NOT NULL DEFAULT 0
+                          CHECK (retained_rows BETWEEN 0 AND 10000)
 );
 ```
 
@@ -1793,6 +1794,13 @@ memory.get(scope, namespace, path) -> Vec<MemoryRecord>
 - **回执是本地审计账本，不是投影。** 存入本地 append-only 表 `context_selection_receipt`（§5.2）；它记录读取时刻的选择，无法也无须从 Git 历史重建，因此明确豁免于「删表可 rebuild」条款（§13.1）。默认每仓保留 30 天且最多 10,000 行，追加时按 `recorded_at` 索引修剪；缺失 UUIDv7 内嵌时间早于 `pruned_before` 返回 `expired`。回执中的 HMAC 与 selected IDs 仍可能暴露工作模式，默认 local-only、不进团队 ref；任何共享另做 visibility / retention / threat-model 审查。
 - **单一 receipt 原语。** Rust 类型与 mainline ML-05 / ML-08 共用同一定义（§0.0.10）；本文与 mainline 各自的注入管线写同一张回执面，不得分叉出两种 schema。
 - `memory inspect-injection` 从回执读取并重放展示，而非从当前投影反推。被预算丢弃的项直接记录在 receipt 的 `omissions` 中，不再为每次读取追加 `PromptTrimmed` 权威事件。
+
+M2-02R 已落地上述共享类型、`ReceiptStore`、SQLite migration 与 retention
+水位。当前阶段只提供 crate-private 写入/查找原语；Memory 候选选择和 prompt
+注入仍由 M2-12 接线。回执中的 `code_commit`、`source_heads`、
+`projection_watermarks`、`selected`、`policy_hash` 与 `bundle_hash` 已在 GC
+source inventory 中声明为 non-root：回执负责审计选择，不取得对象保活权；
+依赖被清理后，重放状态转为 `non_reproducible`。
 
 ### 8.7 混合检索通道（Hybrid Retrieval Channels）
 

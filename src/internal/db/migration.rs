@@ -1398,6 +1398,14 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082402_memory_fts_search.sql"),
             include_str!("../../../sql/migrations/2026082402_memory_fts_search_down.sql"),
         ),
+        // M2-02R: the single local-only context selection receipt ledger shared
+        // by Memory and mainline, plus its bounded retention watermark.
+        sql_migration(
+            2026082403,
+            "context_selection_receipt",
+            include_str!("../../../sql/migrations/2026082403_context_selection_receipt.sql"),
+            include_str!("../../../sql/migrations/2026082403_context_selection_receipt_down.sql"),
+        ),
     ]
 }
 
@@ -1845,9 +1853,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 57);
+        assert_eq!(runner.len(), 58);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026082402));
+        assert_eq!(runner.max_registered_version(), Some(2026082403));
     }
 
     #[test]

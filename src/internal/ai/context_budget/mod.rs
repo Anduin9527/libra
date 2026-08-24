@@ -13,6 +13,13 @@ pub mod frame;
 pub mod handoff;
 pub mod memory_anchor;
 pub mod projection;
+// M2-02R freezes the shared receipt seam before M2-12 wires retrieval into
+// prompt assembly. Keep the staged crate-private implementation lint-clean
+// without exposing it as a public API prematurely.
+#[allow(dead_code)]
+pub(crate) mod receipt;
+#[allow(dead_code)]
+pub(crate) mod receipt_store;
 
 pub use allocator::{
     AllocationOmissionReason, ContextAllocation, ContextAllocationOmission, ContextBudgetAllocator,

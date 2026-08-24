@@ -111,6 +111,63 @@ impl KeyedDigestEnvelope {
     }
 }
 
+/// Purpose-locked digest for an authenticated principal written to a context
+/// selection receipt.
+///
+/// This wrapper deliberately does not implement `Debug` or serialization so a
+/// caller cannot accidentally log it or persist a generic digest envelope.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PrincipalDigest(KeyedDigestEnvelope);
+
+impl PrincipalDigest {
+    pub(crate) const fn version(&self) -> u8 {
+        self.0.version()
+    }
+
+    pub(crate) const fn key_id(&self) -> Uuid {
+        self.0.key_id()
+    }
+
+    pub(crate) fn digest_hex(&self) -> &str {
+        self.0.digest_hex()
+    }
+
+    pub(crate) fn encoded(&self) -> String {
+        encode_receipt_digest(&self.0)
+    }
+}
+
+/// Purpose-locked digest for normalized retrieval inputs written to a context
+/// selection receipt.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct QueryDigest(KeyedDigestEnvelope);
+
+impl QueryDigest {
+    pub(crate) const fn version(&self) -> u8 {
+        self.0.version()
+    }
+
+    pub(crate) const fn key_id(&self) -> Uuid {
+        self.0.key_id()
+    }
+
+    pub(crate) fn digest_hex(&self) -> &str {
+        self.0.digest_hex()
+    }
+
+    pub(crate) fn encoded(&self) -> String {
+        encode_receipt_digest(&self.0)
+    }
+}
+
+fn encode_receipt_digest(envelope: &KeyedDigestEnvelope) -> String {
+    format!(
+        "hmac-sha256:{}:{}",
+        envelope.key_id(),
+        envelope.digest_hex()
+    )
+}
+
 /// Purpose-locked fingerprint for a compiler root's canonical source inputs.
 ///
 /// The wrapper deliberately has no `Debug` or serialization implementation:
@@ -281,6 +338,7 @@ impl hkdf::KeyType for HmacSha256KeyLength {
 }
 
 pub(crate) struct RepositoryKeyedDigest {
+    repository_id: String,
     key_id: Uuid,
     keys: [hmac::Key; 4],
     persisted_config_fingerprint: [u8; 32],
@@ -297,6 +355,22 @@ impl fmt::Debug for RepositoryKeyedDigest {
 }
 
 impl RepositoryKeyedDigest {
+    #[cfg(test)]
+    pub(crate) fn for_receipt_tests(
+        repository_id: &str,
+        key_id: Uuid,
+        seed: [u8; 32],
+        persisted_ciphertext: &str,
+    ) -> Self {
+        Self::from_seed(
+            repository_id.to_string(),
+            key_id,
+            seed,
+            config_fingerprint(persisted_ciphertext),
+        )
+        .expect("fixed test seed must construct a keyed-digest provider")
+    }
+
     pub(crate) async fn load_or_initialize(
         repository_db_path: &Path,
     ) -> Result<Arc<Self>, KeyedDigestError> {
@@ -325,8 +399,14 @@ impl RepositoryKeyedDigest {
             return Err(KeyedDigestError::new(KeyedDigestErrorKind::CacheCapacity));
         }
 
-        let provider =
-            Arc::new(Self::load_or_initialize_uncached(&database, &canonical_db_path).await?);
+        let provider = Arc::new(
+            Self::load_or_initialize_uncached(
+                &database,
+                &canonical_db_path,
+                &cache_key.repository_id,
+            )
+            .await?,
+        );
         cache.insert(cache_key, Arc::clone(&provider));
         Ok(provider)
     }
@@ -334,13 +414,18 @@ impl RepositoryKeyedDigest {
     async fn load_or_initialize_uncached(
         database: &DatabaseConnection,
         repository_db_path: &Path,
+        repository_id: &str,
     ) -> Result<Self, KeyedDigestError> {
         let transaction = db::begin_write_transaction(database)
             .await
             .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::StateQueryFailed))?;
 
-        let result =
-            Self::load_or_initialize_in_transaction(&transaction, repository_db_path).await;
+        let result = Self::load_or_initialize_in_transaction(
+            &transaction,
+            repository_db_path,
+            repository_id,
+        )
+        .await;
         match result {
             Ok(provider) => {
                 transaction
@@ -359,21 +444,25 @@ impl RepositoryKeyedDigest {
     async fn load_or_initialize_in_transaction<C: ConnectionTrait>(
         database: &C,
         repository_db_path: &Path,
+        repository_id: &str,
     ) -> Result<Self, KeyedDigestError> {
         let rows = ConfigKv::get_all_with_conn(database, MEMORY_KEYED_DIGEST_CONFIG_KEY)
             .await
             .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::StateQueryFailed))?;
         match rows.as_slice() {
-            [row] => load_persisted_provider(database, repository_db_path, row).await,
+            [row] => {
+                load_persisted_provider(database, repository_db_path, repository_id, row).await
+            }
             [] => {
                 ensure_initialization_is_eligible(database).await?;
-                initialize_provider(database, repository_db_path).await
+                initialize_provider(database, repository_db_path, repository_id).await
             }
             _ => Err(KeyedDigestError::new(KeyedDigestErrorKind::DuplicateConfig)),
         }
     }
 
     fn from_seed(
+        repository_id: String,
         key_id: Uuid,
         seed: [u8; 32],
         persisted_config_fingerprint: [u8; 32],
@@ -403,6 +492,7 @@ impl RepositoryKeyedDigest {
             .try_into()
             .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::Derivation))?;
         Ok(Self {
+            repository_id,
             key_id,
             keys,
             persisted_config_fingerprint,
@@ -412,6 +502,17 @@ impl RepositoryKeyedDigest {
 
     pub(crate) const fn key_id(&self) -> Uuid {
         self.key_id
+    }
+
+    pub(crate) fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub(crate) async fn validate_for_connection<C: ConnectionTrait>(
+        &self,
+        database: &C,
+    ) -> Result<(), KeyedDigestError> {
+        validate_cached_provider(database, self).await
     }
 
     fn invalidate(&self) {
@@ -428,7 +529,7 @@ impl RepositoryKeyedDigest {
         }
     }
 
-    pub(crate) fn digest(
+    fn digest(
         &self,
         purpose: DigestPurpose,
         input: &[u8],
@@ -453,6 +554,18 @@ impl RepositoryKeyedDigest {
     ) -> Result<SourceInputFingerprint, KeyedDigestError> {
         self.digest(DigestPurpose::SourceInput, input)
             .map(SourceInputFingerprint)
+    }
+
+    pub(crate) fn principal_digest(
+        &self,
+        input: &[u8],
+    ) -> Result<PrincipalDigest, KeyedDigestError> {
+        self.digest(DigestPurpose::Principal, input)
+            .map(PrincipalDigest)
+    }
+
+    pub(crate) fn query_digest(&self, input: &[u8]) -> Result<QueryDigest, KeyedDigestError> {
+        self.digest(DigestPurpose::Query, input).map(QueryDigest)
     }
 }
 
@@ -569,6 +682,7 @@ async fn ensure_initialization_is_eligible<C: ConnectionTrait>(
 async fn initialize_provider<C: ConnectionTrait>(
     database: &C,
     repository_db_path: &Path,
+    repository_id: &str,
 ) -> Result<RepositoryKeyedDigest, KeyedDigestError> {
     use ring::rand::{SecureRandom, SystemRandom};
 
@@ -601,12 +715,18 @@ async fn initialize_provider<C: ConnectionTrait>(
     if !inserted {
         return Err(KeyedDigestError::new(KeyedDigestErrorKind::PersistFailed));
     }
-    RepositoryKeyedDigest::from_seed(key_id, seed, config_fingerprint(&ciphertext_hex))
+    RepositoryKeyedDigest::from_seed(
+        repository_id.to_string(),
+        key_id,
+        seed,
+        config_fingerprint(&ciphertext_hex),
+    )
 }
 
 async fn load_persisted_provider<C: ConnectionTrait>(
     database: &C,
     repository_db_path: &Path,
+    repository_id: &str,
     row: &crate::internal::config::ConfigKvEntry,
 ) -> Result<RepositoryKeyedDigest, KeyedDigestError> {
     if !row.encrypted {
@@ -645,7 +765,12 @@ async fn load_persisted_provider<C: ConnectionTrait>(
     let seed: [u8; 32] = seed_bytes
         .try_into()
         .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::PayloadInvalid))?;
-    RepositoryKeyedDigest::from_seed(payload.key_id, seed, config_fingerprint(&row.value))
+    RepositoryKeyedDigest::from_seed(
+        repository_id.to_string(),
+        payload.key_id,
+        seed,
+        config_fingerprint(&row.value),
+    )
 }
 
 #[cfg(test)]
@@ -673,7 +798,7 @@ mod tests {
     use super::{
         DigestPurpose, KeyedDigestError, KeyedDigestErrorKind, PERSISTED_GENERATION,
         PERSISTED_SCHEMA_VERSION, PersistedDigestKeyV1, RepositoryKeyedDigest,
-        SourceInputFingerprint, SourceInputFingerprintErrorKind, config_fingerprint,
+        SourceInputFingerprint, SourceInputFingerprintErrorKind, config_fingerprint, repository_id,
         reset_digest_cache_for_tests,
     };
     use crate::{
@@ -800,17 +925,25 @@ mod tests {
 
         async fn insert_receipt(&self) {
             let conn = self.connection().await;
-            let backend = conn.get_database_backend();
-            conn.execute_raw(Statement::from_string(
-                backend,
-                "CREATE TABLE context_selection_receipt (id INTEGER PRIMARY KEY)",
-            ))
-            .await
-            .expect("receipt table must be created");
-            conn.execute_raw(Statement::from_string(
-                backend,
-                "INSERT INTO context_selection_receipt (id) VALUES (1)",
-            ))
+            conn.execute_unprepared(
+                "INSERT INTO context_selection_receipt (
+                    receipt_id, schema_version, source_kind, repository_id,
+                    digest_key_id, principal_hmac, query_hmac, effective_at,
+                    source_heads_json, projection_watermarks_json, policy_hash,
+                    selector_version, token_budget, selected_json, omissions_json,
+                    bundle_hash, reproducibility_state, recorded_at
+                 ) VALUES (
+                    '0198a7e0-7c00-7000-8000-000000000001', 1, 'memory', 'repo-test',
+                    '123e4567-e89b-42d3-a456-426614174000',
+                    'hmac-sha256:123e4567-e89b-42d3-a456-426614174000:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'hmac-sha256:123e4567-e89b-42d3-a456-426614174000:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    '2026-08-24T00:00:00.000000000Z', '{}', '{}',
+                    'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                    'memory-v1', 1, '[]', '[]',
+                    'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                    'reproducible', '2026-08-24T00:00:00.000000000Z'
+                 )",
+            )
             .await
             .expect("receipt must be inserted");
         }
@@ -879,6 +1012,7 @@ mod tests {
     fn keyed_digest_domains_are_distinct_and_match_frozen_vectors() {
         let seed: [u8; 32] = std::array::from_fn(|index| index as u8);
         let provider = RepositoryKeyedDigest::from_seed(
+            "test-repository".to_string(),
             Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000")
                 .expect("fixed UUIDv4 must parse"),
             seed,
@@ -944,6 +1078,7 @@ mod tests {
         let key_id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000")
             .expect("fixed UUIDv4 must parse");
         let provider = RepositoryKeyedDigest::from_seed(
+            "test-repository".to_string(),
             key_id,
             [0x24; 32],
             config_fingerprint("source-input-fingerprint"),
@@ -982,6 +1117,40 @@ mod tests {
         assert_eq!(
             invalid_digest.kind(),
             SourceInputFingerprintErrorKind::InvalidDigest
+        );
+    }
+
+    #[test]
+    fn receipt_digests_are_purpose_locked_and_share_the_repository_key() {
+        let key_id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000")
+            .expect("fixed UUIDv4 must parse");
+        let provider = RepositoryKeyedDigest::from_seed(
+            "test-repository".to_string(),
+            key_id,
+            [0x25; 32],
+            config_fingerprint("receipt-digests"),
+        )
+        .expect("fixed seed must construct a provider");
+
+        let principal = provider
+            .principal_digest(b"agent:alice")
+            .expect("valid provider produces a principal digest");
+        let query = provider
+            .query_digest(b"normalized retrieval inputs")
+            .expect("valid provider produces a query digest");
+
+        assert_eq!(principal.key_id(), key_id);
+        assert_eq!(query.key_id(), key_id);
+        assert_eq!(principal.version(), 1);
+        assert_eq!(query.version(), 1);
+        assert_ne!(principal.digest_hex(), query.digest_hex());
+        assert_eq!(
+            principal.encoded(),
+            format!("hmac-sha256:{key_id}:{}", principal.digest_hex())
+        );
+        assert_eq!(
+            query.encoded(),
+            format!("hmac-sha256:{key_id}:{}", query.digest_hex())
         );
     }
 
@@ -1136,7 +1305,8 @@ mod tests {
                 )
                 .await
                 .expect("independent repository connection must open");
-                RepositoryKeyedDigest::load_or_initialize_uncached(&conn, &db_path)
+                let repository_id = repository_id(&conn).await?;
+                RepositoryKeyedDigest::load_or_initialize_uncached(&conn, &db_path, &repository_id)
                     .await
                     .map(|provider| provider.key_id())
             }));

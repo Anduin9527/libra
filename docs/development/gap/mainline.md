@@ -159,7 +159,7 @@ flowchart LR
 | IntentSpec 规范化/草稿/校验/评审/scope | `src/internal/ai/intentspec/{canonical,draft,validator,review,scope}.rs` | ML-02 seal、ML-04 指纹（scope 文件维） |
 | git-internal Intent/Decision 对象 + MCP create | `src/internal/ai/mcp/`、`intentspec/persistence.rs`、`workflow_objects.rs` | ML-02/ML-03 |
 | 外部 agent 捕获 + redaction | `src/internal/ai/hooks/runtime.rs` | ML-08 注入（复用 Redactor） |
-| ContextFrame / ContextSnapshot + local reviewed MemoryAnchor | `context_budget/{frame,memory_anchor}.rs`、`runtime/phase0.rs` | ML-05 选择回执的本地关联与 review/revoke/expiry UX；当前仍无 branch-aware team recall 或可共享 receipt |
+| ContextFrame / ContextSnapshot + local reviewed MemoryAnchor + shared local receipt ledger | `context_budget/{frame,memory_anchor,receipt,receipt_store}.rs`、`runtime/phase0.rs` | `ContextSelectionReceiptV1`、SQLite 账本与 retention 已落地；ML-05 仍需把 intent 检索结果接入该写入器。当前仍无 branch-aware team recall；receipt 保持 local-only |
 | 嵌入式 Next.js + 单向 publish 导出 + C4 observe-only API | `src/internal/publish/ai_export.rs`、`src/internal/ai/web/`（C4 /api/code/*） | ML-09 Hub |
 | 稳定错误码 + `--json/--machine` 输出 | `src/utils/{error,output}.rs` | 全部命令 |
 

@@ -172,6 +172,7 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026081301`  | `approved_permission_provenance` | `2026081301_approved_permission_provenance{,_down}.sql` (plan-20260715 W4-07: Always-approval provenance columns; empty backfill; `project_id` not rewritten; down fail-closed with provenance or linked HEAD evidence.) |
 | `2026082401`  | `memory_core` | `2026082401_memory_core{,_down}.sql` (M2-02: rebuildable Memory projections plus bounded per-root compiler job and source-observer state; FTS5 and receipt storage land in later migrations.) |
 | `2026082402`  | `memory_fts_search` | `2026082402_memory_fts_search{,_down}.sql` (M2-02F: rebuildable Episode search document plus external-content FTS5 using the fixed `unicode61 remove_diacritics 2` tokenizer; non-empty rollback is refused.) |
+| `2026082403`  | `context_selection_receipt` | `2026082403_context_selection_receipt{,_down}.sql` (M2-02R: shared local-only context selection receipt ledger with per-repository 30-day/10,000-row retention metadata; non-empty rollback is refused.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no
