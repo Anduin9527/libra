@@ -11,6 +11,11 @@
 
 mod canonical;
 mod domain;
+mod error;
 mod fts_sql;
 mod job_sql;
+mod policy;
+mod store;
+mod tree;
 mod validation;
+mod writer;

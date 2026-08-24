@@ -26,13 +26,6 @@ const SQLITE_BUSY_MAX_RETRIES: usize = 15;
 const SQLITE_BUSY_RETRY_BASE_MS: u64 = 100;
 
 /// Transfer policy attached to a Libra-owned ref.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "M2-03 freezes the policy consumed by the M2-04 MemoryWriter"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnedRefTransportPolicy {
     /// The ref participates in ordinary repository transport.
@@ -52,13 +45,6 @@ pub(crate) enum OwnedRefSpec {
     AiHistory,
     Traces,
     LegacyTraces,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "M2-03 freezes the owned ref consumed by the M2-04 MemoryWriter"
-        )
-    )]
     MemoryRepo,
 }
 
@@ -92,13 +78,6 @@ impl OwnedRefSpec {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "M2-03 freezes the transport policy consumed by M2-04 and M2-05"
-        )
-    )]
     pub(crate) const fn transport_policy(self) -> OwnedRefTransportPolicy {
         match self {
             Self::AiHistory => OwnedRefTransportPolicy::Ordinary,
