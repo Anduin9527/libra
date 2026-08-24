@@ -1381,6 +1381,14 @@ pub fn builtin_migrations() -> Vec<Migration> {
                 "../../../sql/migrations/2026081301_approved_permission_provenance_down.sql"
             ),
         ),
+        // M2-02: rebuildable Agent Memory projections plus bounded compiler
+        // job/observer state. FTS and receipts intentionally land separately.
+        sql_migration(
+            2026082401,
+            "memory_core",
+            include_str!("../../../sql/migrations/2026082401_memory_core.sql"),
+            include_str!("../../../sql/migrations/2026082401_memory_core_down.sql"),
+        ),
     ]
 }
 
@@ -1828,9 +1836,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 55);
+        assert_eq!(runner.len(), 56);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026081301));
+        assert_eq!(runner.max_registered_version(), Some(2026082401));
     }
 
     #[test]

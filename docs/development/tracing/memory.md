@@ -20,7 +20,7 @@ Libra 在 [`object-model.md`](../../ai/object-model.md) 与
 
 ## 执行摘要
 
-Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / branch 记住事物，且不会像 `CLAUDE.md` 扁平大块文件那样污染上下文或不可审计。核心机制是快照（`MemoryNote`）/ 事件（`MemoryEvent`）/ 投影（SQLite）三层，历史真源落在 `refs/libra/memory/*` 的普通 Git 线性历史上。每一条写入都必须携带 `CompileRecord`（可复现），每一次注入都必须产出 `ContextReceipt`（可重放）；写入统一经 `MemoryWriter` 单一 seam，读取统一经冻结的 `ResolvedMemoryView`。安全性以 fail-closed 为底线：Draft / Quarantined / SecretLike 永不注入 prompt，MCP 工具在 C9 default-deny authorizer 落地前不注册。本设计对应长期路线图 `MEM-01..05`，并行协调 `MEM-06` 见本文 §19（见下方追溯表与 [`plan-long.md`](../plan/plan-long.md)）。
+Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / branch 记住事物，且不会像 `CLAUDE.md` 扁平大块文件那样污染上下文或不可审计。核心机制是快照（`MemoryNote`）/ 事件（`MemoryEvent`）/ 投影（SQLite）三层，历史真源落在 `refs/heads/libra/memory/*` 的普通 Git 线性历史上。每一条写入都必须携带 `CompileRecord`（可复现），每一次注入都必须产出 `ContextReceipt`（可重放）；写入统一经 `MemoryWriter` 单一 seam，读取统一经冻结的 `ResolvedMemoryView`。安全性以 fail-closed 为底线：Draft / Quarantined / SecretLike 永不注入 prompt，MCP 工具在 C9 default-deny authorizer 落地前不注册。本设计对应长期路线图 `MEM-01..05`，并行协调 `MEM-06` 见本文 §19（见下方追溯表与 [`plan-long.md`](../plan/plan-long.md)）。
 
 ### 目录
 
@@ -273,7 +273,7 @@ Libra 的映射为：
 
 本轮多维复核同时识别并修正了八个原草案中的实现阻断；后文规范均以这些结论为准：
 
-1. **ref 前缀冲突**：Git 不能同时保存 `refs/libra/memory` 与 `refs/libra/memory/...`；规范根 ref 改为 `refs/libra/memory/repo`，其它 scope 使用其兄弟 ref。
+1. **ref 前缀冲突**：Git 不能同时保存 `refs/heads/libra/memory` 与 `refs/heads/libra/memory/...`；规范根 ref 改为 `refs/heads/libra/memory/repo`，其它 scope 使用其兄弟 ref。
 2. **OID 自引用**：`MemoryNote` 正文不能包含“自身 blob OID”再参与该 OID 的计算；`revision_oid` 改为写入后派生的 envelope / event 字段，不属于序列化正文。
 3. **事件总序**：普通 Git merge 的 DAG 拓扑不是全序；每个 memory ref 必须保持 first-parent 线性历史，并以单调 `event_seq` 重放。跨 ref 合并由 `libra memory merge/cherry-pick` 重新验证并追加，不直接接受任意 merge commit。
 4. **读写分离**：`SessionAttached`、`PromptTrimmed`、`last_used_at`、`use_count` 属本地访问遥测，不写入权威 memory ref；否则一次读取也会争抢 CAS，并破坏“投影可从 note/event 完全重建”的定义。
@@ -321,7 +321,7 @@ perstate 证明 Git-native memory 的第一性产品价值并不来自新的后�
 
 - 取代 `ContextFrame`、`ContextSnapshot` 或 `MemoryAnchor`。Memory 是一个对它们形成补充的新层——见 §3.1。
 - 提供向量 / embedding 搜索引擎。基于路径的召回是默认方案；embedding 索引可作为后续扩展。
-- 在基础实现中提供图数据库。时序图与实体图可以叠加在 Memory 的事件流之上，但历史层面的真源仍然是 `refs/libra/memory*` 上的普通 Git 历史。
+- 在基础实现中提供图数据库。时序图与实体图可以叠加在 Memory 的事件流之上，但历史层面的真源仍然是 `refs/heads/libra/memory*` 上的普通 Git 历史。
 - 静默存储 secret、私有数据或不可信的网络主张。入库时必须先对敏感度（sensitivity）与可信度（trust）进行分类，任何记忆才能成为可进入 prompt 的内容。
 - 跨仓库联邦化记忆。Memory 是**按仓库（per-repo）**的构造，就像 `.libra/` 状态那样。跨仓库联邦留待将来的设计。
 - 与完整聊天历史持久化竞争。Memory 存储的是**蒸馏后的、可复用的事实**，而不是原始 transcript。Transcript 已经存放在 `.libra/sessions/*.jsonl` 与 `git-internal` 的 AI 历史中。
@@ -795,15 +795,15 @@ ContextReceipt (local ledger) --selected--> MemoryHead[L] / MemoryNote[S]
 如 §4 开头所述，Memory 的字节是自定义 JSON blob，存活在自己的 `libra/memory*` ref 上，与内部 AgentRuntime 的对象历史分离。后者位于孤儿分支 `libra/intent`（常量 `AI_REF`，`src/internal/ai/history.rs:92`），承载 git-internal 的 typed AI 对象（Intent/Plan/...）；而外部 agent 捕获位于 `traces`（常量 `TRACES_BRANCH`，`src/internal/branch.rs:42`，文档中写作 `refs/libra/traces`）。Memory 自己的 ref 命名沿用同一约定：
 
 ```text
-refs/libra/intent                              # 现有 AI 工作流对象的孤儿分支（Intent/Plan/...，归 AgentRuntime）
-refs/libra/memory/repo                         # 新增：仓库共享 memory（NEW）
-refs/libra/memory/global                       # 新增：仅在显式启用 repo-local global policy 时使用（NEW）
-refs/libra/memory/branch/<encoded-full-refname> # 新增：分支作用域 memory（NEW）
-refs/libra/memory/worktree/<encoded-id>        # 新增：worktree 作用域 memory（NEW）
-refs/libra/memory/actor/<principal-hash>       # 新增：actor 私有 memory；不得用可逆 PII 作 ref 名（NEW）
+refs/heads/libra/intent                              # 现有 AI 工作流对象的孤儿分支；SQLite 名称为 libra/intent
+refs/heads/libra/memory/repo                         # 新增：仓库共享 memory；SQLite 名称为 libra/memory/repo
+refs/heads/libra/memory/global                       # 新增：仅在显式启用 repo-local global policy 时使用（NEW）
+refs/heads/libra/memory/branch/<encoded-full-refname> # 新增：分支作用域 memory（NEW）
+refs/heads/libra/memory/worktree/<encoded-id>        # 新增：worktree 作用域 memory（NEW）
+refs/heads/libra/memory/actor/<principal-hash>       # 新增：actor 私有 memory；不得用可逆 PII 作 ref 名（NEW）
 ```
 
-Git 的 file/dir ref 规则禁止同时存在 `refs/libra/memory` 和 `refs/libra/memory/*`，因此不存在无后缀的 memory ref。`Global` 在本设计中仍是**当前仓库内的逻辑作用域**，不等于跨仓库用户档案；真正跨仓库 federation 仍不在范围内。
+Git 的 file/dir ref 规则禁止同时存在 `refs/heads/libra/memory` 和 `refs/heads/libra/memory/*`，因此不存在无后缀的 memory ref。`Global` 在本设计中仍是**当前仓库内的逻辑作用域**，不等于跨仓库用户档案；真正跨仓库 federation 仍不在范围内。
 
 一个「memory commit」就是一个普通的 Git commit，其 tree 中包含：
 
@@ -821,7 +821,7 @@ manifest.json                                             # schema、scope、las
 Memory 的逻辑 key 不得直接拼接进 Git ref 或 tree path：branch name、namespace、actor ref 与动态 path 段都可能包含 `/`、`..`、控制字符、Unicode 归一化差异或大小写冲突。实现必须使用一套稳定、可逆、跨平台大小写安全的编码：
 
 - `scope_key` 的逻辑编码形如 `repo`、`global`、`branch:<full-refname>`、`worktree:<id>`、`actor:<principal-id>`；branch 使用规范化 full refname（如 `refs/heads/main`），而不是短名或当前 commit OID。分支 rename 是显式 scope migration，不能静默产生一份新 memory 或丢失旧 scope。
-- `refs/libra/memory/branch/<encoded-full-refname>` 使用 validated canonical refname 的跨平台编码。actor ref 使用不可逆 principal hash，避免 ref 枚举泄露账号或邮箱。
+- `refs/heads/libra/memory/branch/<encoded-full-refname>` 使用 validated canonical refname 的跨平台编码。actor ref 使用不可逆 principal hash，避免 ref 枚举泄露账号或邮箱。
 - tree path 中的 `<namespace>`、`<note_id>`、`<revision-oid>`、`<event-id>` 必须只包含 `[A-Za-z0-9._-]`；namespace 如 `private:<actor-ref>` 必须编码为安全 segment。
 - 解码后必须拒绝空 segment、`.`、`..`、绝对路径、反斜杠、NUL、控制字符以及超过长度上限的 segment。
 - macOS / Windows 上不得依赖文件系统大小写行为区分两条 memory key；编码后的 segment 必须规范化为大小写不敏感仍不冲突的形式，或在写入前显式检测冲突并 fail-closed。
@@ -830,37 +830,90 @@ Memory 的逻辑 key 不得直接拼接进 Git ref 或 tree path：branch name�
 
 ### 5.2 SQLite 投影表
 
-这些投影表通过**新建一个版本化迁移** `sql/migrations/YYYYMMDDNN_memory.sql` 引入，前向 DDL 必须幂等（`CREATE TABLE IF NOT EXISTS ...`），并可配套一份 `*_down.sql` 回滚脚本；**不要**把它们追加进 bootstrap 文件 `sql/sqlite_20260309_init.sql`。这与外部捕获采用迁移 `2026050303_agent_capture.sql` 的方式属于同一模式。
+M2-02 使用版本化迁移 `sql/migrations/2026082401_memory_core.sql` 与
+`2026082401_memory_core_down.sql` 引入核心 schema。前向 DDL 必须幂等
+（`CREATE TABLE/INDEX IF NOT EXISTS ...`）；**不要**把它们追加进 bootstrap
+文件 `sql/sqlite_20260309_init.sql`。这与外部捕获采用迁移
+`2026050303_agent_capture.sql` 的方式属于同一模式。
+
+该迁移只创建七张可重建投影表 `memory_head`、`memory_path_summary`、
+`memory_note_index`、`memory_revision_index`、`memory_link_index`、
+`memory_projection_state`、`memory_episode_path`，以及两张有界本地运行状态表
+`memory_compile_job`、`memory_compile_observer_state`。FTS 与 search document、
+selection receipt、entity/taxonomy/access statistics、classifier/embedding cache
+分别由 M2-02F、M2-02R 或后续卡片引入，不能被这次 core migration 提前创建。
+
+投影中的对象时间使用 canonical UTC RFC 3339 `TEXT`；SQLite 只检查字段存在，
+Writer / Rebuilder 负责严格解析。projection rebuild、job、lease、retry 与 observer
+的运行时间使用 Unix epoch milliseconds `INTEGER`，便于在本地事务中比较 deadline。所有 keyed
+source-input fingerprint 拆列保存 `version/key_id/digest`；`purpose=source_input`
+由不可绕过的 `SourceInputFingerprint` 类型固定，不在表中重复存字符串。
+迁移本身不得初始化、读取或轮换 repository keyed-digest seed。
 
 下面以普通 `CREATE TABLE` 形式给出表结构，落地时请置于上述迁移文件中并加上 `IF NOT EXISTS` 幂等保护：
 
 ```sql
 -- 每条存活逻辑 note 的当前 head。
 CREATE TABLE memory_head (
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    path                  TEXT NOT NULL,
-    note_id               TEXT NOT NULL,
-    latest_revision_oid   TEXT NOT NULL,
-    live_revision_oid     TEXT,
-    latest_action         TEXT NOT NULL,
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    path                  TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4096),
+    note_id               TEXT NOT NULL CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    latest_revision_oid   TEXT NOT NULL CHECK (
+        length(latest_revision_oid) IN (40,64)
+        AND latest_revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    live_revision_oid     TEXT CHECK (
+        live_revision_oid IS NULL
+        OR (length(live_revision_oid) IN (40,64)
+            AND live_revision_oid NOT GLOB '*[^0-9a-f]*')
+    ),
+    -- taxonomy_expanded 没有 note/revision identity，只更新 taxonomy projection，
+    -- 因而不会成为某条 note 的 latest_action。
+    latest_action         TEXT NOT NULL CHECK (latest_action IN (
+        'created','revised','confirmed','quarantined','superseded',
+        'revoked','forgotten','consolidated'
+    )),
     latest_review_state   TEXT NOT NULL CHECK (latest_review_state IN ('draft','confirmed','quarantined','revoked','superseded','forgotten')),
-    kind                  TEXT NOT NULL,
-    lifecycle             TEXT NOT NULL,
-    confidence            TEXT NOT NULL,
-    trust                 TEXT NOT NULL,
-    sensitivity           TEXT NOT NULL,
-    visibility            TEXT NOT NULL,
+    kind                  TEXT NOT NULL CHECK (kind IN ('procedural','semantic','episodic')),
+    lifecycle             TEXT NOT NULL CHECK (lifecycle IN ('replacement','accretive')),
+    confidence            TEXT NOT NULL CHECK (confidence IN ('low','medium','high')),
+    trust                 TEXT NOT NULL CHECK (trust IN ('verified','repo_evidence','user_asserted','external_untrusted','inferred')),
+    sensitivity           TEXT NOT NULL CHECK (sensitivity IN ('public','internal','confidential','secret_like')),
+    visibility            TEXT NOT NULL CHECK (visibility IN ('private','repo_local','team_candidate')),
     acl_policy_id         TEXT NOT NULL,
     valid_from            TEXT,
     valid_until           TEXT,
-    effective_from_commit TEXT,
-    effective_until_commit TEXT,
+    effective_from_commit TEXT CHECK (
+        effective_from_commit IS NULL
+        OR (length(effective_from_commit) IN (40,64)
+            AND effective_from_commit NOT GLOB '*[^0-9a-f]*')
+    ),
+    effective_until_commit TEXT CHECK (
+        effective_until_commit IS NULL
+        OR (length(effective_until_commit) IN (40,64)
+            AND effective_until_commit NOT GLOB '*[^0-9a-f]*')
+    ),
     expires_at            TEXT,
     rank_hint             INTEGER NOT NULL DEFAULT 0,
-    last_event_seq        INTEGER NOT NULL,
+    last_event_seq        INTEGER NOT NULL CHECK (last_event_seq >= 1),
     updated_at            TEXT NOT NULL,
-    PRIMARY KEY (scope_key, namespace, path, note_id)
+    PRIMARY KEY (scope_key, namespace, path, note_id),
+    UNIQUE (note_id),
+    FOREIGN KEY (scope_key, namespace, path, note_id)
+        REFERENCES memory_note_index(scope_key, namespace, path, note_id),
+    FOREIGN KEY (scope_key, namespace, note_id, latest_revision_oid)
+        REFERENCES memory_revision_index(scope_key, namespace, note_id, revision_oid),
+    FOREIGN KEY (scope_key, namespace, note_id, live_revision_oid)
+        REFERENCES memory_revision_index(scope_key, namespace, note_id, revision_oid)
 );
 CREATE INDEX idx_memory_head_lookup
     ON memory_head(scope_key, namespace, path, latest_review_state);
@@ -870,13 +923,13 @@ CREATE INDEX idx_memory_head_path_prefix
 -- 每条路径的当前聚合。这是 summarize()、prompt 注入、
 -- 以及分类法下钻的快路径。
 CREATE TABLE memory_path_summary (
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    path                  TEXT NOT NULL,
-    confirmed_count       INTEGER NOT NULL DEFAULT 0,
-    quarantined_count     INTEGER NOT NULL DEFAULT 0,
-    child_count           INTEGER NOT NULL DEFAULT 0,
-    prefix_count          INTEGER NOT NULL DEFAULT 0,
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    path                  TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4096),
+    confirmed_count       INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_count >= 0),
+    quarantined_count     INTEGER NOT NULL DEFAULT 0 CHECK (quarantined_count >= 0),
+    child_count           INTEGER NOT NULL DEFAULT 0 CHECK (child_count >= 0),
+    prefix_count          INTEGER NOT NULL DEFAULT 0 CHECK (prefix_count >= 0),
     preview               TEXT NOT NULL DEFAULT '',
     last_changed_at       TEXT NOT NULL,
     PRIMARY KEY (scope_key, namespace, path)
@@ -886,69 +939,289 @@ CREATE INDEX idx_memory_path_summary_prefix
 
 -- 反向索引：note_id -> head 行，用于 O(1) 回答「这条 note 在哪里？」。
 CREATE TABLE memory_note_index (
-    note_id               TEXT PRIMARY KEY,
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    path                  TEXT NOT NULL,
-    kind                  TEXT NOT NULL,
-    lifecycle             TEXT NOT NULL,
-    review_state          TEXT NOT NULL,
-    confidence            TEXT NOT NULL,
-    trust                 TEXT NOT NULL,
-    sensitivity           TEXT NOT NULL,
-    visibility            TEXT NOT NULL,
+    note_id               TEXT PRIMARY KEY CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    path                  TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4096),
+    kind                  TEXT NOT NULL CHECK (kind IN ('procedural','semantic','episodic')),
+    lifecycle             TEXT NOT NULL CHECK (lifecycle IN ('replacement','accretive')),
+    review_state          TEXT NOT NULL CHECK (review_state IN ('draft','confirmed','quarantined','revoked','superseded','forgotten')),
+    confidence            TEXT NOT NULL CHECK (confidence IN ('low','medium','high')),
+    trust                 TEXT NOT NULL CHECK (trust IN ('verified','repo_evidence','user_asserted','external_untrusted','inferred')),
+    sensitivity           TEXT NOT NULL CHECK (sensitivity IN ('public','internal','confidential','secret_like')),
+    visibility            TEXT NOT NULL CHECK (visibility IN ('private','repo_local','team_candidate')),
     acl_policy_id         TEXT NOT NULL,
-    origin                TEXT NOT NULL,
+    origin                TEXT NOT NULL CHECK (origin IN (
+        'explicit','promoted_from_anchor','distilled_from_frame','classifier',
+        'consolidation','onboard','branch_fork','import','coordinator','episode_compiler'
+    )),
     idempotency_key       TEXT NOT NULL,
-    idempotency_scope     TEXT NOT NULL DEFAULT 'cell',
-    created_at            TEXT NOT NULL
+    idempotency_scope     TEXT NOT NULL DEFAULT 'cell'
+        CHECK (idempotency_scope IN ('cell','namespace')),
+    created_at            TEXT NOT NULL,
+    UNIQUE (scope_key, namespace, path, note_id),
+    UNIQUE (note_id, scope_key, namespace)
 );
 -- 幂等键去重（§4.1.1）：默认 Cell scope 在 (scope, namespace, path) 内唯一；
 -- Namespace scope 的聚合入口（consolidation / onboard）在 (scope, namespace) 内唯一。
-CREATE UNIQUE INDEX idx_memory_note_idempotency
-    ON memory_note_index(scope_key, namespace, path, idempotency_key);
+CREATE UNIQUE INDEX idx_memory_note_idempotency_cell
+    ON memory_note_index(scope_key, namespace, path, idempotency_key)
+    WHERE idempotency_scope = 'cell';
 CREATE UNIQUE INDEX idx_memory_note_idempotency_ns
     ON memory_note_index(scope_key, namespace, idempotency_key)
     WHERE idempotency_scope = 'namespace';
 
 -- revision 级 provenance / 影响面索引；可由每个 MemoryNote.compile_record 重建。
 CREATE TABLE memory_revision_index (
-    revision_oid          TEXT PRIMARY KEY,
-    note_id               TEXT NOT NULL,
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    origin                TEXT NOT NULL,
+    revision_oid          TEXT PRIMARY KEY CHECK (
+        length(revision_oid) IN (40,64)
+        AND revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    note_id               TEXT NOT NULL CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    origin                TEXT NOT NULL CHECK (origin IN (
+        'explicit','promoted_from_anchor','distilled_from_frame','classifier',
+        'consolidation','onboard','branch_fork','import','coordinator','episode_compiler'
+    )),
     producer              TEXT NOT NULL,
-    rules_version         INTEGER NOT NULL,
+    rules_version         INTEGER NOT NULL CHECK (rules_version > 0),
     prompt_version        TEXT,
     model_id              TEXT,
     policy_version        TEXT NOT NULL,
-    input_fingerprints_json TEXT NOT NULL,
-    created_at            TEXT NOT NULL
+    input_fingerprints_json TEXT NOT NULL CHECK (
+        json_valid(input_fingerprints_json)
+        AND json_type(input_fingerprints_json) = 'array'
+    ),
+    created_at            TEXT NOT NULL,
+    UNIQUE (note_id, revision_oid),
+    UNIQUE (scope_key, namespace, note_id, revision_oid),
+    FOREIGN KEY (note_id, scope_key, namespace)
+        REFERENCES memory_note_index(note_id, scope_key, namespace) ON DELETE CASCADE
 );
+CREATE INDEX idx_memory_revision_note
+    ON memory_revision_index(note_id, created_at, revision_oid);
 CREATE INDEX idx_memory_revision_producer
-    ON memory_revision_index(producer, prompt_version, model_id, policy_version);
+    ON memory_revision_index(scope_key, namespace, producer, prompt_version, model_id, policy_version);
 
 -- 派生的链接索引。历史真相是 MemoryNote.links。
 CREATE TABLE memory_link_index (
-    source_scope_key      TEXT NOT NULL,
-    source_namespace      TEXT NOT NULL,
-    source_note_id        TEXT NOT NULL,
-    source_revision_oid   TEXT NOT NULL,
-    target_note_id        TEXT NOT NULL,
-    target_revision_oid   TEXT,
-    link_kind             TEXT NOT NULL,
+    source_scope_key      TEXT NOT NULL CHECK (length(CAST(source_scope_key AS BLOB)) BETWEEN 1 AND 512),
+    source_namespace      TEXT NOT NULL CHECK (length(CAST(source_namespace AS BLOB)) BETWEEN 1 AND 512),
+    source_note_id        TEXT NOT NULL CHECK (
+        length(source_note_id) = 36
+        AND substr(source_note_id, 9, 1) = '-'
+        AND substr(source_note_id, 14, 1) = '-'
+        AND substr(source_note_id, 19, 1) = '-'
+        AND substr(source_note_id, 24, 1) = '-'
+        AND length(replace(source_note_id, '-', '')) = 32
+        AND replace(source_note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_revision_oid   TEXT NOT NULL CHECK (
+        length(source_revision_oid) IN (40,64)
+        AND source_revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    target_note_id        TEXT NOT NULL CHECK (
+        length(target_note_id) = 36
+        AND substr(target_note_id, 9, 1) = '-'
+        AND substr(target_note_id, 14, 1) = '-'
+        AND substr(target_note_id, 19, 1) = '-'
+        AND substr(target_note_id, 24, 1) = '-'
+        AND length(replace(target_note_id, '-', '')) = 32
+        AND replace(target_note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    target_revision_oid   TEXT CHECK (
+        target_revision_oid IS NULL
+        OR (length(target_revision_oid) IN (40,64)
+            AND target_revision_oid NOT GLOB '*[^0-9a-f]*')
+    ),
+    link_kind             TEXT NOT NULL CHECK (link_kind IN ('sibling','supports','prerequisite','contradicts','supersedes')),
     source_path           TEXT NOT NULL,
     target_path           TEXT NOT NULL,
-    evidence_refs_json    TEXT NOT NULL,
+    evidence_refs_json    TEXT NOT NULL CHECK (
+        json_valid(evidence_refs_json)
+        AND json_type(evidence_refs_json) = 'array'
+    ),
     valid_from            TEXT,
     valid_until           TEXT,
-    PRIMARY KEY (source_revision_oid, target_note_id, link_kind)
+    PRIMARY KEY (source_revision_oid, target_note_id, link_kind),
+    FOREIGN KEY (source_scope_key, source_namespace, source_path, source_note_id)
+        REFERENCES memory_note_index(scope_key, namespace, path, note_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_scope_key, source_namespace, source_note_id, source_revision_oid)
+        REFERENCES memory_revision_index(scope_key, namespace, note_id, revision_oid) ON DELETE CASCADE,
+    FOREIGN KEY (target_note_id)
+        REFERENCES memory_note_index(note_id) ON DELETE CASCADE,
+    FOREIGN KEY (target_note_id, target_revision_oid)
+        REFERENCES memory_revision_index(note_id, revision_oid)
 );
 CREATE INDEX idx_memory_link_source
     ON memory_link_index(source_scope_key, source_namespace, source_note_id);
 CREATE INDEX idx_memory_link_target
-    ON memory_link_index(source_scope_key, source_namespace, target_note_id, link_kind);
+    ON memory_link_index(target_note_id, target_revision_oid);
+
+-- 每个 memory ref 的已构建水位线。安全敏感读取要求
+-- projected_ref_oid == current_ref_oid。
+CREATE TABLE memory_projection_state (
+    scope_key             TEXT PRIMARY KEY CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    projected_ref_oid     TEXT NOT NULL CHECK (
+        length(projected_ref_oid) IN (40,64)
+        AND projected_ref_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    last_event_seq        INTEGER NOT NULL CHECK (last_event_seq >= 0),
+    schema_version        INTEGER NOT NULL CHECK (schema_version > 0),
+    policy_version        TEXT NOT NULL,
+    rebuilt_at            INTEGER NOT NULL CHECK (rebuilt_at >= 0)
+);
+
+-- Episode revision -> code path。Git path 使用大小写敏感的 BINARY 排序；
+-- prefix query 通过 code_path 的有界 range 扫描，不使用默认 ASCII-insensitive LIKE。
+CREATE TABLE memory_episode_path (
+    note_id               TEXT NOT NULL CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    revision_oid          TEXT NOT NULL CHECK (
+        length(revision_oid) IN (40,64)
+        AND revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    code_path             TEXT NOT NULL CHECK (
+        length(CAST(code_path AS BLOB)) BETWEEN 1 AND 4096
+        AND substr(code_path, 1, 1) <> '/'
+        AND instr(code_path, char(92)) = 0
+    ),
+    PRIMARY KEY (note_id, revision_oid, code_path),
+    FOREIGN KEY (note_id, revision_oid)
+        REFERENCES memory_revision_index(note_id, revision_oid) ON DELETE CASCADE
+);
+CREATE INDEX idx_memory_episode_path_code
+    ON memory_episode_path(code_path, note_id, revision_oid);
+
+-- 每个 Task / Intent root 最多一行的有界编译状态。M2-02 只冻结 schema
+-- 与 observation transaction；lease runner / retry state transition 属于 M2-08。
+CREATE TABLE memory_compile_job (
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    root_kind             TEXT NOT NULL CHECK (root_kind IN ('task','intent')),
+    root_id               TEXT NOT NULL CHECK (
+        length(root_id) > 0 AND length(CAST(root_id AS BLOB)) <= 120
+    ),
+    terminal_source_oid   TEXT NOT NULL CHECK (
+        length(terminal_source_oid) IN (40,64)
+        AND terminal_source_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    input_fingerprint_version INTEGER NOT NULL CHECK (input_fingerprint_version = 1),
+    input_fingerprint_key_id TEXT NOT NULL CHECK (
+        length(input_fingerprint_key_id) = 36
+        AND substr(input_fingerprint_key_id, 9, 1) = '-'
+        AND substr(input_fingerprint_key_id, 14, 1) = '-'
+        AND substr(input_fingerprint_key_id, 19, 1) = '-'
+        AND substr(input_fingerprint_key_id, 24, 1) = '-'
+        AND length(replace(input_fingerprint_key_id, '-', '')) = 32
+        AND replace(input_fingerprint_key_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    input_fingerprint_digest TEXT NOT NULL CHECK (
+        length(input_fingerprint_digest) = 64
+        AND input_fingerprint_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    observed_generation   INTEGER NOT NULL DEFAULT 1 CHECK (observed_generation >= 1),
+    processed_generation  INTEGER NOT NULL DEFAULT 0 CHECK (processed_generation >= 0),
+    state                 TEXT NOT NULL DEFAULT 'dirty'
+        CHECK (state IN ('idle','dirty','inflight','failed')),
+    lease_owner           TEXT,
+    lease_fence           INTEGER NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+    lease_expires_at      INTEGER,
+    retry_count           INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    next_retry_at         INTEGER,
+    last_error_code       TEXT CHECK (
+        last_error_code IS NULL
+        OR (length(last_error_code) = 14
+            AND last_error_code GLOB 'LBR-MEMORY-[0-9][0-9][0-9]')
+    ),
+    last_error_summary    TEXT CHECK (
+        last_error_summary IS NULL
+        OR length(CAST(last_error_summary AS BLOB)) <= 1024
+    ),
+    created_at            INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at            INTEGER NOT NULL CHECK (updated_at >= created_at),
+    PRIMARY KEY (scope_key, root_kind, root_id),
+    CHECK (processed_generation <= observed_generation),
+    CHECK (
+        (lease_owner IS NULL AND lease_expires_at IS NULL)
+        OR
+        (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_fence > 0)
+    ),
+    CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+    CHECK (next_retry_at IS NULL OR next_retry_at >= 0),
+    CHECK (last_error_summary IS NULL OR last_error_code IS NOT NULL),
+    CHECK (
+        (state = 'idle'
+         AND processed_generation = observed_generation
+         AND lease_owner IS NULL AND lease_expires_at IS NULL
+         AND retry_count = 0 AND next_retry_at IS NULL
+         AND last_error_code IS NULL AND last_error_summary IS NULL)
+        OR
+        (state = 'dirty'
+         AND processed_generation < observed_generation
+         AND lease_owner IS NULL AND lease_expires_at IS NULL)
+        OR
+        (state = 'inflight'
+         AND processed_generation < observed_generation
+         AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
+         AND next_retry_at IS NULL)
+        OR
+        (state = 'failed'
+         AND processed_generation < observed_generation
+         AND lease_owner IS NULL AND lease_expires_at IS NULL
+         AND retry_count > 0 AND next_retry_at IS NULL
+         AND last_error_code IS NOT NULL)
+    ),
+    CHECK (next_retry_at IS NULL OR state = 'dirty'),
+    CHECK (
+        retry_count > 0
+        OR (next_retry_at IS NULL
+            AND last_error_code IS NULL AND last_error_summary IS NULL)
+    )
+);
+CREATE INDEX idx_memory_compile_job_runnable
+    ON memory_compile_job(state, next_retry_at, lease_expires_at, updated_at);
+CREATE INDEX idx_memory_compile_job_scope_generation
+    ON memory_compile_job(scope_key, observed_generation, processed_generation);
+
+-- 每个 source ref 的 first-parent 增量扫描水位。名称使用 reference 表中的
+-- Branch.name，而不是展示用 full refname。
+CREATE TABLE memory_compile_observer_state (
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    source_ref_name       TEXT NOT NULL
+        CHECK (source_ref_name IN ('libra/intent','libra/memory/repo')),
+    scanned_through_oid   TEXT NOT NULL CHECK (
+        length(scanned_through_oid) IN (40,64)
+        AND scanned_through_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    updated_at            INTEGER NOT NULL CHECK (updated_at >= 0),
+    PRIMARY KEY (scope_key, source_ref_name)
+);
+
+-- 以下均为后续长期方案，不属于 2026082401_memory_core。
 
 -- 实体 mention / alias 反向索引。历史真相是 MemoryNote.entities；
 -- canonical_key 与 alias_key 均为经过规范化的 repository-local key。
@@ -983,17 +1256,6 @@ CREATE TABLE memory_taxonomy_node (
 );
 CREATE INDEX idx_memory_taxonomy_parent
     ON memory_taxonomy_node(scope_key, namespace, parent_path);
-
--- 每个 memory ref 的已构建水位线。安全敏感读取要求
--- projected_ref_oid == current_ref_oid。
-CREATE TABLE memory_projection_state (
-    scope_key             TEXT PRIMARY KEY,
-    projected_ref_oid     TEXT NOT NULL,
-    last_event_seq        INTEGER NOT NULL,
-    schema_version        INTEGER NOT NULL,
-    policy_version        TEXT NOT NULL,
-    rebuilt_at            TEXT NOT NULL
-);
 
 -- 本地访问统计，不是 Git 投影，不参与默认 deterministic ranking。
 CREATE TABLE memory_access_stats (
@@ -1071,13 +1333,65 @@ CREATE TABLE context_selection_receipt_retention (
 );
 ```
 
-`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 是可重建投影。`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats`、`context_selection_receipt` 与 `context_selection_receipt_retention` 是本地有界账本及其保留水位，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
+#### 5.2.1 M2-02 observation transaction
+
+M2-02 的 `job_sql` 是 crate-private 深 Module。调用方提交一次 pinned scan 的
+完整结果，不能直接拼表名、SQL 或 generation update。最小 Interface 为：
+
+```rust,ignore
+record_observation_batch(
+    db,
+    ObservationBatch {
+        scope_key,
+        source_ref_name,
+        expected_cursor,
+        scanned_through_oid,
+        roots,
+    },
+) -> Result<ObservationBatchOutcome, RecordObservationError>
+```
+
+`ObservedRoot` 只接收已经通过 M2-01 constructor 的 `EpisodeRoot`、已解析的
+`ObjectHash` 与 purpose-specific `SourceInputFingerprint`。后者是
+`KeyedDigestEnvelope` 的私有 newtype，只公开 `version/key_id/digest` getter；
+通用 envelope 或任意自定义 purpose 不能进入 `job_sql`。同一 batch 内 root key
+必须唯一；空 `roots` 合法，用于记录“该扫描区间没有终态 root”。
+
+Module 使用现有 SQLite writer-lock helper 开启一个短事务，并按固定顺序执行：
+
+1. 读取 `(scope_key, source_ref_name)` 当前 cursor，比较 `expected_cursor`；
+2. 幂等登记 batch 内全部 root job；
+3. CAS 创建或推进 `scanned_through_oid`；
+4. commit。任一步或 commit 失败都整批回滚。
+
+generation 比较完整 `(version, key_id, digest)`：
+
+- 不存在 job 时创建 `observed_generation=1`、`processed_generation=0`、`state=dirty`；
+- fingerprint 与 `terminal_source_oid` 均相同时不改 job 的 generation、lease、retry、error 或 timestamp；
+- fingerprint 相同而 source OID 不同时返回稳定的 source-mismatch 错误并整批回滚；
+- fingerprint 变化时只把 `observed_generation` 加一，更新 source/fingerprint，保持 `processed_generation` 与递增过的 `lease_fence`；`state='inflight'` 时原样保留 lease 与 state，其余状态转为 `dirty` 并清除旧 generation 的 retry/error。M2-02 不读取当前时间，也不判断 `lease_expires_at` 是否已过期；租约接管由 M2-08 负责。
+
+cursor 校验必须先拒绝“`expected_cursor == scanned_through_oid` 且 roots 非空”的
+非法 batch，再进入幂等判断。其余使用 compare-and-swap 语义：无行只接受 `expected_cursor=None`；当前值等于
+expected 时正常推进；当前值已经等于 `scanned_through_oid` 时返回
+`AlreadyRecorded` 且不再碰 job，用于恢复“数据库已提交但调用方未收到成功”；
+其它差异返回 `CursorConflict`。`expected_cursor == scanned_through_oid` 只允许空
+batch。first-parent 后代关系与扫描预算由 M2-08 observer 在调用前验证，SQL
+Module 不读取 Git 对象。
+
+本卡只实现上述 observation transaction。ref 扫描、terminal 判断、canonical
+input 构造、lease acquire/renew/takeover、runner、compiler、retry scheduling 与
+processed-generation completion 均属于 M2-08。down migration 仅在九张 M2-02
+表全部为空时按 `observer/job → episode_path/link/head → revision → note → projection_state/path_summary`
+的依赖顺序删除；任何表有行都以稳定错误拒绝，不能级联丢状态。
+
+`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_projection_state`、`memory_episode_path` 是 M2-02 的可重建投影。`memory_compile_job` 与 `memory_compile_observer_state` 是有界本地运行状态。后续的 `memory_entity_index`、`memory_taxonomy_node` 仍是可重建投影；`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats`、`context_selection_receipt` 与 `context_selection_receipt_retention` 是本地有界账本及其保留水位，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
 
 查询实现必须始终带上 `scope_key` 与 `namespace`，禁止只按 `path` 做全局查询后在内存中过滤。跨 scope / namespace 的检索只能由显式 `--all-namespaces` 或策略允许的 scope fallback 触发，并且必须在结果中保留原始 `scope` 与 `namespace`，防止 prompt 注入时发生来源混淆。
 
 `list_prefix` 与 `summarize` 不得执行无上限扫描。实现应使用规范化后的 path 前缀范围查询和 keyset pagination，并设置默认 `LIMIT`（建议 100 条 summary、50 条 note）与硬上限。因为 SQL `LIKE` 的转义与 collation 容易引入前缀越界，推荐存储 canonical `path_key` / `parent_path` 后做复合索引范围查询；复杂度表述统一为 O(log n + k)，其中 k 是有界返回量。
 
-在访问模式上还有一条对齐约定值得明确：Memory 的投影表用 SeaORM entity 来访问（与同样可重建的 `ai_index_*` 投影一致），而不采用 `agent_session` / `agent_checkpoint` / `agent_usage_stats` 那种**故意**保持的 raw-SQL、无 entity 风格。原因在于：`agent_*` 那批表是外部捕获的独立账本，而 Memory 的这些表是 git 真源（`refs/libra/memory/...`）的可重建投影，本质与 `ai_index_*` 同类，因而对齐 `ai_index_*` 的 SeaORM 模式。账本例外是 `memory_access_stats` 与 `context_selection_receipt`（§8.6）：二者都不是可重建投影，沿用 raw-SQL 账本模式，不配 entity。
+在访问模式上还有一条对齐约定值得明确：Memory 的投影表用 SeaORM entity 来访问（与同样可重建的 `ai_index_*` 投影一致），而不采用 `agent_session` / `agent_checkpoint` / `agent_usage_stats` 那种**故意**保持的 raw-SQL、无 entity 风格。原因在于：`agent_*` 那批表是外部捕获的独立账本，而 Memory 的这些表是 git 真源（`refs/heads/libra/memory/...`）的可重建投影，本质与 `ai_index_*` 同类，因而对齐 `ai_index_*` 的 SeaORM 模式。账本例外是 `memory_access_stats` 与 `context_selection_receipt`（§8.6）：二者都不是可重建投影，沿用 raw-SQL 账本模式，不配 entity。
 
 ### 5.3 ClientStorage 分层
 
@@ -1092,7 +1406,7 @@ CREATE TABLE context_selection_receipt_retention (
 
 ### 5.4 远端发布与传输边界
 
-第一版所有 `refs/libra/memory/*` 都是 **local-only**，不会进入默认 push/fetch/clone，也不提供 `memory push`。这里的 `Repo` 表示同一仓库 / 关联 worktree 的本地共享 scope，不表示团队远端可见。原因是普通 Git ref 传输只有并发保护，没有 record-level ACL、redaction manifest、revocation propagation 或 remote principal authorization。
+第一版所有 `refs/heads/libra/memory/*` 都是 **local-only**，不会进入默认 push/fetch/clone，也不提供 `memory push`。这里的 `Repo` 表示同一仓库 / 关联 worktree 的本地共享 scope，不表示团队远端可见。原因是普通 Git ref 传输只有并发保护，没有 record-level ACL、redaction manifest、revocation propagation 或 remote principal authorization。
 
 未来若增加团队 Memory publication，必须另行定义类似 `mainline.md` ML-01 的 allow-list manifest、隔离 tracking ref、ingress validation、lease、visibility/trust/sensitivity policy 与 tombstone 传播；不能直接 mirror 本地 memory ref。portable sealed intent / pin 仍由 `refs/libra/intent-team` 负责，Memory 不复制其 transport stack。该约束也意味着 `Confidential`、actor-private note、receipt、access stats 和原始 compile input HMAC 永不进入团队 publication。
 
@@ -1462,13 +1776,13 @@ query
 
 `scope = Branch("main")` 的 note 存放在
 `libra/memory/branch/<encoded-full-refname>`（git ref 全名写作
-`refs/libra/memory/branch/<encoded-full-refname>`）。切换用户的工作分支
+`refs/heads/libra/memory/branch/<encoded-full-refname>`）。切换用户的工作分支
 （通过 `libra switch`）会隐式切换被查询的作用域：
 
 ```text
 libra switch experiment
    -> agent 从 libra/memory/branch/<encoded-refs-heads-experiment> 读取 Branch 作用域，
-      并按显式 precedence 合并 refs/libra/memory/repo 的 Repo 作用域
+      并按显式 precedence 合并 refs/heads/libra/memory/repo 的 Repo 作用域
 ```
 
 这解决了 §2.1 中描述的「上下文污染」失效模式。
@@ -1504,7 +1818,7 @@ libra memory blame <path>                # 当前 head 由谁、于何时设定
 ```
 
 这些都是 Libra 既有 `log` / `diff` / `blame` 命令之上的薄封装（thin shim），
-作用域限定在 `refs/libra/memory/...`。
+作用域限定在 `refs/heads/libra/memory/...`。
 
 ### 9.3 merge 与 rebase
 
@@ -1593,7 +1907,7 @@ libra memory revoke <path-or-note-id> --reason "..."
 **Working 层（A3，四层巩固）。** 沿 §0.0.4（agentmemory 四层巩固）与 §0.2 决策，
 归并需要一条显式、有界的 **Working 摄入缓冲**：原始 observation 只在本地
 有界 intake 缓冲中作为 compiler 输入（§7.1 的 intake audit），**不写入
-`refs/libra/memory/*`，也不新增 note kind**——与「先编译，再使用」一致。
+`refs/heads/libra/memory/*`，也不新增 note kind**——与「先编译，再使用」一致。
 Working 层不是 `MemoryNote` 快照，只是 intake 到确认之间的中间态：
 
 - 只保留经 redaction 的 observation 摘要 + 来源 + 脱敏输入 HMAC + TTL；
@@ -1925,9 +2239,9 @@ agent 捕获使用的 `2026050303_agent_capture.sql` 迁移属于同一模式，
 - `memory_access_stats`（§5.2，本地账本，不参与 rebuild）
 - `context_selection_receipt`（§8.6，共享账本：append-only、豁免 rebuild、按保留策略有界修剪）
 
-只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/libra/memory/...` 重建。classifier cache 与 embedding cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
+只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/heads/libra/memory/...` 重建。classifier cache 与 embedding cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
 
-协调 namespace（§19.3）的**路径占用索引**（§19.4 claim 跨 task 重叠检查）属于可重建投影：它由 `coordination.*` 活 claim 的规范化 `body` 路径范围派生，随 `refs/libra/memory/...` 事件重放重建，删除后可随 rebuild 恢复；其结构与实体索引同模式（见 §19.4 设计边界的索引规模与性能预算）。`CoordinationView`（§19.5）是读取时对该索引的投影视图，不新增独立存储。
+协调 namespace（§19.3）的**路径占用索引**（§19.4 claim 跨 task 重叠检查）属于可重建投影：它由 `coordination.*` 活 claim 的规范化 `body` 路径范围派生，随 `refs/heads/libra/memory/...` 事件重放重建，删除后可随 rebuild 恢复；其结构与实体索引同模式（见 §19.4 设计边界的索引规模与性能预算）。`CoordinationView`（§19.5）是读取时对该索引的投影视图，不新增独立存储。
 
 值得一提的是模式选择上的对比：Memory 的投影表用 SeaORM entity 建模（与同样可
 重建的 `ai_index_*` 投影同模式），而外部捕获的 `agent_session` /
@@ -1943,7 +2257,7 @@ Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身
 - 在 `src/internal/ai/memory/` 中定义 `MemoryNote` / `MemoryEvent`
   的 Rust 类型。
 - 建立唯一的 `MemoryWriter` Module 与 Adapter contract；Phase A 的 CLI 写入只通过该 seam，writer 内部完成对象持久化、事件序号、CAS 与投影事务。
-- 对 repo memory ref（`refs/libra/memory/repo`）的写入 / 读取；每个 commit 单父、`event_seq` 连续、CAS 有界重试。
+- 对 repo memory ref（`refs/heads/libra/memory/repo`）的写入 / 读取；每个 commit 单父、`event_seq` 连续、CAS 有界重试。
 - SQLite 投影（§5.2）+ Sea-ORM entity：
   `memory_head`、`memory_path_summary`、`memory_note_index`、
   `memory_revision_index`、`memory_link_index`、`memory_entity_index`、
@@ -2185,7 +2499,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 
 > 本节曾于 2026-08-10 拆分为独立文档 `docs/development/tracing/memory-coordination.md`，现合并回本文（2026-08-10）。与主 Memory 设计共享的所有原语、约束与验收口径以本文为准。
 
-本设计为本文（主 Memory 设计）的**相邻但正交**扩展：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。本设计**不新增存储层、不新增第二套并发机制**，完全构建在本文 §3（概念模型）/ §4（对象模型）/ §5（存储布局）之上：一个保留 namespace（`coordination`）+ 一个 `MemoryCoordinator` 入口 + 一个 `CoordinationView` 投影，并复用 Working 缓冲（§10.5）与 Trust Gate（§7.5.1）。`CompileRecord.origin` 相应新增 `Coordinator` 值（§4.1.1 的 additive 扩展）。
+本设计为本文（主 Memory 设计）的**相邻但正交**扩展：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/heads/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。本设计**不新增存储层、不新增第二套并发机制**，完全构建在本文 §3（概念模型）/ §4（对象模型）/ §5（存储布局）之上：一个保留 namespace（`coordination`）+ 一个 `MemoryCoordinator` 入口 + 一个 `CoordinationView` 投影，并复用 Working 缓冲（§10.5）与 Trust Gate（§7.5.1）。`CompileRecord.origin` 相应新增 `Coordinator` 值（§4.1.1 的 additive 扩展）。
 
 ### 19.1 开发者问题
 
@@ -2240,7 +2554,7 @@ coordination.conflicts.<encoded-tag>      # 变更面冲突声明（accretive，
 | `body` | 有界正文：声明的文件/路径范围、移交的交付物摘要、进度的一行状态 |
 | `evidence_refs` | 移交/冲突可选引用 commit OID / Run / Evidence |
 
-**存储位置（与 §19.2 / §19.4 / §19.5 / §19.7 / §19.8 一致）。** 协调条目（claim / release / handoff / progress / conflict-declare / sync-point）**直接写入共享 memory ref**（`refs/libra/memory/...` 下 Repo scope 的 `coordination` namespace，经 `MemoryWriter.MemoryCoordinator` 与 ref CAS），**不是** Working 缓冲中的 ephemeral 状态：
+**存储位置（与 §19.2 / §19.4 / §19.5 / §19.7 / §19.8 一致）。** 协调条目（claim / release / handoff / progress / conflict-declare / sync-point）**直接写入共享 memory ref**（`refs/heads/libra/memory/...` 下 Repo scope 的 `coordination` namespace，经 `MemoryWriter.MemoryCoordinator` 与 ref CAS），**不是** Working 缓冲中的 ephemeral 状态：
 
 - 短 TTL 只控制 `CoordinationView` 的可见性与默认召回排除（§19.6）；历史事件与 note 保留在 ref 上可 `libra memory log` 审计（§10.7），这也满足 §19.8「从 refs 可重建」的验收。
 - Working 缓冲（§10.5）只承接**巩固（consolidation）**的输入与输出：归并作业读取近期协调条目 + 原始 observation 摘要，产出候选 semantic / procedural note 并经 Trust Gate 确认；协调条目本身不落 Working 缓冲。若 claim / handoff 只存在本地缓冲，跨进程不可见、`CoordinationView` 只能看到本地声明、单写者赢也无法跨进程由 CAS 保证——那将整体破坏 §19.1 的协调目标。
@@ -2317,7 +2631,7 @@ MEM-06 **不新增存储层、不新增第二套并发机制**，完全构建在
 - **过期不毒化**：claim 的 TTL 过期后从 `CoordinationView` 排除，历史仍在 `log` 可审计；不因过期条目拒绝新 claim。
 - **冲突声明**：两个 agent 并行改重叠路径，`conflict_declare` 触发 `contradicts` 链接并进入隔离；`CoordinationView` 显示未解冲突。
 - **不越权**：`SecretLike` / `Confidential` 不进协调通道；`actor` 不信任自报。
-- **无第二真源**：协调条目直接写入共享 memory ref、仍从 `refs/libra/memory/*` 可重建；Working 缓冲只承载 consolidation 输入/输出、可丢弃；`MemoryCoordinator` 不绕过 `MemoryWriter`。
+- **无第二真源**：协调条目直接写入共享 memory ref、仍从 `refs/heads/libra/memory/*` 可重建；Working 缓冲只承载 consolidation 输入/输出、可丢弃；`MemoryCoordinator` 不绕过 `MemoryWriter`。
 - **与并行工作区衔接**：跨 worktree（§9.1 / [`libra-worktree-architecture.md`](../libra-worktree-architecture.md)）的 agent 都能读到同一 repo 级协调（Repo scope 共享），worktree 级协调按需隔离。
 
 ### 19.9 分阶段与优先级
@@ -2376,7 +2690,7 @@ MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建
 
 ### 20.3 保留的强项（不修改）
 
-1. Snapshot/Event/Projection 三层模型 + `refs/libra/memory/*` 线性历史 + CAS 并发（§0.1、§4）。
+1. Snapshot/Event/Projection 三层模型 + `refs/heads/libra/memory/*` 线性历史 + CAS 并发（§0.1、§4）。
 2. CompileRecord / ContextReceipt 的确定性可重放承诺（§0.2、§8.6）。
 3. 分层 scope（Actor→Worktree→Branch→Repo→Global）与 fail-closed 读取（§3.4）。
 4. 遗忘/脱敏语义、MCP C9 门禁、`SecretLike` 边界（§10.6、§13）。

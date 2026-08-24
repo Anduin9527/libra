@@ -2699,6 +2699,42 @@ pub struct GcObjectSource {
     pub note: &'static str,
 }
 
+const fn memory_projection_oid(
+    location: &'static str,
+    column: &'static str,
+    note: &'static str,
+) -> GcObjectSource {
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location,
+        column,
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082401_memory_core rebuildable projection",
+        read_bound: "not read by GC; projection replay removes stale rows",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note,
+    }
+}
+
+const fn memory_runtime_oid(
+    location: &'static str,
+    column: &'static str,
+    note: &'static str,
+) -> GcObjectSource {
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location,
+        column,
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082401_memory_core bounded runtime state",
+        read_bound: "not read by GC; one bounded row per compiler root or source cursor",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note,
+    }
+}
+
 /// §C.4.3: the FILE-backed half of the inventory. Each entry names the
 /// collector or gate that implements its classification, so a reader can
 /// check the claim rather than trust it.
@@ -3254,6 +3290,61 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         corruption: GcCorruptionPolicy::LenientSkip,
         note: "cache validity key (the tip is ref-anchored); rebuilt on demand",
     },
+    memory_projection_oid(
+        "memory_revision_index",
+        "revision_oid",
+        "Memory revision lookup cache; the future authoritative Memory ref/object graph owns reachability, while replay can discard this row",
+    ),
+    memory_projection_oid(
+        "memory_projection_state",
+        "projected_ref_oid",
+        "Memory projection watermark; it records which authoritative ref tip was replayed and never keeps that tip alive",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "latest_revision_oid",
+        "Latest Memory revision cache; authoritative events and the Memory ref own reachability, and projection replay repairs this pointer",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "live_revision_oid",
+        "Effective Memory revision cache; authoritative events and the Memory ref own reachability, and projection replay repairs this pointer",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "effective_from_commit",
+        "Code-applicability cache derived from the authoritative Memory revision; the code ref/reflog and Memory authority, not SQLite, define retention",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "effective_until_commit",
+        "Code-applicability cache derived from the authoritative Memory revision; the code ref/reflog and Memory authority, not SQLite, define retention",
+    ),
+    memory_projection_oid(
+        "memory_link_index",
+        "source_revision_oid",
+        "Rebuildable Memory link index source; the authoritative Memory event graph owns the revision and replay can discard this row",
+    ),
+    memory_projection_oid(
+        "memory_link_index",
+        "target_revision_oid",
+        "Optional pinned Memory link target in a rebuildable index; the authoritative event graph owns retention and replay repairs the row",
+    ),
+    memory_projection_oid(
+        "memory_episode_path",
+        "revision_oid",
+        "Rebuildable Episode path lookup keyed by a Memory revision; it accelerates filtering and contributes no reachability authority",
+    ),
+    memory_runtime_oid(
+        "memory_compile_job",
+        "terminal_source_oid",
+        "Compiler input cursor into an authoritative Task or Intent source ref; bounded job state is recoverable by observation and is not an object root",
+    ),
+    memory_runtime_oid(
+        "memory_compile_observer_state",
+        "scanned_through_oid",
+        "First-parent observer watermark into an authoritative source ref; rescanning repairs it and the cursor itself keeps no object alive",
+    ),
     GcObjectSource {
         origin: GcSourceOrigin::Column,
         location: "object_obliteration",

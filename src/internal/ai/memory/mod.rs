@@ -11,4 +11,5 @@
 
 mod canonical;
 mod domain;
+mod job_sql;
 mod validation;

@@ -111,6 +111,84 @@ impl KeyedDigestEnvelope {
     }
 }
 
+/// Purpose-locked fingerprint for a compiler root's canonical source inputs.
+///
+/// The wrapper deliberately has no `Debug` or serialization implementation:
+/// job persistence writes its three validated parts explicitly, and routine
+/// diagnostics must not print the digest.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SourceInputFingerprint(KeyedDigestEnvelope);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceInputFingerprintErrorKind {
+    UnsupportedVersion,
+    InvalidKeyId,
+    InvalidDigest,
+}
+
+#[derive(Debug, Error)]
+#[error("persisted source-input fingerprint is invalid ({kind:?})")]
+pub(crate) struct SourceInputFingerprintError {
+    kind: SourceInputFingerprintErrorKind,
+}
+
+impl SourceInputFingerprintError {
+    const fn new(kind: SourceInputFingerprintErrorKind) -> Self {
+        Self { kind }
+    }
+
+    pub(crate) const fn kind(&self) -> SourceInputFingerprintErrorKind {
+        self.kind
+    }
+}
+
+impl SourceInputFingerprint {
+    pub(crate) fn from_parts(
+        version: u8,
+        key_id: Uuid,
+        digest: String,
+    ) -> Result<Self, SourceInputFingerprintError> {
+        if version != DIGEST_VERSION {
+            return Err(SourceInputFingerprintError::new(
+                SourceInputFingerprintErrorKind::UnsupportedVersion,
+            ));
+        }
+        if key_id.get_version_num() != 4 {
+            return Err(SourceInputFingerprintError::new(
+                SourceInputFingerprintErrorKind::InvalidKeyId,
+            ));
+        }
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SourceInputFingerprintError::new(
+                SourceInputFingerprintErrorKind::InvalidDigest,
+            ));
+        }
+
+        Ok(Self(KeyedDigestEnvelope {
+            version,
+            key_id,
+            purpose: DigestPurpose::SourceInput,
+            digest,
+        }))
+    }
+
+    pub(crate) const fn version(&self) -> u8 {
+        self.0.version()
+    }
+
+    pub(crate) const fn key_id(&self) -> Uuid {
+        self.0.key_id()
+    }
+
+    pub(crate) fn digest_hex(&self) -> &str {
+        self.0.digest_hex()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyedDigestErrorKind {
     RepositoryUnavailable,
@@ -368,6 +446,14 @@ impl RepositoryKeyedDigest {
         self.ensure_valid()?;
         Ok(envelope)
     }
+
+    pub(crate) fn source_input_fingerprint(
+        &self,
+        input: &[u8],
+    ) -> Result<SourceInputFingerprint, KeyedDigestError> {
+        self.digest(DigestPurpose::SourceInput, input)
+            .map(SourceInputFingerprint)
+    }
 }
 
 fn config_fingerprint(ciphertext_hex: &str) -> [u8; 32] {
@@ -586,7 +672,8 @@ mod tests {
 
     use super::{
         DigestPurpose, KeyedDigestError, KeyedDigestErrorKind, PERSISTED_GENERATION,
-        PERSISTED_SCHEMA_VERSION, PersistedDigestKeyV1, RepositoryKeyedDigest, config_fingerprint,
+        PERSISTED_SCHEMA_VERSION, PersistedDigestKeyV1, RepositoryKeyedDigest,
+        SourceInputFingerprint, SourceInputFingerprintErrorKind, config_fingerprint,
         reset_digest_cache_for_tests,
     };
     use crate::{
@@ -850,6 +937,52 @@ mod tests {
         assert_eq!(json["purpose"], "query");
         assert_eq!(json["digest"], envelope.digest_hex());
         assert!(json.get("seed").is_none());
+    }
+
+    #[test]
+    fn source_input_fingerprint_is_purpose_locked_and_round_trips_parts() {
+        let key_id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000")
+            .expect("fixed UUIDv4 must parse");
+        let provider = RepositoryKeyedDigest::from_seed(
+            key_id,
+            [0x24; 32],
+            config_fingerprint("source-input-fingerprint"),
+        )
+        .expect("fixed seed must construct a provider");
+
+        let fingerprint = provider
+            .source_input_fingerprint(b"task-42 terminal inputs")
+            .expect("valid provider produces a source-input fingerprint");
+        assert_eq!(fingerprint.version(), 1);
+        assert_eq!(fingerprint.key_id(), key_id);
+        assert_eq!(fingerprint.digest_hex().len(), 64);
+
+        let restored = SourceInputFingerprint::from_parts(
+            fingerprint.version(),
+            fingerprint.key_id(),
+            fingerprint.digest_hex().to_owned(),
+        )
+        .expect("persisted source-input parts must round-trip");
+        assert!(restored == fingerprint);
+
+        let Err(unsupported_version) =
+            SourceInputFingerprint::from_parts(2, key_id, "a".repeat(64))
+        else {
+            panic!("unsupported versions must fail closed");
+        };
+        assert_eq!(
+            unsupported_version.kind(),
+            SourceInputFingerprintErrorKind::UnsupportedVersion
+        );
+
+        let Err(invalid_digest) = SourceInputFingerprint::from_parts(1, key_id, "A".repeat(64))
+        else {
+            panic!("non-canonical digest text must fail closed");
+        };
+        assert_eq!(
+            invalid_digest.kind(),
+            SourceInputFingerprintErrorKind::InvalidDigest
+        );
     }
 
     #[test]
