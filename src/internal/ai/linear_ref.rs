@@ -183,10 +183,25 @@ pub(crate) enum LinearRefTransactionOutcome {
 #[error("linear ref transaction exceeded its execution deadline")]
 pub(crate) struct LinearRefDeadlineExceeded;
 
+/// Borrowed proof that the enclosing owned-ref transaction acquired SQLite's
+/// write lock before any companion reads or writes.
+///
+/// The constructor stays inside this module so companion implementations
+/// cannot certify an arbitrary deferred transaction as write-locked.
+pub(crate) struct LinearRefWriteTransaction<'a> {
+    transaction: &'a DatabaseTransaction,
+}
+
+impl<'a> LinearRefWriteTransaction<'a> {
+    pub(crate) const fn as_database_transaction(&self) -> &'a DatabaseTransaction {
+        self.transaction
+    }
+}
+
 /// Companion mutation applied after the ref CAS succeeds and before commit.
 #[async_trait::async_trait]
 pub(crate) trait LinearRefCompanion: Send + Sync {
-    async fn apply(&self, txn: &DatabaseTransaction) -> Result<()>;
+    async fn apply(&self, txn: &LinearRefWriteTransaction<'_>) -> Result<()>;
 }
 
 /// Advance an owned ref and apply `companion` in the same SQLite transaction.
@@ -293,7 +308,9 @@ pub(crate) async fn linear_ref_transaction(
         }
 
         if let Some(companion) = companion
-            && let Err(err) = companion.apply(&txn).await
+            && let Err(err) = companion
+                .apply(&LinearRefWriteTransaction { transaction: &txn })
+                .await
         {
             let _ = txn.rollback().await;
             return Err(err.context("companion mutation failed; owned ref update rolled back"));
@@ -358,7 +375,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LinearRefCompanion for InsertCompanion {
-        async fn apply(&self, txn: &DatabaseTransaction) -> Result<()> {
+        async fn apply(&self, txn: &LinearRefWriteTransaction<'_>) -> Result<()> {
+            let txn = txn.as_database_transaction();
             txn.execute_raw(Statement::from_string(
                 txn.get_database_backend(),
                 "INSERT INTO config_kv(key, value, encrypted) VALUES ('projection', '1', 0)"
@@ -373,7 +391,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LinearRefCompanion for FailingCompanion {
-        async fn apply(&self, txn: &DatabaseTransaction) -> Result<()> {
+        async fn apply(&self, txn: &LinearRefWriteTransaction<'_>) -> Result<()> {
+            let txn = txn.as_database_transaction();
             txn.execute_raw(Statement::from_string(
                 txn.get_database_backend(),
                 "INSERT INTO config_kv(key, value, encrypted) VALUES ('rolled-back', '1', 0)"
@@ -388,7 +407,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LinearRefCompanion for DeadlineExpiringCompanion {
-        async fn apply(&self, txn: &DatabaseTransaction) -> Result<()> {
+        async fn apply(&self, txn: &LinearRefWriteTransaction<'_>) -> Result<()> {
+            let txn = txn.as_database_transaction();
             txn.execute_raw(Statement::from_string(
                 txn.get_database_backend(),
                 "INSERT INTO config_kv(key, value, encrypted) VALUES ('deadline', '1', 0)"

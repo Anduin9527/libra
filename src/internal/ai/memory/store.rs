@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -9,10 +9,15 @@ use serde::Serialize;
 use super::{
     domain::{MemoryEventV1, MemoryNoteV1},
     error::{MemoryWriterError, MemoryWriterErrorKind},
+    projection::materialize_linear,
+    replay::{ProjectedNote, ProjectedReviewState, ReducedProjection, ReplayRecord},
     tree::parse_oid,
 };
 use crate::internal::{
-    ai::{keyed_digest::RepositoryKeyedDigest, linear_ref::LinearRefCompanion},
+    ai::{
+        keyed_digest::RepositoryKeyedDigest,
+        linear_ref::{LinearRefCompanion, LinearRefWriteTransaction},
+    },
     workspace::RepoIdentity,
 };
 
@@ -145,10 +150,10 @@ fn projected_cell_from_row(row: QueryResult) -> Result<ProjectedCell, MemoryWrit
 #[derive(Clone)]
 pub(super) struct ProjectionMutation {
     pub(super) note: MemoryNoteV1,
+    pub(super) transition: MemoryEventV1,
     pub(super) event: MemoryEventV1,
     pub(super) revision_oid: ObjectHash,
     pub(super) commit_oid: ObjectHash,
-    pub(super) is_create: bool,
     pub(super) rebuilt_at_ms: i64,
     pub(super) expected_head: Option<ObjectHash>,
     pub(super) expected_event_seq: u64,
@@ -159,22 +164,47 @@ pub(super) struct ProjectionMutation {
 
 #[async_trait]
 impl LinearRefCompanion for ProjectionMutation {
-    async fn apply(&self, txn: &DatabaseTransaction) -> Result<()> {
-        revalidate_snapshot(txn, self).await?;
-        if self.is_create {
-            insert_note(txn, &self.note).await?;
-        } else {
-            update_note(txn, &self.note).await?;
+    async fn apply(&self, txn: &LinearRefWriteTransaction<'_>) -> Result<()> {
+        revalidate_snapshot(txn.as_database_transaction(), self).await?;
+        let mut reduced = ReducedProjection {
+            last_event_seq: self.expected_event_seq,
+            ..ReducedProjection::default()
+        };
+        if let Some(cell) = &self.expected_cell {
+            let mut revisions = BTreeSet::new();
+            revisions.insert(cell.latest_revision_oid.to_string());
+            reduced.notes.insert(
+                self.note.note_id,
+                ProjectedNote {
+                    latest_revision_oid: cell.latest_revision_oid,
+                    live_revision_oid: cell
+                        .live_revision_oid
+                        .as_deref()
+                        .map(parse_oid)
+                        .transpose()?,
+                    latest_action: super::domain::MemoryEventAction::Confirmed,
+                    review_state: ProjectedReviewState::Confirmed,
+                    last_event_seq: self.expected_event_seq,
+                    updated_at: self.transition.at,
+                    revisions,
+                },
+            );
         }
-        insert_revision(txn, &self.note, self.revision_oid).await?;
-        replace_links(txn, &self.note, self.revision_oid).await?;
-        replace_episode_paths(txn, &self.note, self.revision_oid).await?;
-        upsert_head(txn, &self.note, &self.event, self.revision_oid).await?;
-        upsert_projection_state(
+        reduced.apply(ReplayRecord {
+            event: self.transition.clone(),
+            revision_oid: Some(self.revision_oid),
+            note: Some(self.note.clone()),
+        })?;
+        reduced.apply(ReplayRecord {
+            event: self.event.clone(),
+            revision_oid: Some(self.revision_oid),
+            note: Some(self.note.clone()),
+        })?;
+        materialize_linear(
             txn,
-            &self.note,
-            &self.event,
+            &reduced,
             self.commit_oid,
+            &self.note.compile_record.policy_version,
             self.rebuilt_at_ms,
         )
         .await?;
@@ -272,7 +302,7 @@ async fn find_cell_in_transaction(
     decode_unique_cell(rows)
 }
 
-async fn insert_note(txn: &DatabaseTransaction, note: &MemoryNoteV1) -> Result<()> {
+pub(super) async fn insert_note(txn: &DatabaseTransaction, note: &MemoryNoteV1) -> Result<()> {
     execute(
         txn,
         "INSERT INTO memory_note_index (
@@ -300,7 +330,7 @@ async fn insert_note(txn: &DatabaseTransaction, note: &MemoryNoteV1) -> Result<(
     .await
 }
 
-async fn update_note(txn: &DatabaseTransaction, note: &MemoryNoteV1) -> Result<()> {
+pub(super) async fn update_note(txn: &DatabaseTransaction, note: &MemoryNoteV1) -> Result<()> {
     let result = txn
         .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
@@ -327,7 +357,7 @@ async fn update_note(txn: &DatabaseTransaction, note: &MemoryNoteV1) -> Result<(
     Ok(())
 }
 
-async fn insert_revision(
+pub(super) async fn insert_revision(
     txn: &DatabaseTransaction,
     note: &MemoryNoteV1,
     revision_oid: ObjectHash,
@@ -356,7 +386,7 @@ async fn insert_revision(
     .await
 }
 
-async fn replace_links(
+pub(super) async fn replace_links(
     txn: &DatabaseTransaction,
     note: &MemoryNoteV1,
     revision_oid: ObjectHash,
@@ -398,7 +428,7 @@ async fn replace_links(
     Ok(())
 }
 
-async fn replace_episode_paths(
+pub(super) async fn replace_episode_paths(
     txn: &DatabaseTransaction,
     note: &MemoryNoteV1,
     revision_oid: ObjectHash,
@@ -421,90 +451,11 @@ async fn replace_episode_paths(
     Ok(())
 }
 
-async fn upsert_head(
+pub(super) async fn execute(
     txn: &DatabaseTransaction,
-    note: &MemoryNoteV1,
-    event: &MemoryEventV1,
-    revision_oid: ObjectHash,
+    sql: &str,
+    values: Vec<sea_orm::Value>,
 ) -> Result<()> {
-    execute(
-        txn,
-        "INSERT INTO memory_head (
-            scope_key, namespace, path, note_id, latest_revision_oid,
-            live_revision_oid, latest_action, latest_review_state, kind,
-            lifecycle, confidence, trust, sensitivity, visibility, acl_policy_id,
-            valid_from, valid_until, effective_from_commit, effective_until_commit,
-            expires_at, rank_hint, last_event_seq, updated_at
-         ) VALUES ('repo', ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-         ON CONFLICT(scope_key, namespace, path, note_id) DO UPDATE SET
-            latest_revision_oid = excluded.latest_revision_oid,
-            live_revision_oid = excluded.live_revision_oid,
-            latest_action = excluded.latest_action,
-            latest_review_state = excluded.latest_review_state,
-            confidence = excluded.confidence,
-            trust = excluded.trust,
-            sensitivity = excluded.sensitivity,
-            visibility = excluded.visibility,
-            acl_policy_id = excluded.acl_policy_id,
-            effective_from_commit = excluded.effective_from_commit,
-            last_event_seq = excluded.last_event_seq,
-            updated_at = excluded.updated_at",
-        vec![
-            note.namespace.clone().into(),
-            note.path.clone().into(),
-            note.note_id.to_string().into(),
-            revision_oid.to_string().into(),
-            revision_oid.to_string().into(),
-            enum_label(&event.action)?.into(),
-            enum_label(&note.kind)?.into(),
-            enum_label(&note.lifecycle)?.into(),
-            enum_label(&note.confidence)?.into(),
-            enum_label(&note.trust)?.into(),
-            enum_label(&note.sensitivity)?.into(),
-            enum_label(&note.visibility)?.into(),
-            note.acl_policy_id.clone().into(),
-            note.valid_from.map(|value| value.to_rfc3339()).into(),
-            note.valid_until.map(|value| value.to_rfc3339()).into(),
-            note.effective_from_commit.clone().into(),
-            note.effective_until_commit.clone().into(),
-            note.expires_at.map(|value| value.to_rfc3339()).into(),
-            i64::try_from(event.event_seq)?.into(),
-            event.at.to_rfc3339().into(),
-        ],
-    )
-    .await
-}
-
-async fn upsert_projection_state(
-    txn: &DatabaseTransaction,
-    note: &MemoryNoteV1,
-    event: &MemoryEventV1,
-    commit_oid: ObjectHash,
-    rebuilt_at_ms: i64,
-) -> Result<()> {
-    execute(
-        txn,
-        "INSERT INTO memory_projection_state (
-            scope_key, projected_ref_oid, last_event_seq, schema_version,
-            policy_version, rebuilt_at
-         ) VALUES ('repo', ?, ?, 1, ?, ?)
-         ON CONFLICT(scope_key) DO UPDATE SET
-            projected_ref_oid = excluded.projected_ref_oid,
-            last_event_seq = excluded.last_event_seq,
-            schema_version = excluded.schema_version,
-            policy_version = excluded.policy_version,
-            rebuilt_at = excluded.rebuilt_at",
-        vec![
-            commit_oid.to_string().into(),
-            i64::try_from(event.event_seq)?.into(),
-            note.compile_record.policy_version.clone().into(),
-            rebuilt_at_ms.into(),
-        ],
-    )
-    .await
-}
-
-async fn execute(txn: &DatabaseTransaction, sql: &str, values: Vec<sea_orm::Value>) -> Result<()> {
     txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         sql,
@@ -514,7 +465,7 @@ async fn execute(txn: &DatabaseTransaction, sql: &str, values: Vec<sea_orm::Valu
     Ok(())
 }
 
-fn enum_label<T: Serialize>(value: &T) -> Result<String> {
+pub(super) fn enum_label<T: Serialize>(value: &T) -> Result<String> {
     let value = serde_json::to_value(value).context("serialize Memory enum")?;
     value
         .as_str()

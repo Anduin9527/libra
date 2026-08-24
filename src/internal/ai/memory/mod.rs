@@ -15,6 +15,8 @@ mod error;
 mod fts_sql;
 mod job_sql;
 mod policy;
+mod projection;
+mod replay;
 mod store;
 mod tree;
 mod validation;

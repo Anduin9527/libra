@@ -10,6 +10,7 @@ pub(crate) enum MemoryWriterErrorKind {
     UnknownDigestKey,
     CorruptHistory,
     CorruptProjection,
+    ProjectionStale,
     StorageFailure,
     ConflictExhausted,
 }
@@ -21,6 +22,7 @@ impl MemoryWriterErrorKind {
             Self::InvalidProposal => "LBR-MEMORY-002",
             Self::PolicyRejected | Self::UnknownDigestKey => "LBR-MEMORY-003",
             Self::CorruptHistory | Self::CorruptProjection => "LBR-MEMORY-004",
+            Self::ProjectionStale => "LBR-MEMORY-PROJECTION-STALE",
             Self::StorageFailure | Self::ConflictExhausted => "LBR-MEMORY-005",
         }
     }

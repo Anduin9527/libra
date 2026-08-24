@@ -12,7 +12,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, S
 use thiserror::Error;
 
 use super::domain::{CodeChangeStatus, CompletionStatus, EpisodeRoot, EpisodeRootKind};
-use crate::internal::db;
+use crate::internal::{ai::linear_ref::LinearRefWriteTransaction, db};
 
 const MAX_SEARCH_TEXT_BYTES: usize = 64 * 1024;
 const MAX_MATCH_INPUT_BYTES: usize = 4 * 1024;
@@ -253,7 +253,20 @@ pub(crate) async fn upsert_document(
     transaction: &MemoryWriteTransaction,
     document: &EpisodeSearchDocument,
 ) -> Result<i64, MemoryFtsError> {
-    let transaction = transaction.as_database_transaction();
+    upsert_document_on(transaction.as_database_transaction(), document).await
+}
+
+pub(super) async fn upsert_document_in_linear_transaction(
+    transaction: &LinearRefWriteTransaction<'_>,
+    document: &EpisodeSearchDocument,
+) -> Result<i64, MemoryFtsError> {
+    upsert_document_on(transaction.as_database_transaction(), document).await
+}
+
+async fn upsert_document_on(
+    transaction: &DatabaseTransaction,
+    document: &EpisodeSearchDocument,
+) -> Result<i64, MemoryFtsError> {
     let note_id = document.note_id();
     let revision_oid = document.revision_oid();
     if let Some(stored) = read_document(transaction, &note_id, &revision_oid).await? {

@@ -92,6 +92,18 @@ pub(super) struct MemoryCommitObjects {
     pub(super) commit_oid: ObjectHash,
 }
 
+#[derive(Clone)]
+pub(super) struct MemoryHistoryRecord {
+    pub(super) event: super::domain::MemoryEventV1,
+    pub(super) revision_oid: Option<ObjectHash>,
+    pub(super) note: Option<super::domain::MemoryNoteV1>,
+}
+
+pub(super) struct MemoryHistoryDelta {
+    pub(super) manifest: MemoryManifestV1,
+    pub(super) records: Vec<MemoryHistoryRecord>,
+}
+
 pub(super) struct MemoryCommitInput<'a> {
     pub(super) note_id: &'a str,
     pub(super) namespace: &'a str,
@@ -144,7 +156,7 @@ pub(super) fn load_snapshot(
             "Memory commit parent count does not match its event sequence",
         ));
     }
-    validate_append_edge(storage_path, &commit, &root_items, &manifest)?;
+    let _ = validate_append_edge(storage_path, &commit, &root_items, &manifest)?;
     if manifest.policy_version != policy_version {
         return Err(MemoryWriterError::new(
             MemoryWriterErrorKind::PolicyRejected,
@@ -162,11 +174,11 @@ fn validate_append_edge(
     commit: &Commit,
     root_items: &[TreeItem],
     manifest: &MemoryManifestV1,
-) -> Result<(), MemoryWriterError> {
+) -> Result<Vec<MemoryHistoryRecord>, MemoryWriterError> {
     validate_root_shape(root_items)?;
     let (parent_items, parent_manifest) = match commit.parent_commit_ids.as_slice() {
         [] => {
-            if manifest.commit_count != 1 || manifest.last_event_seq != 2 {
+            if manifest.commit_count != 1 || manifest.last_event_seq == 0 {
                 return Err(corrupt(
                     "Memory root commit has an invalid manifest sequence",
                 ));
@@ -181,7 +193,7 @@ fn validate_append_edge(
             let expected_parent_count = usize::from(parent_manifest.commit_count > 1);
             if parent.parent_commit_ids.len() != expected_parent_count
                 || parent_manifest.commit_count.checked_add(1) != Some(manifest.commit_count)
-                || parent_manifest.last_event_seq.checked_add(2) != Some(manifest.last_event_seq)
+                || parent_manifest.last_event_seq >= manifest.last_event_seq
                 || parent_manifest.scope_key != manifest.scope_key
                 || parent_manifest.policy_version != manifest.policy_version
                 || parent_manifest.policy_snapshot_digest != manifest.policy_snapshot_digest
@@ -205,6 +217,77 @@ fn validate_append_edge(
         previous_seq,
         manifest.last_event_seq,
     )
+}
+
+/// Read and validate the first-parent suffix ending at `head`.
+///
+/// `after` is the already-projected ancestor and is excluded from the result.
+/// Supplying a non-ancestor fails closed rather than silently rebuilding from
+/// an unrelated history.
+pub(super) fn load_history_delta(
+    storage_path: &Path,
+    head: ObjectHash,
+    after: Option<ObjectHash>,
+    policy_version: &str,
+) -> Result<MemoryHistoryDelta, MemoryWriterError> {
+    const MAX_REPLAY_COMMITS: usize = 4096;
+
+    if Some(head) == after {
+        let snapshot = load_snapshot(storage_path, Some(head), policy_version)?;
+        return Ok(MemoryHistoryDelta {
+            manifest: snapshot.manifest,
+            records: Vec::new(),
+        });
+    }
+
+    let mut suffix = Vec::new();
+    let mut cursor = head;
+    loop {
+        if Some(cursor) == after {
+            break;
+        }
+        if suffix.len() == MAX_REPLAY_COMMITS {
+            return Err(corrupt("Memory replay exceeds the commit budget"));
+        }
+        let commit = load_commit(storage_path, cursor)?;
+        if commit.parent_commit_ids.len() > 1 {
+            return Err(corrupt("Memory history contains a merge commit"));
+        }
+        let root_items = load_tree(storage_path, commit.tree_id)?;
+        let manifest = load_manifest(storage_path, &root_items, "replay")?;
+        if manifest.policy_version != policy_version {
+            return Err(MemoryWriterError::new(
+                MemoryWriterErrorKind::PolicyRejected,
+                "Memory replay policy does not match the authoritative history",
+            ));
+        }
+        let parent = commit.parent_commit_ids.first().copied();
+        suffix.push((cursor, commit, root_items, manifest));
+        match parent {
+            Some(parent) => cursor = parent,
+            None if after.is_none() => break,
+            None => {
+                return Err(corrupt(
+                    "Memory projection watermark is not an ancestor of the pinned head",
+                ));
+            }
+        }
+    }
+    suffix.reverse();
+    let manifest = suffix
+        .last()
+        .map(|(_, _, _, manifest)| manifest.clone())
+        .ok_or_else(|| corrupt("Memory replay suffix is empty"))?;
+    let mut records = Vec::new();
+    for (_, commit, root_items, commit_manifest) in &suffix {
+        records.extend(validate_append_edge(
+            storage_path,
+            commit,
+            root_items,
+            commit_manifest,
+        )?);
+    }
+    Ok(MemoryHistoryDelta { manifest, records })
 }
 
 fn validate_root_shape(items: &[TreeItem]) -> Result<(), MemoryWriterError> {
@@ -443,7 +526,7 @@ fn validate_event_edge(
     root_items: &[TreeItem],
     previous_seq: u64,
     last_event_seq: u64,
-) -> Result<(), MemoryWriterError> {
+) -> Result<Vec<MemoryHistoryRecord>, MemoryWriterError> {
     let events = tree_entries(storage_path, root_items, "events")?;
     if events.len() > MAX_MEMORY_TREE_ENTRIES {
         return Err(corrupt(
@@ -460,7 +543,7 @@ fn validate_event_edge(
         None => Vec::new(),
     };
     if u64::try_from(parent_events.len()).ok() != Some(previous_seq)
-        || events.len().checked_sub(parent_events.len()) != Some(2)
+        || events.len() <= parent_events.len()
         || !events.starts_with(&parent_events)
     {
         return Err(corrupt("Memory event tree did not append to its parent"));
@@ -486,17 +569,17 @@ fn validate_event_edge(
         None => NoteTreeIndex::default(),
     };
     let notes = note_blob_map(storage_path, root_items)?;
-    if notes.blobs.len().checked_sub(parent_notes.blobs.len()) != Some(1)
-        || parent_notes
-            .blobs
-            .iter()
-            .any(|(path, oid)| notes.blobs.get(path) != Some(oid))
+    if parent_notes
+        .blobs
+        .iter()
+        .any(|(path, oid)| notes.blobs.get(path) != Some(oid))
     {
         return Err(corrupt("Memory note tree did not append to its parent"));
     }
 
     let tail = &events[parent_events.len()..];
-    let mut parsed = Vec::with_capacity(tail.len());
+    let mut revision_events = BTreeMap::new();
+    let mut records = Vec::with_capacity(tail.len());
     for (offset, item) in tail.iter().enumerate() {
         let sequence = previous_seq
             .checked_add(u64::try_from(offset).map_err(|_| corrupt("Memory event overflowed"))?)
@@ -520,71 +603,95 @@ fn validate_event_edge(
                 "Memory event filename and payload identity disagree",
             ));
         }
-        let note_id = event
-            .note_id
-            .ok_or_else(|| corrupt("Memory revision event has no note ID"))?;
-        let revision_oid = event
-            .revision_oid
-            .as_deref()
-            .ok_or_else(|| corrupt("Memory revision event has no revision OID"))
-            .and_then(parse_oid)?;
-        let note_bytes = load_note_bytes(storage_path, revision_oid)?;
-        let note = parse_memory_note_v1(&note_bytes).map_err(|error| {
-            MemoryWriterError::new(
-                MemoryWriterErrorKind::CorruptHistory,
-                format!("event references an invalid MemoryNote revision: {error}"),
-            )
-        })?;
-        let expected_path = format!(
-            "{}/{}/{}.json",
-            encode_segment(&note.namespace),
-            note.note_id,
-            revision_oid
-        );
-        if note.note_id != note_id || notes.blobs.get(&expected_path) != Some(&revision_oid) {
-            return Err(corrupt(
-                "MemoryEvent revision is not reachable from its canonical note path",
-            ));
-        }
-        parsed.push(event);
-    }
-    let tail_note = parse_memory_note_v1(&load_note_bytes(
-        storage_path,
-        parse_oid(
-            parsed[0]
+        if event.action != super::domain::MemoryEventAction::TaxonomyExpanded {
+            let note_id = event
+                .note_id
+                .ok_or_else(|| corrupt("Memory revision event has no note ID"))?;
+            let revision_oid = event
                 .revision_oid
                 .as_deref()
-                .ok_or_else(|| corrupt("Memory revision event has no revision OID"))?,
-        )?,
-    )?)
-    .map_err(|error| {
-        MemoryWriterError::new(
-            MemoryWriterErrorKind::CorruptHistory,
-            format!("event references an invalid MemoryNote revision: {error}"),
-        )
-    })?;
-    let parent_note_prefix = format!(
-        "{}/{}/",
-        encode_segment(&tail_note.namespace),
-        tail_note.note_id
-    );
-    let expected_first = if parent_notes
+                .ok_or_else(|| corrupt("Memory revision event has no revision OID"))
+                .and_then(parse_oid)?;
+            let note_bytes = load_note_bytes(storage_path, revision_oid)?;
+            let note = parse_memory_note_v1(&note_bytes).map_err(|error| {
+                MemoryWriterError::new(
+                    MemoryWriterErrorKind::CorruptHistory,
+                    format!("event references an invalid MemoryNote revision: {error}"),
+                )
+            })?;
+            let expected_path = format!(
+                "{}/{}/{}.json",
+                encode_segment(&note.namespace),
+                note.note_id,
+                revision_oid
+            );
+            if note.note_id != note_id || notes.blobs.get(&expected_path) != Some(&revision_oid) {
+                return Err(corrupt(
+                    "MemoryEvent revision is not reachable from its canonical note path",
+                ));
+            }
+            if matches!(
+                event.action,
+                super::domain::MemoryEventAction::Created
+                    | super::domain::MemoryEventAction::Revised
+            ) && revision_events
+                .insert(expected_path, event.action)
+                .is_some()
+            {
+                return Err(corrupt(
+                    "Memory revision is introduced by more than one transition",
+                ));
+            }
+            records.push(MemoryHistoryRecord {
+                event,
+                revision_oid: Some(revision_oid),
+                note: Some(note),
+            });
+        } else {
+            records.push(MemoryHistoryRecord {
+                event,
+                revision_oid: None,
+                note: None,
+            });
+        }
+    }
+
+    let added_notes = notes
         .blobs
         .keys()
-        .any(|path| path.starts_with(&parent_note_prefix))
+        .filter(|path| !parent_notes.blobs.contains_key(*path))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if added_notes.len() != revision_events.len()
+        || added_notes
+            .iter()
+            .any(|path| !revision_events.contains_key(path))
     {
-        super::domain::MemoryEventAction::Revised
-    } else {
-        super::domain::MemoryEventAction::Created
-    };
-    if parsed[0].action != expected_first
-        || parsed[1].action != super::domain::MemoryEventAction::Confirmed
-        || parsed[0].note_id != parsed[1].note_id
-        || parsed[0].revision_oid != parsed[1].revision_oid
-    {
-        return Err(corrupt("Memory commit event pair is invalid"));
+        return Err(corrupt(
+            "Memory note tree additions do not match revision transitions",
+        ));
     }
-    Ok(())
+    for (path, action) in revision_events {
+        let note_prefix = path
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/"))
+            .ok_or_else(|| corrupt("Memory note path is not canonical"))?;
+        let existed = parent_notes
+            .blobs
+            .keys()
+            .any(|candidate| candidate.starts_with(&note_prefix));
+        let expected = if existed {
+            super::domain::MemoryEventAction::Revised
+        } else {
+            super::domain::MemoryEventAction::Created
+        };
+        if action != expected {
+            return Err(corrupt(
+                "Memory revision transition disagrees with note ancestry",
+            ));
+        }
+    }
+    Ok(records)
 }
 
 fn tree_entries(

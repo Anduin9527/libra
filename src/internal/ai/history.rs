@@ -4605,7 +4605,11 @@ struct HistoryLinearRefCompanion<'a> {
 
 #[async_trait::async_trait]
 impl LinearRefCompanion for HistoryLinearRefCompanion<'_> {
-    async fn apply(&self, txn: &DatabaseTransaction) -> Result<()> {
+    async fn apply(
+        &self,
+        txn: &crate::internal::ai::linear_ref::LinearRefWriteTransaction<'_>,
+    ) -> Result<()> {
+        let txn = txn.as_database_transaction();
         // An expired ordinary marker may have been fenced and retired while
         // this writer was stalled. Revalidation remains inside the winning
         // ref transaction.

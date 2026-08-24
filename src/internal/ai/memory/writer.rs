@@ -340,10 +340,10 @@ impl MemoryWriter {
 
             let mutation = ProjectionMutation {
                 note: note.clone(),
+                transition: transition.clone(),
                 event: confirmed.clone(),
                 revision_oid,
                 commit_oid: objects.commit_oid,
-                is_create: cell.is_none(),
                 rebuilt_at_ms: Utc::now().timestamp_millis(),
                 expected_head: current_head,
                 expected_event_seq: base_event_seq,
@@ -497,7 +497,7 @@ fn event_id(note: &MemoryNoteV1, revision_oid: ObjectHash, action: MemoryEventAc
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::internal::ai::memory) mod tests {
     use std::{fs, sync::Arc};
 
     use chrono::{TimeZone, Utc};
@@ -535,16 +535,16 @@ mod tests {
     const TEST_CIPHERTEXT: &str = "memory-writer-test-ciphertext";
     const SOURCE_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    struct Fixture {
-        _temp: tempfile::TempDir,
-        database: Arc<DatabaseConnection>,
-        writer: Arc<MemoryWriter>,
-        context: AuthenticatedMemoryContext,
-        target: TrustedMemoryTarget,
-        key_id: Uuid,
+    pub(in crate::internal::ai::memory) struct Fixture {
+        pub(in crate::internal::ai::memory) _temp: tempfile::TempDir,
+        pub(in crate::internal::ai::memory) database: Arc<DatabaseConnection>,
+        pub(in crate::internal::ai::memory) writer: Arc<MemoryWriter>,
+        pub(in crate::internal::ai::memory) context: AuthenticatedMemoryContext,
+        pub(in crate::internal::ai::memory) target: TrustedMemoryTarget,
+        pub(in crate::internal::ai::memory) key_id: Uuid,
     }
 
-    async fn fixture() -> Fixture {
+    pub(in crate::internal::ai::memory) async fn fixture() -> Fixture {
         let database = Database::connect("sqlite::memory:")
             .await
             .expect("connect test database");
@@ -607,7 +607,7 @@ mod tests {
         }
     }
 
-    fn proposal(
+    pub(in crate::internal::ai::memory) fn proposal(
         target: &TrustedMemoryTarget,
         key_id: Uuid,
         generation: u8,
