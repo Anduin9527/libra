@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use super::source::RedactedEpisodeSource;
 
+pub(crate) mod intent;
 pub(crate) mod schema;
 pub(crate) mod task;
 
@@ -100,4 +101,38 @@ pub(crate) trait EpisodeCompiler: Send + Sync {
         source: &RedactedEpisodeSource,
         config: &EpisodeCompileConfig,
     ) -> Result<EpisodeCompilerProposalV1, EpisodeCompilerError>;
+}
+
+/// One repository worker consumes a mixed Task/Intent queue. This pair keeps
+/// each adapter's frozen configuration beside it so a claimed root can never
+/// be sent through the wrong prompt contract.
+pub(crate) struct EpisodeCompilerSet<'a, T, I> {
+    task_compiler: &'a T,
+    task_config: &'a EpisodeCompileConfig,
+    intent_compiler: &'a I,
+    intent_config: &'a EpisodeCompileConfig,
+}
+
+impl<'a, T, I> EpisodeCompilerSet<'a, T, I> {
+    pub(crate) const fn new(
+        task_compiler: &'a T,
+        task_config: &'a EpisodeCompileConfig,
+        intent_compiler: &'a I,
+        intent_config: &'a EpisodeCompileConfig,
+    ) -> Self {
+        Self {
+            task_compiler,
+            task_config,
+            intent_compiler,
+            intent_config,
+        }
+    }
+
+    pub(crate) const fn task(&self) -> (&T, &EpisodeCompileConfig) {
+        (self.task_compiler, self.task_config)
+    }
+
+    pub(crate) const fn intent(&self) -> (&I, &EpisodeCompileConfig) {
+        (self.intent_compiler, self.intent_config)
+    }
 }

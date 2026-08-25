@@ -1522,6 +1522,35 @@ source-manifest fingerprint 与幂等键。Task 的 `completed | failed | cancel
 `changed | unchanged | unknown` 保持正交；两者均来自受信任 source facts，不由模型判断。
 同一 generation 重放时，既有 job/input fingerprint 和 Writer 幂等合同保证零新增事件。
 
+#### 5.2.4 M2-10 Intent Iteration 编译合同
+
+Intent Adapter 与 Task Adapter 复用同一个 `EpisodeCompiler` 接口和唯一 Writer；混合 job
+队列在领取 root 后按 `Task | Intent` 选择各自冻结的 compiler/config，避免 Intent 被 Task
+prompt 误处理。首个 Intent 合同固定为 `rules_version=1`、
+`prompt_version=intent-iteration-v1`，provider 调用沿用 temperature 0、禁用 tools/stream、
+60 秒 timeout、单 JSON text block 和 16 KiB 输出上限。
+
+来源解析先在终态 Intent 的 AI 历史固定版本中验证根 Intent、终态事件与 child Task 关系，
+再从投影水位与 `libra/memory/repo` 一致的冻结读取视图中取得每个 child Task 当前已确认的
+`note_id + live_revision_oid`。任何一个 Task 缺少已确认 revision 时，本 generation 进入稳定的
+dependency-pending 失败且不推进 processed generation；Task revision 后续写入会改变父 Intent
+的规范输入指纹并重新唤醒 job。Task 数量、Memory 历史回放和来源正文均有硬上限，超限时
+fail-closed，不生成只有部分 Task 的 Intent note。
+
+模型输入只包含两类数据：已脱敏的根 Intent/IntentEvent 片段，以及从固定 Task revision
+机械生成的紧凑结构（状态、summary、observations、inferences、decisions、failed attempts、
+unresolved、相关 Run ID）。紧凑结构移除 Task claim 自身的 EvidenceRef 和 MemoryNote envelope，
+不复制 Task 全文、原始 Run、Session 或工具输出。模型负责综合需求变化、跨 Task 决策、重复
+失败、根因和未决项；root/related IDs、时间、状态、代码锚点和 revision link 仍由准入层填写。
+
+每个贡献 Task 在 Intent `MemoryNote.links` 中恰有一个 `kind=Supports` 链接，目标为 Task 的
+稳定 `note_id`，并以非空 `target_revision_oid` 固定本次汇总实际读取的版本。payload 的
+`related_task_ids` 与 Supports 链接一一对应，`related_run_ids` 来自这些固定 Task revision
+的并集。source manifest 另记冻结的 Memory dependency ref；Writer 重校验时读取该不可变
+依赖快照，因此无关 Memory 写入不会使已准入输入漂移，Task 新 revision 则由下一 generation
+前滚为同一 Intent note 的新 revision。旧 generation 已在执行时可以先提交，但 lease 完成后
+仍保持最新 generation 为 dirty，最终只保留一个固定 Cell/note ID 的 live head。
+
 查询实现必须始终带上 `scope_key` 与 `namespace`，禁止只按 `path` 做全局查询后在内存中过滤。跨 scope / namespace 的检索只能由显式 `--all-namespaces` 或策略允许的 scope fallback 触发，并且必须在结果中保留原始 `scope` 与 `namespace`，防止 prompt 注入时发生来源混淆。
 
 `list_prefix` 与 `summarize` 不得执行无上限扫描。实现应使用规范化后的 path 前缀范围查询和 keyset pagination，并设置默认 `LIMIT`（建议 100 条 summary、50 条 note）与硬上限。因为 SQL `LIKE` 的转义与 collation 容易引入前缀越界，推荐存储 canonical `path_key` / `parent_path` 后做复合索引范围查询；复杂度表述统一为 O(log n + k)，其中 k 是有界返回量。

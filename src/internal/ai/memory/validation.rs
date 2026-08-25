@@ -611,6 +611,17 @@ fn validate_intent_task_links(
     if payload.root_kind != EpisodeRootKind::Intent {
         return Ok(());
     }
+    if note
+        .links
+        .iter()
+        .filter(|link| link.kind == MemoryLinkKind::Supports)
+        .count()
+        != payload.related_task_ids.len()
+    {
+        return Err(MemoryContractError::InvalidField {
+            field: "MemoryNote.intent_task_links",
+        });
+    }
 
     for task_id in &payload.related_task_ids {
         let task_note_id = EpisodeRoot::task(task_id)?.note_id();
@@ -1238,6 +1249,22 @@ mod tests {
         assert!(
             parse_memory_note_v1(&serde_json::to_vec(&duplicate).expect("note serializes"))
                 .is_err(),
+        );
+
+        let mut extra = note.clone();
+        let mut extra_link = extra["links"][0].clone();
+        extra_link["target_note_id"] = serde_json::json!(
+            EpisodeRoot::task("unrelated-task")
+                .expect("construct unrelated Task root")
+                .note_id()
+        );
+        extra["links"]
+            .as_array_mut()
+            .expect("links fixture is an array")
+            .push(extra_link);
+        refresh_note_digest(&mut extra);
+        assert!(
+            parse_memory_note_v1(&serde_json::to_vec(&extra).expect("note serializes")).is_err(),
         );
 
         let mut floating = note;

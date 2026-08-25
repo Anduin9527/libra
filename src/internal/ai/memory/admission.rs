@@ -11,8 +11,9 @@ use super::{
     },
     domain::{
         CompileOriginV1, CompileRecordV1, EpisodeClaimV1, EpisodeOmissionsV1, EpisodePayloadV1,
-        EpistemicStatus, IdempotencyScopeV1, MemoryKind, MemoryLifecycle, MemoryNoteV1,
-        MemoryScopeV1, MemorySensitivity, MemoryTrust, MemoryVisibility,
+        EpistemicStatus, IdempotencyScopeV1, MemoryKind, MemoryLifecycle, MemoryLinkKind,
+        MemoryLinkV1, MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust,
+        MemoryVisibility,
     },
     policy::{
         AuthenticatedMemoryContext, DeterministicMemoryProposal, REPO_EPISODE_ACL_POLICY_ID,
@@ -166,6 +167,23 @@ impl<'a> EpisodeAdmission<'a> {
             .iter()
             .map(|fragment| fragment.evidence().clone())
             .collect::<Vec<_>>();
+        let links = source
+            .pinned_task_episodes()
+            .iter()
+            .map(|task| {
+                let evidence = source
+                    .evidence(task.fragment_id())
+                    .ok_or_else(invalid_proposal)?;
+                Ok(MemoryLinkV1 {
+                    kind: MemoryLinkKind::Supports,
+                    target_note_id: task.note_id(),
+                    target_revision_oid: Some(task.revision_oid().to_string()),
+                    evidence_refs: vec![evidence.clone()],
+                    valid_from: None,
+                    valid_until: None,
+                })
+            })
+            .collect::<Result<Vec<_>, EpisodeAdmissionError>>()?;
         let related_run_omissions = source
             .manifest()
             .omissions
@@ -214,7 +232,7 @@ impl<'a> EpisodeAdmission<'a> {
             rationale: None,
             episode: Some(episode),
             evidence_refs: source_evidence,
-            links: Vec::new(),
+            links,
             entities: Vec::new(),
             parents: Vec::new(),
             tags: vec!["episode".to_string()],

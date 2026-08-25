@@ -513,6 +513,7 @@ const fn writer_error_kind_for_source(kind: EpisodeSourceErrorKind) -> MemoryWri
         EpisodeSourceErrorKind::Unauthorized
         | EpisodeSourceErrorKind::InvalidRequest
         | EpisodeSourceErrorKind::SourceNotReachable
+        | EpisodeSourceErrorKind::DependencyPending
         | EpisodeSourceErrorKind::RedactionFailed => MemoryWriterErrorKind::SourceRejected,
         EpisodeSourceErrorKind::SourceCorrupt => MemoryWriterErrorKind::EvidenceMismatch,
     }

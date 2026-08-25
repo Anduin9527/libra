@@ -31,7 +31,8 @@ use crate::internal::ai::{
 const MAX_OBSERVER_COMMITS: usize = 2_048;
 const MAX_OBSERVER_TREE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OBSERVER_BLOB_BYTES: u64 = 512 * 1024;
-const MAX_INTENT_TASKS: usize = 512;
+const MAX_INTENT_TASKS: usize = 128;
+const MAX_TASK_SCAN: usize = 4_096;
 const TASK_OBJECT_TYPE: &str = "task";
 const TASK_EVENT_OBJECT_TYPE: &str = "task_event";
 const INTENT_EVENT_OBJECT_TYPE: &str = "intent_event";
@@ -221,7 +222,7 @@ async fn intent_task_revisions(
         .await
         .map_err(|_| EpisodeObserverError::history())?;
     let listing = view
-        .list(TASK_OBJECT_TYPE, MAX_INTENT_TASKS)
+        .list(TASK_OBJECT_TYPE, MAX_TASK_SCAN)
         .map_err(|_| EpisodeObserverError::history())?;
     if listing.omitted() != 0 {
         return Err(EpisodeObserverError::new(
@@ -243,6 +244,11 @@ async fn intent_task_revisions(
             .map_err(|_| EpisodeObserverError::corrupt_event())?;
         let revision = live_revision(database, scope_key, task_root.note_id().to_string()).await?;
         tasks.push((task_id, revision));
+        if tasks.len() > MAX_INTENT_TASKS {
+            return Err(EpisodeObserverError::new(
+                EpisodeObserverErrorKind::BudgetExceeded,
+            ));
+        }
     }
     tasks.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(tasks)
@@ -405,7 +411,7 @@ fn canonical_task_input(root: &EpisodeRoot, terminal_source_oid: ObjectHash) -> 
     bytes
 }
 
-fn canonical_intent_input(
+pub(super) fn canonical_intent_input(
     root: &EpisodeRoot,
     terminal_source_oid: ObjectHash,
     task_revisions: &[(String, Option<String>)],

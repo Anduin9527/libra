@@ -1,8 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use chrono::{DateTime, Utc};
 use git_internal::hash::ObjectHash;
 use regex::bytes::Regex;
+use sea_orm::ConnectionTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -11,10 +15,14 @@ use thiserror::Error;
 use super::{
     domain::{
         CodeChangeStatus, CompletionStatus, EpisodeCodeContextV1, EpisodeRootKind, EvidenceKind,
-        EvidenceLocatorV1, EvidenceRefV1, EvidenceSourcePlane, EvidenceVisibility, ToolCallPart,
+        EvidenceLocatorV1, EvidenceRefV1, EvidenceSourcePlane, EvidenceVisibility, MemoryNoteV1,
+        ToolCallPart,
     },
     limits::EpisodeSourceLimits,
     policy::{AuthenticatedMemoryContext, TrustedMemoryTarget},
+    store::{read_memory_ref_head, validate_projection_watermark},
+    tree::{load_history_delta_bounded, load_note_bytes, load_snapshot},
+    validation::parse_memory_note_v1,
 };
 use crate::internal::ai::{
     history::{HistoryManager, PinnedHistoryBlob, PinnedHistoryView},
@@ -37,6 +45,9 @@ const DECISION: &str = "decision";
 const PATCHSET: &str = "patchset";
 const CONTEXT_FRAME: &str = "context_frame";
 const INVOCATION: &str = "invocation";
+const TASK_EPISODE: &str = "task_episode";
+const MAX_INTENT_TASKS: usize = 128;
+const MAX_MEMORY_DEPENDENCY_COMMITS: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EpisodeSourceErrorKind {
@@ -47,6 +58,7 @@ pub(crate) enum EpisodeSourceErrorKind {
     LimitExceeded,
     RedactionFailed,
     DigestUnavailable,
+    DependencyPending,
 }
 
 #[derive(Debug, Error)]
@@ -105,9 +117,36 @@ pub(crate) struct SourceManifestFragmentV1 {
     pub(crate) object_type: String,
     pub(crate) object_id: String,
     pub(crate) object_oid: String,
+    pub(crate) source_ref_oid: String,
     pub(crate) locator: EvidenceLocatorV1,
     pub(crate) fragment_digest: String,
     pub(crate) code_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedTaskEpisodeV1 {
+    task_id: String,
+    note_id: uuid::Uuid,
+    revision_oid: ObjectHash,
+    fragment_id: String,
+}
+
+impl PinnedTaskEpisodeV1 {
+    pub(crate) fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub(crate) const fn note_id(&self) -> uuid::Uuid {
+        self.note_id
+    }
+
+    pub(crate) const fn revision_oid(&self) -> ObjectHash {
+        self.revision_oid
+    }
+
+    pub(crate) fn fragment_id(&self) -> &str {
+        &self.fragment_id
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -120,6 +159,7 @@ pub(crate) struct EpisodeSourceManifestV1 {
     pub(crate) repository_id: String,
     pub(crate) principal_digest: String,
     pub(crate) source_ref_oid: String,
+    pub(crate) dependency_ref_oid: Option<String>,
     pub(crate) limits: EpisodeSourceLimitSnapshotV1,
     pub(crate) object_count: usize,
     pub(crate) redacted_bytes: usize,
@@ -184,6 +224,7 @@ pub(crate) struct RedactedEpisodeSource {
     manifest: EpisodeSourceManifestV1,
     facts: EpisodeSourceFacts,
     fragments: Vec<RedactedEpisodeFragment>,
+    pinned_task_episodes: Vec<PinnedTaskEpisodeV1>,
 }
 
 impl RedactedEpisodeSource {
@@ -197,6 +238,10 @@ impl RedactedEpisodeSource {
 
     pub(crate) fn fragments(&self) -> &[RedactedEpisodeFragment] {
         &self.fragments
+    }
+
+    pub(crate) fn pinned_task_episodes(&self) -> &[PinnedTaskEpisodeV1] {
+        &self.pinned_task_episodes
     }
 
     pub(crate) fn evidence(&self, fragment_id: &str) -> Option<&EvidenceRefV1> {
@@ -237,6 +282,7 @@ impl RedactedEpisodeSource {
                 object_type: object_type.to_string(),
                 object_id: fragment_id.to_string(),
                 object_oid: object_oid.to_string(),
+                source_ref_oid: source_ref_oid.clone(),
                 locator: EvidenceLocatorV1::Object,
                 fragment_digest,
                 code_commit: None,
@@ -266,6 +312,7 @@ impl RedactedEpisodeSource {
                 repository_id: "compiler-test-repository".to_string(),
                 principal_digest: "hmac-sha256:test".to_string(),
                 source_ref_oid,
+                dependency_ref_oid: None,
                 limits: limits.into(),
                 object_count: redacted_fragments.len(),
                 redacted_bytes,
@@ -290,6 +337,7 @@ impl RedactedEpisodeSource {
                 },
             },
             fragments: redacted_fragments,
+            pinned_task_episodes: Vec::new(),
         }
     }
 }
@@ -354,6 +402,20 @@ impl<'a> EpisodeSourceResolver<'a> {
         target: &TrustedMemoryTarget,
         source_ref_oid: ObjectHash,
     ) -> Result<RedactedEpisodeSource, EpisodeSourceError> {
+        let mut source = self.resolve_base(context, target, source_ref_oid).await?;
+        if target.root().kind() == EpisodeRootKind::Intent {
+            self.attach_intent_task_episodes(target, &mut source, None)
+                .await?;
+        }
+        Ok(source)
+    }
+
+    async fn resolve_base(
+        &self,
+        context: &AuthenticatedMemoryContext,
+        target: &TrustedMemoryTarget,
+        source_ref_oid: ObjectHash,
+    ) -> Result<RedactedEpisodeSource, EpisodeSourceError> {
         if context.repository_id() != self.digest.repository_id() {
             return Err(EpisodeSourceError::new(
                 EpisodeSourceErrorKind::Unauthorized,
@@ -395,10 +457,26 @@ impl<'a> EpisodeSourceResolver<'a> {
             .source_ref_oid
             .parse::<ObjectHash>()
             .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
-        let rebuilt = self.resolve(context, target, source_oid).await?;
+        let mut rebuilt = self.resolve_base(context, target, source_oid).await?;
+        if target.root().kind() == EpisodeRootKind::Intent {
+            let dependency_ref_oid = source
+                .manifest
+                .dependency_ref_oid
+                .as_deref()
+                .ok_or_else(|| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?
+                .parse::<ObjectHash>()
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+            self.attach_intent_task_episodes(
+                target,
+                &mut rebuilt,
+                Some((dependency_ref_oid, &source.pinned_task_episodes)),
+            )
+            .await?;
+        }
         if rebuilt.manifest != source.manifest
             || rebuilt.facts != source.facts
             || rebuilt.fragments != source.fragments
+            || rebuilt.pinned_task_episodes != source.pinned_task_episodes
         {
             return Err(EpisodeSourceError::new(
                 EpisodeSourceErrorKind::SourceCorrupt,
@@ -406,6 +484,329 @@ impl<'a> EpisodeSourceResolver<'a> {
         }
         Ok(())
     }
+
+    async fn attach_intent_task_episodes(
+        &self,
+        target: &TrustedMemoryTarget,
+        source: &mut RedactedEpisodeSource,
+        pinned: Option<(ObjectHash, &[PinnedTaskEpisodeV1])>,
+    ) -> Result<(), EpisodeSourceError> {
+        if source.facts.related_task_ids.is_empty()
+            || source.facts.related_task_ids.len() > MAX_INTENT_TASKS
+        {
+            return Err(EpisodeSourceError::new(
+                EpisodeSourceErrorKind::DependencyPending,
+            ));
+        }
+        let database = self.history.database_connection();
+        let memory_head = match pinned {
+            Some((head, _)) => head,
+            None => read_memory_ref_head(&database)
+                .await
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceNotReachable))?
+                .ok_or_else(|| {
+                    EpisodeSourceError::new(EpisodeSourceErrorKind::DependencyPending)
+                })?,
+        };
+        let snapshot = load_snapshot(
+            self.history.repository_path(),
+            Some(memory_head),
+            super::policy::REPO_EPISODE_POLICY_VERSION,
+        )
+        .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+        match pinned {
+            None => validate_projection_watermark(
+                &database,
+                Some(memory_head),
+                snapshot.manifest.last_event_seq,
+            )
+            .await
+            .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceNotReachable))?,
+            Some(_) => {
+                let current_head = read_memory_ref_head(&database)
+                    .await
+                    .map_err(|_| {
+                        EpisodeSourceError::new(EpisodeSourceErrorKind::SourceNotReachable)
+                    })?
+                    .ok_or_else(|| {
+                        EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt)
+                    })?;
+                let current_snapshot = load_snapshot(
+                    self.history.repository_path(),
+                    Some(current_head),
+                    super::policy::REPO_EPISODE_POLICY_VERSION,
+                )
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+                validate_projection_watermark(
+                    &database,
+                    Some(current_head),
+                    current_snapshot.manifest.last_event_seq,
+                )
+                .await
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceNotReachable))?;
+                load_history_delta_bounded(
+                    self.history.repository_path(),
+                    current_head,
+                    Some(memory_head),
+                    super::policy::REPO_EPISODE_POLICY_VERSION,
+                    MAX_MEMORY_DEPENDENCY_COMMITS,
+                )
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+            }
+        }
+
+        let mut related_run_ids = BTreeSet::new();
+        let task_ids = source.facts.related_task_ids.clone();
+        for task_id in task_ids {
+            let task_root = super::domain::EpisodeRoot::task(task_id.clone())
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+            let revision_oid = match pinned {
+                Some((_, pins)) => {
+                    let pin = pins
+                        .iter()
+                        .find(|pin| pin.task_id == task_id)
+                        .ok_or_else(|| {
+                            EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt)
+                        })?;
+                    let revision_rows = database
+                        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                            database.get_database_backend(),
+                            "SELECT 1 AS present FROM memory_revision_index
+                             WHERE scope_key = 'repo' AND namespace = 'default'
+                               AND note_id = ? AND revision_oid = ? LIMIT 2",
+                            [
+                                task_root.note_id().to_string().into(),
+                                pin.revision_oid.to_string().into(),
+                            ],
+                        ))
+                        .await
+                        .map_err(|_| {
+                            EpisodeSourceError::new(EpisodeSourceErrorKind::SourceNotReachable)
+                        })?;
+                    if pin.note_id != task_root.note_id() || revision_rows.len() != 1 {
+                        return Err(EpisodeSourceError::new(
+                            EpisodeSourceErrorKind::SourceCorrupt,
+                        ));
+                    }
+                    pin.revision_oid
+                }
+                None => {
+                    let rows = database
+                        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                            database.get_database_backend(),
+                            "SELECT live_revision_oid FROM memory_head
+                             WHERE scope_key = 'repo' AND namespace = 'default' AND note_id = ?
+                             LIMIT 2",
+                            [task_root.note_id().to_string().into()],
+                        ))
+                        .await
+                        .map_err(|_| {
+                            EpisodeSourceError::new(EpisodeSourceErrorKind::SourceNotReachable)
+                        })?;
+                    if rows.len() != 1 {
+                        return Err(EpisodeSourceError::new(if rows.is_empty() {
+                            EpisodeSourceErrorKind::DependencyPending
+                        } else {
+                            EpisodeSourceErrorKind::SourceCorrupt
+                        }));
+                    }
+                    let revision_oid: Option<String> =
+                        rows[0].try_get("", "live_revision_oid").map_err(|_| {
+                            EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt)
+                        })?;
+                    let revision_oid = revision_oid.ok_or_else(|| {
+                        EpisodeSourceError::new(EpisodeSourceErrorKind::DependencyPending)
+                    })?;
+                    ObjectHash::from_str(&revision_oid).map_err(|_| {
+                        EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt)
+                    })?
+                }
+            };
+            let note_bytes = load_note_bytes(self.history.repository_path(), revision_oid)
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+            let note = parse_memory_note_v1(&note_bytes)
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+            validate_task_episode_dependency(target, &task_root, &note)?;
+            let episode = note
+                .episode
+                .as_ref()
+                .ok_or_else(|| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+            related_run_ids.extend(episode.related_run_ids.iter().cloned());
+            self.append_task_episode_fragment(source, memory_head, revision_oid, &task_id, &note)?;
+        }
+        if pinned.is_none()
+            && read_memory_ref_head(&database)
+                .await
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceNotReachable))?
+                != Some(memory_head)
+        {
+            return Err(EpisodeSourceError::new(
+                EpisodeSourceErrorKind::SourceNotReachable,
+            ));
+        }
+        source.facts.related_run_ids = related_run_ids.into_iter().collect();
+        source.manifest.dependency_ref_oid = Some(memory_head.to_string());
+        Ok(())
+    }
+
+    fn append_task_episode_fragment(
+        &self,
+        source: &mut RedactedEpisodeSource,
+        memory_head: ObjectHash,
+        revision_oid: ObjectHash,
+        task_id: &str,
+        note: &MemoryNoteV1,
+    ) -> Result<(), EpisodeSourceError> {
+        if source.fragments.len() == self.limits.max_objects {
+            return Err(EpisodeSourceError::new(
+                EpisodeSourceErrorKind::LimitExceeded,
+            ));
+        }
+        let compact = CompactTaskEpisodeV1::from_note(task_id, note)?;
+        let raw = serde_json::to_vec(&compact)
+            .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+        let redacted = self.redactor.redact(&raw)?;
+        let text = String::from_utf8(redacted)
+            .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::RedactionFailed))?;
+        let next_bytes = source.manifest.redacted_bytes.saturating_add(text.len());
+        if next_bytes > self.limits.max_total_bytes
+            || estimate_tokens(next_bytes) > self.limits.max_token_estimate
+        {
+            return Err(EpisodeSourceError::new(
+                EpisodeSourceErrorKind::LimitExceeded,
+            ));
+        }
+        let fragment_id = format!("{TASK_EPISODE}:{task_id}");
+        let fragment_digest = format!("sha256:{}", hex::encode(Sha256::digest(text.as_bytes())));
+        let evidence = EvidenceRefV1 {
+            schema_version: 1,
+            source_plane: EvidenceSourcePlane::AgentRuntime,
+            kind: EvidenceKind::Task,
+            object_id: note.note_id.to_string(),
+            source_ref_oid: memory_head.to_string(),
+            locator: EvidenceLocatorV1::Object,
+            fragment_digest: fragment_digest.clone(),
+            visibility: EvidenceVisibility::RepoLocal,
+            captured_at: Some(note.created_at),
+            code_commit: note.effective_from_commit.clone(),
+        };
+        source.manifest.fragments.push(SourceManifestFragmentV1 {
+            fragment_id: fragment_id.clone(),
+            object_type: TASK_EPISODE.to_string(),
+            object_id: task_id.to_string(),
+            object_oid: revision_oid.to_string(),
+            source_ref_oid: memory_head.to_string(),
+            locator: EvidenceLocatorV1::Object,
+            fragment_digest,
+            code_commit: note.effective_from_commit.clone(),
+        });
+        source.fragments.push(RedactedEpisodeFragment {
+            fragment_id: fragment_id.clone(),
+            object_type: TASK_EPISODE.to_string(),
+            object_id: task_id.to_string(),
+            object_oid: revision_oid,
+            text,
+            evidence,
+        });
+        source.pinned_task_episodes.push(PinnedTaskEpisodeV1 {
+            task_id: task_id.to_string(),
+            note_id: note.note_id,
+            revision_oid,
+            fragment_id,
+        });
+        source.manifest.object_count = source.fragments.len();
+        source.manifest.redacted_bytes = next_bytes;
+        source.manifest.token_estimate = estimate_tokens(next_bytes);
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct CompactTaskEpisodeV1<'a> {
+    schema_version: u32,
+    task_id: &'a str,
+    completion_status: CompletionStatus,
+    code_change_status: CodeChangeStatus,
+    summary: CompactEpisodeClaimV1<'a>,
+    observations: Vec<CompactEpisodeClaimV1<'a>>,
+    inferences: Vec<CompactEpisodeClaimV1<'a>>,
+    decisions: Vec<CompactEpisodeClaimV1<'a>>,
+    failed_attempts: Vec<CompactEpisodeClaimV1<'a>>,
+    unresolved: Vec<CompactEpisodeClaimV1<'a>>,
+    related_run_ids: &'a [String],
+}
+
+impl<'a> CompactTaskEpisodeV1<'a> {
+    fn from_note(task_id: &'a str, note: &'a MemoryNoteV1) -> Result<Self, EpisodeSourceError> {
+        let episode = note
+            .episode
+            .as_ref()
+            .ok_or_else(|| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+        Ok(Self {
+            schema_version: 1,
+            task_id,
+            completion_status: episode.completion_status,
+            code_change_status: episode.code_change_status,
+            summary: CompactEpisodeClaimV1::from(&episode.summary),
+            observations: compact_claims(&episode.observations),
+            inferences: compact_claims(&episode.inferences),
+            decisions: compact_claims(&episode.decisions),
+            failed_attempts: compact_claims(&episode.failed_attempts),
+            unresolved: compact_claims(&episode.unresolved),
+            related_run_ids: &episode.related_run_ids,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct CompactEpisodeClaimV1<'a> {
+    epistemic_status: super::domain::EpistemicStatus,
+    claim: &'a str,
+    confidence: Option<crate::internal::ai::context_budget::MemoryAnchorConfidence>,
+}
+
+impl<'a> From<&'a super::domain::EpisodeClaimV1> for CompactEpisodeClaimV1<'a> {
+    fn from(claim: &'a super::domain::EpisodeClaimV1) -> Self {
+        Self {
+            epistemic_status: claim.epistemic_status,
+            claim: &claim.claim,
+            confidence: claim.confidence,
+        }
+    }
+}
+
+fn compact_claims(claims: &[super::domain::EpisodeClaimV1]) -> Vec<CompactEpisodeClaimV1<'_>> {
+    claims.iter().map(Into::into).collect()
+}
+
+fn validate_task_episode_dependency(
+    intent_target: &TrustedMemoryTarget,
+    task_root: &super::domain::EpisodeRoot,
+    note: &MemoryNoteV1,
+) -> Result<(), EpisodeSourceError> {
+    let episode = note
+        .episode
+        .as_ref()
+        .ok_or_else(|| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+    if note.note_id != task_root.note_id()
+        || note.namespace != task_root.namespace()
+        || note.path != task_root.path()
+        || episode.root_kind != EpisodeRootKind::Task
+        || episode.root_id != task_root.id()
+        || !episode
+            .related_task_ids
+            .iter()
+            .any(|task_id| task_id == task_root.id())
+        || !episode
+            .related_intent_ids
+            .iter()
+            .any(|intent_id| intent_id == intent_target.root().id())
+    {
+        return Err(EpisodeSourceError::new(
+            EpisodeSourceErrorKind::SourceCorrupt,
+        ));
+    }
+    Ok(())
 }
 
 struct SourceCollector<'resolver, 'history> {
@@ -510,16 +911,8 @@ impl<'resolver, 'history> SourceCollector<'resolver, 'history> {
             }
         }
         if root_type == INTENT {
-            let intent_ids = self.intent_ids.clone();
-            self.scan(TASK, move |value| {
-                field_id(value, "intent").is_some_and(|id| intent_ids.contains(id))
-            })?;
-            self.task_ids.extend(
-                self.values
-                    .keys()
-                    .filter(|(kind, _)| kind == TASK)
-                    .map(|(_, id)| id.clone()),
-            );
+            self.collect_intent_task_ids(&root_id)?;
+            return Ok(());
         }
 
         let task_ids = self.task_ids.clone();
@@ -624,6 +1017,7 @@ impl<'resolver, 'history> SourceCollector<'resolver, 'history> {
             repository_id: self.repository_id.to_string(),
             principal_digest: self.principal_digest,
             source_ref_oid: self.view.head().to_string(),
+            dependency_ref_oid: None,
             limits: self.resolver.limits.into(),
             object_count: self.fragments.len(),
             redacted_bytes: self.redacted_bytes,
@@ -636,6 +1030,7 @@ impl<'resolver, 'history> SourceCollector<'resolver, 'history> {
                     object_type: fragment.object_type.clone(),
                     object_id: fragment.object_id.clone(),
                     object_oid: fragment.object_oid.to_string(),
+                    source_ref_oid: fragment.evidence.source_ref_oid.clone(),
                     locator: fragment.evidence.locator.clone(),
                     fragment_digest: fragment.evidence.fragment_digest.clone(),
                     code_commit: fragment.evidence.code_commit.clone(),
@@ -657,6 +1052,7 @@ impl<'resolver, 'history> SourceCollector<'resolver, 'history> {
                 code,
             },
             fragments: self.fragments,
+            pinned_task_episodes: Vec::new(),
         })
     }
 
@@ -686,6 +1082,46 @@ impl<'resolver, 'history> SourceCollector<'resolver, 'history> {
         F: Fn(&Value) -> bool,
     {
         self.scan_with_requirement(object_type, predicate, |_| false)
+    }
+
+    fn collect_intent_task_ids(&mut self, intent_id: &str) -> Result<(), EpisodeSourceError> {
+        let remaining = self
+            .resolver
+            .limits
+            .max_candidate_objects
+            .saturating_sub(self.candidate_count);
+        if remaining == 0 {
+            return Err(EpisodeSourceError::new(
+                EpisodeSourceErrorKind::LimitExceeded,
+            ));
+        }
+        let listing = self
+            .view
+            .list(TASK, remaining)
+            .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+        if listing.omitted() != 0 {
+            return Err(EpisodeSourceError::new(
+                EpisodeSourceErrorKind::LimitExceeded,
+            ));
+        }
+        let entries = listing.entries().to_vec();
+        for entry in entries {
+            self.consume_candidate()?;
+            let blob = self
+                .view
+                .read_blob(&entry, self.resolver.limits.max_object_bytes)
+                .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))?;
+            let value = parse_object(TASK, &blob)?;
+            if field_id(&value, "intent") == Some(intent_id) {
+                self.task_ids.insert(blob.object_id().to_string());
+                if self.task_ids.len() > MAX_INTENT_TASKS {
+                    return Err(EpisodeSourceError::new(
+                        EpisodeSourceErrorKind::LimitExceeded,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn scan_with_requirement<F, R>(

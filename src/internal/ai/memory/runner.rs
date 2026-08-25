@@ -9,16 +9,16 @@ use thiserror::Error;
 
 use super::{
     admission::{EpisodeAdmission, EpisodeAdmissionErrorKind},
-    compiler::{EpisodeCompileConfig, EpisodeCompiler},
+    compiler::{EpisodeCompiler, EpisodeCompilerSet},
     domain::{ActorKind, ActorRefV1, EpisodeRootKind},
     error::MemoryWriterErrorKind,
-    job_sql::{claim_next_job, complete_job, record_job_failure},
+    job_sql::{claim_next_job, complete_job, record_job_failure, release_job_dirty},
     job_state::{
         CompileFailureClass, CompileJobCompletionOutcome, CompileJobMutationOutcome,
         StableJobFailure,
     },
     limits::EpisodeSourceLimits,
-    observer::MemoryDependencyObserver,
+    observer::{MemoryDependencyObserver, canonical_intent_input},
     policy::{AuthenticatedMemoryContext, TrustedMemoryTarget},
     source::{EpisodeSourceErrorKind, EpisodeSourceResolver},
     writer::MemoryWriter,
@@ -39,6 +39,7 @@ pub(crate) enum GenerationRunOutcome {
     RetryScheduled,
     StableFailure,
     FencedOut,
+    NewGenerationPending,
 }
 
 /// Drives exactly one claimed generation through the complete Memory write
@@ -78,10 +79,9 @@ impl<'a> EpisodeGenerationRunner<'a> {
         })
     }
 
-    pub(crate) async fn run_one<C: EpisodeCompiler>(
+    pub(crate) async fn run_one<T: EpisodeCompiler, I: EpisodeCompiler>(
         &self,
-        compiler: &C,
-        config: &EpisodeCompileConfig,
+        compilers: &EpisodeCompilerSet<'_, T, I>,
         owner: &str,
         now_ms: i64,
     ) -> Result<GenerationRunOutcome, EpisodeGenerationRunnerError> {
@@ -111,10 +111,55 @@ impl<'a> EpisodeGenerationRunner<'a> {
                 return self.record_failure(&lease, failure, now_ms).await;
             }
         };
-        let admitted = match EpisodeAdmission::new(self.digest)
-            .compile(compiler, config, &context, &target, source)
-            .await
+        if lease.key().root().kind() == EpisodeRootKind::Intent
+            && !self.intent_lease_matches(&lease, &source)?
         {
+            let observer = MemoryDependencyObserver::new(
+                self.history,
+                self.database,
+                self.digest,
+                self.scope_key,
+            )
+            .map_err(|_| EpisodeGenerationRunnerError::configuration())?;
+            if observer.observe_task_revisions().await.is_err() {
+                return self
+                    .record_failure(
+                        &lease,
+                        failure(
+                            CompileFailureClass::Transient,
+                            "LBR-MEMORY-201",
+                            "Intent dependencies could not be refreshed",
+                        )?,
+                        now_ms,
+                    )
+                    .await;
+            }
+            return match release_job_dirty(self.database, &lease, now_ms)
+                .await
+                .map_err(|_| EpisodeGenerationRunnerError::job())?
+            {
+                CompileJobMutationOutcome::Applied => {
+                    Ok(GenerationRunOutcome::NewGenerationPending)
+                }
+                CompileJobMutationOutcome::FencedOut => Ok(GenerationRunOutcome::FencedOut),
+            };
+        }
+        let admission = EpisodeAdmission::new(self.digest);
+        let admitted_result = match lease.key().root().kind() {
+            EpisodeRootKind::Task => {
+                let (compiler, config) = compilers.task();
+                admission
+                    .compile(compiler, config, &context, &target, source)
+                    .await
+            }
+            EpisodeRootKind::Intent => {
+                let (compiler, config) = compilers.intent();
+                admission
+                    .compile(compiler, config, &context, &target, source)
+                    .await
+            }
+        };
+        let admitted = match admitted_result {
             Ok(admitted) => admitted,
             Err(error) => {
                 let failure = admission_failure(error.kind())?;
@@ -156,6 +201,32 @@ impl<'a> EpisodeGenerationRunner<'a> {
             }
             CompileJobCompletionOutcome::FencedOut => Ok(GenerationRunOutcome::FencedOut),
         }
+    }
+
+    fn intent_lease_matches(
+        &self,
+        lease: &super::job_state::CompileJobLease,
+        source: &super::source::RedactedEpisodeSource,
+    ) -> Result<bool, EpisodeGenerationRunnerError> {
+        let revisions = source
+            .pinned_task_episodes()
+            .iter()
+            .map(|task| {
+                (
+                    task.task_id().to_string(),
+                    Some(task.revision_oid().to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fingerprint = self
+            .digest
+            .source_input_fingerprint(&canonical_intent_input(
+                lease.key().root(),
+                lease.terminal_source_oid(),
+                &revisions,
+            ))
+            .map_err(|_| EpisodeGenerationRunnerError::configuration())?;
+        Ok(&fingerprint == lease.input_fingerprint())
     }
 
     async fn terminal_actor(
@@ -255,6 +326,11 @@ fn source_failure(
             CompileFailureClass::Transient,
             "LBR-MEMORY-201",
             "terminal source is not currently reachable",
+        ),
+        EpisodeSourceErrorKind::DependencyPending => (
+            CompileFailureClass::Stable,
+            "LBR-MEMORY-202",
+            "required Task Episode revisions are not confirmed",
         ),
         EpisodeSourceErrorKind::Unauthorized
         | EpisodeSourceErrorKind::InvalidRequest
@@ -371,6 +447,8 @@ mod tests {
 
     use git_internal::internal::object::{
         ObjectTrait,
+        intent::Intent,
+        intent_event::{IntentEvent, IntentEventKind},
         task::Task,
         task_event::{TaskEvent, TaskEventKind},
         types::ActorRef,
@@ -385,13 +463,24 @@ mod tests {
                 CompletionResponse, Message, OneOrMany, Text, UserContent,
             },
             memory::{
-                compiler::task::{
-                    TASK_EPISODE_PROMPT_VERSION, TASK_EPISODE_RULES_VERSION, TaskEpisodeCompiler,
+                compiler::{
+                    EpisodeCompileConfig,
+                    intent::{
+                        INTENT_ITERATION_PROMPT_VERSION, INTENT_ITERATION_RULES_VERSION,
+                        IntentIterationCompiler,
+                    },
+                    task::{
+                        TASK_EPISODE_PROMPT_VERSION, TASK_EPISODE_RULES_VERSION,
+                        TaskEpisodeCompiler,
+                    },
                 },
                 domain::EpisodeRoot,
                 observer::EpisodeObserver,
                 policy::REPO_EPISODE_PRODUCER,
-                writer::tests::fixture,
+                store::read_memory_ref_head,
+                tree::load_note_bytes,
+                validation::parse_memory_note_v1,
+                writer::tests::{fixture, proposal},
             },
         },
         utils::{object::write_git_object, storage::local::LocalStorage},
@@ -434,6 +523,68 @@ mod tests {
                     "claim": "the task reached a terminal state",
                     "confidence": null,
                     "evidence_fragment_ids": [fragment_id]
+                }],
+                "inferences": [],
+                "decisions": [],
+                "failed_attempts": [],
+                "unresolved": []
+            })
+            .to_string();
+            Ok(CompletionResponse {
+                content: vec![AssistantContent::Text(Text { text: reply })],
+                reasoning_content: None,
+                raw_response: (),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct IntentPromptModel;
+
+    impl CompletionModel for IntentPromptModel {
+        type Response = ();
+
+        async fn completion(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            let Message::User { content } = request
+                .chat_history
+                .last()
+                .expect("Intent compiler emits one user message")
+            else {
+                panic!("Intent compiler must emit a user message");
+            };
+            let OneOrMany::One(UserContent::Text(input)) = content else {
+                panic!("Intent compiler must emit one text input");
+            };
+            let input: serde_json::Value =
+                serde_json::from_str(&input.text).expect("parse Intent prompt input");
+            let task_fragments = input["task_episodes"]
+                .as_array()
+                .expect("Intent input has pinned Task Episodes")
+                .iter()
+                .map(|fragment| {
+                    fragment["fragment_id"]
+                        .as_str()
+                        .expect("pinned Task summary has a fragment ID")
+                })
+                .collect::<Vec<_>>();
+            let intent_fragment = input["intent_fragments"][0]["fragment_id"]
+                .as_str()
+                .expect("Intent input has a root fragment");
+            let reply = serde_json::json!({
+                "summary": {
+                    "epistemic_status": "inference",
+                    "claim": "the intent converged across all pinned task revisions",
+                    "confidence": "medium",
+                    "evidence_fragment_ids": task_fragments
+                },
+                "observations": [{
+                    "epistemic_status": "observation",
+                    "claim": "the parent intent reached a terminal state",
+                    "confidence": null,
+                    "evidence_fragment_ids": [intent_fragment]
                 }],
                 "inferences": [],
                 "decisions": [],
@@ -502,6 +653,7 @@ mod tests {
         .expect("construct compile config");
         let compiler = TaskEpisodeCompiler::for_tests(TaskPromptModel, "deterministic-fake")
             .expect("construct Task Episode compiler");
+        let compilers = EpisodeCompilerSet::new(&compiler, &config, &compiler, &config);
         let runner = EpisodeGenerationRunner::new(
             &history,
             fixture.database.as_ref(),
@@ -513,7 +665,7 @@ mod tests {
         .expect("construct generation runner");
         assert_eq!(
             runner
-                .run_one(&compiler, &config, "runner-a", 2_000_000_000_000)
+                .run_one(&compilers, "runner-a", 2_000_000_000_000)
                 .await
                 .expect("run one generation"),
             GenerationRunOutcome::Committed {
@@ -563,7 +715,7 @@ mod tests {
         );
         assert_eq!(
             runner
-                .run_one(&compiler, &config, "runner-a", 2_000_000_000_001)
+                .run_one(&compilers, "runner-a", 2_000_000_000_001)
                 .await
                 .expect("repeat completed generation"),
             GenerationRunOutcome::NoWork
@@ -589,7 +741,7 @@ mod tests {
             .expect("observe revised terminal Task event");
         assert_eq!(
             runner
-                .run_one(&compiler, &config, "runner-a", 2_000_000_000_002)
+                .run_one(&compilers, "runner-a", 2_000_000_000_002)
                 .await
                 .expect("run revised generation"),
             GenerationRunOutcome::Committed {
@@ -615,6 +767,266 @@ mod tests {
         assert_eq!(
             revision_count.try_get::<i64>("", "revision_count").unwrap(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn intent_generation_waits_for_pins_and_revises_after_task_change() {
+        let fixture = fixture().await;
+        let storage = Arc::new(LocalStorage::new(fixture._temp.path().join("objects")));
+        let history = HistoryManager::new(
+            storage,
+            fixture._temp.path().to_path_buf(),
+            Arc::clone(&fixture.database),
+        );
+        let actor = ActorRef::agent("intent-runner-agent").expect("test actor");
+        let intent = Intent::new(actor.clone(), "deliver a version-bound memory iteration")
+            .expect("construct Intent");
+        let intent_id = intent.header().object_id();
+        append_object(&history, "intent", &intent_id.to_string(), &intent).await;
+
+        let mut task_ids = Vec::new();
+        for title in ["implement source pins", "verify dependency wakeup"] {
+            let mut task = Task::new(actor.clone(), title, None).expect("construct child Task");
+            task.set_intent(Some(intent_id));
+            let task_id = task.header().object_id();
+            append_object(&history, "task", &task_id.to_string(), &task).await;
+            let done = TaskEvent::new(actor.clone(), task_id, TaskEventKind::Done)
+                .expect("construct terminal Task event");
+            append_object(
+                &history,
+                "task_event",
+                &done.header().object_id().to_string(),
+                &done,
+            )
+            .await;
+            task_ids.push(task_id);
+        }
+        let completed = IntentEvent::new(actor.clone(), intent_id, IntentEventKind::Completed)
+            .expect("construct terminal Intent event");
+        append_object(
+            &history,
+            "intent_event",
+            &completed.header().object_id().to_string(),
+            &completed,
+        )
+        .await;
+
+        EpisodeObserver::new(&history, fixture.database.as_ref(), &fixture.digest, "repo")
+            .expect("construct terminal observer")
+            .observe_terminal_events()
+            .await
+            .expect("observe terminal Task and Intent events");
+        let task_config = EpisodeCompileConfig::new(
+            REPO_EPISODE_PRODUCER,
+            TASK_EPISODE_RULES_VERSION,
+            TASK_EPISODE_PROMPT_VERSION,
+            "deterministic-task",
+        )
+        .expect("construct Task config");
+        let intent_config = EpisodeCompileConfig::new(
+            REPO_EPISODE_PRODUCER,
+            INTENT_ITERATION_RULES_VERSION,
+            INTENT_ITERATION_PROMPT_VERSION,
+            "deterministic-intent",
+        )
+        .expect("construct Intent config");
+        let task_compiler = TaskEpisodeCompiler::for_tests(TaskPromptModel, "deterministic-task")
+            .expect("construct Task compiler");
+        let intent_compiler =
+            IntentIterationCompiler::for_tests(IntentPromptModel, "deterministic-intent")
+                .expect("construct Intent compiler");
+        let compilers = EpisodeCompilerSet::new(
+            &task_compiler,
+            &task_config,
+            &intent_compiler,
+            &intent_config,
+        );
+        let runner = EpisodeGenerationRunner::new(
+            &history,
+            fixture.database.as_ref(),
+            &fixture.digest,
+            &fixture.writer,
+            "repo",
+            EpisodeSourceLimits::repo_v1(),
+        )
+        .expect("construct generation runner");
+
+        assert_eq!(
+            runner
+                .run_one(&compilers, "intent-runner", 2_000_000_100_000)
+                .await
+                .expect("run missing-dependency Intent generation"),
+            GenerationRunOutcome::StableFailure,
+            "the lexically first Intent job must not publish before Task Episodes exist"
+        );
+        for offset in 1..=2 {
+            assert_eq!(
+                runner
+                    .run_one(&compilers, "intent-runner", 2_000_000_100_000 + offset,)
+                    .await
+                    .expect("compile one child Task"),
+                GenerationRunOutcome::Committed {
+                    appended: true,
+                    new_generation_pending: false,
+                }
+            );
+        }
+        let intent_root =
+            EpisodeRoot::intent(intent_id.to_string()).expect("construct Intent root");
+        let intent_target = TrustedMemoryTarget::episode(intent_root.clone());
+        let resolver =
+            EpisodeSourceResolver::new(&history, &fixture.digest, EpisodeSourceLimits::repo_v1())
+                .expect("construct Intent source resolver");
+        let terminal_source_oid = history
+            .resolve_history_head()
+            .await
+            .expect("read terminal AI history head")
+            .expect("terminal AI history head exists");
+        let pinned_source = resolver
+            .resolve(&fixture.context, &intent_target, terminal_source_oid)
+            .await
+            .expect("resolve pinned Intent dependencies");
+        let unrelated_target = TrustedMemoryTarget::episode(
+            EpisodeRoot::task("unrelated-memory-write").expect("construct unrelated root"),
+        );
+        fixture
+            .writer
+            .commit(
+                &fixture.context,
+                &unrelated_target,
+                &proposal(&unrelated_target, fixture.key_id, 1),
+                None,
+            )
+            .await
+            .expect("commit unrelated Memory revision");
+        resolver
+            .revalidate(&fixture.context, &intent_target, &pinned_source)
+            .await
+            .expect("unrelated Memory writes do not invalidate pinned Task revisions");
+        let intent_outcome = runner
+            .run_one(&compilers, "intent-runner", 2_000_000_100_003)
+            .await
+            .expect("compile Intent after all Task pins exist");
+        if intent_outcome
+            != (GenerationRunOutcome::Committed {
+                appended: true,
+                new_generation_pending: false,
+            })
+        {
+            let job = fixture
+                .database
+                .query_one_raw(Statement::from_sql_and_values(
+                    fixture.database.get_database_backend(),
+                    "SELECT last_error_code, last_error_summary FROM memory_compile_job
+                     WHERE scope_key = 'repo' AND root_kind = 'intent' AND root_id = ?",
+                    [intent_id.to_string().into()],
+                ))
+                .await
+                .expect("query failed Intent job")
+                .expect("Intent job exists");
+            panic!(
+                "unexpected Intent outcome {intent_outcome:?}: {:?} {:?}",
+                job.try_get::<Option<String>>("", "last_error_code")
+                    .expect("decode Intent error code"),
+                job.try_get::<Option<String>>("", "last_error_summary")
+                    .expect("decode Intent error summary")
+            );
+        }
+
+        let intent_head = fixture
+            .database
+            .query_one_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "SELECT live_revision_oid FROM memory_head
+                 WHERE scope_key = 'repo' AND note_id = ?",
+                [intent_root.note_id().to_string().into()],
+            ))
+            .await
+            .expect("query Intent Memory head")
+            .expect("Intent Memory head exists");
+        let first_intent_revision: String = intent_head
+            .try_get::<Option<String>>("", "live_revision_oid")
+            .expect("decode Intent live revision")
+            .expect("Intent has a confirmed revision");
+        let first_note = parse_memory_note_v1(
+            &load_note_bytes(
+                history.repository_path(),
+                first_intent_revision
+                    .parse()
+                    .expect("parse Intent revision OID"),
+            )
+            .expect("load Intent revision"),
+        )
+        .expect("parse Intent revision");
+        assert_eq!(first_note.note_id, intent_root.note_id());
+        assert_eq!(first_note.links.len(), 2);
+        assert_eq!(
+            first_note
+                .episode
+                .as_ref()
+                .expect("Intent note has Episode payload")
+                .related_task_ids
+                .len(),
+            2
+        );
+        assert!(first_note.links.iter().all(|link| {
+            link.kind == super::super::domain::MemoryLinkKind::Supports
+                && link.target_revision_oid.is_some()
+        }));
+
+        let revised = TaskEvent::new(actor, task_ids[0], TaskEventKind::Failed)
+            .expect("construct revised terminal Task event");
+        append_object(
+            &history,
+            "task_event",
+            &revised.header().object_id().to_string(),
+            &revised,
+        )
+        .await;
+        EpisodeObserver::new(&history, fixture.database.as_ref(), &fixture.digest, "repo")
+            .expect("construct terminal observer")
+            .observe_terminal_events()
+            .await
+            .expect("observe revised Task terminal source");
+        assert!(matches!(
+            runner
+                .run_one(&compilers, "intent-runner", 2_000_000_100_004)
+                .await
+                .expect("compile revised Task generation"),
+            GenerationRunOutcome::Committed { appended: true, .. }
+        ));
+        assert!(matches!(
+            runner
+                .run_one(&compilers, "intent-runner", 2_000_000_100_005)
+                .await
+                .expect("recompile parent Intent generation"),
+            GenerationRunOutcome::Committed { appended: true, .. }
+        ));
+        let revisions = fixture
+            .database
+            .query_one_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "SELECT COUNT(*) AS revision_count FROM memory_revision_index
+                 WHERE scope_key = 'repo' AND note_id = ?",
+                [intent_root.note_id().to_string().into()],
+            ))
+            .await
+            .expect("query Intent revisions")
+            .expect("Intent revision count exists");
+        assert_eq!(revisions.try_get::<i64>("", "revision_count").unwrap(), 2);
+        assert_eq!(
+            runner
+                .run_one(&compilers, "intent-runner", 2_000_000_100_006)
+                .await
+                .expect("repeat converged generation"),
+            GenerationRunOutcome::NoWork
+        );
+        assert!(
+            read_memory_ref_head(fixture.database.as_ref())
+                .await
+                .expect("read final Memory head")
+                .is_some()
         );
     }
 }
