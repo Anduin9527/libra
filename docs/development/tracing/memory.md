@@ -1551,6 +1551,33 @@ unresolved、相关 Run ID）。紧凑结构移除 Task claim 自身的 Evidence
 前滚为同一 Intent note 的新 revision。旧 generation 已在执行时可以先提交，但 lease 完成后
 仍保持最新 generation 为 dirty，最终只保留一个固定 Cell/note ID 的 live head。
 
+#### 5.2.5 M2-11 冻结读取与确定性召回合同
+
+`EpisodeReader` 在一个 SQLite 读事务内解析当前 Libra HEAD，并冻结 repository ID、
+principal HMAC、当前代码 commit、完整分支 ref、Memory ref OID、投影事件水位与 policy
+snapshot hash；这些字段共同生成 `view_hash`。detached / unborn HEAD、Memory ref 与投影水位
+不一致、未知 policy 或读取过程中视图变化都会 fail-closed。调用方不能自行拼接代码 commit
+与分支名来构造读取视图。
+
+候选查询只读取 `memory_head.live_revision_oid` 指向且 review state 为 `confirmed` 的 Episode。
+root kind/ID、完成状态、代码变化状态、结束时间与 canonical path exact/prefix 均作为绑定参数
+进入结构化 SQL；Intent/Task relation 在已经授权并加载的 Episode 上做有界复核。文本查询严格
+复用 §5.2 的 `normalize_plain_text_v1`、`unicode61` 与固定五列 BM25 权重。SQL 候选上限为
+200，最终结果上限为 50；普通查询默认返回 10 条。
+
+候选随后按当前代码版本计算 `exact`、`descendant_unchanged`、
+`descendant_path_changed`、`diverged` 或 `unknown`。祖先遍历最多 2,048 个 commit，每条
+Episode 最多比较 512 个 canonical code path；预算耗尽或对象不可解析得到 `unknown`。
+普通注入候选只保留前两种状态，诊断查询可以查看其余状态。固定 selector version 为
+`episode-fts-bm25-v1`，排序依次为 applicability tier、BM25 ASC、`ended_at` DESC、
+`note_id`、`revision_oid`，因此同一冻结视图和查询会产生相同顺序。
+
+证据只对最终选中的 Episode 按需展开。每个 `EvidenceRef` 都重新检查 repo-local visibility、
+固定 source ref 的当前可达性、对象类型/ID、脱敏后 fragment digest 与资源上限。运行历史对象
+沿固定的 `libra/intent` 版本读取；Intent 汇总引用的 Task Episode 沿固定 Memory 版本重放并
+重新生成同一紧凑结构。单次最多处理 64 个去重引用、累计 512 KiB；私有、不可达、损坏、
+摘要不匹配或尚未支持的 locator 只产生稳定 omission，不放宽权限，也不使其它证据失效。
+
 查询实现必须始终带上 `scope_key` 与 `namespace`，禁止只按 `path` 做全局查询后在内存中过滤。跨 scope / namespace 的检索只能由显式 `--all-namespaces` 或策略允许的 scope fallback 触发，并且必须在结果中保留原始 `scope` 与 `namespace`，防止 prompt 注入时发生来源混淆。
 
 `list_prefix` 与 `summarize` 不得执行无上限扫描。实现应使用规范化后的 path 前缀范围查询和 keyset pagination，并设置默认 `LIMIT`（建议 100 条 summary、50 条 note）与硬上限。因为 SQL `LIKE` 的转义与 collation 容易引入前缀越界，推荐存储 canonical `path_key` / `parent_path` 后做复合索引范围查询；复杂度表述统一为 O(log n + k)，其中 k 是有界返回量。

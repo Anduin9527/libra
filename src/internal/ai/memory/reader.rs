@@ -1,0 +1,678 @@
+use git_internal::hash::ObjectHash;
+use sea_orm::{DatabaseConnection, TransactionTrait};
+use thiserror::Error;
+
+use super::{
+    applicability::{
+        CodeApplicability, CodeHistory, RepositoryCodeHistory, classify_code_applicability,
+    },
+    domain::{MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust, MemoryVisibility},
+    evidence::{EvidenceExpansionV1, EvidenceResolver},
+    fts_sql::{EpisodeSearchCandidate, MemoryFtsError, search_candidates},
+    policy::{AuthenticatedMemoryContext, REPO_EPISODE_ACL_POLICY_ID, REPO_EPISODE_POLICY_VERSION},
+    query::{EpisodeQueryError, EpisodeQueryV1},
+    selector::{EPISODE_SELECTOR_VERSION, SelectableEpisode, select_episode_indexes},
+    tree::load_note_bytes,
+    validation::parse_memory_note_v1,
+    view::{FrozenCodeAnchorV1, ResolvedMemoryViewError, ResolvedMemoryViewV1},
+};
+use crate::internal::{
+    ai::{history::HistoryManager, keyed_digest::RepositoryKeyedDigest},
+    head::Head,
+};
+
+pub(crate) struct EpisodeReader<'a> {
+    history: &'a HistoryManager,
+    database: DatabaseConnection,
+    digest: &'a RepositoryKeyedDigest,
+    code_history: RepositoryCodeHistory,
+    evidence: EvidenceResolver<'a>,
+}
+
+impl<'a> EpisodeReader<'a> {
+    pub(crate) fn new(
+        history: &'a HistoryManager,
+        digest: &'a RepositoryKeyedDigest,
+    ) -> Result<Self, EpisodeReaderError> {
+        if history.repository_path().as_os_str().is_empty()
+            || history.database_connection().get_database_backend()
+                != sea_orm::DatabaseBackend::Sqlite
+        {
+            return Err(EpisodeReaderError::new(
+                EpisodeReaderErrorKind::InvalidConfiguration,
+            ));
+        }
+        Ok(Self {
+            history,
+            database: history.database_connection(),
+            digest,
+            code_history: RepositoryCodeHistory::new(history.repository_path()),
+            evidence: EvidenceResolver::new(history).map_err(|_| {
+                EpisodeReaderError::new(EpisodeReaderErrorKind::InvalidConfiguration)
+            })?,
+        })
+    }
+
+    pub(crate) async fn freeze_view(
+        &self,
+        context: &AuthenticatedMemoryContext,
+    ) -> Result<ResolvedMemoryViewV1, EpisodeReaderError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        let current = Head::current_result_with_conn(&transaction)
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::InvalidCodeAnchor))?;
+        let Head::Branch(branch) = current else {
+            return Err(EpisodeReaderError::new(
+                EpisodeReaderErrorKind::InvalidCodeAnchor,
+            ));
+        };
+        let commit_oid = Head::current_commit_result_with_conn(&transaction)
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::InvalidCodeAnchor))?
+            .ok_or_else(|| EpisodeReaderError::new(EpisodeReaderErrorKind::InvalidCodeAnchor))?;
+        let full_branch_ref = if branch.starts_with("refs/heads/") {
+            branch
+        } else {
+            format!("refs/heads/{branch}")
+        };
+        let code_anchor = FrozenCodeAnchorV1::new(commit_oid, full_branch_ref)
+            .map_err(EpisodeReaderError::from)?;
+        self.code_history
+            .parents(code_anchor.commit_oid())
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::InvalidCodeAnchor))?;
+        let view = ResolvedMemoryViewV1::freeze(
+            &transaction,
+            self.history.repository_path(),
+            self.digest,
+            context,
+            code_anchor,
+        )
+        .await
+        .map_err(EpisodeReaderError::from)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        Ok(view)
+    }
+
+    pub(crate) async fn search(
+        &self,
+        context: &AuthenticatedMemoryContext,
+        view: &ResolvedMemoryViewV1,
+        query: &EpisodeQueryV1,
+    ) -> Result<EpisodeSearchResultV1, EpisodeReaderError> {
+        query.validate().map_err(EpisodeReaderError::from)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        view.revalidate(
+            &transaction,
+            self.history.repository_path(),
+            self.digest,
+            context,
+        )
+        .await
+        .map_err(EpisodeReaderError::from)?;
+        if view.memory_ref_oid().is_none() {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+            return Ok(EpisodeSearchResultV1::empty(view));
+        }
+
+        let projected = search_candidates(&transaction, query)
+            .await
+            .map_err(EpisodeReaderError::from)?;
+        let mut loaded = Vec::with_capacity(projected.len());
+        let mut relation_omissions = 0usize;
+        for candidate in projected {
+            let note = self.load_candidate(&candidate)?;
+            if !authorized_note(&note) {
+                continue;
+            }
+            let episode = note.episode.as_ref().ok_or_else(|| {
+                EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection)
+            })?;
+            if !query.matches_episode(episode) {
+                relation_omissions = relation_omissions.saturating_add(1);
+                continue;
+            }
+            let applicability = classify_code_applicability(
+                &self.code_history,
+                view.code_anchor().commit_oid(),
+                &episode.code,
+            );
+            loaded.push(LoadedEpisode {
+                selectable: SelectableEpisode {
+                    note_id: candidate.note_id,
+                    revision_oid: candidate.revision_oid,
+                    bm25_score: candidate.bm25_score,
+                    ended_at: candidate.ended_at,
+                    applicability,
+                },
+                note,
+            });
+        }
+        view.revalidate(
+            &transaction,
+            self.history.repository_path(),
+            self.digest,
+            context,
+        )
+        .await
+        .map_err(EpisodeReaderError::from)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+
+        let selectable = loaded
+            .iter()
+            .map(|candidate| SelectableEpisode {
+                note_id: candidate.selectable.note_id,
+                revision_oid: candidate.selectable.revision_oid,
+                bm25_score: candidate.selectable.bm25_score,
+                ended_at: candidate.selectable.ended_at,
+                applicability: candidate.selectable.applicability,
+            })
+            .collect::<Vec<_>>();
+        let selected = select_episode_indexes(&selectable, query.include_diagnostics, query.limit);
+        let omitted_by_applicability = loaded
+            .iter()
+            .filter(|candidate| !candidate.selectable.applicability.injectable())
+            .count();
+        let mut items = Vec::with_capacity(selected.len());
+        let mut evidence_reads = 0usize;
+        for index in selected {
+            let candidate = &loaded[index];
+            let evidence = if query.expand_evidence {
+                let expanded = self
+                    .evidence
+                    .expand(&candidate.note, view.memory_ref_oid())
+                    .await;
+                evidence_reads = evidence_reads
+                    .saturating_add(expanded.resolved.len())
+                    .saturating_add(expanded.omissions.len());
+                expanded
+            } else {
+                EvidenceExpansionV1::default()
+            };
+            items.push(EpisodeReadItemV1 {
+                note: candidate.note.clone(),
+                revision_oid: candidate.selectable.revision_oid,
+                bm25_score: candidate.selectable.bm25_score,
+                applicability: candidate.selectable.applicability,
+                evidence,
+            });
+        }
+        Ok(EpisodeSearchResultV1 {
+            view_hash: view.view_hash().to_string(),
+            selector_version: EPISODE_SELECTOR_VERSION,
+            candidates_examined: loaded.len(),
+            relation_omissions,
+            omitted_by_applicability,
+            evidence_reads,
+            items,
+        })
+    }
+
+    fn load_candidate(
+        &self,
+        candidate: &EpisodeSearchCandidate,
+    ) -> Result<MemoryNoteV1, EpisodeReaderError> {
+        let bytes = load_note_bytes(self.history.repository_path(), candidate.revision_oid)
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))?;
+        let note = parse_memory_note_v1(&bytes)
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))?;
+        let episode = note
+            .episode
+            .as_ref()
+            .ok_or_else(|| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))?;
+        if note.note_id != candidate.note_id
+            || episode.root_kind != candidate.root_kind
+            || episode.root_id != candidate.root_id
+            || episode.completion_status != candidate.completion_status
+            || episode.code_change_status != candidate.code_change_status
+            || episode.ended_at != candidate.ended_at
+        {
+            return Err(EpisodeReaderError::new(
+                EpisodeReaderErrorKind::CorruptProjection,
+            ));
+        }
+        Ok(note)
+    }
+}
+
+struct LoadedEpisode {
+    selectable: SelectableEpisode,
+    note: MemoryNoteV1,
+}
+
+fn authorized_note(note: &MemoryNoteV1) -> bool {
+    note.namespace == "default"
+        && note.scope == MemoryScopeV1::Repo
+        && note.visibility == MemoryVisibility::RepoLocal
+        && note.acl_policy_id == REPO_EPISODE_ACL_POLICY_ID
+        && note.compile_record.policy_version == REPO_EPISODE_POLICY_VERSION
+        && note.trust == MemoryTrust::RepoEvidence
+        && note.sensitivity != MemorySensitivity::SecretLike
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EpisodeReadItemV1 {
+    pub(crate) note: MemoryNoteV1,
+    pub(crate) revision_oid: ObjectHash,
+    pub(crate) bm25_score: f64,
+    pub(crate) applicability: CodeApplicability,
+    pub(crate) evidence: EvidenceExpansionV1,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EpisodeSearchResultV1 {
+    pub(crate) view_hash: String,
+    pub(crate) selector_version: &'static str,
+    pub(crate) candidates_examined: usize,
+    pub(crate) relation_omissions: usize,
+    pub(crate) omitted_by_applicability: usize,
+    pub(crate) evidence_reads: usize,
+    pub(crate) items: Vec<EpisodeReadItemV1>,
+}
+
+impl EpisodeSearchResultV1 {
+    fn empty(view: &ResolvedMemoryViewV1) -> Self {
+        Self {
+            view_hash: view.view_hash().to_string(),
+            selector_version: EPISODE_SELECTOR_VERSION,
+            candidates_examined: 0,
+            relation_omissions: 0,
+            omitted_by_applicability: 0,
+            evidence_reads: 0,
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EpisodeReaderErrorKind {
+    InvalidConfiguration,
+    InvalidQuery,
+    InvalidCodeAnchor,
+    Unauthorized,
+    StaleProjection,
+    UnknownPolicy,
+    StorageUnavailable,
+    CorruptProjection,
+}
+
+#[derive(Debug, Error)]
+#[error("Episode reader failed ({kind:?})")]
+pub(crate) struct EpisodeReaderError {
+    kind: EpisodeReaderErrorKind,
+}
+
+impl EpisodeReaderError {
+    const fn new(kind: EpisodeReaderErrorKind) -> Self {
+        Self { kind }
+    }
+
+    pub(crate) const fn kind(&self) -> EpisodeReaderErrorKind {
+        self.kind
+    }
+}
+
+impl From<EpisodeQueryError> for EpisodeReaderError {
+    fn from(_: EpisodeQueryError) -> Self {
+        Self::new(EpisodeReaderErrorKind::InvalidQuery)
+    }
+}
+
+impl From<MemoryFtsError> for EpisodeReaderError {
+    fn from(error: MemoryFtsError) -> Self {
+        match error {
+            MemoryFtsError::InvalidQuery { .. } => Self::new(EpisodeReaderErrorKind::InvalidQuery),
+            MemoryFtsError::CorruptProjection => {
+                Self::new(EpisodeReaderErrorKind::CorruptProjection)
+            }
+            MemoryFtsError::InvalidDocument { .. } | MemoryFtsError::Storage(_) => {
+                Self::new(EpisodeReaderErrorKind::StorageUnavailable)
+            }
+        }
+    }
+}
+
+impl From<ResolvedMemoryViewError> for EpisodeReaderError {
+    fn from(error: ResolvedMemoryViewError) -> Self {
+        use super::view::ResolvedMemoryViewErrorKind as View;
+        match error.kind() {
+            View::InvalidCodeAnchor => Self::new(EpisodeReaderErrorKind::InvalidCodeAnchor),
+            View::Unauthorized | View::DigestUnavailable => {
+                Self::new(EpisodeReaderErrorKind::Unauthorized)
+            }
+            View::StorageUnavailable => Self::new(EpisodeReaderErrorKind::StorageUnavailable),
+            View::StaleProjection => Self::new(EpisodeReaderErrorKind::StaleProjection),
+            View::CorruptProjection => Self::new(EpisodeReaderErrorKind::CorruptProjection),
+            View::UnknownPolicy => Self::new(EpisodeReaderErrorKind::UnknownPolicy),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::{TimeZone, Utc};
+    use git_internal::internal::object::{
+        ObjectTrait,
+        commit::Commit,
+        signature::{Signature, SignatureType},
+        tree::{Tree, TreeItem, TreeItemMode},
+    };
+    use sea_orm::{ConnectionTrait, Statement};
+
+    use super::*;
+    use crate::{
+        internal::ai::memory::{
+            domain::{EpisodeRoot, EpisodeRootKind},
+            policy::TrustedMemoryTarget,
+            writer::tests::{Fixture, fixture, proposal},
+        },
+        utils::{object::write_git_object, storage::local::LocalStorage},
+    };
+
+    const CODE_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn history(fixture: &Fixture) -> HistoryManager {
+        HistoryManager::new(
+            Arc::new(LocalStorage::new(fixture._temp.path().join("objects"))),
+            fixture._temp.path().to_path_buf(),
+            Arc::clone(&fixture.database),
+        )
+    }
+
+    async fn frozen_view(fixture: &Fixture) -> ResolvedMemoryViewV1 {
+        ResolvedMemoryViewV1::freeze(
+            fixture.database.as_ref(),
+            fixture._temp.path(),
+            fixture.digest.as_ref(),
+            &fixture.context,
+            FrozenCodeAnchorV1::new(CODE_OID.parse().expect("fixed code OID"), "refs/heads/main")
+                .expect("valid code anchor"),
+        )
+        .await
+        .expect("freeze reader view")
+    }
+
+    async fn seed_code_head(fixture: &Fixture) -> ObjectHash {
+        let blob_oid = write_git_object(fixture._temp.path(), "blob", b"reader anchor\n")
+            .expect("write code blob");
+        let tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob_oid,
+            "README.md".to_string(),
+        )])
+        .expect("construct code tree");
+        let tree_oid = write_git_object(
+            fixture._temp.path(),
+            "tree",
+            &tree.to_data().expect("serialize code tree"),
+        )
+        .expect("write code tree");
+        let commit = Commit::new(
+            Signature::new(
+                SignatureType::Author,
+                "Libra Test".to_string(),
+                "test@libra.local".to_string(),
+            ),
+            Signature::new(
+                SignatureType::Committer,
+                "Libra Test".to_string(),
+                "test@libra.local".to_string(),
+            ),
+            tree_oid,
+            Vec::new(),
+            "reader code anchor",
+        );
+        let commit_oid = write_git_object(
+            fixture._temp.path(),
+            "commit",
+            &commit.to_data().expect("serialize code commit"),
+        )
+        .expect("write code commit");
+        fixture
+            .database
+            .execute_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "INSERT INTO reference(name, kind, `commit`, remote, worktree_id)
+                 VALUES ('main', 'Branch', ?, NULL, NULL),
+                        ('main', 'Head', NULL, NULL, NULL)",
+                [commit_oid.to_string().into()],
+            ))
+            .await
+            .expect("seed current Libra branch and HEAD");
+        commit_oid
+    }
+
+    #[tokio::test]
+    async fn reader_freezes_current_libra_head() {
+        let fixture = fixture().await;
+        let commit_oid = seed_code_head(&fixture).await;
+        let history = history(&fixture);
+        let reader = EpisodeReader::new(&history, fixture.digest.as_ref()).expect("reader");
+        let view = reader
+            .freeze_view(&fixture.context)
+            .await
+            .expect("freeze current Libra HEAD");
+        assert_eq!(view.code_anchor().commit_oid(), commit_oid);
+        assert_eq!(view.code_anchor().full_branch_ref(), "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn reader_bm25_weights_asc() {
+        let fixture = fixture().await;
+        let goal_target =
+            TrustedMemoryTarget::episode(EpisodeRoot::task("task-rank-goal").expect("goal target"));
+        let summary_target = TrustedMemoryTarget::episode(
+            EpisodeRoot::task("task-rank-summary").expect("summary target"),
+        );
+        let mut goal = proposal(&goal_target, fixture.key_id, 1);
+        let goal_episode = goal.note_mut().episode.as_mut().expect("Episode payload");
+        goal_episode.goal.claim = "ranktoken appears in the goal".to_string();
+        goal_episode.summary.claim = "an unrelated summary".to_string();
+        let mut summary = proposal(&summary_target, fixture.key_id, 2);
+        let summary_episode = summary
+            .note_mut()
+            .episode
+            .as_mut()
+            .expect("Episode payload");
+        summary_episode.goal.claim = "an unrelated goal".to_string();
+        summary_episode.summary.claim = "ranktoken appears in the summary".to_string();
+        fixture
+            .writer
+            .commit(&fixture.context, &goal_target, &goal, None)
+            .await
+            .expect("commit goal-weighted Episode");
+        fixture
+            .writer
+            .commit(&fixture.context, &summary_target, &summary, None)
+            .await
+            .expect("commit summary-weighted Episode");
+
+        let history = history(&fixture);
+        let reader = EpisodeReader::new(&history, fixture.digest.as_ref()).expect("reader");
+        let result = reader
+            .search(
+                &fixture.context,
+                &frozen_view(&fixture).await,
+                &EpisodeQueryV1 {
+                    text: Some("ranktoken".to_string()),
+                    include_diagnostics: true,
+                    ..EpisodeQueryV1::default()
+                },
+            )
+            .await
+            .expect("search weighted documents");
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(
+            result.items[0]
+                .note
+                .episode
+                .as_ref()
+                .expect("Episode")
+                .root_id,
+            goal_target.root().id(),
+        );
+        assert!(result.items[0].bm25_score < result.items[1].bm25_score);
+    }
+
+    #[tokio::test]
+    async fn reader_deterministic_ties_and_structured_filters() {
+        let fixture = fixture().await;
+        let ended_at = Utc
+            .with_ymd_and_hms(2026, 8, 24, 12, 0, 0)
+            .single()
+            .expect("fixed timestamp");
+        let mut expected_ids = Vec::new();
+        for (task_id, generation) in [("task-tie-b", 1), ("task-tie-a", 2)] {
+            let target =
+                TrustedMemoryTarget::episode(EpisodeRoot::task(task_id).expect("tie target"));
+            let mut candidate = proposal(&target, fixture.key_id, generation);
+            let episode = candidate
+                .note_mut()
+                .episode
+                .as_mut()
+                .expect("Episode payload");
+            episode.goal.claim = "deterministictoken".to_string();
+            episode.summary.claim = "same summary".to_string();
+            episode.ended_at = Some(ended_at);
+            fixture
+                .writer
+                .commit(&fixture.context, &target, &candidate, None)
+                .await
+                .expect("commit tied Episode");
+            expected_ids.push(target.root().note_id());
+        }
+        expected_ids.sort();
+
+        let history = history(&fixture);
+        let reader = EpisodeReader::new(&history, fixture.digest.as_ref()).expect("reader");
+        let view = frozen_view(&fixture).await;
+        let query = EpisodeQueryV1 {
+            text: Some("deterministictoken".to_string()),
+            root_kind: Some(EpisodeRootKind::Task),
+            root_id: Some("task-tie-a".to_string()),
+            related_task_id: Some("task-tie-a".to_string()),
+            ended_from: Some(ended_at),
+            ended_until: Some(ended_at),
+            path: Some(super::super::query::EpisodePathFilter::Prefix(
+                "episodic.tasks".to_string(),
+            )),
+            include_diagnostics: true,
+            ..EpisodeQueryV1::default()
+        };
+        let filtered = reader
+            .search(&fixture.context, &view, &query)
+            .await
+            .expect("search structured filters");
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(
+            filtered.items[0]
+                .note
+                .episode
+                .as_ref()
+                .expect("Episode")
+                .root_id,
+            "task-tie-a",
+        );
+
+        let unfiltered = EpisodeQueryV1 {
+            text: Some("deterministictoken".to_string()),
+            include_diagnostics: true,
+            ..EpisodeQueryV1::default()
+        };
+        let first = reader
+            .search(&fixture.context, &view, &unfiltered)
+            .await
+            .expect("first deterministic search");
+        let second = reader
+            .search(&fixture.context, &view, &unfiltered)
+            .await
+            .expect("second deterministic search");
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.note.note_id)
+                .collect::<Vec<_>>(),
+            expected_ids,
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_only_returns_the_confirmed_live_revision() {
+        let fixture = fixture().await;
+        let mut old = proposal(&fixture.target, fixture.key_id, 1);
+        old.note_mut()
+            .episode
+            .as_mut()
+            .expect("Episode payload")
+            .goal
+            .claim = "oldrevisiontoken".to_string();
+        fixture
+            .writer
+            .commit(&fixture.context, &fixture.target, &old, None)
+            .await
+            .expect("commit old revision");
+        let mut current = proposal(&fixture.target, fixture.key_id, 2);
+        current
+            .note_mut()
+            .episode
+            .as_mut()
+            .expect("Episode payload")
+            .goal
+            .claim = "currentrevisiontoken".to_string();
+        fixture
+            .writer
+            .commit(&fixture.context, &fixture.target, &current, None)
+            .await
+            .expect("commit current revision");
+
+        let history = history(&fixture);
+        let reader = EpisodeReader::new(&history, fixture.digest.as_ref()).expect("reader");
+        let view = frozen_view(&fixture).await;
+        let old_result = reader
+            .search(
+                &fixture.context,
+                &view,
+                &EpisodeQueryV1 {
+                    text: Some("oldrevisiontoken".to_string()),
+                    include_diagnostics: true,
+                    ..EpisodeQueryV1::default()
+                },
+            )
+            .await
+            .expect("search old posting");
+        assert!(old_result.items.is_empty());
+        let current_result = reader
+            .search(
+                &fixture.context,
+                &view,
+                &EpisodeQueryV1 {
+                    text: Some("currentrevisiontoken".to_string()),
+                    include_diagnostics: true,
+                    ..EpisodeQueryV1::default()
+                },
+            )
+            .await
+            .expect("search current posting");
+        assert_eq!(current_result.items.len(), 1);
+    }
+}

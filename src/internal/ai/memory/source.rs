@@ -342,14 +342,14 @@ impl RedactedEpisodeSource {
     }
 }
 
-struct MemorySourceRedactor {
+pub(super) struct MemorySourceRedactor {
     secrets: Redactor,
     email: Regex,
     home_path: Regex,
 }
 
 impl MemorySourceRedactor {
-    fn new() -> Result<Self, EpisodeSourceError> {
+    pub(super) fn new() -> Result<Self, EpisodeSourceError> {
         Ok(Self {
             secrets: Redactor::new_default(),
             email: Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
@@ -359,7 +359,7 @@ impl MemorySourceRedactor {
         })
     }
 
-    fn redact(&self, raw: &[u8]) -> Result<Vec<u8>, EpisodeSourceError> {
+    pub(super) fn redact(&self, raw: &[u8]) -> Result<Vec<u8>, EpisodeSourceError> {
         let (secret_redacted, _) = self.secrets.redact(raw);
         let private_redacted = redact_private_markers(secret_redacted.bytes())?;
         let email_redacted = self
@@ -756,6 +756,15 @@ impl<'a> CompactTaskEpisodeV1<'a> {
             related_run_ids: &episode.related_run_ids,
         })
     }
+}
+
+pub(super) fn compact_task_episode_bytes(
+    task_id: &str,
+    note: &MemoryNoteV1,
+) -> Result<Vec<u8>, EpisodeSourceError> {
+    let compact = CompactTaskEpisodeV1::from_note(task_id, note)?;
+    serde_json::to_vec(&compact)
+        .map_err(|_| EpisodeSourceError::new(EpisodeSourceErrorKind::SourceCorrupt))
 }
 
 #[derive(Serialize)]

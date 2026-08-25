@@ -4,14 +4,17 @@
 //! outside this module lets a future projection writer update ordinary Memory
 //! indexes, the search document, FTS postings, and its watermark atomically.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use git_internal::hash::ObjectHash;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, Statement, Value};
 use thiserror::Error;
 
-use super::domain::{CodeChangeStatus, CompletionStatus, EpisodeRoot, EpisodeRootKind};
+use super::{
+    domain::{CodeChangeStatus, CompletionStatus, EpisodeRoot, EpisodeRootKind},
+    query::{EpisodePathFilter, EpisodeQueryV1, MAX_CANDIDATES},
+};
 use crate::internal::{ai::linear_ref::LinearRefWriteTransaction, db};
 
 const MAX_SEARCH_TEXT_BYTES: usize = 64 * 1024;
@@ -189,6 +192,197 @@ impl BoundMatchQuery {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+pub(crate) struct EpisodeSearchCandidate {
+    pub(crate) note_id: uuid::Uuid,
+    pub(crate) revision_oid: ObjectHash,
+    pub(crate) root_kind: EpisodeRootKind,
+    pub(crate) root_id: String,
+    pub(crate) completion_status: CompletionStatus,
+    pub(crate) code_change_status: CodeChangeStatus,
+    pub(crate) ended_at: Option<DateTime<Utc>>,
+    pub(crate) bm25_score: f64,
+}
+
+/// Read a bounded candidate set from the frozen projection transaction.
+/// Every dynamic value is bound; the SQL shape and BM25 weights are fixed by
+/// selector version rather than accepted from a caller.
+pub(crate) async fn search_candidates<C: ConnectionTrait>(
+    database: &C,
+    query: &EpisodeQueryV1,
+) -> Result<Vec<EpisodeSearchCandidate>, MemoryFtsError> {
+    let mut values = Vec::<Value>::new();
+    let mut sql = if query.text.is_some() {
+        "SELECT document.note_id, document.revision_oid, document.root_kind,
+                document.root_id, document.completion_status,
+                document.code_change_status, document.ended_at,
+                bm25(memory_episode_fts, 8.0, 5.0, 4.0, 3.0, 2.0) AS bm25_score
+         FROM memory_episode_fts
+         JOIN memory_episode_search_doc AS document
+           ON document.rowid = memory_episode_fts.rowid
+         JOIN memory_head AS head
+           ON head.scope_key = 'repo' AND head.namespace = 'default'
+          AND head.note_id = document.note_id
+          AND head.live_revision_oid = document.revision_oid
+         WHERE memory_episode_fts MATCH ?
+           AND head.latest_review_state = 'confirmed'"
+            .to_string()
+    } else {
+        "SELECT document.note_id, document.revision_oid, document.root_kind,
+                document.root_id, document.completion_status,
+                document.code_change_status, document.ended_at,
+                0.0 AS bm25_score
+         FROM memory_episode_search_doc AS document
+         JOIN memory_head AS head
+           ON head.scope_key = 'repo' AND head.namespace = 'default'
+          AND head.note_id = document.note_id
+          AND head.live_revision_oid = document.revision_oid
+         WHERE head.latest_review_state = 'confirmed'"
+            .to_string()
+    };
+    if let Some(text) = &query.text {
+        values.push(normalize_plain_text_v1(text)?.as_str().to_string().into());
+    }
+    if let Some(root_kind) = query.root_kind {
+        sql.push_str(" AND document.root_kind = ?");
+        values.push(root_kind_label(root_kind).into());
+    }
+    if let Some(root_id) = &query.root_id {
+        sql.push_str(" AND document.root_id = ?");
+        values.push(root_id.as_str().into());
+    }
+    if let Some(status) = query.completion_status {
+        sql.push_str(" AND document.completion_status = ?");
+        values.push(completion_status_label(status).into());
+    }
+    if let Some(status) = query.code_change_status {
+        sql.push_str(" AND document.code_change_status = ?");
+        values.push(code_change_status_label(status).into());
+    }
+    if let Some(from) = query.ended_from {
+        sql.push_str(" AND document.ended_at >= ?");
+        values.push(from.to_rfc3339().into());
+    }
+    if let Some(until) = query.ended_until {
+        sql.push_str(" AND document.ended_at <= ?");
+        values.push(until.to_rfc3339().into());
+    }
+    match &query.path {
+        Some(EpisodePathFilter::Exact(path)) => {
+            sql.push_str(" AND head.path = ?");
+            values.push(path.as_str().into());
+        }
+        Some(EpisodePathFilter::Prefix(path)) => {
+            sql.push_str(" AND (head.path = ? OR (head.path >= ? AND head.path < ?))");
+            values.push(path.as_str().into());
+            values.push(format!("{path}.").into());
+            values.push(format!("{path}.\u{10ffff}").into());
+        }
+        None => {}
+    }
+    sql.push_str(
+        " ORDER BY bm25_score ASC, document.ended_at DESC,
+                   document.note_id ASC, document.revision_oid ASC LIMIT ?",
+    );
+    values.push((MAX_CANDIDATES as i64).into());
+    database
+        .query_all_raw(Statement::from_sql_and_values(
+            database.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await?
+        .into_iter()
+        .map(|row| {
+            let note_id: String = row
+                .try_get("", "note_id")
+                .map_err(|_| MemoryFtsError::CorruptProjection)?;
+            let revision_oid: String = row
+                .try_get("", "revision_oid")
+                .map_err(|_| MemoryFtsError::CorruptProjection)?;
+            let root_kind: String = row
+                .try_get("", "root_kind")
+                .map_err(|_| MemoryFtsError::CorruptProjection)?;
+            let ended_at: Option<String> = row
+                .try_get("", "ended_at")
+                .map_err(|_| MemoryFtsError::CorruptProjection)?;
+            Ok(EpisodeSearchCandidate {
+                note_id: uuid::Uuid::parse_str(&note_id)
+                    .map_err(|_| MemoryFtsError::CorruptProjection)?,
+                revision_oid: ObjectHash::from_str(&revision_oid)
+                    .map_err(|_| MemoryFtsError::CorruptProjection)?,
+                root_kind: parse_root_kind(&root_kind)?,
+                root_id: row
+                    .try_get("", "root_id")
+                    .map_err(|_| MemoryFtsError::CorruptProjection)?,
+                completion_status: parse_completion_status(
+                    &row.try_get::<String>("", "completion_status")
+                        .map_err(|_| MemoryFtsError::CorruptProjection)?,
+                )?,
+                code_change_status: parse_code_change_status(
+                    &row.try_get::<String>("", "code_change_status")
+                        .map_err(|_| MemoryFtsError::CorruptProjection)?,
+                )?,
+                ended_at: ended_at
+                    .map(|value| value.parse::<DateTime<Utc>>())
+                    .transpose()
+                    .map_err(|_| MemoryFtsError::CorruptProjection)?,
+                bm25_score: row
+                    .try_get("", "bm25_score")
+                    .map_err(|_| MemoryFtsError::CorruptProjection)?,
+            })
+        })
+        .collect()
+}
+
+const fn root_kind_label(kind: EpisodeRootKind) -> &'static str {
+    match kind {
+        EpisodeRootKind::Task => "task",
+        EpisodeRootKind::Intent => "intent",
+    }
+}
+
+const fn completion_status_label(status: CompletionStatus) -> &'static str {
+    match status {
+        CompletionStatus::Completed => "completed",
+        CompletionStatus::Failed => "failed",
+        CompletionStatus::Cancelled => "cancelled",
+    }
+}
+
+const fn code_change_status_label(status: CodeChangeStatus) -> &'static str {
+    match status {
+        CodeChangeStatus::Changed => "changed",
+        CodeChangeStatus::Unchanged => "unchanged",
+        CodeChangeStatus::Unknown => "unknown",
+    }
+}
+
+fn parse_root_kind(value: &str) -> Result<EpisodeRootKind, MemoryFtsError> {
+    match value {
+        "task" => Ok(EpisodeRootKind::Task),
+        "intent" => Ok(EpisodeRootKind::Intent),
+        _ => Err(MemoryFtsError::CorruptProjection),
+    }
+}
+
+fn parse_completion_status(value: &str) -> Result<CompletionStatus, MemoryFtsError> {
+    match value {
+        "completed" => Ok(CompletionStatus::Completed),
+        "failed" => Ok(CompletionStatus::Failed),
+        "cancelled" => Ok(CompletionStatus::Cancelled),
+        _ => Err(MemoryFtsError::CorruptProjection),
+    }
+}
+
+fn parse_code_change_status(value: &str) -> Result<CodeChangeStatus, MemoryFtsError> {
+    match value {
+        "changed" => Ok(CodeChangeStatus::Changed),
+        "unchanged" => Ok(CodeChangeStatus::Unchanged),
+        "unknown" => Ok(CodeChangeStatus::Unknown),
+        _ => Err(MemoryFtsError::CorruptProjection),
     }
 }
 
