@@ -20,13 +20,16 @@ DeepSeek Harness 的公开定位是“一切皆插件”：模型、工具、技
 | --- | --- | --- |
 | DeepSeek Harness pin | `dsh-v0.1.0-rc.7` / `99f6f02fecdb7dff40c3fbc9470f5907c29f74ca` | 上游 tag `dsh-v0.1.0-rc.7`；架构文档确认 `web`/`headless` profile、`--dump-config`、`agent.inject()`、`sessionPersistence`、`ctx.codeRuntime` |
 | Harness 生命周期事件 | `session/created`、`session/event`、`session/flush`、`session/disposed`、`agent/created`、`agent/disposed`、`subagent/start`、`subagent/end`、`agent/turn-stopping` 均存在；`tool/result` 是 session event 变体，不是独立 Cordis dispatch 事件 | pin 的 `docs/event-producer-consumer.md` / `docs/architecture.md` |
-| Libra bridge 入口 | **目标态**；`AgentSubcommand` 尚无 `Bridge` | `src/command/agent/mod.rs`（约 `123-195`） |
+| Libra bridge 入口 | **已实现（LB-01..LB-06 全量 20 method）**；`libra agent bridge --stdio` 提供协议 v1 + NDJSON transport、`initialize` 握手、session/event durable ingress、只读方法（`context.get/status.get/history.search/checkpoint.list/checkpoint.show/diff.get`）、mutation admission/authorization/approval 管线（`operation_id` 幂等 + digest conflict、actor binding、危险动作默认 deny），以及 workspace lease（`workspace.claim/renew/release` 通过既有 `WorkspaceStore` 的 owner+fence 语义，actor 由 session lineage 派生）。`diff.get`、`commit.create`、`checkpoint.restore`、`review.run` 已通过 typed `agent_bridge/vcs.rs` adapter 接入真实 VCS/review service：`diff.get` 只接受封闭 `mode`（worktree/staged/checkpoint）+ 经校验的仓库相对 `paths`，并强制 `--no-ext-diff`/`--no-textconv`；`commit.create` 只提交当前 index 并把关联图写入 `agent_bridge_link`（不拼进 commit message）；`checkpoint.restore` 要求显式 `expected_head` + 干净 index/worktree，且绝不移动 HEAD；`review.run` 同步完成校验/admission 后由受监督的后台任务执行，bridge 退出时统一 cancel + bounded drain。HEAD 漂移或脏 worktree 以 `LBR-AGENT-038` 在写入前 fail-closed | `src/command/agent/bridge.rs`；`src/internal/ai/agent_bridge/{protocol,transport,storage,ingress,redaction,methods,mutations,authorization,provenance,workspace,vcs}.rs` |
 | Libra Code 控制面 | `libra code --control stdio` 已是 JSON-RPC NDJSON **client**，控制已有 Code session，不是 Harness ingress | `docs/commands/code.md`（约 `96-115`） |
 | Libra worktree | linked worktree 共享 common storage（db/objects）与分支 ref 目录；**HEAD/index 已按 `worktree_id` 作用域隔离**；真正的分支隔离仍需独立 clone 或显式 branch scope | `src/internal/worktree_scope.rs`；`docs/development/libra-worktree-architecture.md` |
 | Actor 兼容风险 | 低层 AI/MCP adapter 仍接受调用方自报 `actor_kind`/`actor_id`；bridge 不得沿用该模型 | `src/internal/ai/mcp/resource.rs` |
 | 实施计划 | Libra Rust 与 TypeScript 插件分仓落地 | [`plan-20260818.md`](../plan/plan-20260818.md)（Libra）；兄弟仓 `deepseek-harness-libra-plugin/docs/plan/plan-20260818.md` |
 
-本文档中标为“目标态”“提议契约”或“待实现”的接口不是当前已存在的 Libra API。
+本文档中标为“提议契约”或“待实现”的接口不是当前已存在的 Libra API。
+**Libra 侧的 bridge 已不在此列**：`libra agent bridge --stdio` 与 protocol v1 的全部 20 个
+method 自 `v0.21.1` 起已实现并发布（plan-20260818 LB-01..LB-07），下文凡描述 bridge 行为处
+均为现状而非目标态；仍属目标态的是 TypeScript 侧的 `@libra/dsh-bundle` 与 Harness profile。
 跨仓库发布顺序固定为 **`REL-LB-01`（Rust bridge + authoritative schema/fixture）→ `REL-TS-01`（`@libra/dsh-bundle`）**；不得用 TypeScript 自造第二份 server schema。
 
 ### 1.1 事实源边界
@@ -71,7 +74,7 @@ flowchart LR
     BRIDGE --> LIBRA
 ```
 
-标准写入入口是目标态的 `libra agent bridge --stdio`。Harness
+标准写入入口是 `libra agent bridge --stdio`（已实现，`v0.21.1`）。Harness
 通过 JSON-RPC NDJSON 将 session、workspace、checkpoint、evidence 和 provenance
 操作发送给 Libra 的 Agent ingress/runtime。
 
@@ -88,8 +91,9 @@ flowchart LR
 
 ## 3. 第一阶段：Agent Bridge 能力插件
 
-Harness 不直接访问 Libra 数据库，也不再以旧的工具服务器传输作为标准写入路径。目标态由
-`@libra/dsh-bundle` 启动一个受 Libra 管理的 JSON-RPC NDJSON bridge：
+Harness 不直接访问 Libra 数据库，也不再以旧的工具服务器传输作为标准写入路径。Libra 侧的
+bridge 已就绪；仍待实现的是由 `@libra/dsh-bundle` 启动这个受 Libra 管理的 JSON-RPC NDJSON
+bridge（TypeScript 侧 `REL-TS-01`）：
 
 ```yaml
 - id: libra
@@ -102,9 +106,16 @@ Harness 不直接访问 Libra 数据库，也不再以旧的工具服务器传�
       cwd: /path/to/repository
 ```
 
-上面的 bundle 配置和 `libra agent bridge --stdio` 都是目标态契约，当前 checkout
-还没有这个子命令。当前 `libra agent` 主要是外部 Agent capture 的操作面；实现 bridge
-时应复用其内部 session/checkpoint/provenance service，而不是把写入逻辑放进 Node 插件。
+上面的 bundle 配置和 `libra agent bridge --stdio` 已由 plan-20260818 LB-01..LB-03 落地为
+实际子命令（协议 v1 + JSON-RPC NDJSON transport + `initialize` 握手 + session/event
+durable ingress）。实现 bridge 时复用其内部 session/checkpoint/provenance service，
+而不是把写入逻辑放进 Node 插件。
+
+**ack 语义（LB-03）**：`event.append` 的 ack（`last_acked_seq`）只承诺 Libra 侧的
+脱敏 projection 已 durable（事务提交后返回），**不代表 Harness 原始 transcript 已被
+Libra 接管**——TypeScript 仍保留自己的 outbox/replay；`(session_id,event_seq)` 与
+`operation_id` 重试在 digest 相同时是成功重放（无重复落库），digest 不同时 fail-closed
+返回 conflict，绝不做 last-writer-wins。
 
 入口职责必须保持分离：
 

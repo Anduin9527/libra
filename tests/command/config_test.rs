@@ -2734,12 +2734,17 @@ async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
 
 #[test]
 fn test_config_upgrade_mode_import_skips_reserved() {
-    if Command::new("git").arg("--version").output().is_err() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    if Command::new("git")
+        .arg("--version")
+        .current_dir(p)
+        .output()
+        .is_err()
+    {
         eprintln!("skipped (git binary not available)");
         return;
     }
-    let temp = tempdir().unwrap();
-    let p = temp.path();
     let home = p.join(".libra-test-home");
     std::fs::create_dir_all(&home).unwrap();
 
@@ -2751,6 +2756,7 @@ fn test_config_upgrade_mode_import_skips_reserved() {
     ] {
         let out = Command::new("git")
             .args(["config", "--global", kv[0], kv[1]])
+            .current_dir(p)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .output()

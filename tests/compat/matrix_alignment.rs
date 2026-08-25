@@ -542,8 +542,13 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
     );
     assert_contains(
         &web_admission,
-        "PLAN_EXECUTION_NOT_AVAILABLE",
-        "Network Allow fail-closed implementation",
+        "HeadlessPhase1Command::StartPlanExecution",
+        "Network Allow admits confirmed plan execution",
+    );
+    assert_contains(
+        &headless,
+        "submit_confirmed_plan_execution",
+        "Web confirmed-plan handoff uses the runtime queue",
     );
     assert_contains(
         &phase1,
@@ -709,7 +714,7 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
     for needle in [
         "validate_same_intent_repository(",
         "The Intent repository changed since this plan was generated",
-        ".workspace_matches(self.turn_executor.registry.working_dir())",
+        ".validate_exact(\n                self.turn_executor.registry.working_dir(),",
         "Execute will perform an exact identity and content recheck",
     ] {
         assert_contains(&headless, needle, "Web Execute consumes exact authority");
@@ -737,7 +742,7 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
         "Windows uses pinned handles, `FILE_FLAG_OPEN_REPARSE_POINT`, final-path/file-identity checks, and `FSCTL_GET_REPARSE_POINT`",
         "unsupported platforms fail closed",
         "Empty revision notes return `PLAN_REVISION_NOTE_REQUIRED` and remain unconsumed",
-        "Network Allow fails closed with `PLAN_EXECUTION_NOT_AVAILABLE`, leaves the gate pending, and performs no mutation",
+        "Network Allow admits confirmed plan execution onto the serialized AgentRuntime queue; mutating tools still require approval/sandbox/ACL, and classified failures enter the W2-11 repair loop. The catalogued `PLAN_EXECUTION_NOT_AVAILABLE` 409 is retained for older clients and is no longer produced on Allow",
         "persistent regular-file OS append lock is never age-reclaimed or unlinked",
         "distinct process-lifetime Phase 1 writer lease is acquired before reload/fold",
         "It is not the append lock or browser controller lease",
@@ -767,8 +772,8 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
         "unsupported platforms fail closed",
         "distinct process-lifetime Phase 1 writer lease is acquired before reload/fold",
         "separate from append/controller locks",
-        "do not treat either drift 409 or Network-Allow 409 as execution parity",
-        "Keep W2-04 open until confirmed-plan execution is implemented and tested",
+        "do not treat a `PHASE1_WORKSPACE_CHANGED` drift 409 as execution parity",
+        "W2-04 confirmed-plan execution is implemented and tested",
         "Startup rejects sequence gaps/window cuts before gate authority or context GC",
     ] {
         assert_contains(
@@ -805,18 +810,18 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
     );
     assert_contains(
         &plan,
-        "- [ ] Confirmed plan execution 进入 runtime serialized queue",
-        "W2-04 remains outside the W2-03 repair",
+        "- [x] Confirmed plan execution 进入 runtime serialized queue",
+        "W2-04 confirmed-plan execution is closed on the default Web path",
     );
     for needle in [
         "2026-08-21 Web repair acceptance（候选；在完整验证与独立审查逐字 `PASS` 前全部保持 pending）",
-        "- [ ] 每份 committed replay 只构造一个线性的 `ValidatedIntentRevisionReceiptIndex`",
+        "- [x] 每份 committed replay 只构造一个线性的 `ValidatedIntentRevisionReceiptIndex`",
         "5,000 events / 2,000 retries 的 startup/Claiming/Consuming lookup",
         "receipt 后出现的 invalid non-mutating Web intent 均 fail closed",
         "pending cancel receipt 若先于 later Web command",
-        "- [ ] fresh explicit-direct（包括 padded `/intent cancel`）",
-        "- [ ] scanner 保留 ignore-aware、path-based name enumeration，但它不是 read authority",
-        "- [ ] 独立 process-lifetime Phase 1 writer lease 在 reload/fold 前取得",
+        "- [x] fresh explicit-direct（包括 padded `/intent cancel`）",
+        "- [x] scanner 保留 ignore-aware、path-based name enumeration，但它不是 read authority",
+        "- [x] 独立 process-lifetime Phase 1 writer lease 在 reload/fold 前取得",
         "完整 Windows repo check",
         "不得把 isolated scanner harness 的通过写成完整 Windows repo check 通过",
         "33 passed / 0 failed / 0 ignored / 4405 filtered",
@@ -907,6 +912,10 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
         (
             &scenario_tests,
             "plan_review_network_allow_returns_conflict_and_preserves_pending_gate",
+        ),
+        (
+            &scenario_tests,
+            "plan_review_network_allow_enters_runtime_queue",
         ),
         (
             &wire_tests,

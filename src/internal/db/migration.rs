@@ -1381,30 +1381,52 @@ pub fn builtin_migrations() -> Vec<Migration> {
                 "../../../sql/migrations/2026081301_approved_permission_provenance_down.sql"
             ),
         ),
+        // plan-20260818 LB-02: DeepSeek Harness bridge durable projection
+        // (agent_bridge_session/event/operation/checkpoint/link). Forward-only:
+        // the down path freezes while any bridge row exists and never deletes
+        // acked events/evidence. See docs/development/tracing/deepseek-harness.md
+        // and the plan's ADR-LB-02/03.
+        sql_migration(
+            2026081801,
+            "agent_bridge_capture",
+            include_str!("../../../sql/migrations/2026081801_agent_bridge_capture.sql"),
+            include_str!("../../../sql/migrations/2026081801_agent_bridge_capture_down.sql"),
+        ),
+        // plan-20260818 LB-04/LB-05: `agent_bridge_link` becomes a real
+        // relation graph — edge-level uniqueness so one result can carry its
+        // operation, workspace, parent-session and evidence associations, plus
+        // the mutation source kinds (`commit`/`restore`/`review`). Down freezes
+        // while any link row exists (ER-LB-04: never delete acked provenance).
+        sql_migration(
+            2026082401,
+            "agent_bridge_link_relations",
+            include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations.sql"),
+            include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql"),
+        ),
         // M2-02: rebuildable Agent Memory projections plus bounded compiler
         // job/observer state. FTS and receipts intentionally land separately.
         sql_migration(
-            2026082401,
+            2026082501,
             "memory_core",
-            include_str!("../../../sql/migrations/2026082401_memory_core.sql"),
-            include_str!("../../../sql/migrations/2026082401_memory_core_down.sql"),
+            include_str!("../../../sql/migrations/2026082501_memory_core.sql"),
+            include_str!("../../../sql/migrations/2026082501_memory_core_down.sql"),
         ),
         // M2-02F: a single-copy Episode search document and its
         // external-content FTS5 postings. Runtime synchronization is owned by
         // internal::ai::memory::fts_sql; no triggers or fallback scan exist.
         sql_migration(
-            2026082402,
+            2026082502,
             "memory_fts_search",
-            include_str!("../../../sql/migrations/2026082402_memory_fts_search.sql"),
-            include_str!("../../../sql/migrations/2026082402_memory_fts_search_down.sql"),
+            include_str!("../../../sql/migrations/2026082502_memory_fts_search.sql"),
+            include_str!("../../../sql/migrations/2026082502_memory_fts_search_down.sql"),
         ),
         // M2-02R: the single local-only context selection receipt ledger shared
         // by Memory and mainline, plus its bounded retention watermark.
         sql_migration(
-            2026082403,
+            2026082503,
             "context_selection_receipt",
-            include_str!("../../../sql/migrations/2026082403_context_selection_receipt.sql"),
-            include_str!("../../../sql/migrations/2026082403_context_selection_receipt_down.sql"),
+            include_str!("../../../sql/migrations/2026082503_context_selection_receipt.sql"),
+            include_str!("../../../sql/migrations/2026082503_context_selection_receipt_down.sql"),
         ),
     ]
 }
@@ -1853,9 +1875,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 58);
+        assert_eq!(runner.len(), 60);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026082403));
+        assert_eq!(runner.max_registered_version(), Some(2026082503));
     }
 
     #[test]

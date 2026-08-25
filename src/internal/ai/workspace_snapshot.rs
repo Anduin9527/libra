@@ -1109,8 +1109,10 @@ fn parse_windows_reparse_record(
     let print_end = print_start.checked_add(print_len).ok_or_else(&invalid)?;
     let _ = record.get(print_start..print_end).ok_or_else(&invalid)?;
     let target = substitute_bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     Ok(ParsedWindowsReparsePoint {
         tag,

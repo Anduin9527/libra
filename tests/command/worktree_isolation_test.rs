@@ -5893,14 +5893,17 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         // cleanly here because a fresh repository holds no workspace lease —
         // its own down guard refuses once one exists, which is also what keeps
         // a live lease from being rolled through the deeper guards.
-        assert_eq!(
-            rolled,
-            vec![
-                2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401, 2026073101,
-                2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
-                2026072502, 2026072501, 2026072403, 2026072402, 2026072401
-            ]
-        );
+        // Derived from the registry rather than pinned to a literal: every
+        // unrelated migration that lands on top rolls back with the marker,
+        // so a hard-coded list turns the next schema addition into a spurious
+        // failure here.
+        let mut expected_rolled: Vec<i64> = libra::internal::db::migration::builtin_migrations()
+            .into_iter()
+            .map(|migration| migration.version)
+            .filter(|version| *version > 2026072304)
+            .collect();
+        expected_rolled.reverse();
+        assert_eq!(rolled, expected_rolled);
         conn.close().await.expect("close");
     }
 
@@ -8556,23 +8559,23 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     let db_url = format!("sqlite://{}?mode=rwc", db.display());
 
     // Use the real down migration rather than deleting its ledger row. The
-    // Memory FTS migration creates physical tables, so undoing it represents
-    // a repository that is genuinely one migration behind.
+    // newest Memory receipt migration creates physical tables, so undoing it
+    // represents a repository that is genuinely one migration behind.
     let conn = Database::connect(&db_url)
         .await
         .expect("open repository db");
     assert_eq!(
         builtin_runner()
             .expect("builtin runner")
-            .rollback_to(&conn, 2026082401)
+            .rollback_to(&conn, 2026082502)
             .await
             .expect("roll back newest migration"),
-        vec![2026082402]
+        vec![2026082503]
     );
     conn.close().await.expect("close repository db");
     assert!(
-        sqlite_max_schema_version(&db) < 2026082402,
-        "2026082402 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026082503,
+        "2026082503 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

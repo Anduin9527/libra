@@ -19,7 +19,7 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 
 该命令支持八种 AI provider 后端（Gemini、OpenAI、Anthropic、DeepSeek、Kimi、Zhipu、Ollama、Codex），以及三种运行上下文（dev、review、research），用于针对不同工作流调节 agent 行为。会话可以通过 Libra 规范的 `--resume <thread_id>` 流程持久化和恢复。传入 `--goal "<objective>"` 会直接以 goal 模式启动会话，由 supervisor 驱动 tool loop 朝既定 objective 前进，直到 verifier 接受完成。
 
-沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。Headless Web 会话在 `dev` 上下文中默认使用 workspace-write 执行且禁止网络访问（遗留 TUI resume driver 已在 W5-06 删除）。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel。Modify 会关闭当前 review，并把下一条纯文本消息作为 durable revision instruction，随后打开替换 review。Execute 会打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`）；Deny 放弃执行，Back 返回新一代 Plan review，两个 gate 都可在崩溃后恢复。当前 Network Allow 会以 `PLAN_EXECUTION_NOT_AVAILABLE` fail-closed 并保持 gate pending：默认 Web runtime 的 confirmed-plan execution handoff 必须在后续版本中重新验收并恢复，因此批准不会静默启动无人持有的 mutating turn。Review 和 research 上下文保持只读，且不授予网络访问。
+沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。Headless Web 会话在 `dev` 上下文中默认使用 workspace-write 执行且禁止网络访问（遗留 TUI resume driver 已在 W5-06 删除）。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel。Modify 会关闭当前 review，并把下一条纯文本消息作为 durable revision instruction，随后打开替换 review。Execute 会打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`）；Deny 放弃执行，Back 返回新一代 Plan review，两个 gate 都可在崩溃后恢复。Network Allow 会把 confirmed plan execution 送入串行的 AgentRuntime 队列。Mutating tools 仍须通过 approval、sandbox 与 tool ACL；失败进入 W2-11 repair loop。目录中保留的 `PLAN_EXECUTION_NOT_AVAILABLE` 409 供旧客户端解码，Allow 不再产生该码。Review 和 research 上下文保持只读，且不授予网络访问。
 
 实时版本图在 Web Code UI 中查看；`libra graph --json` 仍是 agent 路径，交互式 graph TUI 入口已在 W5 breaking 发布中删除（W5-08）。遗留 TUI 退出时打印后续 `libra graph --json <thread_id>` 命令的行为已随 TUI 在 W5-06 一并删除；请自行运行 `libra graph --json <thread_id>`（紧凑形式可用 `--machine`）。检查非当前目录仓库时，使用 `libra graph --json <thread_id> --repo <path>`。
 
@@ -144,7 +144,7 @@ Execution/repair 面板从 live session snapshot 投影 `plans[]`、`toolCalls[]
 
 SSE resilience 面板展示 reconnecting / resync-required / resynced 状态，同时保留最后一次投影的 session snapshot 与 wire 提供的 cursor seq（浏览器从不自造序号）。显式 snapshot resync 走共享 store 的 `refresh()`，仅在 refresh 成功应用（或被更新的 live 更新 superseded）时报告成功；production v2 backlog/resync 事件在后续 wire 卡（W3-06/W3-08）落地，内置 SPA 切换归 W3-09。
 
-Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_choice`（network policy 同 kind，用 `metadata.phase = "networkPolicy"` 区分）。Confirm/modify/cancel（以及 execute / network-allow / network-deny / back）经 leased interaction endpoint 发送 `selectedOption`；当浏览器不能 write 时 turn cancel fail-closed。选择 Plan Modify 后，下一条被接纳的纯文本消息就是 revision note；Libra 将其 durable 绑定到被拒绝的计划，并在 Phase 1 完成后打开替换 review。面板不保存第二套 workflow FSM，等待下一次 snapshot/SSE 更新。在后续版本恢复默认 Web confirmed-plan handoff 前，Network Allow 返回 `PLAN_EXECUTION_NOT_AVAILABLE`、保持 network gate pending，且不执行 mutation。
+Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_choice`（network policy 同 kind，用 `metadata.phase = "networkPolicy"` 区分）。Confirm/modify/cancel（以及 execute / network-allow / network-deny / back）经 leased interaction endpoint 发送 `selectedOption`；当浏览器不能 write 时 turn cancel fail-closed。选择 Plan Modify 后，下一条被接纳的纯文本消息就是 revision note；Libra 将其 durable 绑定到被拒绝的计划，并在 Phase 1 完成后打开替换 review。面板不保存第二套 workflow FSM，等待下一次 snapshot/SSE 更新。Network Allow 会消费 network gate，并把 confirmed plan execution 送入串行 runtime 队列；mutating tools 仍走 approval/sandbox/ACL，repair 仍由 W2-11 持有。
 
 IntentSpec Modify 后，revision mode 可接收下一条纯文本消息，也可使用严格控制形式 `/intent modify <changes>`。其私有 HMAC 认证状态依次经过 `Prepared`、`Active`、`Claiming` 和绑定 event 的 `Consuming`：完整 consumer command binding 在 Runtime admission 前 fsync，精确 event id/sequence 在 executor start gate 打开前绑定。只有 durable effect proof 成立后才会提交收据：原始文本精确等于 `/intent cancel` 时是固定的无 provider effect，Modify 时则是恰好一次成功的 `submit_intent_draft` 加替换 review marker。收据之后才能删除 sidecar。该 authority 活跃时，新的 explicit direct command 在写入 intent 或 transcript 前返回 `409 SESSION_BUSY`；精确 terminal 重试或匹配的 live `commandId` 重试仍是幂等确认。带空白的 cancel 写法是普通 explicit-direct 输入。`/intent cancel` 不会取消 pending Plan revision；后者仍需要下一条非空纯文本 Plan note。
 
@@ -206,7 +206,7 @@ gate。对于同一 Intent repository 内的新 HEAD，Modify 后的下一条非
 
 同一时间只有一个 writer 持有 controller lease：当已有 lease 活跃时，第二个 browser 或 automation attach 会以 `CONTROLLER_CONFLICT` 失败；lease takeover 会丢弃前一个 controller 的 session 审批（见下文 Approval Policies）。
 
-对于默认 Web 启动的非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走共享的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop，但上文的 revision controls `/intent modify <changes>` 和 `/intent cancel` 例外。IntentSpec review、Phase 1 draft/revision、Plan/network-policy gates、approval 与 resume 使用 runtime-owned interaction 和 event 路径。W2-04 负责把 confirmed-plan approval 接回既有 execution path（其中 repair loop 仍由 W2-11 持有）；该 handoff 在默认 Web runtime 中尚不可用，因此 Network Allow 会 fail-closed，而不会虚报 parity。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。默认 Web `--resume <thread_id>` 会为非 Codex provider 在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。Web `--provider codex` 仍拒绝 `--resume`；裸 `libra code --provider codex --resume <thread_id>` 以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除；managed Codex Web resume 尚未落地）。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，取消会被接受（`200`），runtime interaction 进入 `Cancelling`；浏览器可见的 `status` 在工具取得可判定结果前仍为 `executing_tool`。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn；取消等待期间的并发 submit 会以 `SESSION_BUSY` 被拒绝。
+对于默认 Web 启动的非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走共享的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop，但上文的 revision controls `/intent modify <changes>` 和 `/intent cancel` 例外。IntentSpec review、Phase 1 draft/revision、Plan/network-policy gates、approval 与 resume 使用 runtime-owned interaction 和 event 路径。Network Allow 经 `submit_confirmed_plan_execution` 把 confirmed plan execution 送入串行 AgentRuntime 队列。Mutating tools 仍走共享 hardening/approval/sandbox/ACL 边界，分类失败后由 W2-11 repair loop 接管。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。默认 Web `--resume <thread_id>` 会为非 Codex provider 在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。Web `--provider codex` 仍拒绝 `--resume`；裸 `libra code --provider codex --resume <thread_id>` 以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除；managed Codex Web resume 尚未落地）。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，取消会被接受（`200`），runtime interaction 进入 `Cancelling`；浏览器可见的 `status` 在工具取得可判定结果前仍为 `executing_tool`。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn；取消等待期间的并发 submit 会以 `SESSION_BUSY` 被拒绝。
 
 对于 Web `--provider codex`，managed app-server 的 websocket 通知归一到共享 runtime `AgentEvent` 信封（与其他 provider 同一 projection 路径）。未知 Codex method 走显式可诊断的 `ProviderNotification` fallback，不 silent drop、也不 panic。Ask-mode approvals 挂在共享 `AgentRuntime` interaction 注册表上，并把浏览器 `respond_interaction` 决策转发到 app-server；Codex 仍拥有 app-server 内的 approval 回环（见 `docs/development/tracing/code.md` 的 DEFER-07）。对外 approval option id 与非 Codex 一致（`approve` / `deny` / `abort`）。
 
@@ -319,7 +319,10 @@ unlink sidecar。成功 draft 调用为零次或多次时都 fail closed，且�
 空白或其它不精确写法的 `/intent cancel` 是普通 explicit-direct 输入，不会获得固定
 cancel 特权。Modify suffix 会在写入 Claiming 之前去除首尾空白并限制为 16 KiB。
 
-SSE v2 把已提交收据投影为专用的 `kind: "intent_revision_consumed"`，payload 为
+已提交的消费会以 additive 的 `intent_revision_consumption` 收据字段追加到 workflow
+事件流中，绑定准确的 terminal lineage、consumer command intent 以及 consumer intent 的
+event id/sequence。SSE v2 把已提交收据投影为专用的
+`kind: "intent_revision_consumed"`，payload 为
 `{ "consumption": ... }`；其中不含通用 resolution 字段或原始 note。durable effect proof
 之前崩溃会保留 Consuming，以便按准确 consumer 身份恢复。替换 review marker 或 cancel
 收据之后崩溃时，startup 不会重跑 provider，会规范化残留的 transcript/tool projection，并
@@ -385,7 +388,7 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `CONTROLLER_CONFLICT` | 409 | 另一个 live controller 拥有 lease，或会话正忙。 |
 | `INTERACTION_NOT_ACTIVE` | 409 | respond 目标 interaction 没有活跃的 runtime turn。 |
 | `PHASE1_WORKSPACE_CHANGED` | 409 | Execute 的精确 checkout identity/content 不再匹配已审 Plan，或 Libra 无法验证/重新捕获。仅 metadata 变化的 `workspaceWarning` 可能通过精确复核，本身不会产生此错误。不会启动 mutation，陈旧 Execute 保留 pending gate。同一 repository 的新 HEAD 可用 Modify 重生成；不同 repository 必须 Cancel 后发起新 request。重新捕获失败不会消费 note。 |
-| `PLAN_EXECUTION_NOT_AVAILABLE` | 409 | 已选择 Network Allow，但默认 Web runtime 尚未拥有 confirmed-plan execution。不会启动 mutation，network-policy gate 保持 pending；请选择 Deny/Back，或在后续版本恢复该 handoff 后重试。 |
+| `PLAN_EXECUTION_NOT_AVAILABLE` | 409 | 历史 Web 409：当时 confirmed-plan execution 尚未接线。W2-04 之后 Network Allow 会把执行送入串行 runtime 队列，而不再产生该码。旧客户端仍可解码目录中的 409。 |
 | `SESSION_BUSY` | 409 | 有 turn 运行时重复 submit、无 turn 可取消时 cancel，或 IntentSpec revision authority 活跃时发送新的 explicit-direct command。精确 terminal retry 与匹配 live `commandId` retry 是幂等确认，不追加事件。 |
 | `BROWSER_CONTROL_DISABLED` | 403 | 浏览器写控制已禁用。 |
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | 用非 automation lease 调用了 automation-only 路径。 |
@@ -513,7 +516,7 @@ libra code --provider codex --plan-mode
 
 ## 人工输出
 
-输出会根据模式通过 Web UI 或 MCP 协议交付。Web 模式会在 stdout 打印 URL / control 信息并前台常驻直到 SIGINT/SIGTERM。在 generic provider workflow 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。Modify 会等待下一条纯文本 revision note，再展示替换计划；Execute 只推进到强制 network-policy gate。Deny 与 Back 可用；在后续版本把默认 Web confirmed-plan handoff 接回既有 execution path 与 W2-11-owned repair loop 前，Network Allow 返回 `PLAN_EXECUTION_NOT_AVAILABLE`，且不会启动执行。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
+输出会根据模式通过 Web UI 或 MCP 协议交付。Web 模式会在 stdout 打印 URL / control 信息并前台常驻直到 SIGINT/SIGTERM。在 generic provider workflow 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。Modify 会等待下一条纯文本 revision note，再展示替换计划；Execute 只推进到强制 network-policy gate。Deny 与 Back 可用；Network Allow 会把 confirmed plan execution 送入串行 runtime 队列。Mutating tools 仍须 approval/sandbox/ACL，分类失败进入 W2-11 repair loop。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
 
 ## Diagnostics
 

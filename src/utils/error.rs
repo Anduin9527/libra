@@ -319,6 +319,13 @@ pub enum StableErrorCode {
     /// matches the stored lease — a doctor/scavenger reclaim took it over with
     /// a higher fence, or the record already settled (plan-20260714 §C.8 W4).
     AgentWorkspaceLeaseLost,
+    /// `review --fix` reached an existing Code-runtime tool or sandbox gate
+    /// that the foreground user explicitly denied. No patch is reported as
+    /// applied (DF-09).
+    AgentFixExecutionDenied,
+    /// `review --fix` did not finish a controlled execution cleanly and did not
+    /// enter the runtime's deterministic repair contract (DF-09).
+    AgentFixExecutionFailed,
     /// A `worktree doctor` pagination cursor is malformed, was issued by a
     /// different listing, or has expired (plan-20260714 §C.13 W4). Fail closed
     /// rather than silently restarting at page one: a caller walking a keyset
@@ -404,6 +411,8 @@ impl StableErrorCode {
             Self::AgentGraphSessionUnknown => "LBR-AGENT-021",
             Self::AgentWorkspaceLeaseHeld => "LBR-AGENT-022",
             Self::AgentWorkspaceLeaseLost => "LBR-AGENT-023",
+            Self::AgentFixExecutionDenied => "LBR-AGENT-039",
+            Self::AgentFixExecutionFailed => "LBR-AGENT-040",
             Self::WorktreeCursorInvalid => "LBR-WORKTREE-001",
             Self::WorktreeScopeCorrupt => "LBR-WORKTREE-002",
             Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
@@ -475,7 +484,9 @@ impl StableErrorCode {
             | Self::AgentTranscriptAuthorizationMissing
             | Self::AgentGraphSessionUnknown
             | Self::AgentWorkspaceLeaseHeld
-            | Self::AgentWorkspaceLeaseLost => CliErrorCategory::Internal,
+            | Self::AgentWorkspaceLeaseLost
+            | Self::AgentFixExecutionDenied
+            | Self::AgentFixExecutionFailed => CliErrorCategory::Internal,
         }
     }
 
@@ -652,6 +663,12 @@ impl StableErrorCode {
             }
             Self::AgentWorkspaceLeaseLost => {
                 "The presented workspace lease owner/fence is stale; the lease was reclaimed or already released."
+            }
+            Self::AgentFixExecutionDenied => {
+                "review --fix was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied."
+            }
+            Self::AgentFixExecutionFailed => {
+                "review --fix stopped without a clean patch or deterministic repair outcome; inspect the active Code session and worktree before retrying."
             }
             Self::WorktreeCursorInvalid => {
                 "The pagination cursor is malformed or expired; drop it and re-read the first page."
@@ -2250,6 +2267,8 @@ mod tests {
             (StableErrorCode::AgentGraphSessionUnknown, "LBR-AGENT-021"),
             (StableErrorCode::AgentWorkspaceLeaseHeld, "LBR-AGENT-022"),
             (StableErrorCode::AgentWorkspaceLeaseLost, "LBR-AGENT-023"),
+            (StableErrorCode::AgentFixExecutionDenied, "LBR-AGENT-039"),
+            (StableErrorCode::AgentFixExecutionFailed, "LBR-AGENT-040"),
             (StableErrorCode::WorktreeCursorInvalid, "LBR-WORKTREE-001"),
             (StableErrorCode::WorktreeScopeCorrupt, "LBR-WORKTREE-002"),
         ] {
@@ -2413,6 +2432,8 @@ mod tests {
             StableErrorCode::AgentGraphSessionUnknown,
             StableErrorCode::AgentWorkspaceLeaseHeld,
             StableErrorCode::AgentWorkspaceLeaseLost,
+            StableErrorCode::AgentFixExecutionDenied,
+            StableErrorCode::AgentFixExecutionFailed,
         ] {
             assert_eq!(variant.category(), CliErrorCategory::Internal);
         }

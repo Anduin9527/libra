@@ -167,7 +167,7 @@ pub async fn run_control_stdio_client(url: &str, token_file: &PathBuf) -> CliRes
 /// `X-Libra-Control-Token`. Restrict the base URL to loopback HTTP(S) so a
 /// mistaken or malicious `--control-url` cannot exfiltrate that
 /// token (or an arbitrary readable file passed as the token path) off-box.
-fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
+pub(crate) fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(CliError::command_usage(format!(
@@ -193,7 +193,7 @@ fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
     )))
 }
 
-fn read_control_token(path: &PathBuf) -> CliResult<String> {
+pub(crate) fn read_control_token(path: &PathBuf) -> CliResult<String> {
     if !path.exists() {
         return Err(CliError::fatal(format!(
             "CONTROL_TOKEN_MISSING: local control token file '{}' is missing",
@@ -463,7 +463,7 @@ async fn send_post(
     response_json_or_error(response).await
 }
 
-fn apply_control_headers(
+pub(crate) fn apply_control_headers(
     request: RequestBuilder,
     control_token: &str,
     controller_token: Option<&str>,

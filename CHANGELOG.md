@@ -1,5 +1,118 @@
 # Changelog
 
+## [0.21.1] — 2026-08-24
+
+### Added: the bridge's remaining VCS methods (plan-20260818 LB-04/LB-05, closes DEFER-LB-07)
+
+`0.21.0` shipped `libra agent bridge --stdio` with `diff.get` returning a stable
+not-implemented error and `commit.create` / `review.run` / `checkpoint.restore`
+passing admission but failing closed before any VCS service. All four are now
+wired through a typed adapter (`src/internal/ai/agent_bridge/vcs.rs`), so the
+v1 20-method allowlist is implemented end to end.
+
+- **`diff.get`** returns the real working-tree, staged, or checkpoint-scoped
+  diff. Selectors stay typed: a closed `mode` enum (`worktree` / `staged` /
+  `checkpoint`) plus validated repository-relative `paths` — never a free-form
+  revision or pathspec magic. `checkpoint` mode resolves its revision from the
+  bridge's own `agent_bridge_checkpoint` row (or its linked
+  `agent_checkpoint.parent_commit`), so a request can never name an arbitrary
+  commit. The diff forces `--no-ext-diff` / `--no-textconv`, so repository
+  configuration cannot turn a bridge read into process execution (GC-LB-03).
+  Results are bounded by the page cap and a shared patch budget, with explicit
+  `diff_truncated` / `diff_patch_budget_exhausted` warnings.
+- **`commit.create`** commits the current index — no `-a`, no pathspec, no
+  amend, no author override — and records its association graph (operation,
+  workspace, parent session, evidence ids) as `agent_bridge_link` rows rather
+  than splicing metadata into the commit message. An optional `expected_head`
+  is verified before the commit is created.
+- **`checkpoint.restore`** restores the working tree to the commit a bridge
+  checkpoint pins, reusing the same typed path as
+  `libra agent checkpoint rewind --apply`. It requires an explicit
+  `expected_head` fence **and** a clean index/worktree, and never moves HEAD.
+- **`review.run`** validates the reviewer roster against the launchable
+  capability matrix, resolves an optional checkpoint scope and takes an
+  agent-run admission slot — all before any run directory exists — then runs the
+  read-only review under a supervisor. When the bridge's stdio loop ends the
+  supervisor cancels and drains every live run, so no reviewer process group
+  outlives the bridge (GC-LB-10).
+- **Non-idempotent replay is safe.** Replaying a recorded `operation_id` for
+  `commit.create`, `checkpoint.restore` or `review.run` returns the ORIGINAL
+  result (and, for a review, its current run state) instead of executing a
+  second time — the "response was lost, query by operation id" recovery path.
+
+### Fixed
+
+- **A bridge mutation can record more than one association.**
+  `agent_bridge_link` was keyed `UNIQUE(source_type, source_id)`, which allowed
+  exactly one association per result: every workspace / parent-session /
+  evidence link after the first was reported as a retarget conflict, so the
+  rich provenance LB-05 promises could never be persisted.
+
+### Added
+
+- `LBR-AGENT-038` — a bridge mutation's fence drifted (HEAD moved, or the
+  index/worktree is dirty where the operation requires a clean one). Refused
+  **before** any write, so nothing is partially applied.
+
+### Migration
+
+- `2026082401_agent_bridge_link_relations` rebuilds `agent_bridge_link` with
+  edge-level uniqueness `(source_type, source_id, target_type, target_id)` and
+  adds the `commit` / `restore` / `review` source kinds. Every existing edge is
+  copied verbatim. The down path is forward-only: it freezes while any link row
+  exists and never deletes recorded provenance (ER-LB-04).
+
+## [0.21.0] — 2026-08-23
+
+### Added: DeepSeek Harness bridge (`agent bridge --stdio`, plan-20260818 LB-01..LB-06)
+
+- **`libra agent bridge --stdio`** — the repository-scoped DeepSeek Harness JSON-RPC
+  2.0 NDJSON ingress. The ONLY standard inbound write transport for the Harness
+  plugin; intentionally different from `libra code --control stdio` (a client
+  controlling a live Code session) and from any MCP transport. Protocol v1: a
+  20-method allowlist, 256 KiB frame cap, 64 in-flight requests, 64-event /
+  256 KiB batch, 30 s default request deadline.
+- **Durable ingress** (`agent_bridge_session/event/operation/checkpoint/link`
+  tables, migration `2026081801`): idempotent `session.open`, bounded
+  `event.append` with per-event accepted/duplicate/digest-conflict status and
+  monotonic `last_acked_seq`, `session.flush`/`session.close`, and
+  `evidence.append`/`provenance.append` association links. Ack means the
+  redacted projection is durable — never that Harness took over Libra's raw
+  transcript.
+- **Server-side redaction** (GC-LB-08): only a bounded, redacted projection is
+  persisted; raw prompts/reasoning/tokens/secrets never land in the store, and
+  a payload that cannot be safely redacted is refused fail-closed with no raw
+  fallback.
+- **Typed read methods** (LB-04): `context.get`, `status.get`,
+  `history.search`, `checkpoint.list`, `checkpoint.show` over the bridge
+  projection with a unified `{schema_version, repository_id, workspace_id,
+  operation_id, status, data, warnings}` envelope, bounded pagination, and
+  repository-scoped queries (a cross-repository `status.get` cannot leak
+  another repo's totals).
+- **Mutation admission + approval + actor binding** (LB-05): `checkpoint.create`
+  is fully wired; every mutation requires an `operation_id` (idempotent replay,
+  digest-conflict fail-closed), binds the trusted session/actor scope, and
+  enforces a default-deny approval gate for dangerous actions. `commit.create`,
+  `review.run` and `checkpoint.restore` pass admission but fail closed with a
+  stable "not wired to the VCS service" error until the service plumbing lands
+  (wired in `0.21.1`).
+- **Workspace lease** (LB-06): `workspace.claim`/`renew`/`release` route through
+  the existing `WorkspaceStore` (owner + monotonic fence); the lease owner is
+  derived from the authenticated bridge session identity (never a self-reported
+  value), so a stale owner or a forged `agent_id` cannot reclaim another
+  session's lease. Dedicated error codes `LBR-AGENT-022` (lease held) and
+  `LBR-AGENT-023` (lease lost).
+- **Protocol authority** (GC-LB-02): the schema, method allowlist, limits,
+  error catalogue and frame shapes live only in
+  `src/internal/ai/agent_bridge/protocol.rs`; the TypeScript plugin consumes
+  the fixture published from it and must not define a second schema.
+
+### Migration
+
+- `2026081801_agent_bridge_capture` creates the five bridge durable tables.
+  Down-migration is forward-only: it freezes while any bridge row exists and
+  never deletes acked events/evidence (GC-LB-09 / ER-LB-04).
+
 ## [Unreleased]
 
 ### Fixed (plan-20260715 W2-03 repair, 2026-08-21, v0.20.4)
@@ -39,10 +152,13 @@
   lineage instead of rescanning the workflow once per receipt. A 5,000-event
   regression with 700 receipts caps indexed relationship visits at four times
   the replay size.
-- **Network Allow preserves the W2-03/W2-04 boundary.** Until a later release
-  restores the default-Web confirmed-plan handoff, Allow returns typed
-  `409 PLAN_EXECUTION_NOT_AVAILABLE`, leaves the same network-policy gate
-  pending, and starts no mutation; Deny, Back, and crash/resume remain usable.
+- **Network Allow admits confirmed plan execution (W2-04).** Allow consumes the
+  network-policy gate and submits the reviewed plan onto the serialized
+  `AgentRuntime` queue via `submit_confirmed_plan_execution`. Mutating tools
+  still pass through the shared hardening/approval/sandbox/ACL boundary;
+  classified failures park the W2-11 repair loop. The catalogued
+  `PLAN_EXECUTION_NOT_AVAILABLE` 409 is retained for older clients and is no
+  longer produced on Allow. Deny, Back, and crash/resume remain usable.
 - **Fresh repositories can enter Phase 1 safely.** A named unborn HEAD after
   `libra init` is now captured as a valid checkout binding with no object id;
   detached checkouts and existing branches still require an exact valid id.

@@ -96,3 +96,39 @@ not process-local "created" state, controls zero-progress session reaping.
 Retention GC physically deletes terminal ownerless import identities once no
 coverage claim remains, including zero-checkpoint rows. Dry-run obtains the
 same identity count by simulating coverage removal in a rolled-back transaction.
+
+## Bridge (plan-20260818 LB-01)
+
+`libra agent bridge --stdio` is the repository-scoped DeepSeek Harness ingress.
+
+- **Transport:** JSON-RPC 2.0 over newline-delimited frames on stdin/stdout.
+  stdout carries exactly one protocol frame per response; diagnostics go to
+  stderr (GC-LB-04). The command requires `--stdio` and has no other transport.
+- **Protocol authority:** the frame/method/limit/error contract lives only in
+  `src/internal/ai/agent_bridge/{protocol,transport}.rs` (GC-LB-02). The
+  TypeScript plugin consumes the fixture generated from it; it must not define
+  a second schema. Protocol v1: 20-method allowlist, 256 KiB frame cap, 64
+  in-flight requests, 64-event/256 KiB batch, 30 s default deadline.
+- **Scope:** repository/worktree/workspace/actor scope is derived from the
+  trusted context at handshake (GC-LB-06/07); self-reported identity is never
+  a credential. `deepseek-harness` is NOT an `AgentKind` (ADR-LB-02).
+- **Non-goals:** not `libra code --control stdio` and not an MCP server
+  (ADR-LB-01). Implemented: the CLI + protocol + transport (LB-01), the durable
+  session/event/operation storage (LB-02), the session/event ingress (LB-03),
+  the typed read methods (LB-04), mutation admission/approval/actor binding
+  (LB-05) and workspace lease claim/renew/release over `WorkspaceStore`
+  (LB-06). As of `v0.21.1` all 20 v1 methods are implemented:
+  `diff.get`/`commit.create`/`review.run`/`checkpoint.restore` reach the real
+  services through the typed `agent_bridge/vcs.rs` adapter instead of failing
+  closed behind the admission/approval gate.
+- **Preflight:** the bridge uses the standard repository preflight (it is
+  repo-scoped). It must never start without `--stdio`.
+- **Publish lock:** `commit.create` takes `MaintenanceLock::shared` itself, for
+  the span of that one commit. `command_holds_shared_maintenance_lock`
+  (`src/cli.rs`) excludes the whole `agent` surface because an agent's VCS
+  mutations are supposed to spawn `libra` as a subprocess and let the child
+  hold the lock — which stopped being true once LB-05 called `run_commit`
+  in-process. The hold is per mutation, never for the session lifetime (§C.10),
+  so a bridge session cannot starve a deletion phase while still being ordered
+  against one (§C.4.3 writer-vs-deleter). Regression:
+  `agent_bridge_vcs_test::commit_create_waits_for_a_deletion_phase_before_publishing`.

@@ -1659,13 +1659,14 @@ fn plan_review_repository_replacement_blocks_modify_and_preserves_gate() -> Resu
     session.shutdown()
 }
 
-/// W2-03/W2-04 boundary: Network Allow is visible but cannot close its gate
-/// until plan execution is wired. The HTTP refusal must be typed and leave the
-/// exact pending network authority and workspace unchanged.
+/// W2-04: Network Allow admits confirmed plan execution onto the runtime
+/// serialized queue. The network gate is consumed, execution starts, and
+/// mutating tools still pass through approval/sandbox/ACL (the fake fixture
+/// completes without apply_patch/shell).
 #[cfg(feature = "test-provider")]
 #[test]
 #[serial]
-fn plan_review_network_allow_returns_conflict_and_preserves_pending_gate() -> Result<()> {
+fn plan_review_network_allow_enters_runtime_queue() -> Result<()> {
     let repo_root = initialize_plan_review_repo("plan-review-network-allow")?;
     let repo_dir = repo_root.path().join("repo");
     let mut session = CodeSession::spawn(
@@ -1703,29 +1704,55 @@ fn plan_review_network_allow_returns_conflict_and_preserves_pending_gate() -> Re
         &network_interaction_id,
         &json!({ "selectedOption": "network-allow" }),
     )?;
-    assert_eq!(http_status, StatusCode::CONFLICT, "unexpected body: {body}");
-    assert_eq!(error_code(&body), Some("PLAN_EXECUTION_NOT_AVAILABLE"));
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "Network Allow should admit confirmed plan execution: {body}"
+    );
+    assert_ne!(error_code(&body), Some("PLAN_EXECUTION_NOT_AVAILABLE"));
 
-    let after = session.snapshot()?;
-    let pending_network = find_network_policy_interaction(&after)
-        .ok_or_else(|| anyhow::anyhow!("Network Allow removed the pending gate: {after}"))?;
-    assert_eq!(
-        pending_network.get("id").and_then(Value::as_str),
-        Some(network_interaction_id.as_str()),
-        "Network Allow refusal must preserve the same gate generation"
+    let after = session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        let network_resolved = find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            != Some("pending");
+        let executing = status(snapshot) == Some("thinking")
+            || snapshot
+                .get("transcript")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("phase"))
+                        .and_then(Value::as_str)
+                        == Some("plan_execution")
+                        || entry.get("title").and_then(Value::as_str) == Some("Plan execution")
+                });
+        let settled = matches!(
+            status(snapshot),
+            Some("idle" | "awaiting_interaction" | "error")
+        );
+        network_resolved && (executing || settled)
+    })?;
+    assert!(
+        find_network_policy_interaction(&after)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            != Some("pending"),
+        "Network Allow must consume the pending network gate: {after}"
     );
-    assert_eq!(
-        pending_network.get("status").and_then(Value::as_str),
-        Some("pending"),
-        "Network Allow refusal must leave the gate pending"
-    );
-    assert_eq!(
-        status(&after),
-        Some("awaiting_interaction"),
-        "Network Allow refusal must retain the human-gate hold"
-    );
-    assert_plan_review_has_no_execution_side_effects(&session, &after)?;
     session.shutdown()
+}
+
+/// Historical W2-03 leftover name: the 409 PLAN_EXECUTION_NOT_AVAILABLE
+/// boundary was replaced by W2-04 Web confirmed-plan admission.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_network_allow_returns_conflict_and_preserves_pending_gate() -> Result<()> {
+    plan_review_network_allow_enters_runtime_queue()
 }
 
 /// Drive the default Web process through IntentSpec confirm → Phase 1

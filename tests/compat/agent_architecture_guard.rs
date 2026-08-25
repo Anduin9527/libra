@@ -498,6 +498,77 @@ fn terminal_ui_dependencies_and_production_symbols_remain_retired() {
     }
 }
 
+/// W5-05: Code runtime behavior must not return to TUI or a Web-private plan
+/// workflow state machine. Docs must keep Web as the default surface.
+#[test]
+fn code_runtime_stays_web_owned_without_tui_or_private_plan_state() {
+    let code = fs::read_to_string(repo_root().join("src/command/code.rs")).expect("read code.rs");
+    for forbidden in ["TuiCodeUiAdapter", "execute_tui", "Tui::new", "Tui::"] {
+        assert!(
+            !code.contains(forbidden),
+            "src/command/code.rs must not restore TUI startup/adapter token {forbidden:?}"
+        );
+    }
+
+    let mut web_sources = Vec::new();
+    fn visit(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read web source directory") {
+            let entry = entry.expect("read web source entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    visit(&repo_root().join("src/internal/ai/web"), &mut web_sources);
+    let mut saw_runtime_plan_handoff = false;
+    for source in &web_sources {
+        let contents = fs::read_to_string(source).expect("read web rust source");
+        assert!(
+            !contents.contains("TuiCodeUiAdapter"),
+            "{} must not restore TuiCodeUiAdapter",
+            source.display()
+        );
+        assert!(
+            !contents.contains("pending_post_plan") && !contents.contains("struct PendingPlan"),
+            "{} must not keep a private Plan workflow state machine",
+            source.display()
+        );
+        if contents.contains("submit_confirmed_plan_execution")
+            || contents.contains("StartPlanExecution")
+        {
+            saw_runtime_plan_handoff = true;
+        }
+    }
+    assert!(
+        saw_runtime_plan_handoff,
+        "Web adapter must hand confirmed plan execution to AgentRuntime"
+    );
+
+    let code_doc = fs::read_to_string(repo_root().join("docs/commands/code.md"))
+        .expect("read docs/commands/code.md");
+    let zh_doc = fs::read_to_string(repo_root().join("docs/commands/zh-CN/code.md"))
+        .expect("read docs/commands/zh-CN/code.md");
+    for (path, body) in [
+        ("docs/commands/code.md", &code_doc),
+        ("docs/commands/zh-CN/code.md", &zh_doc),
+    ] {
+        let lowered = body.to_ascii_lowercase();
+        assert!(
+            !lowered.contains("default mode launches the tui")
+                && !lowered.contains("defaults to the tui")
+                && !lowered.contains("默认启动 tui"),
+            "{path} must not advertise TUI as the current default"
+        );
+        assert!(
+            body.contains("Web Code UI") || body.contains("Web Code UI"),
+            "{path} must keep Web Code UI as the default surface"
+        );
+    }
+}
+
 /// W0-01: retain the source-grounded conflict and A0-consumption records
 /// needed to prevent a future Code migration from silently recreating an
 /// Agent-side queue, trust policy, or artifact store.

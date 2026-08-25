@@ -3634,12 +3634,21 @@ mod test {
             index.tracked_entries(0).len()
         );
 
-        // 5. Initialize storage pointing at the temp repo's objects directory
-        let temp_objects_dir = temp_path.path().join(".libra/objects");
+        // 5. Keep fixture objects outside `.libra` so this tree-only test never
+        // enqueues unrelated object-index repair work.
+        let temp_objects_dir = temp_path.path().join("tree-fixture-objects");
         let storage = ClientStorage::init(temp_objects_dir);
 
         // 6. Call create_tree with an empty root (index paths are repo-root-relative)
         let tree = create_tree(&index, &storage, PathBuf::new()).await.unwrap();
+
+        assert!(
+            !temp_path
+                .path()
+                .join(".libra/object-index-repair-locks")
+                .exists(),
+            "tree fixture storage must not enqueue object-index repair work"
+        );
 
         // 7. Verify tree structure
         assert!(

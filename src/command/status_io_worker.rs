@@ -593,6 +593,7 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
             workdir,
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
+            let mut path = bytes_to_path(&path);
             // Only the helper process may chdir: in-process dispatch shares
             // the caller's CWD (tests / `execute_to`) and must not move it.
             if std::env::var_os(STATUS_IO_WORKER_CAP_ENV).is_some() {
@@ -609,8 +610,20 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
                     )?;
                     return Ok(true);
                 }
+                // `chdir` resolves symlinks, so the process CWD can differ
+                // textually from the request's workdir (stock macOS puts
+                // `TMPDIR` under `/var -> private/var`). Attribute lookup
+                // anchors on the resolved CWD and drops any path that does not
+                // look like its descendant, so an absolute request path in the
+                // unresolved spelling would silently lose `.gitattributes` and
+                // hash an LFS-tracked file as raw content. Re-anchor the path
+                // on the workdir we just entered.
+                if let Ok(relative) = path.strip_prefix(&workdir)
+                    && !relative.as_os_str().is_empty()
+                {
+                    path = relative.to_path_buf();
+                }
             }
-            let path = bytes_to_path(&path);
             apply_hash_kind(&hash_kind);
             let result = match crate::command::calc_file_blob_hash(&path) {
                 Ok(hash) => WireResult::Ok(hash.to_string()),

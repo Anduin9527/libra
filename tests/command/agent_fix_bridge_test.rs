@@ -1,8 +1,7 @@
-//! A0-05: the mutating `review --fix` / `investigate fix` paths stay
-//! fail-closed with the stable `LBR-AGENT-010` code (the internal AgentRuntime
-//! fix bridge is a deferred, plan-accepted follow-up — they must never fake
-//! success). This command-layer guard pins both the human and structured-JSON
-//! error surfaces for the two verbs.
+//! `review --fix` executes only through an active, authorized Code runtime; its
+//! no-runtime path, and all current `investigate fix` paths, stay fail-closed
+//! with stable `LBR-AGENT-010`. This command-layer guard pins their human and
+//! structured-JSON error surfaces.
 
 use super::{
     create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command,
@@ -14,7 +13,7 @@ fn review_investigate_fix_json_errors() {
     let repo = create_committed_repo_via_cli();
 
     // review --fix — human surface: fatal (128) + LBR-AGENT-010.
-    let out = run_libra_command(&["review", "--agent", "codex", "--fix"], repo.path());
+    let out = run_libra_command(&["review", "--fix"], repo.path());
     assert_eq!(
         out.status.code(),
         Some(128),
@@ -29,7 +28,7 @@ fn review_investigate_fix_json_errors() {
 
     // review --fix — structured JSON error surface.
     let out = run_libra_command_with_stdin_and_env(
-        &["review", "--agent", "codex", "--fix"],
+        &["review", "--fix"],
         repo.path(),
         "",
         &[("LIBRA_ERROR_JSON", "1")],

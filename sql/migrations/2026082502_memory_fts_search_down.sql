@@ -1,4 +1,4 @@
--- Rollback of 2026082402_memory_fts_search.
+-- Rollback of 2026082502_memory_fts_search.
 --
 -- An empty search projection can be removed. Once a document was indexed,
 -- repair moves forward so rollback cannot silently discard search state.

@@ -880,10 +880,10 @@ mod tests {
     #[test]
     fn memory_core_old_reader_rejects_migrated_schema() {
         assert_eq!(
-            classify_schema_compatibility(Some(2026082401), Some(2026081301)),
+            classify_schema_compatibility(Some(2026082501), Some(2026082401)),
             SchemaCompatibility::UnsupportedFuture {
-                current_version: 2026082401,
-                latest_version: Some(2026081301),
+                current_version: 2026082501,
+                latest_version: Some(2026082401),
             }
         );
     }
@@ -891,10 +891,10 @@ mod tests {
     #[test]
     fn memory_fts_old_reader_rejects_migrated_schema() {
         assert_eq!(
-            classify_schema_compatibility(Some(2026082402), Some(2026082401)),
+            classify_schema_compatibility(Some(2026082502), Some(2026082501)),
             SchemaCompatibility::UnsupportedFuture {
-                current_version: 2026082402,
-                latest_version: Some(2026082401),
+                current_version: 2026082502,
+                latest_version: Some(2026082501),
             }
         );
     }
@@ -902,10 +902,10 @@ mod tests {
     #[test]
     fn context_receipt_old_reader_rejects_migrated_schema() {
         assert_eq!(
-            classify_schema_compatibility(Some(2026082403), Some(2026082402)),
+            classify_schema_compatibility(Some(2026082503), Some(2026082502)),
             SchemaCompatibility::UnsupportedFuture {
-                current_version: 2026082403,
-                latest_version: Some(2026082402),
+                current_version: 2026082503,
+                latest_version: Some(2026082502),
             }
         );
     }

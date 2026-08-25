@@ -116,7 +116,7 @@ Libra 自身（`HEAD` `917eea8c`，`Cargo.toml` version `0.20.3`，本地领先 
 - **CT-01 / plan-20260729**：首个 t4 wave 已入库（`t4_port_test.rs` 已合入 `tests/command/`，`a9b2eebf` CT3-02）；FIX-01/FIX-03 修复、CT3-07 转 blocked 延后（DEFER-09）、FIX-04 R94–R97 收口且 M4e 移入 v2.1 independent 发布轨（`917eea8c`）；CT4-01 发布卡未执行（a5f28150 记录其 blocked on upstream test failures）。工作区仍有该计划未提交 WIP（`tests/SERIAL_CLASSIFY.sh`、`tests/SERIAL_REGISTRY.tsv`、`tests/compat/README.md`、`tests/compat/serial_registry.rs`、`plan-20260729.md`），按 FIX-04/R97 属进行中工作，非本轮审计改动。
 - **UP-01**：设计讨论稿冻结（`docs/development/internal/release-signing-auto-upgrade.md`，D1–D10）；日期计划 `plan-20260822.md`（客户端+CI 侧）已建。当前实现仍 inert：`src/internal/upgrade/trusted_keys.rs:39` `PRODUCTION_TRUSTED_KEYS: &[TrustedKey] = &[]`；无签名发布。判「已排期」。
 - **Memory**：M2 研发历程记忆纵向切片计划 `plan-20260819.md` 已建（承接 MEM-01/MEM-02；`MemoryNote`/`MemoryEvent`、`refs/heads/libra/memory/repo` 权威历史、`MemoryWriter` 单一写入器、FTS5/BM25 召回、`libra memory search/show/status/rebuild` 命令面）；无 Memory 代码合入（`src/cli.rs` 无 `memory` 子命令，`src/internal/ai/` 无 memory 模块），判「已排期」。MEM-06 设计在 `tracing/memory.md` §19，仍候选。
-- **deepseek-harness bridge**：`plan-20260818.md` 已建（`libra agent bridge --stdio`）；`src/cli.rs` 尚无 `bridge` 子命令，实现未开始。
+- **deepseek-harness bridge**：`plan-20260818.md` 已完成（`libra agent bridge --stdio`，挂载于 `AgentSubcommand::Bridge`）；LB-01..LB-07 全部合入，protocol v1 的 20 个 method 自 `v0.21.1` 起全部实现。TypeScript 侧 `@libra/dsh-bundle` 仍在兄弟仓待发（`REL-TS-01`）。
 - Part B R0 / Agent lease / W4 list|show 等已合入事实不变；LR-01 仍实施中。
 - SB-01..SB-04 优先级与完成判据不变。
 
@@ -259,7 +259,7 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 | **SB-04** | 测试与子进程资源生命周期隔离 | P1/P2 | 已验证 | 环境/临时路径/child scope 未统一；Grok ProcessScope 为证据 |
 | **LR-06** | Intent Seal、Intent-Commit Pin、安全团队发布 | P1 | 已验证 | 本地 Intent/Decision/checkpoint 有；seal/pin/白名单 publication 无 |
 | **LR-07** | 开工前意图检索与语义冲突 Preflight | P1 | 已验证 | 缺团队 intent projection、确定性 overlap receipt、pre-edit gate |
-| **RT-01** | AgentRuntime / Code UI 中立承载（日期计划） | P1 | 实施中 | [`plan-20260715.md`](plan-20260715.md)：W3/W4 已全部合入，W5 家族经 v0.20.0 breaking minor 基本收口；剩 W5-04/05/10 收尾与 W6-01/02；完成判据复选框未勾选 |
+| **RT-01** | AgentRuntime / Code UI 中立承载（日期计划） | P1 | 已完成 | [`plan-20260715.md`](plan-20260715.md) 完成判据与 Checkpoint A–D 全部满足：Code TUI 已删除、`libra code` 默认 Web Code UI、runtime 为唯一状态机 owner；剩余仅 DEFER-01..10（SSE v1 物理移除 DEFER-08 等），按各自重启条件独立立项 |
 | **LR-10** | Feature/Research Capsule 与实验谱系 | P2 | 已验证 | 有 artifact/skill 捕获；无 capsule lifecycle / compare / ablation |
 | **AG-ATTR** | Agent 代码归因与 transcript 归一（候选） | P2 | 候选 | agent-trace / trajectory / **git-ai（行级 agent/model/prompt 归因）**证明互操作需求；先只读导出，不改 Git 对象默认语义 |
 
@@ -448,9 +448,9 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 1. **CT-01 收尾**（版本管理）：CT3-07（DEFER-09）处置 + **CT4-01 发布卡**（版本面 bump、tag、D-02 证据）；FIX-04/M4e 走 v2.1 independent 发布轨。
 2. **UP-01**（版本管理）：按 [`plan-20260822.md`](plan-20260822.md) 执行客户端 trust table、单调 generation floor、`release.yml` 签名、`install.sh/ps1` fail-closed 验签。
-3. **RT-01 收尾**（Agent 生成代码）：plan-20260715 的 W5-04/05/10 收尾与 W6-01/02 closeout。
+3. ~~**RT-01 收尾**（Agent 生成代码）~~：已完成——plan-20260715 的 W5-04/05/10 与 W6-01/02 均已收口，完成判据全部勾选；后续只按 DEFER-08 等重启条件独立立项。
 4. **MEM-01/MEM-02**（Memory）：按 M2 计划 [`plan-20260819.md`](plan-20260819.md) 执行首个纵向切片；不得在 SB-02 完成前开放非 loopback Memory MCP。
-5. deepseek-harness bridge（plan-20260818）按其任务卡排期执行，不与 M2 抢 `agent bridge` 面。
+5. ~~deepseek-harness bridge（plan-20260818）按其任务卡排期执行~~：Libra 侧已完成（LB-01..LB-07，`v0.21.1`）；余下的 TypeScript `@libra/dsh-bundle` 在兄弟仓 `REL-TS-01`。M2 不得再抢 `agent bridge` 面。
 
 ### 阶段零：工程安全
 
@@ -466,7 +466,7 @@ LR-04 → LR-05；并行推进 LR-08 设计。
 
 ### 阶段三：Agent 意图与运行时
 
-LR-06 -> LR-07 + RT-01 收尾（plan-20260715）；Memory MEM-01/MEM-02（plan-20260819 M2 切片）向 LR-07 供数；deepseek-harness bridge（plan-20260818）按任务卡独立排期。
+LR-06 -> LR-07（RT-01 / plan-20260715 已完成，不再是本阶段前置）；Memory MEM-01/MEM-02（plan-20260819 M2 切片）向 LR-07 供数；deepseek-harness bridge（plan-20260818）按任务卡独立排期。
 
 ### 阶段四：Memory 巩固与规模
 
@@ -523,11 +523,12 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260708.md`](plan-20260708.md) | A（LR-04/05/09 相邻基础） | 主线已完成 | 不关闭对应 LR |
 | [`plan-20260713.md`](plan-20260713.md) | B（LR-06/07/10 捕获前置） | 已完成 | 不覆盖 seal/preflight/capsule |
 | [`plan-20260714.md`](plan-20260714.md) | A（UP-01、LR-01）+ 横切 | Part A→UP-01；Part C/D 残留 | LR-01 仍实施中 |
-| [`plan-20260715.md`](plan-20260715.md) | B（RT-01） | 实施中 | W3/W4 已合入，W5 家族经 v0.20.0 收口；剩 W5-04/05/10、W6-01/02 与完成判据复选 |
+| [`plan-20260715.md`](plan-20260715.md) | B（RT-01） | 已完成 | W0–W6 主线、W5-01 家族（v0.20.0 breaking minor）与正交 WIO-01..03 / W6-03 全部合入；W5-04/05/10 与 W6-01/02 已收口，完成判据与 Checkpoint A–D 全部勾选；不覆盖 DEFER-01..10（含 SSE v1 物理移除 DEFER-08） |
 | [`plan-20260729.md`](plan-20260729.md) | A（CT-01） | 实施中 | 首个 t4 wave（含 `t4_port_test.rs`）与 FIX-01/03/04 已合入；FIX-04/M4e 走 v2.1 independent 发布轨；CT3-07 转 blocked（DEFER-09）；**CT4-01 发布卡待执行**；不覆盖 S2 离线发现器、S5 CI 落点与其余族 wave |
-| [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | 已排期 | `libra agent bridge --stdio` 唯一标准入站面；实现未开始（无 `bridge` 子命令）；不覆盖 MCP/旧工具服务器恢复 |
+| [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | 已完成 | `libra agent bridge --stdio` 唯一标准入站面；LB-01..LB-07 全部合入，protocol v1 的 20 个 method 自 `v0.21.1` 起全部实现（`v0.21.0` 首发）；不覆盖 MCP/旧工具服务器恢复，TypeScript 侧 `@libra/dsh-bundle` 归兄弟仓 `REL-TS-01` |
 | [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02） | 已排期 | M2 研发历程记忆首个纵向切片（MemoryNote/MemoryEvent、MemoryWriter、FTS5/BM25、`libra memory` 命令面）；实现未开始；不覆盖 MCP 面、向量检索、团队同步与 MEM-03..06 |
 | [`plan-20260822.md`](plan-20260822.md) | A（UP-01） | 已排期 | 客户端与发布 CI 侧（trust table、generation floor、`release.yml`、install 验签）；Backend Workers 侧在 libra-backend 姊妹计划；密钥 ceremony 私钥半边不在本仓库 |
+| [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | 实施中 | 承接 0715 的 DEFER-01/08/10 与 skill activation 残差；按 DF-01..DF-09 处理文档事实源、fix bridge、SSE v2 默认与 v1 删除。DF-08 仍受成功公开 patch release 的 DEP-02 硬前置约束 |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---

@@ -54,8 +54,8 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
-            2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026082401,
-            2026082402, 2026082403
+            2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
+            2026082401, 2026082501, 2026082502, 2026082503
         ]
     );
     assert_eq!(
@@ -116,6 +116,8 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_usage_runtime_attribution",
             "agent_usage_event_session_scope",
             "approved_permission_provenance",
+            "agent_bridge_capture",
+            "agent_bridge_link_relations",
             "memory_core",
             "memory_fts_search",
             "context_selection_receipt",
@@ -124,8 +126,8 @@ fn builtin_migrations_register_current_schema_migrations() {
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 58);
-    assert_eq!(runner.max_registered_version(), Some(2026082403));
+    assert_eq!(runner.len(), 60);
+    assert_eq!(runner.max_registered_version(), Some(2026082503));
 }
 
 const MEMORY_CORE_TABLES: [&str; 9] = [
@@ -386,13 +388,13 @@ async fn memory_episode_schema_idempotent() {
     let migrations = builtin_migrations();
     let memory_core_index = migrations
         .iter()
-        .position(|migration| migration.version == 2026082401)
+        .position(|migration| migration.version == 2026082501)
         .expect("built-in registry contains Memory core migration");
     let through_memory_core = &migrations[..=memory_core_index];
     let memory_core = through_memory_core
         .last()
         .expect("built-in registry contains Memory core migration");
-    assert_eq!(memory_core.version, 2026082401);
+    assert_eq!(memory_core.version, 2026082501);
     let mut through_core_runner = MigrationRunner::new();
     through_core_runner
         .extend(through_memory_core.iter().cloned())
@@ -401,7 +403,7 @@ async fn memory_episode_schema_idempotent() {
         .run_pending(&fresh)
         .await
         .expect("apply through Memory core to fresh database");
-    assert_eq!(fresh_applied.last(), Some(&2026082401));
+    assert_eq!(fresh_applied.last(), Some(&2026082501));
     assert!(
         through_core_runner
             .run_pending(&fresh)
@@ -429,7 +431,7 @@ async fn memory_episode_schema_idempotent() {
     let (memory_core, previous) = through_memory_core
         .split_last()
         .expect("built-in registry contains Memory core migration");
-    assert_eq!(memory_core.version, 2026082401);
+    assert_eq!(memory_core.version, 2026082501);
     let mut old_runner = MigrationRunner::new();
     old_runner
         .extend(previous.iter().cloned())
@@ -440,13 +442,13 @@ async fn memory_episode_schema_idempotent() {
         .expect("apply previous migration tip");
     assert_eq!(
         old_runner.current_version(&upgrade).await.unwrap(),
-        Some(2026081301)
+        Some(2026082401)
     );
     assert_eq!(
         run_builtin_migrations(&upgrade)
             .await
             .expect("upgrade old database"),
-        vec![2026082401, 2026082402, 2026082403]
+        vec![2026082501, 2026082502, 2026082503]
     );
     assert_eq!(memory_core_schema_snapshot(&upgrade).await, fresh_snapshot);
 }
@@ -563,14 +565,14 @@ async fn memory_episode_down_guard() {
         conn.execute_unprepared(insert)
             .await
             .unwrap_or_else(|error| panic!("seed {table}: {error}"));
-        let error = runner.rollback_to(&conn, 2026081301).await.unwrap_err();
+        let error = runner.rollback_to(&conn, 2026082401).await.unwrap_err();
         assert!(
             format!("{error:#}").contains("memory_core_down_guard_empty"),
             "{table} data must fail the stable down guard: {error:#}"
         );
         assert_eq!(
             runner.current_version(&conn).await.unwrap(),
-            Some(2026082401)
+            Some(2026082501)
         );
         conn.execute_unprepared(&format!("DELETE FROM `{table}`"))
             .await
@@ -582,10 +584,10 @@ async fn memory_episode_down_guard() {
         .expect("restore foreign key enforcement");
     assert_eq!(
         runner
-            .rollback_to(&conn, 2026081301)
+            .rollback_to(&conn, 2026082401)
             .await
             .expect("empty Memory core schema may roll back"),
-        vec![2026082401]
+        vec![2026082501]
     );
     for table in MEMORY_CORE_TABLES {
         assert!(
@@ -667,7 +669,7 @@ async fn memory_episode_fts_schema() {
     let applied = run_builtin_migrations(&conn)
         .await
         .expect("apply Memory FTS migration");
-    assert!(applied.contains(&2026082402));
+    assert!(applied.contains(&2026082502));
 
     let schema = memory_fts_schema_snapshot(&conn).await;
     assert_eq!(
@@ -798,7 +800,7 @@ async fn memory_episode_fts_schema_idempotent_upgrade_and_empty_down() {
     let fresh_applied = run_builtin_migrations(&fresh)
         .await
         .expect("apply full registry");
-    assert_eq!(fresh_applied.last(), Some(&2026082403));
+    assert_eq!(fresh_applied.last(), Some(&2026082503));
     assert!(
         run_builtin_migrations(&fresh)
             .await
@@ -808,9 +810,9 @@ async fn memory_episode_fts_schema_idempotent_upgrade_and_empty_down() {
     let snapshot = memory_fts_schema_snapshot(&fresh).await;
     let migration = builtin_migrations()
         .into_iter()
-        .find(|migration| migration.version == 2026082402)
+        .find(|migration| migration.version == 2026082502)
         .expect("Memory FTS migration");
-    assert_eq!(migration.version, 2026082402);
+    assert_eq!(migration.version, 2026082502);
     fresh
         .execute_raw(Statement::from_string(
             fresh.get_database_backend(),
@@ -825,7 +827,7 @@ async fn memory_episode_fts_schema_idempotent_upgrade_and_empty_down() {
     let migrations = builtin_migrations();
     let fts_index = migrations
         .iter()
-        .position(|migration| migration.version == 2026082402)
+        .position(|migration| migration.version == 2026082502)
         .expect("Memory FTS migration");
     let previous = &migrations[..fts_index];
     let mut old_runner = MigrationRunner::new();
@@ -838,7 +840,7 @@ async fn memory_episode_fts_schema_idempotent_upgrade_and_empty_down() {
         .expect("apply through Memory core");
     assert_eq!(
         old_runner.current_version(&upgrade).await.unwrap(),
-        Some(2026082401)
+        Some(2026082501)
     );
     upgrade
         .execute_unprepared(
@@ -855,7 +857,7 @@ async fn memory_episode_fts_schema_idempotent_upgrade_and_empty_down() {
         run_builtin_migrations(&upgrade)
             .await
             .expect("upgrade to Memory FTS"),
-        vec![2026082402, 2026082403]
+        vec![2026082502, 2026082503]
     );
     let core_rows: i64 = upgrade
         .query_one_raw(Statement::from_string(
@@ -875,10 +877,10 @@ async fn memory_episode_fts_schema_idempotent_upgrade_and_empty_down() {
     let runner = builtin_runner().expect("builtin runner");
     assert_eq!(
         runner
-            .rollback_to(&upgrade, 2026082401)
+            .rollback_to(&upgrade, 2026082501)
             .await
             .expect("empty search projection can roll back"),
-        vec![2026082403, 2026082402]
+        vec![2026082503, 2026082502]
     );
     assert!(!table_exists(&upgrade, "memory_episode_search_doc").await);
     assert!(!table_exists(&upgrade, "memory_episode_fts").await);
@@ -888,7 +890,7 @@ async fn memory_episode_fts_schema_idempotent_upgrade_and_empty_down() {
             .run_pending(&upgrade)
             .await
             .expect("reapply search migration"),
-        vec![2026082402, 2026082403]
+        vec![2026082502, 2026082503]
     );
 }
 
@@ -903,14 +905,14 @@ async fn memory_episode_fts_nonempty_down_guard() {
         .expect("apply full registry");
     seed_memory_search_fixture(&conn).await;
 
-    let error = runner.rollback_to(&conn, 2026082401).await.unwrap_err();
+    let error = runner.rollback_to(&conn, 2026082501).await.unwrap_err();
     assert!(
         format!("{error:#}").contains("memory_fts_search_down_guard_empty"),
         "non-empty FTS rollback must fail with the stable guard: {error:#}"
     );
     assert_eq!(
         runner.current_version(&conn).await.unwrap(),
-        Some(2026082402)
+        Some(2026082502)
     );
 
     conn.execute_unprepared(
@@ -926,10 +928,10 @@ async fn memory_episode_fts_nonempty_down_guard() {
     .expect("clear search projection through the external-content protocol");
     assert_eq!(
         runner
-            .rollback_to(&conn, 2026082401)
+            .rollback_to(&conn, 2026082501)
             .await
             .expect("empty search projection can roll back"),
-        vec![2026082402]
+        vec![2026082502]
     );
 }
 
@@ -940,7 +942,7 @@ async fn context_selection_receipt_schema() {
     let applied = run_builtin_migrations(&conn)
         .await
         .expect("apply context receipt migration");
-    assert_eq!(applied.last(), Some(&2026082403));
+    assert_eq!(applied.last(), Some(&2026082503));
 
     assert!(table_exists(&conn, "context_selection_receipt").await);
     assert!(table_exists(&conn, "context_selection_receipt_retention").await);
@@ -1018,7 +1020,7 @@ async fn context_selection_receipt_schema() {
 
     let receipt_migration = builtin_migrations()
         .into_iter()
-        .find(|migration| migration.version == 2026082403)
+        .find(|migration| migration.version == 2026082503)
         .expect("context receipt migration");
     let snapshot = conn
         .query_all_raw(Statement::from_string(
@@ -1071,10 +1073,10 @@ async fn context_selection_receipt_schema() {
     let runner = builtin_runner().expect("builtin runner");
     assert_eq!(
         runner
-            .rollback_to(&conn, 2026082402)
+            .rollback_to(&conn, 2026082502)
             .await
             .expect("empty receipt ledger can roll back"),
-        vec![2026082403]
+        vec![2026082503]
     );
     assert!(!table_exists(&conn, "context_selection_receipt").await);
     assert_eq!(
@@ -1082,7 +1084,7 @@ async fn context_selection_receipt_schema() {
             .run_pending(&conn)
             .await
             .expect("upgrade from the previous registry tip"),
-        vec![2026082403]
+        vec![2026082503]
     );
     assert!(table_exists(&conn, "context_selection_receipt").await);
 }
@@ -1119,7 +1121,7 @@ async fn context_selection_receipt_nonempty_down_guard() {
     .expect("seed audit receipt");
 
     let error = runner
-        .rollback_to(&conn, 2026082402)
+        .rollback_to(&conn, 2026082502)
         .await
         .expect_err("non-empty audit evidence must block rollback");
     assert!(
@@ -1128,7 +1130,7 @@ async fn context_selection_receipt_nonempty_down_guard() {
     );
     assert_eq!(
         runner.current_version(&conn).await.expect("current tip"),
-        Some(2026082403)
+        Some(2026082503)
     );
 }
 
@@ -1202,9 +1204,9 @@ async fn usage_event_session_scope_rollback_refuses_duplicate_event_ids() {
         "rollback error must provide collision remediation: {error:#}"
     );
     // `rollback_to` applies each down in its own claim transaction (see
-    // `MigrationRunner::rollback_to` phase 2), so the intervening 2026082401
-    // Memory core and 2026081301 provenance downs (both empty in this fixture)
-    // roll back cleanly BEFORE 2026080403's guard refuses.
+    // `MigrationRunner::rollback_to` phase 2), so the intervening
+    // 2026081301 provenance down (empty provenance, no linked HEADs in
+    // this fixture) rolls back cleanly BEFORE 2026080403's guard refuses.
     // The migration under test — the session-scope event migration — must
     // remain applied; the runner's partial-plan semantics leave the
     // version at exactly that refused step.
@@ -2043,7 +2045,7 @@ async fn connect_with_busy_timeout(url: &str) -> DatabaseConnection {
     opts.sqlx_logging(false);
     // Match the production busy-timeout path so the test exercises the
     // realistic concurrency model.
-    opts.map_sqlx_sqlite_opts(move |sqlx_opts| sqlx_opts.busy_timeout(Duration::from_secs(30)));
+    opts.map_sqlx_sqlite_opts(move |sqlx_opts| sqlx_opts.busy_timeout(Duration::from_secs(5)));
     Database::connect(opts).await.expect("connect")
 }
 
@@ -2212,8 +2214,8 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
-            2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026082401,
-            2026082402, 2026082403
+            2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
+            2026082401, 2026082501, 2026082502, 2026082503
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -2407,7 +2409,8 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401, 2026080402, 2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080401, 2026080402, 2026080403, 2026081301, 2026081801, 2026082401, 2026082501,
+            2026082502, 2026082503
         ]
     );
     conn.execute_raw(Statement::from_string(
@@ -2472,8 +2475,8 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302,
             2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502,
             2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005,
-            2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026082401, 2026082402,
-            2026082403
+            2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801, 2026082401,
+            2026082501, 2026082502, 2026082503
         ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
@@ -2577,7 +2580,8 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401, 2026080402, 2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080401, 2026080402, 2026080403, 2026081301, 2026081801, 2026082401, 2026082501,
+            2026082502, 2026082503
         ]
     );
     let claim = conn
@@ -2711,7 +2715,8 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401, 2026080402, 2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080401, 2026080402, 2026080403, 2026081301, 2026081801, 2026082401, 2026082501,
+            2026082502, 2026082503
         ]
     );
     let cursor = conn
@@ -2755,11 +2760,11 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-            2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404, 2026071403, 2026071402
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002,
+            2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402,
+            2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101,
+            2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -2778,7 +2783,7 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
             2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
             2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
             2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401, 2026080402,
-            2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080403, 2026081301, 2026081801, 2026082401, 2026082501, 2026082502, 2026082503
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -2809,11 +2814,11 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-            2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002,
+            2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402,
+            2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101,
+            2026071901, 2026071407, 2026071406, 2026071405, 2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -2832,7 +2837,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
             2026072301, 2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403,
             2026072501, 2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003,
             2026073004, 2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301,
-            2026082401, 2026082402, 2026082403
+            2026081801, 2026082401, 2026082501, 2026082502, 2026082503
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -3177,14 +3182,14 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-            2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301,
-            2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401,
-            2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401,
-            2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002,
+            2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402,
+            2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101,
+            2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402,
+            2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601,
+            2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401,
+            2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -3215,7 +3220,7 @@ async fn approved_permission_up_down_up_round_trip() {
             2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
             2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
             2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401, 2026080402,
-            2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080403, 2026081301, 2026081801, 2026082401, 2026082501, 2026082502, 2026082503
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -3651,8 +3656,8 @@ async fn bisect_state_migration_keeps_newest_row_per_scope() {
 async fn concurrent_run_pending_applies_each_migration_exactly_once() {
     for round in 0..3 {
         let (_dir, url, _path) = fresh_db_url();
-        let conn_a = connect_with_busy_timeout(&url).await;
-        let conn_b = connect_with_busy_timeout(&url).await;
+        let conn_a = connect(&url).await;
+        let conn_b = connect(&url).await;
         let runner_a = builtin_runner().expect("builtin runner A");
         let runner_b = builtin_runner().expect("builtin runner B");
 
@@ -4087,10 +4092,10 @@ async fn legacy_layer_rows_with_linked_fail_migration() {
             .await
             .expect("rollback layer scope"),
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-            2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002,
+            2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402,
+            2026072401, 2026072304, 2026072303
         ]
     );
     conn.execute_raw(Statement::from_string(
@@ -4143,8 +4148,8 @@ async fn legacy_layer_rows_with_linked_fail_migration() {
         vec![
             2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502,
             2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005,
-            2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026082401, 2026082402,
-            2026082403
+            2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801, 2026082401,
+            2026082501, 2026082502, 2026082503
         ]
     );
     let row = conn
@@ -4421,9 +4426,10 @@ async fn sparse_migration_projects_last_wins_toggle() {
             .await
             .expect("rollback sparse scope"),
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-            2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002,
+            2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402,
+            2026072401, 2026072304
         ]
     );
     // Duplicate legacy rows: stale `true` (lower id) then effective `false`
@@ -4459,7 +4465,8 @@ async fn sparse_migration_projects_last_wins_toggle() {
         vec![
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401, 2026080402, 2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080401, 2026080402, 2026080403, 2026081301, 2026081801, 2026082401, 2026082501,
+            2026082502, 2026082503
         ]
     );
     let row = conn
@@ -4494,9 +4501,10 @@ async fn legacy_sparse_state_with_linked_requires_adopt_or_clear() {
             .await
             .expect("rollback sparse scope"),
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-            2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002,
+            2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402,
+            2026072401, 2026072304
         ]
     );
     conn.execute_raw(Statement::from_string(
@@ -4539,7 +4547,8 @@ async fn legacy_sparse_state_with_linked_requires_adopt_or_clear() {
         vec![
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401, 2026080402, 2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080401, 2026080402, 2026080403, 2026081301, 2026081801, 2026082401, 2026082501,
+            2026082502, 2026082503
         ]
     );
     assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
@@ -4705,9 +4714,6 @@ async fn gc_object_source_inventory_covers_every_oid_column() {
         ("operation_view_workspace", "pointer_value"),
         ("object_index", "o_id"),
         ("metadata_kv", "value"),
-        ("context_selection_receipt", "source_heads_json"),
-        ("context_selection_receipt", "projection_watermarks_json"),
-        ("context_selection_receipt", "selected_json"),
     ] {
         let inventoried = GC_OBJECT_SOURCE_INVENTORY
             .iter()
@@ -4763,9 +4769,10 @@ async fn worktree_registry_v2_capability_marker_round_trip() {
             .await
             .expect("rollback capability marker"),
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-            2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002,
+            2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402,
+            2026072401
         ]
     );
     assert!(!table_exists(&conn, "worktree_registry_capability").await);
@@ -4776,7 +4783,8 @@ async fn worktree_registry_v2_capability_marker_round_trip() {
         vec![
             2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902,
             2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401,
-            2026080402, 2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080402, 2026080403, 2026081301, 2026081801, 2026082401, 2026082501, 2026082502,
+            2026082503
         ]
     );
     assert!(table_exists(&conn, "worktree_registry_capability").await);
@@ -4899,7 +4907,7 @@ async fn registry_v2_down_migration_rejects_nonterminal_state() {
         vec![
             2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
             2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401, 2026080402,
-            2026080403, 2026081301, 2026082401, 2026082402, 2026082403
+            2026080403, 2026081301, 2026081801, 2026082401, 2026082501, 2026082502, 2026082503
         ]
     );
 }
@@ -4982,7 +4990,7 @@ async fn workspace_record_down_migration_rejects_nonterminal_state() {
         vec![
             2026072501, 2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003,
             2026073004, 2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301,
-            2026082401, 2026082402, 2026082403
+            2026081801, 2026082401, 2026082501, 2026082502, 2026082503
         ]
     );
 
@@ -5474,7 +5482,7 @@ async fn registry_v3_rollback_refuses_live_generations() {
             .current_version(&conn)
             .await
             .expect("current version"),
-        Some(2026082403),
+        Some(2026082503),
         "and the schema is untouched"
     );
 }
@@ -5521,8 +5529,8 @@ async fn registry_v3_rollback_allows_absent_generations() {
         assert_eq!(
             rolled,
             vec![
-                2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-                2026073101, 2026073005
+                2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+                2026080402, 2026080401, 2026073101, 2026073005
             ],
             "{label}: exactly v3 rolled back"
         );
@@ -5551,8 +5559,8 @@ async fn registry_v3_rollback_allows_unreadable_registry() {
             .await
             .expect("an unparseable registry does not block the rollback"),
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101, 2026073005
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101, 2026073005
         ]
     );
 }
@@ -5848,8 +5856,8 @@ async fn stash_generation_fence_up_down_up_round_trip() {
     );
     assert_eq!(
         runner.current_version(&conn).await.expect("version"),
-        Some(2026082403),
-        "the context receipt migration is the newest migration — retarget this test when a newer one lands"
+        Some(2026082503),
+        "the runtime usage migrations are the newest migrations — retarget this test when a newer one lands"
     );
 
     let rolled = runner
@@ -5859,8 +5867,8 @@ async fn stash_generation_fence_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026082403, 2026082402, 2026082401, 2026081301, 2026080403, 2026080402, 2026080401,
-            2026073101
+            2026082503, 2026082502, 2026082501, 2026082401, 2026081801, 2026081301, 2026080403,
+            2026080402, 2026080401, 2026073101
         ],
         "the runtime attribution, scope, and fence migrations roll back in order"
     );
@@ -5943,7 +5951,9 @@ async fn approved_permission_provenance_migration() {
     // Up: empty provenance backfill; project_id unchanged.
     assert_eq!(
         runner.run_pending(&conn).await.expect("apply W4-07"),
-        vec![2026081301, 2026082401, 2026082402, 2026082403]
+        vec![
+            2026081301, 2026081801, 2026082401, 2026082501, 2026082502, 2026082503
+        ]
     );
     assert!(column_exists(&conn, "approved_permission", "source_worktree_id").await);
     assert!(column_exists(&conn, "approved_permission", "source_session_id").await);
@@ -6035,7 +6045,9 @@ async fn approved_permission_provenance_migration() {
 
     assert_eq!(
         runner.run_pending(&conn).await.expect("re-up"),
-        vec![2026081301, 2026082401, 2026082402, 2026082403]
+        vec![
+            2026081301, 2026081801, 2026082401, 2026082501, 2026082502, 2026082503
+        ]
     );
     let kept_after: i64 = conn
         .query_one_raw(Statement::from_string(
@@ -6070,7 +6082,7 @@ async fn approved_permission_old_reader_rejects_migrated_schema() {
         .await
         .expect("read tip")
         .expect("applied tip");
-    assert_eq!(current, 2026082403);
+    assert_eq!(current, 2026082503);
     // An old binary whose registry tip is still 2026080403 would see this
     // repository as UnsupportedFuture. Prove the refuse path on repository
     // DBs (not global config.db) by planting a version above this binary.

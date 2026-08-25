@@ -1,4 +1,4 @@
--- Rollback of 2026082403_context_selection_receipt.
+-- Rollback of 2026082503_context_selection_receipt.
 --
 -- A non-empty ledger or retention watermark is audit evidence. Refuse to drop
 -- either and require a forward migration instead.

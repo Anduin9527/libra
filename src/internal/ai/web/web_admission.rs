@@ -733,8 +733,43 @@ impl WebCodeUiAdmission {
             }
         }
 
+        if let Ok(snapshot) = runtime.snapshot(self.runtime_session_id.clone()).await {
+            use crate::internal::ai::runtime::InteractionState;
+            if matches!(
+                snapshot.interaction,
+                InteractionState::Queued
+                    | InteractionState::Running
+                    | InteractionState::AwaitingIntentReview { .. }
+                    | InteractionState::AwaitingPlanReview { .. }
+                    | InteractionState::AwaitingPlanRepair { .. }
+                    | InteractionState::AwaitingNetworkPolicy { .. }
+                    | InteractionState::AwaitingToolApproval { .. }
+                    | InteractionState::AwaitingUserInput { .. }
+                    | InteractionState::Cancelling
+            ) {
+                return Err(CodeUiApiError::conflict(
+                    "SESSION_BUSY",
+                    "A turn is already running; cancel it or wait for the assistant to finish before sending another message",
+                )
+                .into());
+            }
+        }
+
         if let Some(IntentRevisionControl::Modify(changes)) = intent_control
             && changes.len() > crate::internal::ai::session::MAX_INTENT_REVISION_NOTE_BYTES
+        {
+            return Err(CodeUiApiError::bad_request(
+                "INVALID_QUERY_PARAM",
+                format!(
+                    "IntentSpec Modify note exceeds the {}-byte UTF-8 limit",
+                    crate::internal::ai::session::MAX_INTENT_REVISION_NOTE_BYTES
+                ),
+            )
+            .into());
+        }
+        if mode == WebTurnMode::PlanPhase0
+            && self.pending_intent_revision.lock().await.is_some()
+            && text.trim().len() > crate::internal::ai::session::MAX_INTENT_REVISION_NOTE_BYTES
         {
             return Err(CodeUiApiError::bad_request(
                 "INVALID_QUERY_PARAM",
@@ -1060,6 +1095,9 @@ impl WebCodeUiAdmission {
             }
         }
 
+        // Release the transition lock before the durable write so shutdown can
+        // cancel an unstarted worker turn without waiting on session storage.
+        drop(plan_transition);
         if let Some(persistence) = self.persistence.as_ref() {
             let mut durable_snapshot = session.snapshot().await;
             durable_snapshot.transcript.push(user_entry.clone());
@@ -1078,7 +1116,6 @@ impl WebCodeUiAdmission {
                     .await?;
                 self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                     .await?;
-                drop(plan_transition);
                 return Err(anyhow!(
                     "Unable to persist the headless web message; no turn was started. Verify session storage and retry: {error}"
                 ));
@@ -1102,7 +1139,6 @@ impl WebCodeUiAdmission {
             .await?;
             self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                 .await?;
-            drop(plan_transition);
             return Ok(());
         }
         session.upsert_transcript_entry(user_entry.clone()).await;
@@ -1132,7 +1168,6 @@ impl WebCodeUiAdmission {
             .await?;
             self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                 .await?;
-            drop(plan_transition);
             return Ok(());
         }
         start_open.store(true, Ordering::Release);
@@ -1143,7 +1178,6 @@ impl WebCodeUiAdmission {
         // shutdown branch above then commits the sole terminal projection
         // instead of letting this tail republish Thinking.
         drop(slot);
-        drop(plan_transition);
         Ok(())
     }
 
@@ -1410,15 +1444,8 @@ impl WebCodeUiAdmission {
         } else {
             None
         };
-        if network_decision
-            == Some(crate::internal::ai::runtime::phase1::NetworkPolicyDecision::Allow)
-        {
-            return Err(CodeUiApiError::conflict(
-                "PLAN_EXECUTION_NOT_AVAILABLE",
-                "Network Allow is not connected to the W2-04 plan-execution handoff; the network gate remains pending",
-            )
-            .into());
-        }
+        let network_allow = network_decision
+            == Some(crate::internal::ai::runtime::phase1::NetworkPolicyDecision::Allow);
         if plan_decision == Some(crate::internal::ai::runtime::phase1::PlanReviewDecision::Revise) {
             let persistence = self.persistence.as_ref().ok_or_else(|| {
                 anyhow!("Plan Modify requires durable Phase 1 session persistence")
@@ -1996,6 +2023,20 @@ impl WebCodeUiAdmission {
                 parked
                     .await
                     .map_err(|_| anyhow!("Phase 1 coordinator dropped Plan Back park"))?
+                    .map_err(|error| anyhow!(error))?;
+            }
+            if network_allow {
+                let (reply, started) = tokio::sync::oneshot::channel();
+                self.send_phase1_command(HeadlessPhase1Command::StartPlanExecution {
+                    network_interaction_id: interaction_id.to_string(),
+                    reply,
+                })
+                .await?;
+                started
+                    .await
+                    .map_err(|_| {
+                        anyhow!("Phase 1 coordinator dropped confirmed plan-execution start")
+                    })?
                     .map_err(|error| anyhow!(error))?;
             }
             Ok(())

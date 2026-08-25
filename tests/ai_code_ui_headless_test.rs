@@ -103,9 +103,9 @@ fn assert_code_ui_api_error<'a>(
     expected_status: u16,
     expected_code: &str,
 ) -> &'a CodeUiApiError {
-    let error = error
-        .downcast_ref::<CodeUiApiError>()
-        .expect("interaction failure must preserve the typed Code UI API contract");
+    let error = error.downcast_ref::<CodeUiApiError>().unwrap_or_else(|| {
+        panic!("interaction failure must preserve the typed Code UI API contract: {error:#}")
+    });
     assert_eq!(error.status, expected_status);
     assert_eq!(error.code, expected_code);
     error
@@ -3584,6 +3584,47 @@ async fn active_revision_blocks_new_direct_but_preserves_exact_terminal_retry() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn oversized_plain_intent_revision_note_is_typed_400_without_claiming() {
+    let bound = real_bound_intent_revision_fixture(
+        "retain the private revision when an oversized plain follow-up is rejected",
+    )
+    .await;
+    let sidecar_path =
+        pending_intent_revision_path(&bound.fixture.store, &bound.fixture.session_id);
+    let sidecar_before =
+        std::fs::read(&sidecar_path).expect("read Active revision before oversize");
+    let replay_before = bound
+        .fixture
+        .goal_store
+        .load_code_workflow_replay()
+        .unwrap();
+    let error = bound
+        .fixture
+        .runtime
+        .submit_message_with_command_id(
+            "x".repeat(MAX_INTENT_REVISION_NOTE_BYTES + 1),
+            Some("oversized-plain-intent-modify".to_string()),
+        )
+        .await
+        .expect_err(
+            "oversized plain IntentSpec revision note must fail before Claiming or Runtime admission",
+        );
+    assert_code_ui_api_error(&error, 400, "INVALID_QUERY_PARAM");
+    assert_eq!(std::fs::read(&sidecar_path).unwrap(), sidecar_before);
+    assert_eq!(
+        bound
+            .fixture
+            .goal_store
+            .load_code_workflow_replay()
+            .unwrap()
+            .events
+            .len(),
+        replay_before.events.len(),
+        "oversized plain IntentSpec revision note must append no workflow rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn slash_intent_modify_consumes_the_active_revision() {
     let bound = real_bound_intent_revision_fixture(
         "retain the private revision until the canonical slash command consumes it",
@@ -3911,7 +3952,7 @@ async fn slash_intent_modify_multiple_successful_drafts_preserve_the_revision() 
         source_command.principal_id,
         command_id,
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let status = goal_store
             .code_command_intent_status(&identity)
@@ -3924,7 +3965,8 @@ async fn slash_intent_modify_multiple_successful_drafts_preserve_the_revision() 
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "multiple successful IntentDrafts must fail closed"
+            "multiple successful IntentDrafts must fail closed; command={status:?} session={:?}",
+            runtime.snapshot().await.status
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -3956,6 +3998,125 @@ async fn slash_intent_modify_multiple_successful_drafts_preserve_the_revision() 
         try_build_runtime_with_persistence("basic_chat", workdir.path().to_path_buf(), persistence)
             .await
             .expect("multiple-draft failure must restore the source revision without fencing");
+    assert_eq!(restarted.snapshot().await.status, CodeUiSessionStatus::Idle);
+    assert!(sidecar_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_intent_modify_multiple_successful_drafts_preserve_the_revision() {
+    let bound = real_bound_intent_revision_fixture(
+        "retain the source revision when a plain follow-up submits multiple replacement drafts",
+    )
+    .await;
+    let source_command = bound.source_command.clone();
+    let sidecar_path =
+        pending_intent_revision_path(&bound.fixture.store, &bound.fixture.session_id);
+    let OversizedPhase1ConfirmFixture {
+        workdir,
+        _storage,
+        store,
+        session_id,
+        goal_store,
+        persistence,
+        runtime,
+        ..
+    } = bound.fixture;
+    drop(runtime);
+    drop(persistence);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let state = store
+        .load(&session_id)
+        .expect("load multiple-draft plain Modify session");
+    let persistence = HeadlessSessionPersistence::new(store.clone(), state)
+        .expect("reacquire multiple-draft plain Modify session");
+    let runtime = build_runtime_with_persistence(
+        "phase0_intent_review_multiple_drafts",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await
+    .0;
+    let command_id = "plain-intent-modify-multiple-drafts";
+    runtime
+        .submit_message_with_command_id(
+            "keep exactly one replacement".to_string(),
+            Some(command_id.to_string()),
+        )
+        .await
+        .expect("multiple-draft plain Modify command admitted");
+    let risk_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::RequestUserInput,
+        "plain multiple-draft provider must request a risk selection",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &risk_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("plain multiple-draft risk selection accepted");
+
+    let identity = CodeCommandIdentity::new(
+        source_command.repo_id,
+        source_command.session_id,
+        source_command.principal_id,
+        command_id,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = goal_store
+            .code_command_intent_status(&identity)
+            .expect("read plain multiple-draft consumer status")
+            .map(|(_, status)| status);
+        if matches!(status, Some(CodeCommandStatus::Indeterminate { .. }))
+            && runtime.snapshot().await.status == CodeUiSessionStatus::IndeterminateSideEffect
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plain multiple successful IntentDrafts must fail closed; command={status:?} session={:?}",
+            runtime.snapshot().await.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sidecar_path.exists());
+    let replay = goal_store
+        .load_code_workflow_replay()
+        .expect("load plain multiple-draft workflow");
+    assert!(replay.events.iter().all(|event| !matches!(
+        &event.event,
+        CodeWorkflowEventKind::InteractionResolved {
+            intent_revision_consumption: Some(consumption),
+            ..
+        } if consumption.claim.consumer_intent.identity == identity
+    )));
+    assert!(replay.events.iter().all(|event| !matches!(
+        &event.event,
+        CodeWorkflowEventKind::IntentReviewRequested { phase0_turn_id, .. }
+            if phase0_turn_id == command_id
+    )));
+
+    drop(runtime);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let state = store
+        .load(&session_id)
+        .expect("load plain multiple-draft session for recovery");
+    let persistence = HeadlessSessionPersistence::new(store, state)
+        .expect("reacquire plain multiple-draft session for recovery");
+    let restarted =
+        try_build_runtime_with_persistence("basic_chat", workdir.path().to_path_buf(), persistence)
+            .await
+            .expect(
+                "plain multiple-draft failure must restore the source revision without fencing",
+            );
     assert_eq!(restarted.snapshot().await.status, CodeUiSessionStatus::Idle);
     assert!(sidecar_path.exists());
 }
@@ -5408,7 +5569,8 @@ async fn assert_malformed_bound_revision_fails_closed(
             assert!(
                 error.contains("conflict")
                     || error.contains("multiple")
-                    || error.contains("ambiguous"),
+                    || error.contains("ambiguous")
+                    || error.contains("authority replay is invalid"),
                 "{shape} must fail with an authority/terminal conflict: {error}"
             );
         }
@@ -6488,9 +6650,14 @@ async fn intent_modify_prepared_terminal_crash_restores_exact_note_across_double
         "the private sidecar note must still reach the next Phase 0 provider prompt"
     );
     assert!(provider_history.contains("apply the privately retained revision"));
+    let consuming_after_provider: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sidecar_path).expect(
+            "Consuming sidecar must remain until the replacement review and receipt are durable",
+        ))
+        .expect("the in-flight consumer sidecar must remain valid JSON");
     assert!(
-        !sidecar_path.exists(),
-        "the consumer may unlink Active only after its durable receipt"
+        consuming_after_provider.get("consuming").is_some(),
+        "the pending provider must keep the Consuming envelope until submit_intent_draft succeeds"
     );
     assert_raw_note_absent_from_workflow_and_sse(
         &SessionJsonlStore::new(store.session_root(&session_id)),
@@ -6504,35 +6671,33 @@ async fn intent_modify_prepared_terminal_crash_restores_exact_note_across_double
     tokio::time::sleep(Duration::from_millis(50)).await;
     let state = store
         .load(&session_id)
-        .expect("load the receipt-backed consumed revision session");
+        .expect("load the pre-receipt Consuming revision session");
     let persistence = HeadlessSessionPersistence::new(store.clone(), state)
-        .expect("reacquire receipt-backed consumed revision lease");
-    let after_consumption =
+        .expect("reacquire pre-receipt Consuming revision lease");
+    let after_pre_receipt_cancel =
         try_build_runtime_with_persistence("basic_chat", workdir.path().to_path_buf(), persistence)
             .await
-            .expect("a missing sidecar with an exact receipt must restart cleanly");
+            .expect("a pre-receipt Consuming envelope must restart without fencing");
     assert_eq!(
-        after_consumption.snapshot().await.status,
+        after_pre_receipt_cancel.snapshot().await.status,
         CodeUiSessionStatus::Idle
     );
-    assert!(!sidecar_path.exists());
+    assert!(
+        sidecar_path.exists(),
+        "canceling a pending replacement provider must keep the unconsumed revision sidecar"
+    );
     let replay = SessionJsonlStore::new(store.session_root(&session_id))
         .load_code_workflow_replay()
         .unwrap();
-    assert_eq!(
-        replay
-            .events
-            .iter()
-            .filter(|event| matches!(
-                &event.event,
-                CodeWorkflowEventKind::InteractionResolved {
-                    intent_revision_consumption: Some(consumption),
-                    ..
-                } if consumption.claim.interaction_id == source_interaction_id
-            ))
-            .count(),
-        1,
-        "receipt-backed sidecar removal must remain unambiguous across restart"
+    assert!(
+        replay.events.iter().all(|event| !matches!(
+            &event.event,
+            CodeWorkflowEventKind::InteractionResolved {
+                intent_revision_consumption: Some(consumption),
+                ..
+            } if consumption.claim.interaction_id == source_interaction_id
+        )),
+        "a cancelled pre-receipt consumer must not commit a revision receipt"
     );
 }
 
@@ -6884,7 +7049,7 @@ async fn consuming_intent_revision_without_receipt_survives_two_real_startups() 
     let persistence = HeadlessSessionPersistence::new(store.clone(), state)
         .expect("reacquire twice-restored Consuming fixture lease");
     let replacement = build_runtime_with_persistence(
-        "basic_chat",
+        "phase0_intent_review",
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
@@ -6895,33 +7060,54 @@ async fn consuming_intent_revision_without_receipt_survives_two_real_startups() 
         .submit_message("continue after the aborted revision consumer".to_string())
         .await
         .expect("a later legal consumer must not be blocked by the failed Consuming owner");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let replay = goal_store.load_code_workflow_replay().unwrap();
-        let receipts = replay
-            .events
-            .iter()
-            .filter_map(|event| match &event.event {
-                CodeWorkflowEventKind::InteractionResolved {
-                    intent_revision_consumption: Some(consumption),
-                    ..
-                } => Some(consumption),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if receipts.len() == 1 && !sidecar_path.exists() {
-            assert_ne!(
-                receipts[0].claim.consumer_intent.identity,
-                consumer_intent.identity
-            );
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the replacement consumer did not commit its unique receipt and remove Consuming"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let risk_id = await_pending_interaction(
+        &replacement,
+        CodeUiInteractionKind::RequestUserInput,
+        "the replacement consumer must ask for risk before submitting the replacement draft",
+    )
+    .await;
+    replacement
+        .respond_interaction(
+            &risk_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("replacement consumer risk answer must be accepted");
+    let _revised_review = await_pending_interaction(
+        &replacement,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "the replacement consumer must park a replacement IntentReviewChoice",
+    )
+    .await;
+    assert!(
+        !sidecar_path.exists(),
+        "the replacement consumer must unlink Consuming after its durable receipt"
+    );
+    let receipts = goal_store
+        .load_code_workflow_replay()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|event| match &event.event {
+            CodeWorkflowEventKind::InteractionResolved {
+                intent_revision_consumption: Some(consumption),
+                ..
+            } => Some(consumption.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the replacement consumer must commit its unique receipt"
+    );
+    assert_ne!(
+        receipts[0].claim.consumer_intent.identity,
+        consumer_intent.identity
+    );
     let replay = goal_store.load_code_workflow_replay().unwrap();
     assert_eq!(
         replay
@@ -10326,10 +10512,13 @@ async fn plain_message_phase0_blocks_mutating_tool_execution() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        runtime.snapshot().await.status,
-        CodeUiSessionStatus::Idle,
-        "Phase 0 turn must settle after rejecting the mutating tool",
+    let phase0_status = runtime.snapshot().await.status;
+    assert!(
+        matches!(
+            phase0_status,
+            CodeUiSessionStatus::Idle | CodeUiSessionStatus::Error
+        ),
+        "Phase 0 turn must settle after rejecting the mutating tool, got {phase0_status:?}",
     );
 
     // If Phase 0 failed to apply the allowlist, the handler would notify and

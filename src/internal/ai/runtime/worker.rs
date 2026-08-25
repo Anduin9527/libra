@@ -1781,6 +1781,16 @@ impl AgentRuntimeWorker {
             && active.execution_in_progress
             && !active.response_in_progress
         {
+            if active.cancellation.is_cancelled() || active.cancel_requested_after_mutation {
+                // Lease takeover / cancel dropped the pending gate. Do not
+                // park an early response waiting for a gate that will never
+                // be re-registered on this turn.
+                let _ = reply.send(Err(RuntimeWorkerError::UnknownInteraction {
+                    turn_id: turn_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                }));
+                return;
+            }
             const MAX_EARLY_RESPONSE_WAITERS: usize = 8;
             match active.early_response.as_mut() {
                 Some(early)

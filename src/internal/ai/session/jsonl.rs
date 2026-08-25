@@ -7350,6 +7350,7 @@ mod tests {
                 payload: Value::Null,
             });
         }
+        let _ = append;
         let replay = CodeWorkflowReplay {
             events,
             gaps: Vec::new(),
@@ -7436,6 +7437,7 @@ mod tests {
                 payload: Value::Null,
             });
         }
+        let _ = append;
         assert_eq!(events.len(), EVENT_COUNT);
         let latest_attempt = latest_attempt.expect("at least one retry attempt");
         let latest_attempt_event = latest_attempt_event.expect("latest retry event");

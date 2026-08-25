@@ -6,9 +6,9 @@
 workflow：把一段 spotlighting 定界的固定 review prompt 扇出给首批三个外部
 reviewer CLI（`claude-code`、`codex`、`opencode`），在隔离 workspace 中以最小
 权限只读形态运行，reviewer 输出经有界 sink + redaction 落盘为可审计的 run
-目录，并保证每个 run 恰好收敛到五个 terminal state 之一。任何 mutation
-（`--fix`）在内部 fix bridge 落地前稳定 unsupported（`LBR-AGENT-010`），绝不
-伪装成功。
+目录，并保证每个 run 恰好收敛到五个 terminal state 之一。`--fix` 不消费外部
+review findings，而是把一条固定可信请求交给已运行的内部 AgentRuntime，并逐项
+转发用户对既有 plan/approval/sandbox/network/ACL gate 的明确决定。
 
 ## 对比 Git 与兼容性
 
@@ -32,9 +32,10 @@ reviewer CLI（`claude-code`、`codex`、`opencode`），在隔离 workspace 中
     `render_untrusted_findings`（ANSI/控制序列剥离）；
   - `runner.rs` —— 并发 fan-in→串行 sink 的 run loop、五个 terminal state、
     共享 cancel/cleanup、`agent.review.run` span。
-- 参数模型：`ReviewArgs`（`subcommand_negates_reqs` + 
+- 参数模型：`ReviewArgs`（`subcommand_negates_reqs` +
   `args_conflicts_with_subcommands`）：裸 `review --agent <slug>...
-  [--since <rev>] [--checkpoint <id>] [--fix]` 即运行；子命令
+  [--since <rev>] [--checkpoint <id>]` 运行只读 review；`review --fix` 运行
+  受控修复，并与 `--agent` / `--since` / `--checkpoint` 冲突；子命令
   `list [--limit] [--cursor]`、`show <run_id>`、`cancel <run_id>`、
   `clean [--run <id>|--all]`。全局 `--json` 输出结构化 envelope。
 - `target_scope` 推导（纯函数，单测钉死）：默认 `HEAD~1..HEAD`；
@@ -53,6 +54,29 @@ reviewer CLI（`claude-code`、`codex`、`opencode`），在隔离 workspace 中
   `list`/`show`/`cancel`/`clean`/run 的 JSON envelope 均带 `schema_version`；
   `list` envelope 为 `{schema_version, items, next_cursor, has_more}`（统一
   分页契约，默认 50 / cap 500 / 不透明 keyset cursor）。
+
+### `--fix` 受控执行
+
+- `runtime::fix_bridge` 只负责固定请求、trusted/untrusted provenance 与稳定错误；
+  `runtime::fix_control` 复用同 worktree 的 loopback/token/controller 协议；
+  `runtime::fix_protocol` 在 HTTP 边界把 session/interaction/patch/repair 投影解析为
+  强类型；`runtime::fix_execution` 驱动唯一状态机，不创建第二条 mutation queue。
+- 提交固定请求前必须观察到 `idle`、无 pending interaction、无 plan-execution repair；
+  任何遗留状态都在 submit 前以 `LBR-AGENT-040` fail-closed，避免把旧 approval 或
+  repair 错认成本次请求的结局。
+- 前台 responder 只呈现 runtime 的 typed interaction，并把用户原样决定送回；敏感
+  问题隐藏输入，终端文本先剥离控制序列，单次输入与整次响应都有大小上限。
+- automation controller lease 在模型规划和用户等待期间定期以同一 client id 续期；
+  token 发生替换说明旧 lease 已过期/接管，立即以 `LBR-AGENT-040` fail-closed，并在
+  返回前尝试 detach。
+- denial 只有在 runtime 接受决定且未观察到新 patchset 时返回 `LBR-AGENT-039`；
+  即使随后 detach 失败，已确定的 denial 仍保持 039；只有原本成功的 execution 会因
+  detach 失败转为 `LBR-AGENT-040`。
+  tool failure 返回既有 `repair_required`，并如实携带是否已有部分 patch；只有 runtime
+  回到 `idle` / `completed` 且出现新 patchset 时才报告 clean `patch_applied`。
+- 无 session/无授权仍为 `LBR-AGENT-010`；外部 seed 在发现 endpoint 前为
+  `LBR-AGENT-011`。任何中途传输失败、异常 token、indeterminate state 或 patch-before-
+  denial 都是 `LBR-AGENT-040`，提示用户同时检查 Code session 与 worktree。
 
 ### Run 目录布局（E8-libra run wire）
 
@@ -127,10 +151,10 @@ workspace lease、`cancelled` 落盘。
   raw-redacted 文本，spotlighting 定界；`review show`（人类与 JSON 输出均是）
   必经 `render_untrusted_findings` 剥离 ANSI/终端控制序列后才渲染——绝不输出
   原文，防 reviewer 伪造终端输出。
-- **`--fix` unsupported**：无内部 serialized fix bridge 源码锚点与
-  approval/sandbox/tool gate 测试前，`--fix` 稳定返回 `LBR-AGENT-010`
-  （`StableErrorCode::AgentFixBridgeUnavailable`）；该语义由本卡首先落地，
-  A8（`investigate fix`）复用。
+- **`--fix` provenance / writer boundary**：命令不接收 `--agent`、scope 或外部 seed，
+  固定请求不含 findings/transcript/env；唯一 writer 仍是现有 AgentRuntime，所有 mutation
+  必须通过其 serialized plan execution、hardening、approval、sandbox、network 与 ACL
+  gate。denied 路径在补丁前 fail-closed；部分写入或状态不确定时绝不伪装 clean success。
 
 ### 可观测性
 
@@ -144,12 +168,13 @@ stdout 为禁止字段。
 - 用户文档：`docs/commands/review.md`（zh-CN 同步页
   `docs/commands/zh-CN/review.md`）。
 - Synopsis：`libra review --agent <slug>... [--since <rev>]
-  [--checkpoint <id>] [--json]`；`list` / `show` / `cancel` / `clean`。
+  [--checkpoint <id>] [--json]` 或 `libra review --fix [--json]`；`list` /
+  `show` / `cancel` / `clean`。
 - compat 接线：`COMPATIBILITY.md` 顶层矩阵行（intentionally-different）、
   ROOT_AFTER_HELP "AI And Automation" 组行、`REVIEW_EXAMPLES` +
   `after_help`、`tests/compat/help_examples_banner.rs` VISIBLE_COMMANDS 行。
 
 ## 还未实现的功能
 
-- `--fix`（内部 AgentRuntime fix bridge；Code 阶段 C7 源码锚点 + approval/
-  sandbox/tool gate 测试为前置；现由 plan-20260714 Part D PD-01 跟踪）。
+- `investigate fix` 尚未接入同一 controlled-execution helper；由
+  plan-20260824 DF-04 跟踪，不得复制 queue 或放宽 `review --fix` 的 gate。

@@ -1285,6 +1285,18 @@ async fn takeover_reports_its_own_fence_even_if_another_lands_immediately_after(
         .await
         .expect("doctor-1 parks in the post-write window");
 
+    // `RETURNING` has produced doctor-1's row, but a separate SQLite
+    // connection is the authority for this bare-connection regression: prove
+    // it can already observe that autocommit before asking doctor-2 to write.
+    // This avoids treating scheduler timing as a commit barrier while keeping
+    // doctor-1 parked across doctor-2's takeover.
+    let first_record = WorkspaceStore::get_with_conn(&second, &stale.workspace_id)
+        .await
+        .expect("doctor-2 observes doctor-1's committed takeover")
+        .expect("doctor-1's workspace record");
+    assert_eq!(first_record.lease_fence, 2);
+    assert_eq!(first_record.lease_owner.as_deref(), Some("doctor-1"));
+
     // While doctor-1 is parked, doctor-2 takes the lease over.
     let second_lease =
         WorkspaceStore::reclaim_expired(&second, &stale.workspace_id, "doctor-2", TTL, later)

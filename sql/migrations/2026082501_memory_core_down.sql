@@ -1,4 +1,4 @@
--- Rollback of 2026082401_memory_core.
+-- Rollback of 2026082501_memory_core.
 --
 -- Every table in this migration must be empty. Once a projection or compiler
 -- observation exists, repair moves forward; rollback must not erase it.

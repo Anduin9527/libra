@@ -12,6 +12,11 @@
 //! particular, `internal` is an implementation detail and is not a stable
 //! external embedding surface.
 
+// The bridge dispatcher (`command::agent::bridge`) awaits the full VCS service
+// stack inside one async block, whose type layout nests deeper than rustc's
+// default query depth. Raising the limit is a compile-time-only knob.
+#![recursion_limit = "256"]
+
 pub mod cli;
 pub mod command;
 pub mod common_utils;

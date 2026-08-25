@@ -65,9 +65,10 @@ use crate::internal::ai::{
     },
     runtime::{
         AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig, AgentSnapshot,
-        ExecutionControlService, InteractionResponse, InteractionState, RuntimeCommandDurability,
-        RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
-        RuntimeTurnExecutor, RuntimeWorkerError, TurnRequest,
+        DeferredPlanExecutionExecutor, ExecutionControlService, InteractionResponse,
+        InteractionState, RuntimeCommandDurability, RuntimeExecutionContext,
+        RuntimeInteractionDelivery, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
+        TurnRequest, is_plan_execution_turn,
         phase0::{
             IntentReviewDecision, open_intent_review_from_workflow, phase0_plan_tool_loop_config,
             phase0_planning_prompt, phase0_revision_help_message, phase0_revision_prompt,
@@ -84,7 +85,7 @@ use crate::internal::ai::{
             validate_phase1_context_session_budget, validate_phase1_retry_intent_review_for_seed,
             validate_phase1_review_context_preflight,
         },
-        runtime_worker_adapter_message,
+        runtime_worker_adapter_message, submit_confirmed_plan_execution,
     },
     sandbox::{ExecApprovalRequest, NetworkAccess, ReviewDecision},
     session::{
@@ -403,6 +404,12 @@ pub(crate) enum HeadlessPhase1Command {
     /// generation. Until this command is observed, its terminal attempt state
     /// remains a tombstone so an aborted duplicate cannot recreate Planning.
     CleanupAttempt { phase1_turn_id: String },
+    /// W2-04: Network Allow has closed the human gate; admit confirmed plan
+    /// execution onto the serialized runtime queue.
+    StartPlanExecution {
+        network_interaction_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -623,76 +630,90 @@ impl HeadlessSessionLease {
 }
 
 fn open_phase1_writer_lock_file(path: &Path) -> io::Result<File> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if phase1_writer_lock_metadata_is_unsafe(&metadata) => {
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Code session writer lease '{}' cannot be acquired on this platform; Phase 1 writer leases require Unix or Windows identity checks",
+                path.display()
+            ),
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if phase1_writer_lock_metadata_is_unsafe(&metadata) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Code session writer lease '{}' must be a regular non-link file",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options.open(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to open regular Code session writer lease '{}': {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect opened Code session writer lease '{}': {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if phase1_writer_lock_metadata_is_unsafe(&metadata) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Code session writer lease '{}' must be a regular non-link file",
+                    "Code session writer lease '{}' is not a regular non-link file",
                     path.display()
                 ),
             ));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        if !phase1_writer_lock_path_matches_file(path, &file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Code session writer lease '{}' changed while it was opened",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(file)
     }
-
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "failed to open regular Code session writer lease '{}': {error}",
-                path.display()
-            ),
-        )
-    })?;
-    let metadata = file.metadata().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "failed to inspect opened Code session writer lease '{}': {error}",
-                path.display()
-            ),
-        )
-    })?;
-    if phase1_writer_lock_metadata_is_unsafe(&metadata) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Code session writer lease '{}' is not a regular non-link file",
-                path.display()
-            ),
-        ));
-    }
-    if !phase1_writer_lock_path_matches_file(path, &file)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Code session writer lease '{}' changed while it was opened",
-                path.display()
-            ),
-        ));
-    }
-    Ok(file)
 }
 
 #[cfg(unix)]
@@ -710,8 +731,8 @@ fn phase1_writer_lock_metadata_is_unsafe(metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn phase1_writer_lock_metadata_is_unsafe(metadata: &std::fs::Metadata) -> bool {
-    !metadata.is_file()
+fn phase1_writer_lock_metadata_is_unsafe(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -772,13 +793,11 @@ fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn phase1_writer_lock_path_matches_file(path: &Path, file: &File) -> io::Result<bool> {
-    let opened = file.metadata()?;
-    match std::fs::symlink_metadata(path) {
-        Ok(current) => Ok(current.is_file() && opened.len() == current.len()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+fn phase1_writer_lock_path_matches_file(_path: &Path, _file: &File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Code session writer lease identity checks are unsupported on this platform",
+    ))
 }
 
 struct HeadlessProjectionCheckpoint {
@@ -1065,6 +1084,52 @@ impl HeadlessSessionPersistence {
     /// SSE wire v2 durable fan-out for this session.
     pub fn workflow_hub(&self) -> Arc<CodeUiWorkflowHub> {
         self.workflow_hub.clone()
+    }
+
+    /// Adopt the durable projection checkpoint into the live session before
+    /// startup recovery inspects it. The production `--resume` caller already
+    /// folds this same checkpoint into the session it builds, making adoption
+    /// a no-op there; direct-runtime callers rely on it so stale browser rows
+    /// can be repaired in place. A fresh persistence (cursor 0) is skipped.
+    /// Any projection deltas durable after the checkpoint cursor are folded in
+    /// and the checkpoint is advanced so later delta emission stays exact.
+    pub(crate) async fn adopt_projection_checkpoint(
+        &self,
+        session: &Arc<CodeUiSession>,
+    ) -> io::Result<()> {
+        let (bootstrap, after_sequence) = {
+            let checkpoint = self.projection_checkpoint.lock().await;
+            (checkpoint.snapshot.clone(), checkpoint.sequence)
+        };
+        if after_sequence == 0 {
+            return Ok(());
+        }
+        let replay = self
+            .projection_store
+            .load_code_workflow_replay_since_committed(
+                after_sequence,
+                super::code_ui_projection::MAX_CODE_UI_PROJECTION_EVENTS,
+                super::code_ui_projection::MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+            )?;
+        let folded =
+            super::code_ui_projection::rebuild_code_ui_read_model_from_events(bootstrap, &replay)
+                .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to fold the durable Code UI projection checkpoint: {error}"),
+                )
+            })?;
+        {
+            let mut checkpoint = self.projection_checkpoint.lock().await;
+            checkpoint.snapshot = folded.snapshot.clone();
+            if let Some(last_sequence) = folded.last_sequence {
+                checkpoint.sequence = last_sequence;
+            }
+        }
+        session
+            .replace_snapshot(CodeUiEventType::SessionUpdated, folded.snapshot)
+            .await;
+        Ok(())
     }
 
     /// Stable durable identity fields used by the runtime worker.
@@ -1687,6 +1752,9 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// session JSONL/context files; retaining the executor adds no Web plan
     /// cursor or pending-plan state.
     turn_executor: Arc<HeadlessTurnExecutor<M>>,
+    /// Stages confirmed-plan bodies so the worker owns Orchestrator::run
+    /// (W2-04). Distinct from the chat/Phase-0/1 executor.
+    plan_execution_executor: Arc<DeferredPlanExecutionExecutor>,
     /// Retained so explicit shutdown can join the worker and report a panic
     /// rather than silently detaching the lifecycle owner.
     runtime_worker_task: Mutex<Option<JoinHandle<()>>>,
@@ -1861,7 +1929,12 @@ where
             pending_intent_revision: pending_intent_revision.clone(),
             mcp_server,
         });
-        let mut worker_config = AgentRuntimeWorkerConfig::new(executor.clone(), tool_boundary);
+        let plan_execution_executor = Arc::new(DeferredPlanExecutionExecutor::new());
+        let worker_executor = Arc::new(WebRuntimeTurnExecutor {
+            chat: executor.clone(),
+            plan: plan_execution_executor.clone(),
+        });
+        let mut worker_config = AgentRuntimeWorkerConfig::new(worker_executor, tool_boundary);
         worker_config.shutdown_timeout = shutdown_timeout;
         // Goal JSONL store also supplies session_root so task.dispatch can
         // attach file-history batches (S2-INV-06), matching the historical `/task` path.
@@ -1883,6 +1956,10 @@ where
         if let Some(persistence) = persistence.as_ref() {
             let (durability, repo_id, principal_id) = persistence.worker_durability_config();
             durability_for_adapter = Some(durability.clone());
+            // Adopt the durable projection checkpoint before any recovery pass
+            // reads the live session projection; on the production resume path
+            // the caller already folded it into this session (no-op here).
+            persistence.adopt_projection_checkpoint(&session).await?;
             // An unresolved IntentSpec review proves the Phase 0 draft mutation
             // finished; complete that one command id and still fence others.
             let goal_store = persistence.goal_event_store();
@@ -2152,6 +2229,7 @@ where
             phase1_tx,
             runtime: runtime_handle,
             turn_executor: executor,
+            plan_execution_executor,
             runtime_worker_task: Mutex::new(Some(runtime_worker_task)),
             shutting_down,
             shutdown_timed_out,
@@ -2378,6 +2456,19 @@ where
                 HeadlessPhase1Command::ParkPlanBack { prepared, reply } => {
                     let result = runtime
                         .park_plan_gate_from_network(prepared)
+                        .await
+                        .map_err(|error| error.to_string());
+                    if let Err(error) = &result {
+                        runtime.fence_phase1_failure(anyhow!(error.clone())).await;
+                    }
+                    let _ = reply.send(result);
+                }
+                HeadlessPhase1Command::StartPlanExecution {
+                    network_interaction_id,
+                    reply,
+                } => {
+                    let result = runtime
+                        .start_confirmed_plan_execution(&network_interaction_id)
                         .await
                         .map_err(|error| error.to_string());
                     if let Err(error) = &result {
@@ -2928,6 +3019,12 @@ where
             )
             .await
             .map_err(|error| anyhow!(runtime_worker_adapter_message(error)))?;
+        // The Plan marker/context is already durable. Drop the crash seed
+        // before the live gate is projected so observers that see PostPlanChoice
+        // cannot still load the pre-write seed.
+        if let Some(persistence) = self.persistence.as_ref() {
+            clear_phase1_start_seed(&persistence.goal_event_store())?;
+        }
 
         if self.shutting_down.load(Ordering::Acquire) {
             // The durable Plan marker/context already exists and the runtime
@@ -3283,6 +3380,278 @@ where
                 .await?;
         }
         Ok(())
+    }
+
+    /// W2-04: after Network Allow, admit confirmed plan execution onto the
+    /// serialized worker queue. Mutating tools still pass through the shared
+    /// hardening / approval / sandbox / ACL boundary.
+    async fn start_confirmed_plan_execution(
+        self: &Arc<Self>,
+        network_interaction_id: &str,
+    ) -> anyhow::Result<()> {
+        use crate::internal::ai::{
+            agent::runtime::ToolLoopCancellation,
+            intentspec::types::NetworkPolicy,
+            orchestrator::{
+                Orchestrator,
+                types::{OrchestratorConfig, PersistedPlanReviewBundle},
+            },
+        };
+
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            anyhow!("Confirmed plan execution requires durable Phase 1 session persistence")
+        })?;
+        let store = persistence.goal_event_store();
+        let replay = store.load_code_workflow_replay()?;
+        let plan_id = replay
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.event {
+                CodeWorkflowEventKind::NetworkPolicyRequested {
+                    interaction_id,
+                    plan_id,
+                    ..
+                } if interaction_id == network_interaction_id => Some(plan_id.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "network-policy gate '{network_interaction_id}' has no durable request marker"
+                )
+            })?;
+        let source_context_id = replay
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.event {
+                CodeWorkflowEventKind::PlanReviewRequested {
+                    interaction_id,
+                    plan_id: candidate,
+                    context_id,
+                    ..
+                } if candidate == &plan_id => Some(if context_id.is_empty() {
+                    interaction_id.clone()
+                } else {
+                    context_id.clone()
+                }),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("network-policy Allow has no matching plan review"))?;
+        let context = load_phase1_review_context(&store, &source_context_id)?;
+        if context.plan_id().unwrap_or_default() != plan_id {
+            return Err(anyhow!(
+                "network-policy Allow context does not match plan id"
+            ));
+        }
+        context
+            .checkout
+            .validate_same_intent_repository(
+                self.turn_executor.registry.working_dir(),
+                &context.intent_spec,
+            )
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "The Intent repository changed since this plan was generated ({error}); confirmed execution was not started."
+                )
+            })?;
+        context
+            .checkout
+            .validate_exact(
+                self.turn_executor.registry.working_dir(),
+                &context.intent_spec,
+            )
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "Libra could not verify the exact checkout still matches this plan ({error}); confirmed execution was not started."
+                )
+            })?;
+
+        let mut spec = context.intent_spec.clone();
+        spec.constraints.security.network_policy = NetworkPolicy::Allow;
+        let persisted_plan_id = context.plan_id().map(str::to_owned);
+        let persisted_plan_bundle = match &context.persisted_plan {
+            Phase1PersistedPlan::Persisted {
+                execution_plan_id,
+                test_plan_id,
+            } => Some(PersistedPlanReviewBundle {
+                plan_id: execution_plan_id.clone(),
+                test_plan_id: test_plan_id.clone(),
+                step_ids: HashMap::new(),
+                task_ids: HashMap::new(),
+                plan_id_by_task_id: HashMap::new(),
+            }),
+            Phase1PersistedPlan::Unavailable => None,
+        };
+        let approved_plan = context.execution_plan.clone();
+        let intent_id = context.intent_id.clone();
+        let runtime_turn_id = format!("plan-exec-{}", uuid::Uuid::new_v4());
+        let session_id = self.runtime_session_id.clone();
+        let model = (*self.turn_executor.model).clone();
+        let base_registry = self.turn_executor.registry.clone();
+        let mut tool_loop_config = (self.turn_executor.config_factory)();
+        let mcp_server = self.turn_executor.mcp_server.clone();
+        let working_dir = base_registry.working_dir().to_path_buf();
+        let session = self.session.clone();
+        let persistence_for_repair = persistence.clone();
+        let runtime_for_repair = self.runtime.clone();
+        let session_id_for_repair = session_id.clone();
+
+        self.session
+            .resolve_interaction(network_interaction_id)
+            .await;
+        let assistant_entry_id = format!("assistant-plan-exec-{runtime_turn_id}");
+        self.session
+            .upsert_transcript_entry(CodeUiTranscriptEntry {
+                id: assistant_entry_id.clone(),
+                kind: CodeUiTranscriptEntryKind::AssistantMessage,
+                title: Some("Plan execution".to_string()),
+                content: Some(String::new()),
+                status: Some("streaming".to_string()),
+                streaming: true,
+                metadata: serde_json::json!({ "phase": "plan_execution" }),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await;
+        self.session.set_status(CodeUiSessionStatus::Thinking).await;
+        persistence
+            .persist_snapshot(self.session.snapshot().await)
+            .await?;
+        self.replace_in_flight_runtime_turn(&runtime_turn_id, "Confirmed plan execution")
+            .await?;
+
+        let observer_session = session.clone();
+        let observer_entry_id = assistant_entry_id.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
+        let observer = Arc::new(WebPlanExecutionObserver {
+            session: observer_session,
+            assistant_entry_id: observer_entry_id,
+            handle: tokio_handle,
+        });
+
+        let runner_session = session.clone();
+        let runner_entry_id = assistant_entry_id.clone();
+        let runner_in_flight = self.in_flight.clone();
+        let runner_turn_id = runtime_turn_id.clone();
+        let runner = Box::new(move |exec_context: RuntimeExecutionContext| {
+            Box::pin(async move {
+                tool_loop_config.cancellation = Some(ToolLoopCancellation::new(
+                    exec_context.cancellation(),
+                    exec_context.mutation_started_marker(),
+                ));
+                let hardened_boundary = exec_context.tool_boundary().with_network_access(true);
+                let registry = Arc::new((*base_registry).clone().with_hardening(hardened_boundary));
+                if let Some(subagent_runtime) = tool_loop_config.subagent_runtime.as_mut() {
+                    subagent_runtime.tool_registry = (*registry).clone();
+                }
+                let config = OrchestratorConfig {
+                    working_dir,
+                    base_commit: None,
+                    persisted_intent_id: Some(intent_id),
+                    persisted_plan_bundle,
+                    persisted_plan_id,
+                    initial_plan: Some(approved_plan),
+                    dagrs_resume_checkpoint_id: None,
+                    tool_loop_config,
+                    coder_preamble: None,
+                    reviewer_preamble: None,
+                    mcp_server,
+                    observer: Some(observer),
+                    phase_confirmer: None,
+                };
+                let orchestrator = Orchestrator::new(model, registry, config);
+                let run_result = orchestrator.run(spec).await;
+                let summary = match &run_result {
+                    Ok(result) => format!(
+                        "Confirmed plan execution finished with decision {:?}.",
+                        result.decision
+                    ),
+                    Err(error) => format!("Confirmed plan execution failed: {error}"),
+                };
+                finalize_assistant_entry(
+                    &runner_session,
+                    &runner_entry_id,
+                    &summary,
+                    if run_result.is_ok() {
+                        "completed"
+                    } else {
+                        "error"
+                    },
+                )
+                .await;
+                match run_result {
+                    Ok(result) => {
+                        let needs_repair = !matches!(
+                            result.decision,
+                            crate::internal::ai::orchestrator::types::DecisionOutcome::Commit
+                        );
+                        if needs_repair {
+                            park_web_plan_execution_repair(
+                                &persistence_for_repair,
+                                &runtime_for_repair,
+                                &session_id_for_repair,
+                                &runner_session,
+                                Some(&result),
+                                Some(&summary),
+                            )
+                            .await?;
+                        } else {
+                            runner_session.set_status(CodeUiSessionStatus::Idle).await;
+                            if let Err(error) = persistence_for_repair
+                                .persist_snapshot(runner_session.snapshot().await)
+                                .await
+                            {
+                                return Err(RuntimeWorkerError::DurabilityFailure(format!(
+                                    "failed to persist confirmed plan execution snapshot: {error}"
+                                )));
+                            }
+                        }
+                        release_web_turn(&runner_in_flight, &runner_turn_id).await;
+                        Ok(RuntimeTurnExecution::Completed { summary })
+                    }
+                    Err(error) => {
+                        park_web_plan_execution_repair(
+                            &persistence_for_repair,
+                            &runtime_for_repair,
+                            &session_id_for_repair,
+                            &runner_session,
+                            None,
+                            Some(&error.to_string()),
+                        )
+                        .await?;
+                        release_web_turn(&runner_in_flight, &runner_turn_id).await;
+                        Err(orchestrator_error_to_runtime(error))
+                    }
+                }
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<RuntimeTurnExecution, RuntimeWorkerError>,
+                            > + Send,
+                    >,
+                >
+        });
+
+        match submit_confirmed_plan_execution(
+            &self.runtime,
+            self.plan_execution_executor.as_ref(),
+            session_id,
+            runtime_turn_id.clone(),
+            runner,
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                release_web_turn(&self.in_flight, &runtime_turn_id).await;
+                self.session.set_status(CodeUiSessionStatus::Idle).await;
+                Err(anyhow!(runtime_worker_adapter_message(error)))
+            }
+        }
     }
 
     async fn prepare_plan_gate_from_network(
@@ -3662,6 +4031,7 @@ where
                 .map_err(|error| anyhow!(runtime_worker_adapter_message(error)))?;
             self.replace_in_flight_runtime_turn(&turn_id, "Network policy")
                 .await?;
+            clear_phase1_start_seed(&store)?;
             self.project_network_policy(
                 &context,
                 &interaction_id,
@@ -3672,7 +4042,6 @@ where
             persistence
                 .persist_snapshot(self.session.snapshot().await)
                 .await?;
-            clear_phase1_start_seed(&store)?;
             return Ok(true);
         }
 
@@ -3769,12 +4138,12 @@ where
             .map_err(|error| anyhow!(runtime_worker_adapter_message(error)))?;
         self.replace_in_flight_runtime_turn(&turn_id, "Plan review")
             .await?;
+        clear_phase1_start_seed(&store)?;
         self.project_plan_review(&context, true, workspace_warning.as_deref())
             .await;
         persistence
             .persist_snapshot(self.session.snapshot().await)
             .await?;
-        clear_phase1_start_seed(&store)?;
         Ok(true)
     }
 
@@ -4837,6 +5206,15 @@ where
             // Default browser chat uses the historical Phase 0 allowlist so apply_patch
             // / shell cannot run before IntentSpec / plan confirmation.
             config = phase0_plan_tool_loop_config(config);
+            let live_revision = self.pending_intent_revision.lock().await.is_some();
+            if live_revision {
+                // Live revision consumption (plain follow-up or `/intent modify`)
+                // must observe every successful draft in the turn. A terminal
+                // `submit_intent_draft` would hide a second draft and incorrectly
+                // park a replacement review. Fresh Phase 0 (no live sidecar)
+                // keeps the historical terminal so the first review parks once.
+                config.terminal_tools = Some(Vec::new());
+            }
         }
         if let Some(usage_context) = config.usage_context.as_mut() {
             // The serialized runtime's request id is durable and replay-stable.
@@ -5380,6 +5758,81 @@ where
                 if open_interaction_id == *interaction_id
                     && phase0_turn_id == request.turn_id
         )
+    }
+}
+
+/// Dispatches chat/Phase-0/1 turns to [`HeadlessTurnExecutor`] and confirmed
+/// plan-execution turns to [`DeferredPlanExecutionExecutor`] so the worker
+/// remains the single serialized owner (W2-04).
+struct WebRuntimeTurnExecutor<M: CompletionModel + 'static> {
+    chat: Arc<HeadlessTurnExecutor<M>>,
+    plan: Arc<DeferredPlanExecutionExecutor>,
+}
+
+#[async_trait]
+impl<M> RuntimeTurnExecutor for WebRuntimeTurnExecutor<M>
+where
+    M: CompletionModel + Clone + Send + Sync + 'static,
+    M::Response: CompletionUsage,
+{
+    async fn execute(
+        &self,
+        request: TurnRequest,
+        context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        if is_plan_execution_turn(&request) {
+            self.plan.execute(request, context).await
+        } else {
+            self.chat.execute(request, context).await
+        }
+    }
+
+    async fn respond(
+        &self,
+        request: TurnRequest,
+        interaction: InteractionResponse,
+        context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        self.chat.respond(request, interaction, context).await
+    }
+
+    async fn interaction_resolution(
+        &self,
+        request: &TurnRequest,
+        interaction: &InteractionResponse,
+    ) -> Option<String> {
+        self.chat.interaction_resolution(request, interaction).await
+    }
+
+    async fn intent_revision_recovery(
+        &self,
+        request: &TurnRequest,
+        interaction: &InteractionResponse,
+    ) -> Option<crate::internal::ai::session::IntentRevisionRecovery> {
+        self.chat
+            .intent_revision_recovery(request, interaction)
+            .await
+    }
+
+    fn validate_interaction_response(
+        &self,
+        interaction: &InteractionResponse,
+    ) -> Result<(), RuntimeWorkerError> {
+        self.chat.validate_interaction_response(interaction)
+    }
+
+    fn preserve_pending_interaction_on_shutdown(
+        &self,
+        request: &TurnRequest,
+        interaction: &InteractionState,
+    ) -> bool {
+        self.chat
+            .preserve_pending_interaction_on_shutdown(request, interaction)
+    }
+
+    fn on_admission_discarded(&self, request: &TurnRequest) {
+        self.plan.on_admission_discarded(request);
+        self.chat.on_admission_discarded(request);
     }
 }
 
@@ -9188,6 +9641,134 @@ where
     }
 }
 
+struct WebPlanExecutionObserver {
+    session: Arc<CodeUiSession>,
+    assistant_entry_id: String,
+    handle: tokio::runtime::Handle,
+}
+
+impl crate::internal::ai::orchestrator::types::OrchestratorObserver for WebPlanExecutionObserver {
+    fn on_task_runtime_event(
+        &self,
+        task: &crate::internal::ai::orchestrator::types::TaskSpec,
+        event: crate::internal::ai::orchestrator::types::TaskRuntimeEvent,
+    ) {
+        use crate::internal::ai::orchestrator::types::TaskRuntimeEvent;
+        let text = match event {
+            TaskRuntimeEvent::AssistantMessage(message) => message,
+            TaskRuntimeEvent::Note { text, .. } => text,
+            TaskRuntimeEvent::ToolCallBegin { tool_name, .. } => {
+                format!("{} started `{tool_name}`", task.objective)
+            }
+            _ => return,
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let session = self.session.clone();
+        let entry_id = self.assistant_entry_id.clone();
+        self.handle.spawn(async move {
+            session
+                .mutate(CodeUiEventType::SessionUpdated, |snapshot| {
+                    if let Some(entry) = snapshot.transcript.iter_mut().find(|e| e.id == entry_id) {
+                        let mut content = entry.content.clone().unwrap_or_default();
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&text);
+                        entry.content = Some(content);
+                        entry.updated_at = Utc::now();
+                    }
+                })
+                .await;
+        });
+    }
+}
+
+fn orchestrator_error_to_runtime(
+    error: crate::internal::ai::orchestrator::types::OrchestratorError,
+) -> RuntimeWorkerError {
+    RuntimeWorkerError::ExecutionFailed(error.to_string())
+}
+
+async fn park_web_plan_execution_repair(
+    persistence: &HeadlessSessionPersistence,
+    runtime: &AgentRuntimeHandle,
+    session_id: &str,
+    session: &Arc<CodeUiSession>,
+    result: Option<&crate::internal::ai::orchestrator::types::OrchestratorResult>,
+    summary: Option<&str>,
+) -> Result<(), RuntimeWorkerError> {
+    use crate::internal::ai::runtime::{
+        DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS, PlanExecutionRepairService,
+        persist_and_park_plan_execution_repair_gate,
+    };
+
+    let interaction_id = format!("plan-repair-{}", uuid::Uuid::new_v4());
+    let repair = PlanExecutionRepairService.after_failure(
+        interaction_id.clone(),
+        result,
+        summary,
+        0,
+        DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+    );
+    let gate_turn_id = format!("plan-repair-turn-{}", uuid::Uuid::new_v4());
+    persist_and_park_plan_execution_repair_gate(
+        &persistence.goal_event_store(),
+        runtime,
+        session_id.to_string(),
+        &repair,
+        gate_turn_id,
+    )
+    .await?;
+    session
+        .set_plan_execution_repair(Some(repair.clone()))
+        .await;
+    if let Some(InteractionState::AwaitingPlanRepair { interaction_id }) =
+        repair.interaction_state()
+    {
+        session
+            .upsert_interaction(CodeUiInteractionRequest {
+                id: interaction_id,
+                kind: CodeUiInteractionKind::PlanExecutionRepair,
+                title: Some("Plan execution repair".to_string()),
+                description: Some(repair.evidence().output.clone()),
+                prompt: None,
+                options: vec![
+                    CodeUiInteractionOption {
+                        id: "continue".to_string(),
+                        label: "Continue".to_string(),
+                        description: Some("Retry plan execution".to_string()),
+                    },
+                    CodeUiInteractionOption {
+                        id: "cancel".to_string(),
+                        label: "Cancel".to_string(),
+                        description: Some("Abandon this plan".to_string()),
+                    },
+                ],
+                status: CodeUiInteractionStatus::Pending,
+                metadata: serde_json::json!({ "phase": "planExecutionRepair" }),
+                requested_at: Utc::now(),
+                resolved_at: None,
+            })
+            .await;
+        session
+            .set_status(CodeUiSessionStatus::AwaitingInteraction)
+            .await;
+    } else {
+        session.set_status(CodeUiSessionStatus::Idle).await;
+    }
+    persistence
+        .persist_snapshot(session.snapshot().await)
+        .await
+        .map_err(|error| {
+            RuntimeWorkerError::DurabilityFailure(format!(
+                "failed to persist plan-execution repair snapshot: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
 // `CodeUiProviderAdapter` is automatically implemented for any `T` that
 // satisfies `CodeUiReadModel + CodeUiCommandAdapter` via the blanket impl in
 // `code_ui.rs`. `Arc<HeadlessCodeRuntime<M>>` picks that up directly because
@@ -10346,6 +10927,22 @@ mod tests {
         .expect("revision sidecar promoted")
     }
 
+    fn persist_replacement_review_marker(
+        store: &crate::internal::ai::session::jsonl::SessionJsonlStore,
+        consumer_command_id: &str,
+        interaction_id: &str,
+        intent_id: &str,
+    ) {
+        store
+            .append_code_workflow_durable(CodeWorkflowEventKind::IntentReviewRequested {
+                interaction_id: interaction_id.to_string(),
+                intent_id: intent_id.to_string(),
+                turn_id: format!("{interaction_id}-gate"),
+                phase0_turn_id: consumer_command_id.to_string(),
+            })
+            .expect("replacement review marker persisted");
+    }
+
     #[test]
     fn intent_revision_note_is_canonical_and_bounded() {
         let response = CodeUiInteractionResponse {
@@ -10419,11 +11016,22 @@ mod tests {
             (intent, terminal)
         };
         let (source_a, terminal_a) = append_legacy_source("source-a", "review-a", "intent-a");
-        let (source_b, terminal_b) = append_legacy_source("source-b", "review-b", "intent-b");
+        use sha2::Digest as _;
         let consumer = CodeCommandIntent::new(
-            CodeCommandIdentity::new(repo_id, session_id, principal_id, "revision-consumer"),
+            CodeCommandIdentity::new(
+                repo_id.clone(),
+                session_id.clone(),
+                principal_id.clone(),
+                "revision-consumer",
+            ),
             CODE_UI_WEB_TURN_KIND,
-            "sha256:consumer",
+            format!(
+                "sha256:{}",
+                hex::encode(sha2::Sha256::digest(
+                    crate::internal::ai::session::jsonl::INTENT_REVISION_CANCEL_COMMAND_INPUT
+                        .as_bytes(),
+                ))
+            ),
             true,
         );
         goal_store
@@ -10447,12 +11055,16 @@ mod tests {
         goal_store
             .record_intent_revision_consumption(&consumption_a)
             .expect("legacy consumption receipt persisted");
+        goal_store
+            .complete_code_command_success(&consumer.identity, "legacy revision cancelled")
+            .expect("legacy cancel terminal persisted");
         let replay = goal_store
             .load_code_workflow_replay_committed()
             .expect("committed legacy receipt replay");
         validate_all_intent_revision_consumption_receipts(&persistence, &replay)
             .expect("one exact legacy receipt is valid");
 
+        let (source_b, terminal_b) = append_legacy_source("source-b", "review-b", "intent-b");
         let claim_b = IntentRevisionConsumptionClaim {
             schema_version: INTENT_REVISION_CONSUMPTION_SCHEMA_VERSION,
             interaction_id: "review-b".to_string(),
@@ -10620,6 +11232,12 @@ mod tests {
         goal_store
             .admit_code_command(consumer.clone())
             .expect("consumer command admitted");
+        persist_replacement_review_marker(
+            &goal_store,
+            &consumer.identity.command_id,
+            "replacement-a",
+            "replacement-intent-a",
+        );
         let claim = pending_consumption_binding(&pending_a, consumer.clone())
             .expect("consumer binding created");
         let consumption = goal_store
@@ -10628,6 +11246,15 @@ mod tests {
         goal_store
             .record_intent_revision_consumption(&consumption)
             .expect("consumer receipt persisted");
+        goal_store
+            .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+                interaction_id: "replacement-a".to_string(),
+                resolution: "cancel".to_string(),
+                command: None,
+                prior_interaction_resolutions: Vec::new(),
+                intent_revision_consumption: None,
+            })
+            .expect("replacement review resolved so a later Modify can open");
         clear_pending_intent_revision(&persistence).expect("consumed sidecar removed");
         goal_store
             .complete_code_command_success(&consumer.identity, "revision consumed")
