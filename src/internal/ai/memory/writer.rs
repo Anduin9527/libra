@@ -9,6 +9,7 @@ use super::{
     canonical::memory_note_content_digest_v1,
     domain::{MemoryEventAction, MemoryEventV1, MemoryNoteV1},
     error::{MemoryWriterError, MemoryWriterErrorKind},
+    job_state::CompileJobLease,
     policy::{
         AuthenticatedMemoryContext, DeterministicMemoryProposal, TrustedMemoryTarget,
         validate_writer_policy,
@@ -159,6 +160,7 @@ impl MemoryWriter {
         target: &TrustedMemoryTarget,
         admitted: &AdmittedEpisodeProposal,
         expected_head: Option<ObjectHash>,
+        job_lease: Option<&CompileJobLease>,
     ) -> Result<CommittedMemoryEnvelope, MemoryWriterError> {
         resolver
             .revalidate(context, target, admitted.source())
@@ -167,8 +169,14 @@ impl MemoryWriter {
                 let kind = writer_error_kind_for_source(error.kind());
                 MemoryWriterError::new(kind, "Episode source evidence could not be revalidated")
             })?;
-        self.commit_validated(context, target, admitted.proposal(), expected_head)
-            .await
+        self.commit_validated(
+            context,
+            target,
+            admitted.proposal(),
+            expected_head,
+            job_lease,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -179,7 +187,7 @@ impl MemoryWriter {
         proposal: &DeterministicMemoryProposal,
         expected_head: Option<ObjectHash>,
     ) -> Result<CommittedMemoryEnvelope, MemoryWriterError> {
-        self.commit_validated(context, target, proposal, expected_head)
+        self.commit_validated(context, target, proposal, expected_head, None)
             .await
     }
 
@@ -189,6 +197,7 @@ impl MemoryWriter {
         target: &TrustedMemoryTarget,
         proposal: &DeterministicMemoryProposal,
         expected_head: Option<ObjectHash>,
+        job_lease: Option<&CompileJobLease>,
     ) -> Result<CommittedMemoryEnvelope, MemoryWriterError> {
         self.digest_provider
             .validate_for_connection(self.database.as_ref())
@@ -383,6 +392,7 @@ impl MemoryWriter {
                 expected_cell: cell.clone(),
                 repository_id: self.digest_provider.repository_id().to_string(),
                 digest_provider: Arc::clone(&self.digest_provider),
+                job_lease: job_lease.cloned(),
             };
             #[cfg(test)]
             if attempt == 0 {
@@ -565,6 +575,7 @@ pub(in crate::internal::ai::memory) mod tests {
                         MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust,
                         MemoryVisibility,
                     },
+                    job_state::{CompileJobKey, CompileJobLease},
                     policy::{
                         AuthenticatedMemoryContext, DeterministicMemoryProposal,
                         TrustedMemoryTarget,
@@ -608,6 +619,7 @@ pub(in crate::internal::ai::memory) mod tests {
         pub(in crate::internal::ai::memory) _temp: tempfile::TempDir,
         pub(in crate::internal::ai::memory) database: Arc<DatabaseConnection>,
         pub(in crate::internal::ai::memory) writer: Arc<MemoryWriter>,
+        pub(in crate::internal::ai::memory) digest: Arc<RepositoryKeyedDigest>,
         pub(in crate::internal::ai::memory) context: AuthenticatedMemoryContext,
         pub(in crate::internal::ai::memory) target: TrustedMemoryTarget,
         pub(in crate::internal::ai::memory) key_id: Uuid,
@@ -652,7 +664,7 @@ pub(in crate::internal::ai::memory) mod tests {
             MemoryWriter::for_tests(
                 temp.path().to_path_buf(),
                 Arc::new(database.clone()),
-                provider,
+                Arc::clone(&provider),
             )
             .await
             .expect("construct Memory writer"),
@@ -670,6 +682,7 @@ pub(in crate::internal::ai::memory) mod tests {
             _temp: temp,
             database: Arc::new(database),
             writer,
+            digest: provider,
             context,
             target,
             key_id,
@@ -854,6 +867,66 @@ pub(in crate::internal::ai::memory) mod tests {
             .expect("decode live revision");
         assert_eq!(review_state, "confirmed");
         assert_eq!(live_revision, committed.revision_oid().to_string());
+    }
+
+    #[tokio::test]
+    async fn writer_fences_reclaimed_generation_before_ref_cas() {
+        let fixture = fixture().await;
+        let source_oid: ObjectHash = SOURCE_OID.parse().expect("fixed source OID");
+        let fingerprint = fixture
+            .digest
+            .source_input_fingerprint(b"writer-fence-test")
+            .expect("derive source fingerprint");
+        let now = Utc::now().timestamp_millis();
+        fixture
+            .database
+            .execute_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "INSERT INTO memory_compile_job (
+                    scope_key, root_kind, root_id, terminal_source_oid,
+                    input_fingerprint_version, input_fingerprint_key_id,
+                    input_fingerprint_digest, observed_generation,
+                    processed_generation, state, lease_owner, lease_fence,
+                    lease_expires_at, created_at, updated_at
+                 ) VALUES ('repo', 'task', ?, ?, ?, ?, ?, 1, 0, 'inflight',
+                           'runner-new', 2, ?, ?, ?)",
+                [
+                    fixture.target.root().id().into(),
+                    source_oid.to_string().into(),
+                    i64::from(fingerprint.version()).into(),
+                    fingerprint.key_id().to_string().into(),
+                    fingerprint.digest_hex().into(),
+                    now.saturating_add(30_000).into(),
+                    now.into(),
+                    now.into(),
+                ],
+            ))
+            .await
+            .expect("seed reclaimed generation lease");
+        let stale = CompileJobLease::from_persisted(
+            CompileJobKey::new("repo", fixture.target.root().clone()).expect("job key"),
+            "runner-old".to_string(),
+            1,
+            1,
+            source_oid,
+            fingerprint,
+        )
+        .expect("construct stale lease snapshot");
+
+        let error = fixture
+            .writer
+            .commit_validated(
+                &fixture.context,
+                &fixture.target,
+                &proposal(&fixture.target, fixture.key_id, 1),
+                None,
+                Some(&stale),
+            )
+            .await
+            .expect_err("reclaimed lease must fence the Memory ref CAS");
+        assert_eq!(error.kind(), MemoryWriterErrorKind::ProjectionStale);
+        assert_eq!(memory_ref_count(&fixture.database).await, 0);
+        assert_eq!(count(&fixture.database, "memory_revision_index").await, 0);
     }
 
     #[tokio::test]

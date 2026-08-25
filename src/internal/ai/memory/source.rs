@@ -1554,6 +1554,7 @@ mod tests {
                 &fixture.target,
                 &admitted,
                 None,
+                None,
             )
             .await
             .expect("commit revalidated admitted Episode");

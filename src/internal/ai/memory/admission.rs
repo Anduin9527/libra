@@ -29,7 +29,8 @@ const MAX_EVIDENCE_PER_CLAIM: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EpisodeAdmissionErrorKind {
-    CompilerFailed,
+    CompilerTransient,
+    CompilerStable,
     InvalidProposal,
     SourceMismatch,
     DigestUnavailable,
@@ -100,11 +101,13 @@ impl<'a> EpisodeAdmission<'a> {
                 .compile(&source, config)
                 .await
                 .map_err(|error| match error.kind() {
+                    EpisodeCompilerErrorKind::ProviderFailed => {
+                        EpisodeAdmissionError::new(EpisodeAdmissionErrorKind::CompilerTransient)
+                    }
                     EpisodeCompilerErrorKind::InvalidConfig
                     | EpisodeCompilerErrorKind::MalformedOutput
-                    | EpisodeCompilerErrorKind::OutputLimitExceeded
-                    | EpisodeCompilerErrorKind::ProviderFailed => {
-                        EpisodeAdmissionError::new(EpisodeAdmissionErrorKind::CompilerFailed)
+                    | EpisodeCompilerErrorKind::OutputLimitExceeded => {
+                        EpisodeAdmissionError::new(EpisodeAdmissionErrorKind::CompilerStable)
                     }
                 })?;
         let proposal = self.admit(config, context, target, &source, compiler_proposal)?;

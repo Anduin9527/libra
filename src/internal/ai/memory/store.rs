@@ -9,6 +9,8 @@ use serde::Serialize;
 use super::{
     domain::{MemoryEventV1, MemoryNoteV1},
     error::{MemoryWriterError, MemoryWriterErrorKind},
+    job_sql::verify_job_lease,
+    job_state::CompileJobLease,
     projection::materialize_linear,
     replay::{ProjectedNote, ProjectedReviewState, ReducedProjection, ReplayRecord},
     tree::parse_oid,
@@ -160,6 +162,7 @@ pub(super) struct ProjectionMutation {
     pub(super) expected_cell: Option<ProjectedCell>,
     pub(super) repository_id: String,
     pub(super) digest_provider: Arc<RepositoryKeyedDigest>,
+    pub(super) job_lease: Option<CompileJobLease>,
 }
 
 #[async_trait]
@@ -216,6 +219,19 @@ async fn revalidate_snapshot(
     txn: &DatabaseTransaction,
     mutation: &ProjectionMutation,
 ) -> Result<(), MemoryWriterError> {
+    if let Some(lease) = &mutation.job_lease
+        && !verify_job_lease(txn, lease).await.map_err(|_| {
+            MemoryWriterError::new(
+                MemoryWriterErrorKind::StorageFailure,
+                "Memory compiler lease could not be revalidated",
+            )
+        })?
+    {
+        return Err(MemoryWriterError::new(
+            MemoryWriterErrorKind::ProjectionStale,
+            "Memory compiler lease expired or was reclaimed before commit",
+        ));
+    }
     let repository = RepoIdentity::resolve(txn).await.map_err(|error| {
         MemoryWriterError::new(
             MemoryWriterErrorKind::CorruptProjection,

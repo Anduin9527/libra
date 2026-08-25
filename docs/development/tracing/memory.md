@@ -1449,11 +1449,48 @@ expected 时正常推进；当前值已经等于 `scanned_through_oid` 时返回
 batch。first-parent 后代关系与扫描预算由 M2-08 observer 在调用前验证，SQL
 Module 不读取 Git 对象。
 
-本卡只实现上述 observation transaction。ref 扫描、terminal 判断、canonical
-input 构造、lease acquire/renew/takeover、runner、compiler、retry scheduling 与
-processed-generation completion 均属于 M2-08。down migration 仅在九张 M2-02
+M2-02 只实现上述 observation transaction；M2-08 在该 Interface 上补齐 ref 扫描、
+terminal 判断、canonical input 构造、lease acquire/takeover、runner、retry scheduling
+与 processed-generation completion。down migration 仅在九张 M2-02
 表全部为空时按 `observer/job → episode_path/link/head → revision → note → projection_state/path_summary`
 的依赖顺序删除；任何表有行都以稳定错误拒绝，不能级联丢状态。
+
+#### 5.2.2 M2-08 terminal observer 与 generation runner
+
+自动编译由两条持久 observer 驱动。AI 历史 observer 只把
+`TaskEventKind::{Done, Failed, Cancelled}` 和
+`IntentEventKind::{Completed, Cancelled}` 视为外部触发；其它 append 仍被扫描，
+但只推进 `libra/intent` 水位。Memory observer 扫描
+`libra/memory/repo`，只接受已经 `Confirmed` 的 Task Episode revision，并重新唤醒
+已经有终态 job 的父 Intent。Intent Episode revision 被忽略，因此编译输出不会反向
+触发自身。
+
+两条 observer 都先固定 ref head，再沿 first-parent 读取不可变 append。单次扫描上限为
+2,048 个 commit，tree 与 blob 也有独立字节上限；head 非 cursor 后代、merge、损坏对象
+或预算超限都会报错，SQLite cursor 保持原值。完整扫描后，root job upsert 与 cursor
+推进复用 §5.2.1 的同一短事务，进程在事务前后退出都可以通过下次启动修复重放。
+
+规范输入指纹使用仓库 keyed digest：
+
+- Task：`root_id + terminal_source_commit_oid`；
+- Intent：`root_id + terminal_source_commit_oid + 按 task_id 排序的
+  (task_id, live_revision_oid | missing)`。
+
+指纹和 terminal source 都未变化时不增加 generation。Task revision 变化只会改变父
+Intent 的指纹；缺失 revision 使用稳定的 `missing` marker，后续补齐时自然产生下一代。
+
+runner 每次只领取一行可运行 job。领取会写入 owner、30 秒 deadline 和单调递增 fence；
+过期 lease 可被新 owner 接管。编译完成后，Memory ref CAS、投影更新和 lease 有效性校验
+处于同一个 SQLite write transaction：owner/fence 已失效或 deadline 已过的 runner 不能
+提交权威 revision。完成、失败和释放也都带 owner/fence 条件，旧 runner 无法覆盖新 owner
+的状态。编译期间出现新 generation 时，旧 generation 可以先完成，job 随后回到 `dirty`
+继续处理最新输入。
+
+transient failure 最多重试五次，使用从 500 ms 开始、上限 30 s 的指数退避；稳定的
+schema/auth/policy failure 进入 `failed`，直到新 generation 到来。job 只保存
+`LBR-MEMORY-201..206` 和经默认 Redactor 脱敏、UTF-8 安全截断到 1,024 bytes 的摘要，
+不保存 provider 原始响应、prompt 或 transcript。终态写入只调度后台 observer，不等待
+扫描和模型；MCP runtime 构造时复用同一 repair seam 补齐崩溃窗口。
 
 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_projection_state`、`memory_episode_path` 是 M2-02 的可重建投影。`memory_compile_job` 与 `memory_compile_observer_state` 是有界本地运行状态。后续的 `memory_entity_index`、`memory_taxonomy_node` 仍是可重建投影；`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats`、`context_selection_receipt` 与 `context_selection_receipt_retention` 是本地有界账本及其保留水位，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
 

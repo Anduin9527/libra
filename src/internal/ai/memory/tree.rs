@@ -94,6 +94,7 @@ pub(super) struct MemoryCommitObjects {
 
 #[derive(Clone)]
 pub(super) struct MemoryHistoryRecord {
+    pub(super) source_commit_oid: ObjectHash,
     pub(super) event: super::domain::MemoryEventV1,
     pub(super) revision_oid: Option<ObjectHash>,
     pub(super) note: Option<super::domain::MemoryNoteV1>,
@@ -216,6 +217,7 @@ fn validate_append_edge(
         root_items,
         previous_seq,
         manifest.last_event_seq,
+        commit.id,
     )
 }
 
@@ -230,7 +232,19 @@ pub(super) fn load_history_delta(
     after: Option<ObjectHash>,
     policy_version: &str,
 ) -> Result<MemoryHistoryDelta, MemoryWriterError> {
-    const MAX_REPLAY_COMMITS: usize = 4096;
+    load_history_delta_bounded(storage_path, head, after, policy_version, 4_096)
+}
+
+pub(super) fn load_history_delta_bounded(
+    storage_path: &Path,
+    head: ObjectHash,
+    after: Option<ObjectHash>,
+    policy_version: &str,
+    max_commits: usize,
+) -> Result<MemoryHistoryDelta, MemoryWriterError> {
+    if max_commits == 0 {
+        return Err(corrupt("Memory replay commit budget must be positive"));
+    }
 
     if Some(head) == after {
         let snapshot = load_snapshot(storage_path, Some(head), policy_version)?;
@@ -246,7 +260,7 @@ pub(super) fn load_history_delta(
         if Some(cursor) == after {
             break;
         }
-        if suffix.len() == MAX_REPLAY_COMMITS {
+        if suffix.len() == max_commits {
             return Err(corrupt("Memory replay exceeds the commit budget"));
         }
         let commit = load_commit(storage_path, cursor)?;
@@ -526,6 +540,7 @@ fn validate_event_edge(
     root_items: &[TreeItem],
     previous_seq: u64,
     last_event_seq: u64,
+    source_commit_oid: ObjectHash,
 ) -> Result<Vec<MemoryHistoryRecord>, MemoryWriterError> {
     let events = tree_entries(storage_path, root_items, "events")?;
     if events.len() > MAX_MEMORY_TREE_ENTRIES {
@@ -643,12 +658,14 @@ fn validate_event_edge(
                 ));
             }
             records.push(MemoryHistoryRecord {
+                source_commit_oid,
                 event,
                 revision_oid: Some(revision_oid),
                 note: Some(note),
             });
         } else {
             records.push(MemoryHistoryRecord {
+                source_commit_oid,
                 event,
                 revision_oid: None,
                 note: None,

@@ -170,6 +170,56 @@ pub(crate) struct PinnedHistoryEntry {
     oid: ObjectHash,
 }
 
+/// One append commit decoded from a bounded first-parent history interval.
+/// The source commit is retained separately from the leaf blob OID because
+/// compiler generation identity is anchored to the immutable history point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryAppend {
+    source_commit_oid: ObjectHash,
+    object_type: String,
+    object_id: String,
+    object_oid: ObjectHash,
+    bytes: Vec<u8>,
+}
+
+impl PinnedHistoryAppend {
+    pub(crate) const fn source_commit_oid(&self) -> ObjectHash {
+        self.source_commit_oid
+    }
+
+    pub(crate) fn object_type(&self) -> &str {
+        &self.object_type
+    }
+
+    pub(crate) fn object_id(&self) -> &str {
+        &self.object_id
+    }
+
+    pub(crate) const fn object_oid(&self) -> ObjectHash {
+        self.object_oid
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryDelta {
+    head: ObjectHash,
+    appends: Vec<PinnedHistoryAppend>,
+}
+
+impl PinnedHistoryDelta {
+    pub(crate) const fn head(&self) -> ObjectHash {
+        self.head
+    }
+
+    pub(crate) fn appends(&self) -> &[PinnedHistoryAppend] {
+        &self.appends
+    }
+}
+
 /// Read-only view whose head was proven to belong to the current first-parent
 /// history. Callers cannot accidentally fall through to the moving ref.
 pub(crate) struct PinnedHistoryView<'a> {
@@ -297,7 +347,13 @@ fn validate_history_path_part(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_single_parent_commit(repo_path: &Path, oid: ObjectHash) -> Result<Option<ObjectHash>> {
+struct LinearHistoryCommit {
+    tree_oid: ObjectHash,
+    parent_oid: Option<ObjectHash>,
+    message: String,
+}
+
+fn read_linear_history_commit(repo_path: &Path, oid: ObjectHash) -> Result<LinearHistoryCommit> {
     let (kind, bytes) =
         read_git_object_bounded_validated(repo_path, &oid, PINNED_HISTORY_COMMIT_MAX_BYTES)
             .with_context(|| format!("failed to read AI history commit {oid}"))?;
@@ -306,28 +362,60 @@ fn read_single_parent_commit(repo_path: &Path, oid: ObjectHash) -> Result<Option
     }
     let text = std::str::from_utf8(&bytes)
         .with_context(|| format!("AI history commit {oid} is not UTF-8"))?;
+    let mut lines = text.split('\n');
     let mut parents = Vec::new();
-    let mut saw_tree = false;
-    for line in text.lines() {
-        if line.is_empty() || line.starts_with("author ") {
-            break;
+    let tree = lines
+        .next()
+        .and_then(|line| line.strip_prefix("tree "))
+        .ok_or_else(|| anyhow!("AI history commit {oid} has no tree header"))?;
+    let tree_oid = ObjectHash::from_str(tree)
+        .map_err(|_| anyhow!("AI history commit {oid} has invalid tree OID"))?;
+    let author_line = loop {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow!("AI history commit {oid} has no author header"))?;
+        if line.starts_with("author ") {
+            break line;
         }
-        if line.starts_with("tree ") {
-            saw_tree = true;
-        } else if let Some(parent) = line.strip_prefix("parent ") {
+        if let Some(parent) = line.strip_prefix("parent ") {
             parents.push(
                 ObjectHash::from_str(parent)
                     .map_err(|_| anyhow!("AI history commit {oid} has invalid parent OID"))?,
             );
+        } else {
+            bail!("AI history commit {oid} has an unexpected header");
         }
+    };
+    if author_line.len() == "author ".len() {
+        bail!("AI history commit {oid} has an empty author header");
     }
-    if !saw_tree {
-        bail!("AI history commit {oid} has no tree header");
+    let committer = lines
+        .next()
+        .ok_or_else(|| anyhow!("AI history commit {oid} has no committer header"))?;
+    if !committer.starts_with("committer ") || committer.len() == "committer ".len() {
+        bail!("AI history commit {oid} has an invalid committer header");
     }
     if parents.len() > 1 {
         bail!("AI history commit {oid} is a merge commit");
     }
-    Ok(parents.into_iter().next())
+    let message = lines
+        .skip_while(|line| line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end_matches('\n')
+        .to_string();
+    if message.is_empty() {
+        bail!("AI history commit {oid} has an empty message");
+    }
+    Ok(LinearHistoryCommit {
+        tree_oid,
+        parent_oid: parents.into_iter().next(),
+        message,
+    })
+}
+
+fn read_single_parent_commit(repo_path: &Path, oid: ObjectHash) -> Result<Option<ObjectHash>> {
+    read_linear_history_commit(repo_path, oid).map(|commit| commit.parent_oid)
 }
 
 #[cfg(test)]
@@ -1284,6 +1372,15 @@ impl HistoryManager {
         &self.ref_name
     }
 
+    /// Return the repository-local Libra storage directory.
+    ///
+    /// This crate-private accessor lets tightly scoped Memory coordinators
+    /// share the existing object database and SQLite file without guessing a
+    /// second path or introducing another storage owner.
+    pub(crate) fn repository_path(&self) -> &Path {
+        &self.repo_path
+    }
+
     /// Append an object to the history log.
     /// This operation is synchronous (commits immediately) for the MVP.
     ///
@@ -1491,6 +1588,169 @@ impl HistoryManager {
             max_tree_bytes,
             root_items,
         })
+    }
+
+    /// Decode append commits between an observer cursor and a pinned head.
+    ///
+    /// The returned appends are oldest-first. The cursor itself is excluded;
+    /// the pinned head is included. Any merge, non-descendant cursor,
+    /// malformed append commit, or budget overrun aborts the entire scan so a
+    /// caller cannot advance a durable observer waterline past unknown data.
+    pub(crate) async fn scan_append_delta(
+        &self,
+        pinned_head: ObjectHash,
+        after: Option<ObjectHash>,
+        max_commits: usize,
+        max_tree_bytes: u64,
+        max_blob_bytes: u64,
+    ) -> Result<PinnedHistoryDelta> {
+        if max_commits == 0 || max_tree_bytes == 0 || max_blob_bytes == 0 {
+            bail!("AI history delta limits must be greater than zero");
+        }
+        let current_head = self
+            .resolve_history_head()
+            .await?
+            .ok_or_else(|| anyhow!("AI history is not initialized"))?;
+        if current_head != pinned_head {
+            bail!("AI history observer head changed before it could be pinned");
+        }
+
+        let mut cursor = Some(pinned_head);
+        let mut visited = HashSet::new();
+        let mut commits = Vec::new();
+        while cursor != after {
+            let Some(commit_oid) = cursor else {
+                bail!("AI history observer cursor is not an ancestor of the pinned head");
+            };
+            if commits.len() == max_commits {
+                bail!("AI history delta exceeds the configured commit budget");
+            }
+            if !visited.insert(commit_oid) {
+                bail!("AI history contains a first-parent cycle");
+            }
+            let commit = read_linear_history_commit(&self.repo_path, commit_oid)?;
+            cursor = commit.parent_oid;
+            commits.push((commit_oid, commit));
+        }
+        commits.reverse();
+
+        let mut appends = Vec::with_capacity(commits.len());
+        for (commit_oid, commit) in commits {
+            let Some(path) = commit.message.strip_prefix("Update ") else {
+                if commit.parent_oid.is_none() {
+                    continue;
+                }
+                bail!("AI history commit {commit_oid} is not a canonical append commit");
+            };
+            let (object_type, object_id) = path.split_once('/').ok_or_else(|| {
+                anyhow!("AI history append commit {commit_oid} has an invalid path")
+            })?;
+            validate_history_path_part("object type", object_type)?;
+            validate_history_path_part("object ID", object_id)?;
+            let object_oid = self
+                .blob_at_tree_path(commit.tree_oid, object_type, object_id, max_tree_bytes)?
+                .ok_or_else(|| {
+                    anyhow!("AI history append commit {commit_oid} does not contain its path")
+                })?;
+            if let Some(parent_oid) = commit.parent_oid {
+                let parent = read_linear_history_commit(&self.repo_path, parent_oid)?;
+                if self.blob_at_tree_path(
+                    parent.tree_oid,
+                    object_type,
+                    object_id,
+                    max_tree_bytes,
+                )? == Some(object_oid)
+                {
+                    bail!("AI history append commit {commit_oid} did not change its path");
+                }
+            }
+            let (kind, bytes) =
+                read_git_object_bounded_validated(&self.repo_path, &object_oid, max_blob_bytes)
+                    .with_context(|| {
+                        format!("failed to read AI history append blob {object_oid}")
+                    })?;
+            if kind != "blob" {
+                bail!("AI history append path does not identify a blob");
+            }
+            appends.push(PinnedHistoryAppend {
+                source_commit_oid: commit_oid,
+                object_type: object_type.to_string(),
+                object_id: object_id.to_string(),
+                object_oid,
+                bytes,
+            });
+        }
+        Ok(PinnedHistoryDelta {
+            head: pinned_head,
+            appends,
+        })
+    }
+
+    /// Read one canonical append commit after proving it remains reachable
+    /// from the moving AI-history head. This is used by generation runners to
+    /// recover the terminal actor from the exact source commit held by their
+    /// lease.
+    pub(crate) async fn read_append_at(
+        &self,
+        commit_oid: ObjectHash,
+        max_ancestry_commits: usize,
+        max_tree_bytes: u64,
+        max_blob_bytes: u64,
+    ) -> Result<PinnedHistoryAppend> {
+        self.pin_history(commit_oid, max_ancestry_commits, max_tree_bytes)
+            .await?;
+        let commit = read_linear_history_commit(&self.repo_path, commit_oid)?;
+        let path = commit
+            .message
+            .strip_prefix("Update ")
+            .ok_or_else(|| anyhow!("AI history commit {commit_oid} is not an append commit"))?;
+        let (object_type, object_id) = path
+            .split_once('/')
+            .ok_or_else(|| anyhow!("AI history append commit {commit_oid} has an invalid path"))?;
+        validate_history_path_part("object type", object_type)?;
+        validate_history_path_part("object ID", object_id)?;
+        let object_oid = self
+            .blob_at_tree_path(commit.tree_oid, object_type, object_id, max_tree_bytes)?
+            .ok_or_else(|| {
+                anyhow!("AI history append commit {commit_oid} does not contain its path")
+            })?;
+        let (kind, bytes) =
+            read_git_object_bounded_validated(&self.repo_path, &object_oid, max_blob_bytes)
+                .with_context(|| format!("failed to read AI history append blob {object_oid}"))?;
+        if kind != "blob" {
+            bail!("AI history append path does not identify a blob");
+        }
+        Ok(PinnedHistoryAppend {
+            source_commit_oid: commit_oid,
+            object_type: object_type.to_string(),
+            object_id: object_id.to_string(),
+            object_oid,
+            bytes,
+        })
+    }
+
+    fn blob_at_tree_path(
+        &self,
+        root_tree_oid: ObjectHash,
+        object_type: &str,
+        object_id: &str,
+        max_tree_bytes: u64,
+    ) -> Result<Option<ObjectHash>> {
+        let root_items = self.load_tree_bounded(&root_tree_oid, max_tree_bytes)?;
+        let Some(type_entry) = root_items.iter().find(|item| item.name == object_type) else {
+            return Ok(None);
+        };
+        if type_entry.mode != TreeItemMode::Tree {
+            bail!("AI history object type path is not a tree");
+        }
+        let type_items = self.load_tree_bounded(&type_entry.id, max_tree_bytes)?;
+        let Some(object_entry) = type_items.iter().find(|item| item.name == object_id) else {
+            return Ok(None);
+        };
+        if object_entry.mode != TreeItemMode::Blob {
+            bail!("AI history object path is not a blob");
+        }
+        Ok(Some(object_entry.id))
     }
 
     /// List all object types present at the current history head.

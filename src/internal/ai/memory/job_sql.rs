@@ -1,13 +1,23 @@
 use std::{
     collections::HashSet,
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use git_internal::hash::ObjectHash;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
 use thiserror::Error;
+use uuid::Uuid;
 
-use super::domain::{EpisodeRoot, EpisodeRootKind};
+use super::{
+    domain::{EpisodeRoot, EpisodeRootKind},
+    job_state::{
+        COMPILE_JOB_LEASE_MS, COMPILE_JOB_MAX_RETRIES, CompileFailureClass,
+        CompileJobCompletionOutcome, CompileJobKey, CompileJobLease, CompileJobMutationOutcome,
+        CompileJobStateError, CompileJobStateErrorKind, StableJobFailure, retry_delay_ms,
+        validate_lease_owner,
+    },
+};
 use crate::internal::{ai::keyed_digest::SourceInputFingerprint, db};
 
 const INTENT_SOURCE_REF: &str = "libra/intent";
@@ -149,7 +159,8 @@ pub(crate) async fn record_observation_batch(
     let transaction = db::begin_write_transaction(database)
         .await
         .map_err(|_| RecordObservationError::storage())?;
-    match record_observation_batch_in_transaction(&transaction, batch).await {
+    let observed_at = epoch_millis()?;
+    match record_observation_batch_in_transaction(&transaction, batch, observed_at).await {
         Ok(outcome) => {
             transaction
                 .commit()
@@ -167,6 +178,7 @@ pub(crate) async fn record_observation_batch(
 async fn record_observation_batch_in_transaction(
     transaction: &DatabaseTransaction,
     batch: ObservationBatch,
+    observed_at: i64,
 ) -> Result<ObservationBatchOutcome, RecordObservationError> {
     let scanned_through_oid = batch.scanned_through_oid.to_string();
     let expected_cursor = batch.expected_cursor.map(|cursor| cursor.to_string());
@@ -188,7 +200,6 @@ async fn record_observation_batch_in_transaction(
         ));
     }
 
-    let observed_at = epoch_millis()?;
     let observed_roots = batch.roots.len();
     for root in batch.roots {
         observe_root(transaction, &batch.scope_key, root, observed_at).await?;
@@ -221,11 +232,126 @@ async fn record_observation_batch_in_transaction(
     Ok(ObservationBatchOutcome::Recorded { observed_roots })
 }
 
+#[cfg(test)]
+async fn record_observation_batch_at(
+    database: &DatabaseConnection,
+    batch: ObservationBatch,
+    observed_at: i64,
+) -> Result<ObservationBatchOutcome, RecordObservationError> {
+    let transaction = db::begin_write_transaction(database)
+        .await
+        .map_err(|_| RecordObservationError::storage())?;
+    match record_observation_batch_in_transaction(&transaction, batch, observed_at).await {
+        Ok(outcome) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| RecordObservationError::storage())?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
 fn epoch_millis() -> Result<i64, RecordObservationError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| RecordObservationError::storage())?;
     i64::try_from(elapsed.as_millis()).map_err(|_| RecordObservationError::storage())
+}
+
+pub(crate) async fn load_observer_cursor(
+    database: &DatabaseConnection,
+    scope_key: &str,
+    source_ref_name: &str,
+) -> Result<Option<ObjectHash>, RecordObservationError> {
+    if !valid_scope_key(scope_key) {
+        return Err(RecordObservationError::new(
+            RecordObservationErrorKind::InvalidScope,
+        ));
+    }
+    if !matches!(source_ref_name, INTENT_SOURCE_REF | MEMORY_SOURCE_REF) {
+        return Err(RecordObservationError::new(
+            RecordObservationErrorKind::InvalidSourceRef,
+        ));
+    }
+    database
+        .query_one_raw(Statement::from_sql_and_values(
+            database.get_database_backend(),
+            "SELECT scanned_through_oid FROM memory_compile_observer_state
+             WHERE scope_key = ? AND source_ref_name = ?",
+            [scope_key.into(), source_ref_name.into()],
+        ))
+        .await
+        .map_err(|_| RecordObservationError::storage())?
+        .map(|row| {
+            let value: String = row
+                .try_get("", "scanned_through_oid")
+                .map_err(|_| RecordObservationError::storage())?;
+            ObjectHash::from_str(&value).map_err(|_| RecordObservationError::storage())
+        })
+        .transpose()
+}
+
+/// Prove that a compiler lease still owns its generation while an enclosing
+/// SQLite write transaction is held. MemoryWriter uses this as a companion
+/// precondition, so lease takeover and the authoritative ref CAS cannot race.
+pub(super) async fn verify_job_lease(
+    transaction: &DatabaseTransaction,
+    lease: &CompileJobLease,
+) -> Result<bool, CompileJobStateError> {
+    let row = transaction
+        .query_one_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "SELECT 1 AS valid
+             FROM memory_compile_job
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?
+               AND state = 'inflight' AND lease_owner = ? AND lease_fence = ?
+               AND processed_generation < ? AND observed_generation >= ?
+               AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000",
+            [
+                lease.key().scope_key().into(),
+                lease.key().root_kind_label().into(),
+                lease.key().root().id().into(),
+                lease.owner().into(),
+                lease.fence().into(),
+                lease.target_generation().into(),
+                lease.target_generation().into(),
+            ],
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    Ok(row.is_some())
+}
+
+pub(crate) async fn load_terminal_job_source(
+    database: &DatabaseConnection,
+    key: &CompileJobKey,
+) -> Result<Option<ObjectHash>, CompileJobStateError> {
+    database
+        .query_one_raw(Statement::from_sql_and_values(
+            database.get_database_backend(),
+            "SELECT terminal_source_oid FROM memory_compile_job
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?",
+            [
+                key.scope_key().into(),
+                key.root_kind_label().into(),
+                key.root().id().into(),
+            ],
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?
+        .map(|row| {
+            let value: String = row
+                .try_get("", "terminal_source_oid")
+                .map_err(|_| CompileJobStateError::storage())?;
+            ObjectHash::from_str(&value)
+                .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::CorruptState))
+        })
+        .transpose()
 }
 
 async fn read_observer_cursor(
@@ -463,6 +589,379 @@ async fn observe_root(
     Ok(())
 }
 
+struct ClaimableJob {
+    key: CompileJobKey,
+    terminal_source_oid: ObjectHash,
+    input_fingerprint: SourceInputFingerprint,
+    observed_generation: i64,
+    next_fence: i64,
+}
+
+/// Claim at most one runnable compiler generation for a repository scope.
+///
+/// Expired leases are reclaimed by incrementing the persisted fence. Every
+/// later mutation includes owner + fence, so an old process cannot complete,
+/// fail, or release work after takeover.
+pub(crate) async fn claim_next_job(
+    database: &DatabaseConnection,
+    scope_key: &str,
+    owner: &str,
+    now_ms: i64,
+) -> Result<Option<CompileJobLease>, CompileJobStateError> {
+    let scope_probe = EpisodeRoot::task("scope-validation")
+        .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::InvalidInput))?;
+    CompileJobKey::new(scope_key, scope_probe)?;
+    validate_lease_owner(owner)?;
+    if now_ms < 0 {
+        return Err(CompileJobStateError::new(
+            CompileJobStateErrorKind::InvalidInput,
+        ));
+    }
+
+    let transaction = db::begin_write_transaction(database)
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    let result = claim_next_job_in_transaction(&transaction, scope_key, owner, now_ms).await;
+    match result {
+        Ok(lease) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| CompileJobStateError::storage())?;
+            Ok(lease)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn claim_next_job_in_transaction(
+    transaction: &DatabaseTransaction,
+    scope_key: &str,
+    owner: &str,
+    now_ms: i64,
+) -> Result<Option<CompileJobLease>, CompileJobStateError> {
+    let row = transaction
+        .query_one_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "SELECT root_kind, root_id, terminal_source_oid,
+                    input_fingerprint_version, input_fingerprint_key_id,
+                    input_fingerprint_digest, observed_generation, lease_fence
+             FROM memory_compile_job
+             WHERE scope_key = ? AND processed_generation < observed_generation
+               AND ((state = 'dirty' AND (next_retry_at IS NULL OR next_retry_at <= ?))
+                    OR (state = 'inflight' AND lease_expires_at <= ?))
+             ORDER BY updated_at ASC, root_kind ASC, root_id ASC
+             LIMIT 1",
+            [scope_key.into(), now_ms.into(), now_ms.into()],
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let root_kind: String = row
+        .try_get("", "root_kind")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let root_id: String = row
+        .try_get("", "root_id")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let root = match root_kind.as_str() {
+        "task" => EpisodeRoot::task(root_id),
+        "intent" => EpisodeRoot::intent(root_id),
+        _ => {
+            return Err(CompileJobStateError::new(
+                CompileJobStateErrorKind::CorruptState,
+            ));
+        }
+    }
+    .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::CorruptState))?;
+    let key = CompileJobKey::new(scope_key, root)
+        .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::CorruptState))?;
+    let terminal_source_oid: String = row
+        .try_get("", "terminal_source_oid")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let terminal_source_oid = ObjectHash::from_str(&terminal_source_oid)
+        .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::CorruptState))?;
+    let fingerprint_version: i64 = row
+        .try_get("", "input_fingerprint_version")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let fingerprint_key_id: String = row
+        .try_get("", "input_fingerprint_key_id")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let fingerprint_digest: String = row
+        .try_get("", "input_fingerprint_digest")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let input_fingerprint = SourceInputFingerprint::from_parts(
+        u8::try_from(fingerprint_version)
+            .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::CorruptState))?,
+        Uuid::parse_str(&fingerprint_key_id)
+            .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::CorruptState))?,
+        fingerprint_digest,
+    )
+    .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::CorruptState))?;
+    let observed_generation: i64 = row
+        .try_get("", "observed_generation")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let current_fence: i64 = row
+        .try_get("", "lease_fence")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let next_fence = current_fence
+        .checked_add(1)
+        .ok_or_else(CompileJobStateError::storage)?;
+    let claimable = ClaimableJob {
+        key,
+        terminal_source_oid,
+        input_fingerprint,
+        observed_generation,
+        next_fence,
+    };
+
+    let lease_expires_at = now_ms.saturating_add(COMPILE_JOB_LEASE_MS);
+    let result = transaction
+        .execute_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "UPDATE memory_compile_job
+             SET state = 'inflight', lease_owner = ?, lease_fence = ?,
+                 lease_expires_at = ?, next_retry_at = NULL, updated_at = ?
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?
+               AND processed_generation < observed_generation
+               AND ((state = 'dirty' AND (next_retry_at IS NULL OR next_retry_at <= ?))
+                    OR (state = 'inflight' AND lease_expires_at <= ?))",
+            [
+                owner.into(),
+                claimable.next_fence.into(),
+                lease_expires_at.into(),
+                now_ms.into(),
+                claimable.key.scope_key().into(),
+                claimable.key.root_kind_label().into(),
+                claimable.key.root().id().into(),
+                now_ms.into(),
+                now_ms.into(),
+            ],
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    if result.rows_affected() != 1 {
+        return Ok(None);
+    }
+
+    CompileJobLease::from_persisted(
+        claimable.key,
+        owner.to_owned(),
+        claimable.next_fence,
+        claimable.observed_generation,
+        claimable.terminal_source_oid,
+        claimable.input_fingerprint,
+    )
+    .map(Some)
+}
+
+pub(crate) async fn complete_job(
+    database: &DatabaseConnection,
+    lease: &CompileJobLease,
+    now_ms: i64,
+) -> Result<CompileJobCompletionOutcome, CompileJobStateError> {
+    if now_ms < 0 {
+        return Err(CompileJobStateError::new(
+            CompileJobStateErrorKind::InvalidInput,
+        ));
+    }
+    let transaction = db::begin_write_transaction(database)
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    let row = transaction
+        .query_one_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "SELECT observed_generation FROM memory_compile_job
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?
+               AND state = 'inflight' AND lease_owner = ? AND lease_fence = ?",
+            lease_identity_values(lease),
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    let Some(row) = row else {
+        transaction.rollback().await.ok();
+        return Ok(CompileJobCompletionOutcome::FencedOut);
+    };
+    let observed_generation: i64 = row
+        .try_get("", "observed_generation")
+        .map_err(|_| CompileJobStateError::storage())?;
+    if observed_generation < lease.target_generation() {
+        transaction.rollback().await.ok();
+        return Err(CompileJobStateError::new(
+            CompileJobStateErrorKind::CorruptState,
+        ));
+    }
+    let clean = observed_generation == lease.target_generation();
+    let state = if clean { "idle" } else { "dirty" };
+    let result = transaction
+        .execute_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "UPDATE memory_compile_job
+             SET processed_generation = ?, state = ?, lease_owner = NULL,
+                 lease_expires_at = NULL, retry_count = 0, next_retry_at = NULL,
+                 last_error_code = NULL, last_error_summary = NULL, updated_at = ?
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?
+               AND state = 'inflight' AND lease_owner = ? AND lease_fence = ?",
+            [
+                lease.target_generation().into(),
+                state.into(),
+                now_ms.into(),
+                lease.key().scope_key().into(),
+                lease.key().root_kind_label().into(),
+                lease.key().root().id().into(),
+                lease.owner().into(),
+                lease.fence().into(),
+            ],
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    if result.rows_affected() != 1 {
+        transaction.rollback().await.ok();
+        return Ok(CompileJobCompletionOutcome::FencedOut);
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    Ok(if clean {
+        CompileJobCompletionOutcome::Clean
+    } else {
+        CompileJobCompletionOutcome::NewGenerationPending
+    })
+}
+
+pub(crate) async fn record_job_failure(
+    database: &DatabaseConnection,
+    lease: &CompileJobLease,
+    failure: &StableJobFailure,
+    now_ms: i64,
+) -> Result<CompileJobMutationOutcome, CompileJobStateError> {
+    if now_ms < 0 {
+        return Err(CompileJobStateError::new(
+            CompileJobStateErrorKind::InvalidInput,
+        ));
+    }
+    let transaction = db::begin_write_transaction(database)
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    let row = transaction
+        .query_one_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "SELECT retry_count FROM memory_compile_job
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?
+               AND state = 'inflight' AND lease_owner = ? AND lease_fence = ?",
+            lease_identity_values(lease),
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    let Some(row) = row else {
+        transaction.rollback().await.ok();
+        return Ok(CompileJobMutationOutcome::FencedOut);
+    };
+    let retry_count: i64 = row
+        .try_get("", "retry_count")
+        .map_err(|_| CompileJobStateError::storage())?;
+    let retry_count = retry_count
+        .checked_add(1)
+        .ok_or_else(CompileJobStateError::storage)?;
+    let retry_count_u32 = u32::try_from(retry_count).unwrap_or(u32::MAX);
+    let retry = failure.class() == CompileFailureClass::Transient
+        && retry_count_u32 < COMPILE_JOB_MAX_RETRIES;
+    let (state, next_retry_at) = if retry {
+        (
+            "dirty",
+            Some(now_ms.saturating_add(retry_delay_ms(retry_count_u32))),
+        )
+    } else {
+        ("failed", None)
+    };
+    let result = transaction
+        .execute_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "UPDATE memory_compile_job
+             SET state = ?, lease_owner = NULL, lease_expires_at = NULL,
+                 retry_count = ?, next_retry_at = ?, last_error_code = ?,
+                 last_error_summary = ?, updated_at = ?
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?
+               AND state = 'inflight' AND lease_owner = ? AND lease_fence = ?",
+            [
+                state.into(),
+                retry_count.into(),
+                next_retry_at.into(),
+                failure.code().into(),
+                failure.summary().into(),
+                now_ms.into(),
+                lease.key().scope_key().into(),
+                lease.key().root_kind_label().into(),
+                lease.key().root().id().into(),
+                lease.owner().into(),
+                lease.fence().into(),
+            ],
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    if result.rows_affected() != 1 {
+        transaction.rollback().await.ok();
+        return Ok(CompileJobMutationOutcome::FencedOut);
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    Ok(CompileJobMutationOutcome::Applied)
+}
+
+pub(crate) async fn release_job_dirty(
+    database: &DatabaseConnection,
+    lease: &CompileJobLease,
+    now_ms: i64,
+) -> Result<CompileJobMutationOutcome, CompileJobStateError> {
+    if now_ms < 0 {
+        return Err(CompileJobStateError::new(
+            CompileJobStateErrorKind::InvalidInput,
+        ));
+    }
+    let result = database
+        .execute_raw(Statement::from_sql_and_values(
+            database.get_database_backend(),
+            "UPDATE memory_compile_job
+             SET state = 'dirty', lease_owner = NULL, lease_expires_at = NULL,
+                 next_retry_at = NULL, updated_at = ?
+             WHERE scope_key = ? AND root_kind = ? AND root_id = ?
+               AND state = 'inflight' AND lease_owner = ? AND lease_fence = ?",
+            [
+                now_ms.into(),
+                lease.key().scope_key().into(),
+                lease.key().root_kind_label().into(),
+                lease.key().root().id().into(),
+                lease.owner().into(),
+                lease.fence().into(),
+            ],
+        ))
+        .await
+        .map_err(|_| CompileJobStateError::storage())?;
+    Ok(if result.rows_affected() == 1 {
+        CompileJobMutationOutcome::Applied
+    } else {
+        CompileJobMutationOutcome::FencedOut
+    })
+}
+
+fn lease_identity_values(lease: &CompileJobLease) -> Vec<sea_orm::Value> {
+    vec![
+        lease.key().scope_key().into(),
+        lease.key().root_kind_label().into(),
+        lease.key().root().id().into(),
+        lease.owner().into(),
+        lease.fence().into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use git_internal::hash::ObjectHash;
@@ -472,9 +971,19 @@ mod tests {
 
     use super::{
         super::domain::EpisodeRoot, ObservationBatch, ObservationBatchOutcome, ObservedRoot,
-        RecordObservationErrorKind, record_observation_batch,
+        RecordObservationErrorKind, claim_next_job, complete_job, epoch_millis, record_job_failure,
+        record_observation_batch, record_observation_batch_at, release_job_dirty, verify_job_lease,
     };
-    use crate::internal::{ai::keyed_digest::SourceInputFingerprint, db};
+    use crate::internal::{
+        ai::{
+            keyed_digest::SourceInputFingerprint,
+            memory::job_state::{
+                CompileFailureClass, CompileJobCompletionOutcome, CompileJobMutationOutcome,
+                StableJobFailure,
+            },
+        },
+        db,
+    };
 
     struct JobSnapshot {
         terminal_source_oid: String,
@@ -959,6 +1468,234 @@ mod tests {
         assert_eq!(
             job.last_error_summary.as_deref(),
             Some("pinned generation diagnostic")
+        );
+    }
+
+    #[tokio::test]
+    async fn compiler_job_lease_fences_expired_owner() {
+        let (_directory, connection) = memory_database().await;
+        let now = epoch_millis().expect("read current test time");
+        let cursor = oid(b"fence-cursor");
+        let source = oid(b"fence-source");
+        let batch = ObservationBatch::new(
+            "repo",
+            "libra/intent",
+            None,
+            cursor,
+            vec![observed_task("task-fence", source, fingerprint('a'))],
+        )
+        .expect("lease observation validates");
+        record_observation_batch_at(&connection, batch, 100)
+            .await
+            .expect("lease observation commits");
+
+        let first = claim_next_job(&connection, "repo", "runner-a", now)
+            .await
+            .expect("first claim succeeds")
+            .expect("first runner receives the job");
+        assert_eq!(first.fence(), 1);
+        assert!(
+            claim_next_job(&connection, "repo", "runner-b", now + 1)
+                .await
+                .expect("contended claim succeeds")
+                .is_none(),
+            "an unexpired lease must exclude another runner"
+        );
+
+        let second = claim_next_job(
+            &connection,
+            "repo",
+            "runner-b",
+            now + super::super::job_state::COMPILE_JOB_LEASE_MS,
+        )
+        .await
+        .expect("expired lease takeover succeeds")
+        .expect("second runner reclaims the expired job");
+        assert_eq!(second.fence(), 2);
+        let transaction = db::begin_write_transaction(&connection)
+            .await
+            .expect("begin lease proof transaction");
+        assert!(
+            !verify_job_lease(&transaction, &first)
+                .await
+                .expect("stale lease proof is readable")
+        );
+        assert!(
+            verify_job_lease(&transaction, &second)
+                .await
+                .expect("current lease proof is readable")
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("rollback read-only lease proof");
+        assert_eq!(
+            complete_job(
+                &connection,
+                &first,
+                now + super::super::job_state::COMPILE_JOB_LEASE_MS + 1,
+            )
+            .await
+            .expect("stale completion is a typed no-op"),
+            CompileJobCompletionOutcome::FencedOut
+        );
+        assert_eq!(
+            release_job_dirty(
+                &connection,
+                &first,
+                now + super::super::job_state::COMPILE_JOB_LEASE_MS + 2,
+            )
+            .await
+            .expect("stale release is a typed no-op"),
+            CompileJobMutationOutcome::FencedOut
+        );
+        assert_eq!(
+            complete_job(
+                &connection,
+                &second,
+                now + super::super::job_state::COMPILE_JOB_LEASE_MS + 3,
+            )
+            .await
+            .expect("new owner completes"),
+            CompileJobCompletionOutcome::Clean
+        );
+        let job = job_snapshot(&connection, "task", "task-fence")
+            .await
+            .expect("completed job remains");
+        assert_eq!(job.state, "idle");
+        assert_eq!(job.processed_generation, 1);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.lease_fence, 2);
+    }
+
+    #[tokio::test]
+    async fn compiler_job_completion_preserves_new_generation() {
+        let (_directory, connection) = memory_database().await;
+        let cursor_one = oid(b"generation-cursor-one");
+        let cursor_two = oid(b"generation-cursor-two");
+        let source_one = oid(b"generation-source-one");
+        let source_two = oid(b"generation-source-two");
+        let first = ObservationBatch::new(
+            "repo",
+            "libra/intent",
+            None,
+            cursor_one,
+            vec![observed_task(
+                "task-generation",
+                source_one,
+                fingerprint('a'),
+            )],
+        )
+        .expect("first generation validates");
+        record_observation_batch_at(&connection, first, 100)
+            .await
+            .expect("first generation commits");
+        let lease = claim_next_job(&connection, "repo", "runner-a", 200)
+            .await
+            .expect("claim succeeds")
+            .expect("first generation is runnable");
+        assert_eq!(lease.target_generation(), 1);
+        assert_eq!(lease.terminal_source_oid(), source_one);
+        assert_eq!(lease.input_fingerprint().digest_hex(), "a".repeat(64));
+
+        let second = ObservationBatch::new(
+            "repo",
+            "libra/intent",
+            Some(cursor_one),
+            cursor_two,
+            vec![observed_task(
+                "task-generation",
+                source_two,
+                fingerprint('b'),
+            )],
+        )
+        .expect("second generation validates");
+        record_observation_batch_at(&connection, second, 300)
+            .await
+            .expect("second generation is observed while generation one runs");
+        assert_eq!(
+            complete_job(&connection, &lease, 400)
+                .await
+                .expect("generation one completion succeeds"),
+            CompileJobCompletionOutcome::NewGenerationPending
+        );
+        let job = job_snapshot(&connection, "task", "task-generation")
+            .await
+            .expect("generation job remains");
+        assert_eq!(job.processed_generation, 1);
+        assert_eq!(job.observed_generation, 2);
+        assert_eq!(job.state, "dirty");
+        assert_eq!(job.lease_owner, None);
+    }
+
+    #[tokio::test]
+    async fn compiler_job_failure_retries_then_stabilizes_redacted_diagnostic() {
+        let (_directory, connection) = memory_database().await;
+        let cursor = oid(b"retry-cursor");
+        let source = oid(b"retry-source");
+        let batch = ObservationBatch::new(
+            "repo",
+            "libra/intent",
+            None,
+            cursor,
+            vec![observed_task("task-retry", source, fingerprint('a'))],
+        )
+        .expect("retry observation validates");
+        record_observation_batch_at(&connection, batch, 100)
+            .await
+            .expect("retry observation commits");
+
+        let lease = claim_next_job(&connection, "repo", "runner-a", 200)
+            .await
+            .expect("claim succeeds")
+            .expect("job is runnable");
+        let transient = StableJobFailure::new(
+            CompileFailureClass::Transient,
+            "LBR-MEMORY-101",
+            format!("provider timeout token ghp_{}", "a".repeat(40)),
+        )
+        .expect("transient failure validates");
+        assert_eq!(
+            record_job_failure(&connection, &lease, &transient, 300)
+                .await
+                .expect("transient failure records"),
+            CompileJobMutationOutcome::Applied
+        );
+        let retrying = job_snapshot(&connection, "task", "task-retry")
+            .await
+            .expect("retrying job remains");
+        assert_eq!(retrying.state, "dirty");
+        assert_eq!(retrying.retry_count, 1);
+        assert_eq!(retrying.next_retry_at, Some(800));
+        assert_eq!(retrying.last_error_code.as_deref(), Some("LBR-MEMORY-101"));
+        assert!(!retrying.last_error_summary.unwrap().contains("ghp_"));
+
+        let retry_lease = claim_next_job(&connection, "repo", "runner-b", 800)
+            .await
+            .expect("retry claim succeeds")
+            .expect("retry deadline makes the job runnable");
+        let stable = StableJobFailure::new(
+            CompileFailureClass::Stable,
+            "LBR-MEMORY-103",
+            "schema rejected",
+        )
+        .expect("stable failure validates");
+        record_job_failure(&connection, &retry_lease, &stable, 900)
+            .await
+            .expect("stable failure records");
+        let failed = job_snapshot(&connection, "task", "task-retry")
+            .await
+            .expect("failed job remains");
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.retry_count, 2);
+        assert_eq!(failed.next_retry_at, None);
+        assert_eq!(failed.last_error_code.as_deref(), Some("LBR-MEMORY-103"));
+        assert!(
+            claim_next_job(&connection, "repo", "runner-c", 1_000)
+                .await
+                .expect("failed claim query succeeds")
+                .is_none(),
+            "stable failure waits for a new observed generation"
         );
     }
 }
