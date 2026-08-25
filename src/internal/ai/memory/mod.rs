@@ -36,4 +36,15 @@ mod validation;
 mod view;
 mod writer;
 
+pub(crate) use applicability::CodeApplicability;
+pub(crate) use domain::{
+    CompletionStatus, EpisodeRootKind, EvidenceKind, EvidenceRefV1, EvidenceSourcePlane,
+    MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust,
+};
 pub(crate) use job::schedule_observer_repair;
+pub(crate) use policy::AuthenticatedMemoryContext;
+pub(crate) use query::{EpisodeQueryV1, MAX_CANDIDATES, MAX_RESULT_LIMIT};
+pub(crate) use reader::{
+    EpisodeReadItemV1, EpisodeReader, EpisodeReaderError, EpisodeReaderErrorKind,
+};
+pub(crate) use view::ResolvedMemoryViewV1;

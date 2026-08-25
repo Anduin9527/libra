@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use thiserror::Error;
 
 use super::domain::{
@@ -10,7 +11,8 @@ pub(crate) const MAX_RESULT_LIMIT: usize = 50;
 pub(crate) const MAX_CANDIDATES: usize = 200;
 const MAX_PATH_BYTES: usize = 512;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", content = "path", rename_all = "snake_case")]
 pub(crate) enum EpisodePathFilter {
     Exact(String),
     Prefix(String),
@@ -24,7 +26,8 @@ impl EpisodePathFilter {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EpisodeQueryV1 {
     pub(crate) text: Option<String>,
     pub(crate) root_kind: Option<EpisodeRootKind>,
@@ -33,6 +36,10 @@ pub(crate) struct EpisodeQueryV1 {
     pub(crate) related_task_id: Option<String>,
     pub(crate) ended_from: Option<DateTime<Utc>>,
     pub(crate) ended_until: Option<DateTime<Utc>>,
+    /// Frozen effective time used only for validity/expiry filtering. Callers
+    /// that inject context must supply this once and persist it in the shared
+    /// selection receipt; the reader never consults the wall clock itself.
+    pub(crate) effective_at: Option<DateTime<Utc>>,
     pub(crate) completion_status: Option<CompletionStatus>,
     pub(crate) code_change_status: Option<CodeChangeStatus>,
     pub(crate) path: Option<EpisodePathFilter>,
@@ -51,6 +58,7 @@ impl Default for EpisodeQueryV1 {
             related_task_id: None,
             ended_from: None,
             ended_until: None,
+            effective_at: None,
             completion_status: None,
             code_change_status: None,
             path: None,

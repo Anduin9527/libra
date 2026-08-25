@@ -1584,6 +1584,33 @@ Episode 最多比较 512 个 canonical code path；预算耗尽或对象不可�
 
 在访问模式上还有一条对齐约定值得明确：Memory 的投影表用 SeaORM entity 来访问（与同样可重建的 `ai_index_*` 投影一致），而不采用 `agent_session` / `agent_checkpoint` / `agent_usage_stats` 那种**故意**保持的 raw-SQL、无 entity 风格。原因在于：`agent_*` 那批表是外部捕获的独立账本，而 Memory 的这些表是 git 真源（`refs/heads/libra/memory/...`）的可重建投影，本质与 `ai_index_*` 同类，因而对齐 `ai_index_*` 的 SeaORM 模式。账本例外是 `memory_access_stats` 与 `context_selection_receipt`（§8.6）：二者都不是可重建投影，沿用 raw-SQL 账本模式，不配 entity。
 
+#### 5.2.6 M2-12 冻结注入与审计交付合同
+
+共享上下文层通过 `MemoryContextAssembler` 取得一次已经认证的读取请求。普通执行先由
+`EpisodeReader` 解析当前 repository、principal、代码 commit、完整分支 ref、worktree、
+Memory ref、投影水位与 policy，冻结为一个 `ResolvedMemoryView`；重放执行则必须显式传入
+原来的冻结 view，不能再读取当前 HEAD 或 wall clock。调用方只提供一次 `effective_at`，它同时
+进入有效期过滤、规范查询 HMAC 与 `ContextSelectionReceiptV1`。
+
+`EpisodeReader` 只返回候选、BM25 分数、适用性、来源与读取成本。注入器把内部候选窗口固定为
+50 条，再由共享 `ContextBudgetAllocator` 按 `ProjectMemory` 段预算和总 prompt 预算确定最终集合；
+调用方的 `limit` 仍是最终条目上限。授权、关系、代码适用性、结果窗口和 token 预算产生的
+排除都会以稳定 reason code 聚合进回执。注入只渲染写入准入时已验证的短证据指针，不主动
+展开原始证据正文；显式证据展开仍沿用 M2-11 的逐项授权与 omission 合同。当前注入层没有
+provider 信任配置，因此自动注入只接受 `Public` / `Internal`，`Confidential` 保持可显式读取但
+进入 `sensitivity_policy` omission，`SecretLike` 继续完全不可注入。
+
+注入块只包含稳定、紧凑的 Episode 字段：note/revision ID、path、namespace、scope、confidence、
+trust、代码适用性、Task/Intent 根、完成状态、goal、summary 与简短证据指针。它复用
+`MemoryAnchor` 所在的 prompt 交付位置，但只存在于本次请求，不创建或持久化第二份 Anchor / Note。
+渲染头明确说明记忆用于提供指引，当前源码和命令输出具有更高优先级。
+
+规范查询 HMAC 覆盖 view hash、worktree identity、查询/过滤条件、`effective_at`、Memory token
+预算和 selector version；bundle hash 覆盖最终渲染字节。共享 `ReceiptStore` 成功追加回执后，
+调用方才能获得 `AuditedMemoryContextBundleV1` 并交给 `SystemPromptBuilder`。回执写入失败时不会
+产生可交付 bundle。相同 frozen view、query、budget、effective time 与 selector 会得到相同
+selected IDs、顺序、reason codes 和 bundle hash；UUIDv7 receipt ID 与记录时间不参与确定性结果。
+
 ### 5.3 ClientStorage 分层
 
 `MemoryNote` / `MemoryEvent` blob 应经 `ClientStorage` 写入，使 `object_index`、本地对象库和可选 durable tier 的行为与其它 AI 对象一致（见 [`workflow.md`](../../ai/workflow.md) 2026-04-29 的说明）。但“可分层”不等于“可无条件上传”：

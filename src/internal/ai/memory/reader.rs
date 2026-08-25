@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use super::{
     applicability::{
-        CodeApplicability, CodeHistory, RepositoryCodeHistory, classify_code_applicability,
+        CodeApplicability, CodeHistory, RepositoryCodeHistory, assess_code_applicability,
     },
     domain::{MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust, MemoryVisibility},
     evidence::{EvidenceExpansionV1, EvidenceResolver},
@@ -19,6 +19,7 @@ use super::{
 use crate::internal::{
     ai::{history::HistoryManager, keyed_digest::RepositoryKeyedDigest},
     head::Head,
+    worktree_scope::WorktreeScope,
 };
 
 pub(crate) struct EpisodeReader<'a> {
@@ -62,6 +63,7 @@ impl<'a> EpisodeReader<'a> {
             .begin()
             .await
             .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        let worktree_scope = WorktreeScope::current();
         let current = Head::current_result_with_conn(&transaction)
             .await
             .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::InvalidCodeAnchor))?;
@@ -79,8 +81,14 @@ impl<'a> EpisodeReader<'a> {
         } else {
             format!("refs/heads/{branch}")
         };
-        let code_anchor = FrozenCodeAnchorV1::new(commit_oid, full_branch_ref)
-            .map_err(EpisodeReaderError::from)?;
+        if WorktreeScope::current() != worktree_scope {
+            return Err(EpisodeReaderError::new(
+                EpisodeReaderErrorKind::InvalidCodeAnchor,
+            ));
+        }
+        let code_anchor =
+            FrozenCodeAnchorV1::new(commit_oid, full_branch_ref, worktree_scope.storage_key())
+                .map_err(EpisodeReaderError::from)?;
         self.code_history
             .parents(code_anchor.commit_oid())
             .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::InvalidCodeAnchor))?;
@@ -131,6 +139,7 @@ impl<'a> EpisodeReader<'a> {
         let projected = search_candidates(&transaction, query)
             .await
             .map_err(EpisodeReaderError::from)?;
+        let candidates_examined = projected.len();
         let mut loaded = Vec::with_capacity(projected.len());
         let mut relation_omissions = 0usize;
         for candidate in projected {
@@ -145,7 +154,7 @@ impl<'a> EpisodeReader<'a> {
                 relation_omissions = relation_omissions.saturating_add(1);
                 continue;
             }
-            let applicability = classify_code_applicability(
+            let assessment = assess_code_applicability(
                 &self.code_history,
                 view.code_anchor().commit_oid(),
                 &episode.code,
@@ -156,9 +165,16 @@ impl<'a> EpisodeReader<'a> {
                     revision_oid: candidate.revision_oid,
                     bm25_score: candidate.bm25_score,
                     ended_at: candidate.ended_at,
-                    applicability,
+                    applicability: assessment.applicability,
                 },
                 note,
+                read_cost: EpisodeReadCostV1 {
+                    projection_rows: 1,
+                    note_objects: 1,
+                    code_commits_visited: assessment.commits_visited,
+                    code_paths_compared: assessment.paths_compared,
+                    evidence_items: 0,
+                },
             });
         }
         view.revalidate(
@@ -185,6 +201,11 @@ impl<'a> EpisodeReader<'a> {
             })
             .collect::<Vec<_>>();
         let selected = select_episode_indexes(&selectable, query.include_diagnostics, query.limit);
+        let selector_limit_omissions = selectable
+            .iter()
+            .filter(|candidate| query.include_diagnostics || candidate.applicability.injectable())
+            .count()
+            .saturating_sub(selected.len());
         let omitted_by_applicability = loaded
             .iter()
             .filter(|candidate| !candidate.selectable.applicability.injectable())
@@ -205,20 +226,27 @@ impl<'a> EpisodeReader<'a> {
             } else {
                 EvidenceExpansionV1::default()
             };
+            let mut read_cost = candidate.read_cost;
+            read_cost.evidence_items = evidence
+                .resolved
+                .len()
+                .saturating_add(evidence.omissions.len());
             items.push(EpisodeReadItemV1 {
                 note: candidate.note.clone(),
                 revision_oid: candidate.selectable.revision_oid,
                 bm25_score: candidate.selectable.bm25_score,
                 applicability: candidate.selectable.applicability,
                 evidence,
+                read_cost,
             });
         }
         Ok(EpisodeSearchResultV1 {
             view_hash: view.view_hash().to_string(),
             selector_version: EPISODE_SELECTOR_VERSION,
-            candidates_examined: loaded.len(),
+            candidates_examined,
             relation_omissions,
             omitted_by_applicability,
+            selector_limit_omissions,
             evidence_reads,
             items,
         })
@@ -242,6 +270,9 @@ impl<'a> EpisodeReader<'a> {
             || episode.completion_status != candidate.completion_status
             || episode.code_change_status != candidate.code_change_status
             || episode.ended_at != candidate.ended_at
+            || note.valid_from != candidate.valid_from
+            || note.valid_until != candidate.valid_until
+            || note.expires_at != candidate.expires_at
         {
             return Err(EpisodeReaderError::new(
                 EpisodeReaderErrorKind::CorruptProjection,
@@ -254,6 +285,7 @@ impl<'a> EpisodeReader<'a> {
 struct LoadedEpisode {
     selectable: SelectableEpisode,
     note: MemoryNoteV1,
+    read_cost: EpisodeReadCostV1,
 }
 
 fn authorized_note(note: &MemoryNoteV1) -> bool {
@@ -273,6 +305,16 @@ pub(crate) struct EpisodeReadItemV1 {
     pub(crate) bm25_score: f64,
     pub(crate) applicability: CodeApplicability,
     pub(crate) evidence: EvidenceExpansionV1,
+    pub(crate) read_cost: EpisodeReadCostV1,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EpisodeReadCostV1 {
+    pub(crate) projection_rows: usize,
+    pub(crate) note_objects: usize,
+    pub(crate) code_commits_visited: usize,
+    pub(crate) code_paths_compared: usize,
+    pub(crate) evidence_items: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -282,6 +324,7 @@ pub(crate) struct EpisodeSearchResultV1 {
     pub(crate) candidates_examined: usize,
     pub(crate) relation_omissions: usize,
     pub(crate) omitted_by_applicability: usize,
+    pub(crate) selector_limit_omissions: usize,
     pub(crate) evidence_reads: usize,
     pub(crate) items: Vec<EpisodeReadItemV1>,
 }
@@ -294,6 +337,7 @@ impl EpisodeSearchResultV1 {
             candidates_examined: 0,
             relation_omissions: 0,
             omitted_by_applicability: 0,
+            selector_limit_omissions: 0,
             evidence_reads: 0,
             items: Vec::new(),
         }
@@ -379,10 +423,17 @@ mod tests {
 
     use super::*;
     use crate::{
-        internal::ai::memory::{
-            domain::{EpisodeRoot, EpisodeRootKind},
-            policy::TrustedMemoryTarget,
-            writer::tests::{Fixture, fixture, proposal},
+        internal::ai::{
+            context_budget::{
+                ContextBudget, ContextSegmentBudget, ContextSegmentKind, TruncationPolicy,
+                memory::MemoryContextAssembler,
+            },
+            memory::{
+                domain::{EpisodeRoot, EpisodeRootKind},
+                policy::TrustedMemoryTarget,
+                writer::tests::{Fixture, fixture, proposal},
+            },
+            prompt::SystemPromptBuilder,
         },
         utils::{object::write_git_object, storage::local::LocalStorage},
     };
@@ -403,16 +454,24 @@ mod tests {
             fixture._temp.path(),
             fixture.digest.as_ref(),
             &fixture.context,
-            FrozenCodeAnchorV1::new(CODE_OID.parse().expect("fixed code OID"), "refs/heads/main")
-                .expect("valid code anchor"),
+            FrozenCodeAnchorV1::new(
+                CODE_OID.parse().expect("fixed code OID"),
+                "refs/heads/main",
+                "",
+            )
+            .expect("valid code anchor"),
         )
         .await
         .expect("freeze reader view")
     }
 
-    async fn seed_code_head(fixture: &Fixture) -> ObjectHash {
-        let blob_oid = write_git_object(fixture._temp.path(), "blob", b"reader anchor\n")
-            .expect("write code blob");
+    fn write_code_commit(
+        fixture: &Fixture,
+        parents: Vec<ObjectHash>,
+        content: &[u8],
+    ) -> ObjectHash {
+        let blob_oid =
+            write_git_object(fixture._temp.path(), "blob", content).expect("write code blob");
         let tree = Tree::from_tree_items(vec![TreeItem::new(
             TreeItemMode::Blob,
             blob_oid,
@@ -437,15 +496,19 @@ mod tests {
                 "test@libra.local".to_string(),
             ),
             tree_oid,
-            Vec::new(),
+            parents,
             "reader code anchor",
         );
-        let commit_oid = write_git_object(
+        write_git_object(
             fixture._temp.path(),
             "commit",
             &commit.to_data().expect("serialize code commit"),
         )
-        .expect("write code commit");
+        .expect("write code commit")
+    }
+
+    async fn seed_code_head(fixture: &Fixture) -> ObjectHash {
+        let commit_oid = write_code_commit(fixture, Vec::new(), b"reader anchor\n");
         fixture
             .database
             .execute_raw(Statement::from_sql_and_values(
@@ -460,6 +523,57 @@ mod tests {
         commit_oid
     }
 
+    async fn advance_code_head(
+        fixture: &Fixture,
+        parent: ObjectHash,
+        content: &[u8],
+    ) -> ObjectHash {
+        let commit_oid = write_code_commit(fixture, vec![parent], content);
+        fixture
+            .database
+            .execute_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "UPDATE reference SET `commit` = ?
+                 WHERE name = 'main' AND kind = 'Branch' AND remote IS NULL",
+                [commit_oid.to_string().into()],
+            ))
+            .await
+            .expect("advance current Libra branch");
+        commit_oid
+    }
+
+    async fn commit_injectable_episode(
+        fixture: &Fixture,
+        code_commit: ObjectHash,
+        task_id: &str,
+        generation: u8,
+        sensitivity: MemorySensitivity,
+        goal: &str,
+        summary: &str,
+    ) -> TrustedMemoryTarget {
+        let target =
+            TrustedMemoryTarget::episode(EpisodeRoot::task(task_id).expect("injection target"));
+        let mut candidate = proposal(&target, fixture.key_id, generation);
+        candidate.note_mut().effective_from_commit = Some(code_commit.to_string());
+        candidate.note_mut().sensitivity = sensitivity;
+        let episode = candidate
+            .note_mut()
+            .episode
+            .as_mut()
+            .expect("Episode payload");
+        episode.goal.claim = goal.to_string();
+        episode.summary.claim = summary.to_string();
+        episode.code.result_oid = Some(code_commit.to_string());
+        episode.code.branch_ref = Some("refs/heads/main".to_string());
+        episode.code.paths = vec!["README.md".to_string()];
+        fixture
+            .writer
+            .commit(&fixture.context, &target, &candidate, None)
+            .await
+            .expect("commit injectable Episode");
+        target
+    }
+
     #[tokio::test]
     async fn reader_freezes_current_libra_head() {
         let fixture = fixture().await;
@@ -472,6 +586,321 @@ mod tests {
             .expect("freeze current Libra HEAD");
         assert_eq!(view.code_anchor().commit_oid(), commit_oid);
         assert_eq!(view.code_anchor().full_branch_ref(), "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn injection_budget_and_receipt_gate_prompt_delivery() {
+        let fixture = fixture().await;
+        let code_commit = seed_code_head(&fixture).await;
+        let selected_target = commit_injectable_episode(
+            &fixture,
+            code_commit,
+            "task-injection-small",
+            1,
+            MemorySensitivity::Internal,
+            "budgettoken authentication retry",
+            "The bounded retry restored the request.",
+        )
+        .await;
+        let omitted_target = commit_injectable_episode(
+            &fixture,
+            code_commit,
+            "task-injection-large",
+            2,
+            MemorySensitivity::Internal,
+            "budgettoken authentication retry",
+            &"largecontext ".repeat(250),
+        )
+        .await;
+        let history = history(&fixture);
+        let assembler = MemoryContextAssembler::new(&history, Arc::clone(&fixture.digest));
+        let budget = ContextBudget::from_segments(
+            700,
+            vec![ContextSegmentBudget::new(
+                ContextSegmentKind::ProjectMemory,
+                700,
+                TruncationPolicy::OldestFirst,
+            )],
+        )
+        .expect("bounded Memory budget");
+        let effective_at = Utc
+            .with_ymd_and_hms(2026, 8, 25, 12, 0, 0)
+            .single()
+            .expect("fixed effective time");
+        let query = EpisodeQueryV1 {
+            text: Some("budgettoken".to_string()),
+            ..EpisodeQueryV1::default()
+        };
+
+        let bundle = assembler
+            .assemble(&fixture.context, &query, &budget, effective_at)
+            .await
+            .expect("assemble audited Memory context");
+        assert_eq!(bundle.receipt().selected().len(), 1);
+        assert_eq!(
+            bundle.receipt().selected()[0].object_id,
+            selected_target.root().note_id().to_string(),
+        );
+        assert!(bundle.receipt().omissions().iter().any(|omission| {
+            matches!(
+                omission.reason_code.as_str(),
+                "segment_budget" | "total_budget"
+            ) && omission.count == 1
+        }));
+        assert!(
+            bundle
+                .prompt_section()
+                .contains(selected_target.root().id())
+        );
+        assert!(!bundle.prompt_section().contains(omitted_target.root().id()));
+        assert_eq!(bundle.receipt().effective_at(), effective_at);
+        assert_eq!(
+            bundle.receipt().code_commit().map(str::to_string),
+            Some(code_commit.to_string()),
+        );
+        assert_eq!(bundle.receipt().full_branch_ref(), Some("refs/heads/main"));
+        assert_eq!(bundle.receipt().token_budget(), 700);
+        assert_eq!(
+            bundle.receipt().source_heads().get("memory_repo"),
+            bundle.receipt().projection_watermarks().get("memory_repo"),
+        );
+        assert!(bundle.receipt().policy_hash().starts_with("sha256:"));
+        assert_eq!(
+            bundle.receipt().selector_version(),
+            "episode-fts-bm25-v1+context-budget-v1",
+        );
+        assert!(!bundle.receipt().query_hmac().contains("budgettoken"));
+
+        let prompt = SystemPromptBuilder::new(fixture._temp.path())
+            .expect("prompt builder")
+            .with_memory_bundle(&bundle)
+            .build()
+            .expect("deliver audited bundle to prompt");
+        assert!(prompt.contains("## Retrieved Project Memory"));
+        assert!(prompt.contains(selected_target.root().id()));
+    }
+
+    #[tokio::test]
+    async fn injection_replay_is_deterministic_and_view_identity_changes() {
+        let fixture = fixture().await;
+        let code_commit = seed_code_head(&fixture).await;
+        let target = commit_injectable_episode(
+            &fixture,
+            code_commit,
+            "task-injection-replay",
+            1,
+            MemorySensitivity::Internal,
+            "replaytoken branch invariant",
+            "The branch invariant remained stable.",
+        )
+        .await;
+        let history = history(&fixture);
+        let reader = EpisodeReader::new(&history, fixture.digest.as_ref()).expect("reader");
+        let frozen = reader
+            .freeze_view(&fixture.context)
+            .await
+            .expect("freeze replay view");
+        let assembler = MemoryContextAssembler::new(&history, Arc::clone(&fixture.digest));
+        let budget = ContextBudget::default();
+        let effective_at = Utc
+            .with_ymd_and_hms(2026, 8, 25, 12, 30, 0)
+            .single()
+            .expect("fixed effective time");
+        let query = EpisodeQueryV1 {
+            text: Some("replaytoken".to_string()),
+            ..EpisodeQueryV1::default()
+        };
+
+        let first = assembler
+            .assemble_for_view(&fixture.context, &frozen, &query, &budget, effective_at)
+            .await
+            .expect("first frozen selection");
+        let repeated = assembler
+            .assemble_for_view(&fixture.context, &frozen, &query, &budget, effective_at)
+            .await
+            .expect("repeated frozen selection");
+        assert_ne!(
+            first.receipt().receipt_id(),
+            repeated.receipt().receipt_id()
+        );
+        assert_eq!(first.prompt_section(), repeated.prompt_section());
+        assert_eq!(first.receipt().selected(), repeated.receipt().selected());
+        assert_eq!(
+            first.receipt().bundle_hash(),
+            repeated.receipt().bundle_hash()
+        );
+        assert_eq!(
+            first.receipt().query_hmac(),
+            repeated.receipt().query_hmac()
+        );
+
+        let next_commit = advance_code_head(&fixture, code_commit, b"reader anchor\n").await;
+        let next = assembler
+            .assemble(&fixture.context, &query, &budget, effective_at)
+            .await
+            .expect("selection on descendant unchanged code");
+        assert_ne!(first.view_hash(), next.view_hash());
+        assert_ne!(first.receipt().query_hmac(), next.receipt().query_hmac());
+        assert_eq!(
+            next.receipt().code_commit().map(str::to_string),
+            Some(next_commit.to_string()),
+        );
+        assert_eq!(next.receipt().selected().len(), 1);
+        assert_eq!(
+            next.receipt().selected()[0].object_id,
+            target.root().note_id().to_string(),
+        );
+    }
+
+    #[tokio::test]
+    async fn injection_secret_and_stale_or_path_changed_are_excluded() {
+        let fixture = fixture().await;
+        let code_commit = seed_code_head(&fixture).await;
+        let history = history(&fixture);
+        let reader = EpisodeReader::new(&history, fixture.digest.as_ref()).expect("reader");
+        let stale_view = reader
+            .freeze_view(&fixture.context)
+            .await
+            .expect("freeze pre-Memory view");
+
+        let secret_target = TrustedMemoryTarget::episode(
+            EpisodeRoot::task("task-injection-secret").expect("secret target"),
+        );
+        let mut secret = proposal(&secret_target, fixture.key_id, 1);
+        secret.note_mut().sensitivity = MemorySensitivity::SecretLike;
+        let secret_result = fixture
+            .writer
+            .commit(&fixture.context, &secret_target, &secret, None)
+            .await;
+        assert!(
+            secret_result.is_err(),
+            "secret-like Episode must not persist"
+        );
+
+        commit_injectable_episode(
+            &fixture,
+            code_commit,
+            "task-injection-confidential",
+            1,
+            MemorySensitivity::Confidential,
+            "confidentialtoken",
+            "This local-only detail must not enter a provider prompt by default.",
+        )
+        .await;
+
+        commit_injectable_episode(
+            &fixture,
+            code_commit,
+            "task-injection-path-changed",
+            2,
+            MemorySensitivity::Internal,
+            "pathchangedtoken",
+            "The original path evidence applied to the old tree.",
+        )
+        .await;
+        let assembler = MemoryContextAssembler::new(&history, Arc::clone(&fixture.digest));
+        let query = EpisodeQueryV1 {
+            text: Some("pathchangedtoken".to_string()),
+            ..EpisodeQueryV1::default()
+        };
+        let effective_at = Utc
+            .with_ymd_and_hms(2026, 8, 25, 12, 45, 0)
+            .single()
+            .expect("fixed effective time");
+        let confidential = assembler
+            .assemble(
+                &fixture.context,
+                &EpisodeQueryV1 {
+                    text: Some("confidentialtoken".to_string()),
+                    ..EpisodeQueryV1::default()
+                },
+                &ContextBudget::default(),
+                effective_at,
+            )
+            .await
+            .expect("audit confidential omission");
+        assert!(confidential.receipt().selected().is_empty());
+        assert!(confidential.prompt_section().is_empty());
+        assert!(confidential.receipt().omissions().iter().any(|omission| {
+            omission.reason_code == "sensitivity_policy" && omission.count == 1
+        }));
+        let stale = assembler
+            .assemble_for_view(
+                &fixture.context,
+                &stale_view,
+                &query,
+                &ContextBudget::default(),
+                effective_at,
+            )
+            .await;
+        let stale_error = match stale {
+            Ok(_) => panic!("advanced Memory projection must invalidate the old view"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            stale_error.kind(),
+            crate::internal::ai::context_budget::memory::MemoryContextAssemblerErrorKind::StaleView,
+        );
+
+        advance_code_head(&fixture, code_commit, b"changed reader anchor\n").await;
+        let changed = assembler
+            .assemble(
+                &fixture.context,
+                &query,
+                &ContextBudget::default(),
+                effective_at,
+            )
+            .await
+            .expect("audit path-changed omission");
+        assert!(changed.receipt().selected().is_empty());
+        assert!(changed.prompt_section().is_empty());
+        assert!(changed.receipt().omissions().iter().any(|omission| {
+            omission.reason_code == "code_applicability" && omission.count == 1
+        }));
+    }
+
+    #[tokio::test]
+    async fn injection_receipt_failure_returns_no_bundle() {
+        let fixture = fixture().await;
+        let code_commit = seed_code_head(&fixture).await;
+        commit_injectable_episode(
+            &fixture,
+            code_commit,
+            "task-injection-receipt-failure",
+            1,
+            MemorySensitivity::Internal,
+            "receiptfailuretoken",
+            "This candidate must never cross a failed audit gate.",
+        )
+        .await;
+        let history = history(&fixture);
+        let assembler = MemoryContextAssembler::new(&history, Arc::clone(&fixture.digest));
+        fixture
+            .database
+            .execute_unprepared("DROP TABLE context_selection_receipt")
+            .await
+            .expect("remove fixture receipt ledger");
+        let result = assembler
+            .assemble(
+                &fixture.context,
+                &EpisodeQueryV1 {
+                    text: Some("receiptfailuretoken".to_string()),
+                    ..EpisodeQueryV1::default()
+                },
+                &ContextBudget::default(),
+                Utc.with_ymd_and_hms(2026, 8, 25, 13, 0, 0)
+                    .single()
+                    .expect("fixed effective time"),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("receipt failure must stop bundle delivery"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            crate::internal::ai::context_budget::memory::MemoryContextAssemblerErrorKind::ReceiptStore,
+        );
     }
 
     #[tokio::test]

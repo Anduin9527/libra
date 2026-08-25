@@ -203,6 +203,9 @@ pub(crate) struct EpisodeSearchCandidate {
     pub(crate) completion_status: CompletionStatus,
     pub(crate) code_change_status: CodeChangeStatus,
     pub(crate) ended_at: Option<DateTime<Utc>>,
+    pub(crate) valid_from: Option<DateTime<Utc>>,
+    pub(crate) valid_until: Option<DateTime<Utc>>,
+    pub(crate) expires_at: Option<DateTime<Utc>>,
     pub(crate) bm25_score: f64,
 }
 
@@ -218,6 +221,7 @@ pub(crate) async fn search_candidates<C: ConnectionTrait>(
         "SELECT document.note_id, document.revision_oid, document.root_kind,
                 document.root_id, document.completion_status,
                 document.code_change_status, document.ended_at,
+                head.valid_from, head.valid_until, head.expires_at,
                 bm25(memory_episode_fts, 8.0, 5.0, 4.0, 3.0, 2.0) AS bm25_score
          FROM memory_episode_fts
          JOIN memory_episode_search_doc AS document
@@ -233,6 +237,7 @@ pub(crate) async fn search_candidates<C: ConnectionTrait>(
         "SELECT document.note_id, document.revision_oid, document.root_kind,
                 document.root_id, document.completion_status,
                 document.code_change_status, document.ended_at,
+                head.valid_from, head.valid_until, head.expires_at,
                 0.0 AS bm25_score
          FROM memory_episode_search_doc AS document
          JOIN memory_head AS head
@@ -268,6 +273,17 @@ pub(crate) async fn search_candidates<C: ConnectionTrait>(
     if let Some(until) = query.ended_until {
         sql.push_str(" AND document.ended_at <= ?");
         values.push(until.to_rfc3339().into());
+    }
+    if let Some(effective_at) = query.effective_at {
+        let effective_at = effective_at.to_rfc3339();
+        sql.push_str(
+            " AND (head.valid_from IS NULL OR head.valid_from <= ?)
+              AND (head.valid_until IS NULL OR head.valid_until > ?)
+              AND (head.expires_at IS NULL OR head.expires_at > ?)",
+        );
+        values.push(effective_at.clone().into());
+        values.push(effective_at.clone().into());
+        values.push(effective_at.into());
     }
     match &query.path {
         Some(EpisodePathFilter::Exact(path)) => {
@@ -308,6 +324,15 @@ pub(crate) async fn search_candidates<C: ConnectionTrait>(
             let ended_at: Option<String> = row
                 .try_get("", "ended_at")
                 .map_err(|_| MemoryFtsError::CorruptProjection)?;
+            let valid_from: Option<String> = row
+                .try_get("", "valid_from")
+                .map_err(|_| MemoryFtsError::CorruptProjection)?;
+            let valid_until: Option<String> = row
+                .try_get("", "valid_until")
+                .map_err(|_| MemoryFtsError::CorruptProjection)?;
+            let expires_at: Option<String> = row
+                .try_get("", "expires_at")
+                .map_err(|_| MemoryFtsError::CorruptProjection)?;
             Ok(EpisodeSearchCandidate {
                 note_id: uuid::Uuid::parse_str(&note_id)
                     .map_err(|_| MemoryFtsError::CorruptProjection)?,
@@ -329,12 +354,24 @@ pub(crate) async fn search_candidates<C: ConnectionTrait>(
                     .map(|value| value.parse::<DateTime<Utc>>())
                     .transpose()
                     .map_err(|_| MemoryFtsError::CorruptProjection)?,
+                valid_from: parse_optional_timestamp(valid_from)?,
+                valid_until: parse_optional_timestamp(valid_until)?,
+                expires_at: parse_optional_timestamp(expires_at)?,
                 bm25_score: row
                     .try_get("", "bm25_score")
                     .map_err(|_| MemoryFtsError::CorruptProjection)?,
             })
         })
         .collect()
+}
+
+fn parse_optional_timestamp(
+    value: Option<String>,
+) -> Result<Option<DateTime<Utc>>, MemoryFtsError> {
+    value
+        .map(|value| value.parse::<DateTime<Utc>>())
+        .transpose()
+        .map_err(|_| MemoryFtsError::CorruptProjection)
 }
 
 const fn root_kind_label(kind: EpisodeRootKind) -> &'static str {

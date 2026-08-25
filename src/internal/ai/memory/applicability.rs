@@ -31,6 +31,27 @@ pub(crate) enum CodeApplicability {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CodeApplicabilityAssessment {
+    pub(crate) applicability: CodeApplicability,
+    pub(crate) commits_visited: usize,
+    pub(crate) paths_compared: usize,
+}
+
+impl CodeApplicabilityAssessment {
+    const fn new(
+        applicability: CodeApplicability,
+        commits_visited: usize,
+        paths_compared: usize,
+    ) -> Self {
+        Self {
+            applicability,
+            commits_visited,
+            paths_compared,
+        }
+    }
+}
+
 impl CodeApplicability {
     pub(crate) const fn tier(self) -> u8 {
         match self {
@@ -130,51 +151,84 @@ impl CodeHistory for RepositoryCodeHistory {
     }
 }
 
-pub(crate) fn classify_code_applicability<H: CodeHistory>(
+pub(crate) fn assess_code_applicability<H: CodeHistory>(
     history: &H,
     current_commit: ObjectHash,
     code: &EpisodeCodeContextV1,
-) -> CodeApplicability {
+) -> CodeApplicabilityAssessment {
     let Some(result_oid) = code
         .result_oid
         .as_deref()
         .and_then(|value| value.parse::<ObjectHash>().ok())
     else {
-        return CodeApplicability::Unknown;
+        return CodeApplicabilityAssessment::new(CodeApplicability::Unknown, 0, 0);
     };
     if result_oid == current_commit {
-        return CodeApplicability::Exact;
+        return CodeApplicabilityAssessment::new(CodeApplicability::Exact, 0, 0);
     }
     if code.paths.is_empty()
         || code.paths.len() > MAX_APPLICABILITY_PATHS
         || code.paths.iter().any(|path| !valid_code_path(path))
     {
-        return CodeApplicability::Unknown;
+        return CodeApplicabilityAssessment::new(CodeApplicability::Unknown, 0, 0);
     }
-    match bounded_ancestry(history, result_oid, current_commit) {
-        Ancestry::Diverged => return CodeApplicability::Diverged,
-        Ancestry::Unknown => return CodeApplicability::Unknown,
+    let (ancestry, commits_visited) = bounded_ancestry(history, result_oid, current_commit);
+    match ancestry {
+        Ancestry::Diverged => {
+            return CodeApplicabilityAssessment::new(
+                CodeApplicability::Diverged,
+                commits_visited,
+                0,
+            );
+        }
+        Ancestry::Unknown => {
+            return CodeApplicabilityAssessment::new(
+                CodeApplicability::Unknown,
+                commits_visited,
+                0,
+            );
+        }
         Ancestry::Ancestor => {}
     }
 
     let mut changed = false;
-    for path in &code.paths {
+    for (index, path) in code.paths.iter().enumerate() {
         let anchored = match history.entry(result_oid, path) {
             Ok(Some(entry)) => entry,
-            Ok(None) | Err(()) => return CodeApplicability::Unknown,
+            Ok(None) | Err(()) => {
+                return CodeApplicabilityAssessment::new(
+                    CodeApplicability::Unknown,
+                    commits_visited,
+                    index,
+                );
+            }
         };
         let current = match history.entry(current_commit, path) {
             Ok(entry) => entry,
-            Err(()) => return CodeApplicability::Unknown,
+            Err(()) => {
+                return CodeApplicabilityAssessment::new(
+                    CodeApplicability::Unknown,
+                    commits_visited,
+                    index,
+                );
+            }
         };
         if current != Some(anchored) {
             changed = true;
         }
     }
     if changed {
-        CodeApplicability::DescendantPathChanged
+        CodeApplicabilityAssessment::new(
+            CodeApplicability::DescendantPathChanged,
+            commits_visited,
+            code.paths.len(),
+        )
     } else {
-        CodeApplicability::DescendantUnchanged
+        CodeApplicabilityAssessment::new(
+            CodeApplicability::DescendantUnchanged,
+            commits_visited,
+            code.paths.len(),
+        )
     }
 }
 
@@ -188,29 +242,29 @@ fn bounded_ancestry<H: CodeHistory>(
     history: &H,
     ancestor: ObjectHash,
     descendant: ObjectHash,
-) -> Ancestry {
+) -> (Ancestry, usize) {
     let mut queue = VecDeque::from([descendant]);
     let mut visited = HashSet::new();
-    for _ in 0..MAX_APPLICABILITY_COMMITS {
+    for commits_visited in 0..MAX_APPLICABILITY_COMMITS {
         let Some(commit) = queue.pop_front() else {
-            return Ancestry::Diverged;
+            return (Ancestry::Diverged, commits_visited);
         };
         if !visited.insert(commit) {
             continue;
         }
         if commit == ancestor {
-            return Ancestry::Ancestor;
+            return (Ancestry::Ancestor, commits_visited.saturating_add(1));
         }
         let parents = match history.parents(commit) {
             Ok(parents) => parents,
-            Err(()) => return Ancestry::Unknown,
+            Err(()) => return (Ancestry::Unknown, commits_visited.saturating_add(1)),
         };
         queue.extend(parents);
     }
     if queue.is_empty() {
-        Ancestry::Diverged
+        (Ancestry::Diverged, MAX_APPLICABILITY_COMMITS)
     } else {
-        Ancestry::Unknown
+        (Ancestry::Unknown, MAX_APPLICABILITY_COMMITS)
     }
 }
 
@@ -291,11 +345,11 @@ mod tests {
             Some(TreeEntryFingerprint::new(blob, TreeItemMode::Blob)),
         );
         assert_eq!(
-            classify_code_applicability(&history, result, &code(result)),
+            assess_code_applicability(&history, result, &code(result)).applicability,
             CodeApplicability::Exact
         );
         assert_eq!(
-            classify_code_applicability(&history, current, &code(result)),
+            assess_code_applicability(&history, current, &code(result)).applicability,
             CodeApplicability::DescendantUnchanged
         );
         history.entries.insert(
@@ -303,11 +357,11 @@ mod tests {
             Some(TreeEntryFingerprint::new(changed_blob, TreeItemMode::Blob)),
         );
         assert_eq!(
-            classify_code_applicability(&history, current, &code(result)),
+            assess_code_applicability(&history, current, &code(result)).applicability,
             CodeApplicability::DescendantPathChanged
         );
         assert_eq!(
-            classify_code_applicability(&history, other, &code(result)),
+            assess_code_applicability(&history, other, &code(result)).applicability,
             CodeApplicability::Diverged
         );
     }
@@ -323,13 +377,13 @@ mod tests {
             .entries
             .insert((result, "src/lib.rs".to_string()), None);
         assert_eq!(
-            classify_code_applicability(&history, current, &code(result)),
+            assess_code_applicability(&history, current, &code(result)).applicability,
             CodeApplicability::Unknown
         );
         let mut no_paths = code(result);
         no_paths.paths.clear();
         assert_eq!(
-            classify_code_applicability(&history, current, &no_paths),
+            assess_code_applicability(&history, current, &no_paths).applicability,
             CodeApplicability::Unknown
         );
     }

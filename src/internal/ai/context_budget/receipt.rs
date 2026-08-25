@@ -505,6 +505,54 @@ impl ContextSelectionReceiptV1 {
         &self.repository_id
     }
 
+    pub(crate) fn query_hmac(&self) -> &str {
+        &self.query_hmac
+    }
+
+    pub(crate) const fn effective_at(&self) -> DateTime<Utc> {
+        self.effective_at
+    }
+
+    pub(crate) fn code_commit(&self) -> Option<&str> {
+        self.code_commit.as_deref()
+    }
+
+    pub(crate) fn full_branch_ref(&self) -> Option<&str> {
+        self.full_branch_ref.as_deref()
+    }
+
+    pub(crate) fn source_heads(&self) -> &BTreeMap<String, String> {
+        &self.source_heads
+    }
+
+    pub(crate) fn projection_watermarks(&self) -> &BTreeMap<String, String> {
+        &self.projection_watermarks
+    }
+
+    pub(crate) fn policy_hash(&self) -> &str {
+        &self.policy_hash
+    }
+
+    pub(crate) fn selector_version(&self) -> &str {
+        &self.selector_version
+    }
+
+    pub(crate) const fn token_budget(&self) -> u64 {
+        self.token_budget
+    }
+
+    pub(crate) fn selected(&self) -> &[ReceiptSelectionV1] {
+        &self.selected
+    }
+
+    pub(crate) fn omissions(&self) -> &[ReceiptOmissionV1] {
+        &self.omissions
+    }
+
+    pub(crate) fn bundle_hash(&self) -> &str {
+        &self.bundle_hash
+    }
+
     pub(crate) fn replay_state(
         &self,
         availability: ReceiptReplayAvailabilityV1,

@@ -14,22 +14,29 @@ use crate::internal::ai::keyed_digest::RepositoryKeyedDigest;
 
 const VIEW_SCHEMA_VERSION: u32 = 1;
 const MAX_FULL_REF_BYTES: usize = 512;
+const MAX_WORKTREE_ID_BYTES: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrozenCodeAnchorV1 {
     commit_oid: ObjectHash,
     full_branch_ref: String,
+    worktree_id: String,
 }
 
 impl FrozenCodeAnchorV1 {
     pub(crate) fn new(
         commit_oid: ObjectHash,
         full_branch_ref: impl Into<String>,
+        worktree_id: impl Into<String>,
     ) -> Result<Self, ResolvedMemoryViewError> {
         let full_branch_ref = full_branch_ref.into();
+        let worktree_id = worktree_id.into();
         if full_branch_ref.len() > MAX_FULL_REF_BYTES
             || !full_branch_ref.starts_with("refs/heads/")
             || !crate::utils::util::is_valid_refname(&full_branch_ref)
+            || worktree_id.len() > MAX_WORKTREE_ID_BYTES
+            || worktree_id.trim() != worktree_id
+            || worktree_id.chars().any(char::is_control)
         {
             return Err(ResolvedMemoryViewError::new(
                 ResolvedMemoryViewErrorKind::InvalidCodeAnchor,
@@ -38,6 +45,7 @@ impl FrozenCodeAnchorV1 {
         Ok(Self {
             commit_oid,
             full_branch_ref,
+            worktree_id,
         })
     }
 
@@ -47,6 +55,10 @@ impl FrozenCodeAnchorV1 {
 
     pub(crate) fn full_branch_ref(&self) -> &str {
         &self.full_branch_ref
+    }
+
+    pub(crate) fn worktree_id(&self) -> &str {
+        &self.worktree_id
     }
 }
 
@@ -91,6 +103,7 @@ impl ResolvedMemoryViewV1 {
             principal_digest: &principal_digest,
             code_commit: code_anchor.commit_oid.to_string(),
             full_branch_ref: code_anchor.full_branch_ref(),
+            worktree_id: code_anchor.worktree_id(),
             scope_key: "repo",
             namespace: "default",
             memory_ref_oid: memory_ref_oid.map(|oid| oid.to_string()),
@@ -156,6 +169,18 @@ impl ResolvedMemoryViewV1 {
         &self.code_anchor
     }
 
+    pub(crate) const fn code_commit(&self) -> ObjectHash {
+        self.code_anchor.commit_oid
+    }
+
+    pub(crate) fn full_branch_ref(&self) -> &str {
+        &self.code_anchor.full_branch_ref
+    }
+
+    pub(crate) fn worktree_id(&self) -> &str {
+        &self.code_anchor.worktree_id
+    }
+
     pub(crate) const fn memory_ref_oid(&self) -> Option<ObjectHash> {
         self.memory_ref_oid
     }
@@ -180,6 +205,7 @@ struct CanonicalViewV1<'a> {
     principal_digest: &'a str,
     code_commit: String,
     full_branch_ref: &'a str,
+    worktree_id: &'a str,
     scope_key: &'static str,
     namespace: &'static str,
     memory_ref_oid: Option<String>,
@@ -354,9 +380,12 @@ mod tests {
     #[tokio::test]
     async fn frozen_view_is_stable_and_rejects_identity_or_watermark_changes() {
         let fixture = fixture().await;
-        let anchor =
-            FrozenCodeAnchorV1::new(CODE_OID.parse().expect("fixed code OID"), "refs/heads/main")
-                .expect("valid code anchor");
+        let anchor = FrozenCodeAnchorV1::new(
+            CODE_OID.parse().expect("fixed code OID"),
+            "refs/heads/main",
+            "",
+        )
+        .expect("valid code anchor");
         let empty = ResolvedMemoryViewV1::freeze(
             fixture.database.as_ref(),
             fixture._temp.path(),
@@ -376,6 +405,21 @@ mod tests {
         .await
         .expect("repeat identical freeze");
         assert_eq!(empty, repeated);
+        let linked_worktree = ResolvedMemoryViewV1::freeze(
+            fixture.database.as_ref(),
+            fixture._temp.path(),
+            fixture.digest.as_ref(),
+            &fixture.context,
+            FrozenCodeAnchorV1::new(
+                CODE_OID.parse().expect("fixed code OID"),
+                "refs/heads/main",
+                "wt-linked",
+            )
+            .expect("valid linked-worktree anchor"),
+        )
+        .await
+        .expect("freeze linked-worktree view");
+        assert_ne!(empty.view_hash(), linked_worktree.view_hash());
 
         let other_context = AuthenticatedMemoryContext::new(
             fixture.context.repository_id(),
@@ -445,8 +489,12 @@ mod tests {
             fixture._temp.path(),
             fixture.digest.as_ref(),
             &fixture.context,
-            FrozenCodeAnchorV1::new(CODE_OID.parse().expect("fixed code OID"), "refs/heads/main")
-                .expect("valid code anchor"),
+            FrozenCodeAnchorV1::new(
+                CODE_OID.parse().expect("fixed code OID"),
+                "refs/heads/main",
+                "",
+            )
+            .expect("valid code anchor"),
         )
         .await
         .expect_err("unknown policy must not use projected rows");
