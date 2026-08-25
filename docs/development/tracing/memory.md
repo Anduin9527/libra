@@ -626,6 +626,29 @@ M2 从现有 Intent / Task / Run / Evidence / Decision / PatchSet / Session 与�
 | `decisions` / `failed_attempts` / `unresolved` | compiler proposal | 每项显式标记 observation 或 inference，并带 EvidenceRef |
 | `omissions` | Writer | 记录每个有界集合被裁掉的条目数 |
 
+Episode 编译前先由 `EpisodeSourceResolver` 固定一份「研发历程来源窗口」
+（Episode source window）。它只接收已认证的仓库与 Agent 身份、受信任的
+Task/Intent 根、AI 历史固定版本 OID 和仓库冻结限制，不接收请求体自报的用户名、
+目录或读取范围。解析器从该固定版本验证根与关系，读取相关 Run、终态事件、Evidence、
+Decision、PatchSet、ToolInvocation 与有明确关联的 ContextFrame。SQLite 反向索引只能
+提示候选 ID，任何候选仍须在固定版本树中重新验证；无法建立明确关系的整段 Session
+不会被拼入模型输入。
+
+来源窗口按以下顺序处理：读取原始对象 → secret 规则 → `<private>` 标记规则 →
+高置信度邮箱与用户主目录规则 → 构造不可由外部代码创建的
+`RedactedEpisodeSource`。默认限制为 256 个入选对象、4096 个候选对象、单对象
+128 KiB、树对象 4 MiB、脱敏正文合计 2 MiB、64 个 ContextFrame 片段、约
+512K tokens 和 2048 个 AI 历史祖先版本。可省略的超限项以稳定 reason code 写入
+omissions；根对象和终态事实若无法在限制内完整取得则整次解析失败，不生成不完整记忆。
+
+每次解析都会产生一份规范来源清单（source manifest），保存根类型/ID、仓库 ID、
+主体 HMAC、固定来源 OID、上述限制、策略/脱敏版本、计数、omissions，以及每个实际输入
+片段的对象类型、对象 ID/OID、类型化 locator、脱敏片段 SHA-256、可选代码版本。
+清单不保存原始正文、主体明文或 secret。模型只返回引用 `fragment_id` 的自然语言提案；
+准入层把它机械映射为 `EvidenceRefV1`，拒绝模型虚构的定位器。Writer 写入前使用同一身份、
+固定版本和限制重新解析并逐项比较清单、事实和脱敏片段；任何漂移、越权或摘要不一致均不
+推进 Memory ref。
+
 `EpisodeClaimV1` 固定为 `epistemic_status + claim + confidence? + evidence_refs`。Observation 禁止携带 confidence；Inference 必须携带 confidence。校验只能证明引用存在、可见且定位/digest 匹配，不能把自然语言蕴含声明为形式化证明。
 
 首个仓库切片固定 `kind=Episodic`、`scope=Repo`、`visibility=RepoLocal`、`lifecycle=Accretive`、`namespace=default`，并使用：

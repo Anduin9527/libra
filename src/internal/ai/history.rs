@@ -120,6 +120,215 @@ pub const CHECKPOINT_OBJECT_IO_HELPER_ARG: &str = "--libra-internal-checkpoint-o
 pub const CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP: u64 = 32 * 1024 * 1024;
 pub const CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP: u64 = 32 * 1024 * 1024;
 const CHECKPOINT_OBJECT_READ_MAX_INFLATED_BYTES: u64 = 16 * 1024 * 1024;
+const PINNED_HISTORY_COMMIT_MAX_BYTES: u64 = 256 * 1024;
+
+/// One object proven reachable from a caller-pinned AI history commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryBlob {
+    object_id: String,
+    oid: ObjectHash,
+    bytes: Vec<u8>,
+}
+
+impl PinnedHistoryBlob {
+    pub(crate) fn object_id(&self) -> &str {
+        &self.object_id
+    }
+
+    pub(crate) const fn oid(&self) -> ObjectHash {
+        self.oid
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A bounded listing from one type subtree in a pinned AI history view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryListing {
+    entries: Vec<PinnedHistoryEntry>,
+    omitted: usize,
+}
+
+impl PinnedHistoryListing {
+    pub(crate) fn entries(&self) -> &[PinnedHistoryEntry] {
+        &self.entries
+    }
+
+    pub(crate) const fn omitted(&self) -> usize {
+        self.omitted
+    }
+}
+
+/// Opaque proof that one path resolved inside a specific pinned view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryEntry {
+    source_head: ObjectHash,
+    object_type: String,
+    object_id: String,
+    oid: ObjectHash,
+}
+
+/// Read-only view whose head was proven to belong to the current first-parent
+/// history. Callers cannot accidentally fall through to the moving ref.
+pub(crate) struct PinnedHistoryView<'a> {
+    manager: &'a HistoryManager,
+    head: ObjectHash,
+    max_tree_bytes: u64,
+    root_items: Vec<TreeItem>,
+}
+
+impl PinnedHistoryView<'_> {
+    pub(crate) const fn head(&self) -> ObjectHash {
+        self.head
+    }
+
+    pub(crate) fn list(
+        &self,
+        object_type: &str,
+        max_entries: usize,
+    ) -> Result<PinnedHistoryListing> {
+        validate_history_path_part("object type", object_type)?;
+        if max_entries == 0 {
+            bail!("pinned history listing limit must be greater than zero");
+        }
+        let Some(type_entry) = self.root_items.iter().find(|item| item.name == object_type) else {
+            return Ok(PinnedHistoryListing {
+                entries: Vec::new(),
+                omitted: 0,
+            });
+        };
+        let mut entries = self
+            .manager
+            .load_tree_bounded(&type_entry.id, self.max_tree_bytes)?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let omitted = entries.len().saturating_sub(max_entries);
+        entries.truncate(max_entries);
+        Ok(PinnedHistoryListing {
+            entries: entries
+                .into_iter()
+                .map(|item| PinnedHistoryEntry {
+                    source_head: self.head,
+                    object_type: object_type.to_string(),
+                    object_id: item.name,
+                    oid: item.id,
+                })
+                .collect(),
+            omitted,
+        })
+    }
+
+    pub(crate) fn get_blob(
+        &self,
+        object_type: &str,
+        object_id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<PinnedHistoryBlob>> {
+        validate_history_path_part("object type", object_type)?;
+        validate_history_path_part("object ID", object_id)?;
+        if max_bytes == 0 {
+            bail!("pinned history object byte limit must be greater than zero");
+        }
+        let Some(type_entry) = self.root_items.iter().find(|item| item.name == object_type) else {
+            return Ok(None);
+        };
+        let type_items = self
+            .manager
+            .load_tree_bounded(&type_entry.id, self.max_tree_bytes)?;
+        let Some(item) = type_items.iter().find(|item| item.name == object_id) else {
+            return Ok(None);
+        };
+        let entry = PinnedHistoryEntry {
+            source_head: self.head,
+            object_type: object_type.to_string(),
+            object_id: object_id.to_string(),
+            oid: item.id,
+        };
+        self.read_blob(&entry, max_bytes).map(Some)
+    }
+
+    pub(crate) fn read_blob(
+        &self,
+        entry: &PinnedHistoryEntry,
+        max_bytes: u64,
+    ) -> Result<PinnedHistoryBlob> {
+        if entry.source_head != self.head {
+            bail!("pinned history entry belongs to a different source view");
+        }
+        validate_history_path_part("object type", &entry.object_type)?;
+        validate_history_path_part("object ID", &entry.object_id)?;
+        if max_bytes == 0 {
+            bail!("pinned history object byte limit must be greater than zero");
+        }
+        let (kind, bytes) =
+            read_git_object_bounded_validated(&self.manager.repo_path, &entry.oid, max_bytes)
+                .with_context(|| {
+                    format!(
+                        "failed to read pinned {}/{}",
+                        entry.object_type, entry.object_id
+                    )
+                })?;
+        if kind != "blob" {
+            bail!(
+                "pinned history entry {}/{} is not a blob",
+                entry.object_type,
+                entry.object_id
+            );
+        }
+        Ok(PinnedHistoryBlob {
+            object_id: entry.object_id.clone(),
+            oid: entry.oid,
+            bytes,
+        })
+    }
+}
+
+fn validate_history_path_part(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        bail!("invalid pinned history {label}");
+    }
+    Ok(())
+}
+
+fn read_single_parent_commit(repo_path: &Path, oid: ObjectHash) -> Result<Option<ObjectHash>> {
+    let (kind, bytes) =
+        read_git_object_bounded_validated(repo_path, &oid, PINNED_HISTORY_COMMIT_MAX_BYTES)
+            .with_context(|| format!("failed to read AI history commit {oid}"))?;
+    if kind != "commit" {
+        bail!("AI history OID {oid} does not identify a commit");
+    }
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("AI history commit {oid} is not UTF-8"))?;
+    let mut parents = Vec::new();
+    let mut saw_tree = false;
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with("author ") {
+            break;
+        }
+        if line.starts_with("tree ") {
+            saw_tree = true;
+        } else if let Some(parent) = line.strip_prefix("parent ") {
+            parents.push(
+                ObjectHash::from_str(parent)
+                    .map_err(|_| anyhow!("AI history commit {oid} has invalid parent OID"))?,
+            );
+        }
+    }
+    if !saw_tree {
+        bail!("AI history commit {oid} has no tree header");
+    }
+    if parents.len() > 1 {
+        bail!("AI history commit {oid} is a merge commit");
+    }
+    Ok(parents.into_iter().next())
+}
 
 #[cfg(test)]
 tokio::task_local! {
@@ -1234,6 +1443,56 @@ impl HistoryManager {
         Ok(Vec::new())
     }
 
+    /// Pin a read-only view to an exact commit on the current AI history's
+    /// first-parent chain. The caller-provided OID is treated as untrusted:
+    /// arbitrary repository commits and stale commits beyond the scan budget
+    /// are rejected before any typed object is returned.
+    pub(crate) async fn pin_history(
+        &self,
+        pinned_head: ObjectHash,
+        max_ancestry_commits: usize,
+        max_tree_bytes: u64,
+    ) -> Result<PinnedHistoryView<'_>> {
+        if max_ancestry_commits == 0 {
+            bail!("pinned history ancestry limit must be greater than zero");
+        }
+        if max_tree_bytes == 0 {
+            bail!("pinned history tree byte limit must be greater than zero");
+        }
+        let current_head = self
+            .resolve_history_head()
+            .await?
+            .ok_or_else(|| anyhow!("AI history is not initialized"))?;
+        let mut cursor = Some(current_head);
+        let mut visited = HashSet::new();
+        let mut found = false;
+        for _ in 0..max_ancestry_commits {
+            let Some(commit_oid) = cursor else {
+                break;
+            };
+            if !visited.insert(commit_oid) {
+                bail!("AI history contains a first-parent cycle");
+            }
+            if commit_oid == pinned_head {
+                found = true;
+                break;
+            }
+            cursor = read_single_parent_commit(&self.repo_path, commit_oid)?;
+        }
+        if !found {
+            bail!(
+                "pinned source commit is not reachable from the current AI history within the configured limit"
+            );
+        }
+        let root_items = self.load_commit_tree_bounded(&pinned_head, max_tree_bytes)?;
+        Ok(PinnedHistoryView {
+            manager: self,
+            head: pinned_head,
+            max_tree_bytes,
+            root_items,
+        })
+    }
+
     /// List all object types present at the current history head.
     ///
     /// Functional scope:
@@ -1328,6 +1587,40 @@ impl HistoryManager {
             }
         }
         Err(anyhow!("Commit has no tree"))
+    }
+
+    fn load_commit_tree_bounded(
+        &self,
+        commit_id: &ObjectHash,
+        max_tree_bytes: u64,
+    ) -> Result<Vec<TreeItem>> {
+        let (kind, data) = read_git_object_bounded_validated(
+            &self.repo_path,
+            commit_id,
+            PINNED_HISTORY_COMMIT_MAX_BYTES,
+        )?;
+        if kind != "commit" {
+            bail!("pinned AI history OID {commit_id} is not a commit");
+        }
+        let content = std::str::from_utf8(&data)
+            .with_context(|| format!("AI history commit {commit_id} is not UTF-8"))?;
+        for line in content.lines() {
+            if let Some(hash_str) = line.strip_prefix("tree ") {
+                let tree_hash = ObjectHash::from_str(hash_str)
+                    .map_err(|error| anyhow!("invalid tree hash in pinned commit: {error}"))?;
+                return self.load_tree_bounded(&tree_hash, max_tree_bytes);
+            }
+        }
+        bail!("pinned AI history commit has no tree")
+    }
+
+    fn load_tree_bounded(&self, tree_id: &ObjectHash, max_bytes: u64) -> Result<Vec<TreeItem>> {
+        let (kind, data) = read_git_object_bounded_validated(&self.repo_path, tree_id, max_bytes)?;
+        if kind != "tree" {
+            bail!("pinned AI history tree OID {tree_id} is not a tree");
+        }
+        let tree = Tree::from_bytes(&data, *tree_id)?;
+        Ok(tree.tree_items)
     }
 
     /// Load and parse a tree object's items.

@@ -9,9 +9,9 @@ use super::{
     error::{MemoryWriterError, MemoryWriterErrorKind},
 };
 
-const REPO_EPISODE_POLICY_VERSION: &str = "repo-policy-v1";
-const REPO_EPISODE_ACL_POLICY_ID: &str = "repo-default-v1";
-const REPO_EPISODE_PRODUCER: &str = "libra-memory/1";
+pub(super) const REPO_EPISODE_POLICY_VERSION: &str = "repo-policy-v1";
+pub(super) const REPO_EPISODE_ACL_POLICY_ID: &str = "repo-default-v1";
+pub(super) const REPO_EPISODE_PRODUCER: &str = "libra-memory/1";
 const REPO_EPISODE_POLICY_SNAPSHOT: &[u8] = br#"{
   "acl_policy":"repo-default-v1",
   "auto_confirm":true,

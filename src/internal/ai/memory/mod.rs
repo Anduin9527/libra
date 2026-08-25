@@ -9,14 +9,18 @@
 //! Storage, projection, compilation, and command adapters are implemented by
 //! later plan slices and must not become alternate write seams.
 
+mod admission;
 mod canonical;
+mod compiler;
 mod domain;
 mod error;
 mod fts_sql;
 mod job_sql;
+mod limits;
 mod policy;
 mod projection;
 mod replay;
+mod source;
 mod store;
 mod tree;
 mod validation;

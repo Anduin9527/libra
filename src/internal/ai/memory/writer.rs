@@ -5,6 +5,7 @@ use git_internal::hash::ObjectHash;
 use uuid::Uuid;
 
 use super::{
+    admission::AdmittedEpisodeProposal,
     canonical::memory_note_content_digest_v1,
     domain::{MemoryEventAction, MemoryEventV1, MemoryNoteV1},
     error::{MemoryWriterError, MemoryWriterErrorKind},
@@ -12,6 +13,7 @@ use super::{
         AuthenticatedMemoryContext, DeterministicMemoryProposal, TrustedMemoryTarget,
         validate_writer_policy,
     },
+    source::{EpisodeSourceErrorKind, EpisodeSourceResolver},
     store::{
         ProjectedCell, ProjectionMutation, find_cell, read_memory_ref_head,
         validate_projection_watermark,
@@ -127,7 +129,7 @@ impl MemoryWriter {
     }
 
     #[cfg(test)]
-    async fn for_tests(
+    pub(in crate::internal::ai::memory) async fn for_tests(
         storage_path: PathBuf,
         database: Arc<sea_orm::DatabaseConnection>,
         digest_provider: Arc<RepositoryKeyedDigest>,
@@ -150,7 +152,38 @@ impl MemoryWriter {
         *slot = Some(barrier);
     }
 
+    pub(crate) async fn commit_admitted(
+        &self,
+        resolver: &EpisodeSourceResolver<'_>,
+        context: &AuthenticatedMemoryContext,
+        target: &TrustedMemoryTarget,
+        admitted: &AdmittedEpisodeProposal,
+        expected_head: Option<ObjectHash>,
+    ) -> Result<CommittedMemoryEnvelope, MemoryWriterError> {
+        resolver
+            .revalidate(context, target, admitted.source())
+            .await
+            .map_err(|error| {
+                let kind = writer_error_kind_for_source(error.kind());
+                MemoryWriterError::new(kind, "Episode source evidence could not be revalidated")
+            })?;
+        self.commit_validated(context, target, admitted.proposal(), expected_head)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn commit(
+        &self,
+        context: &AuthenticatedMemoryContext,
+        target: &TrustedMemoryTarget,
+        proposal: &DeterministicMemoryProposal,
+        expected_head: Option<ObjectHash>,
+    ) -> Result<CommittedMemoryEnvelope, MemoryWriterError> {
+        self.commit_validated(context, target, proposal, expected_head)
+            .await
+    }
+
+    async fn commit_validated(
         &self,
         context: &AuthenticatedMemoryContext,
         target: &TrustedMemoryTarget,
@@ -463,6 +496,18 @@ impl MemoryWriter {
     }
 }
 
+const fn writer_error_kind_for_source(kind: EpisodeSourceErrorKind) -> MemoryWriterErrorKind {
+    match kind {
+        EpisodeSourceErrorKind::DigestUnavailable => MemoryWriterErrorKind::DigestKeyUnavailable,
+        EpisodeSourceErrorKind::LimitExceeded => MemoryWriterErrorKind::SourceLimitExceeded,
+        EpisodeSourceErrorKind::Unauthorized
+        | EpisodeSourceErrorKind::InvalidRequest
+        | EpisodeSourceErrorKind::SourceNotReachable
+        | EpisodeSourceErrorKind::RedactionFailed => MemoryWriterErrorKind::SourceRejected,
+        EpisodeSourceErrorKind::SourceCorrupt => MemoryWriterErrorKind::EvidenceMismatch,
+    }
+}
+
 async fn validate_repository_binding(
     database: &sea_orm::DatabaseConnection,
     digest_provider: &RepositoryKeyedDigest,
@@ -530,6 +575,30 @@ pub(in crate::internal::ai::memory) mod tests {
         },
         utils::{client_storage::ClientStorage, test::ChangeDirGuard},
     };
+
+    #[test]
+    fn source_failures_map_to_stable_writer_categories() {
+        for (source, expected) in [
+            (
+                EpisodeSourceErrorKind::DigestUnavailable,
+                MemoryWriterErrorKind::DigestKeyUnavailable,
+            ),
+            (
+                EpisodeSourceErrorKind::LimitExceeded,
+                MemoryWriterErrorKind::SourceLimitExceeded,
+            ),
+            (
+                EpisodeSourceErrorKind::SourceNotReachable,
+                MemoryWriterErrorKind::SourceRejected,
+            ),
+            (
+                EpisodeSourceErrorKind::SourceCorrupt,
+                MemoryWriterErrorKind::EvidenceMismatch,
+            ),
+        ] {
+            assert_eq!(writer_error_kind_for_source(source), expected);
+        }
+    }
 
     const REPOSITORY_ID: &str = "memory-writer-test-repository";
     const TEST_CIPHERTEXT: &str = "memory-writer-test-ciphertext";

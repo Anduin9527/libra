@@ -244,6 +244,10 @@ impl SourceInputFingerprint {
     pub(crate) fn digest_hex(&self) -> &str {
         self.0.digest_hex()
     }
+
+    pub(crate) fn encoded(&self) -> String {
+        encode_receipt_digest(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,0 +1,115 @@
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use super::{domain::EpistemicStatus, source::RedactedEpisodeSource};
+use crate::internal::ai::context_budget::MemoryAnchorConfidence;
+
+const MAX_PRODUCER_BYTES: usize = 120;
+const MAX_VERSION_BYTES: usize = 80;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct EpisodeCompileConfig {
+    producer: String,
+    rules_version: u32,
+    prompt_version: String,
+    model_id: String,
+}
+
+impl EpisodeCompileConfig {
+    pub(crate) fn new(
+        producer: impl Into<String>,
+        rules_version: u32,
+        prompt_version: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> Result<Self, EpisodeCompilerError> {
+        let config = Self {
+            producer: producer.into(),
+            rules_version,
+            prompt_version: prompt_version.into(),
+            model_id: model_id.into(),
+        };
+        if config.producer.is_empty()
+            || config.producer.len() > MAX_PRODUCER_BYTES
+            || config.rules_version == 0
+            || config.prompt_version.is_empty()
+            || config.prompt_version.len() > MAX_VERSION_BYTES
+            || config.model_id.is_empty()
+            || config.model_id.len() > MAX_VERSION_BYTES
+        {
+            return Err(EpisodeCompilerError::new(
+                EpisodeCompilerErrorKind::InvalidConfig,
+            ));
+        }
+        Ok(config)
+    }
+
+    pub(crate) fn producer(&self) -> &str {
+        &self.producer
+    }
+
+    pub(crate) const fn rules_version(&self) -> u32 {
+        self.rules_version
+    }
+
+    pub(crate) fn prompt_version(&self) -> &str {
+        &self.prompt_version
+    }
+
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct EpisodeClaimProposalV1 {
+    pub(crate) epistemic_status: EpistemicStatus,
+    pub(crate) claim: String,
+    pub(crate) confidence: Option<MemoryAnchorConfidence>,
+    pub(crate) evidence_fragment_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct EpisodeCompilerProposalV1 {
+    pub(crate) summary: EpisodeClaimProposalV1,
+    pub(crate) observations: Vec<EpisodeClaimProposalV1>,
+    pub(crate) inferences: Vec<EpisodeClaimProposalV1>,
+    pub(crate) decisions: Vec<EpisodeClaimProposalV1>,
+    pub(crate) failed_attempts: Vec<EpisodeClaimProposalV1>,
+    pub(crate) unresolved: Vec<EpisodeClaimProposalV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EpisodeCompilerErrorKind {
+    InvalidConfig,
+    ProviderFailed,
+    MalformedOutput,
+    OutputLimitExceeded,
+}
+
+#[derive(Debug, Error)]
+#[error("Episode compiler failed ({kind:?})")]
+pub(crate) struct EpisodeCompilerError {
+    kind: EpisodeCompilerErrorKind,
+}
+
+impl EpisodeCompilerError {
+    pub(crate) const fn new(kind: EpisodeCompilerErrorKind) -> Self {
+        Self { kind }
+    }
+
+    pub(crate) const fn kind(&self) -> EpisodeCompilerErrorKind {
+        self.kind
+    }
+}
+
+/// Crate-private compiler seam. Adapters can inspect only redacted source and
+/// return claim drafts keyed to resolver-issued fragment IDs.
+#[async_trait]
+pub(crate) trait EpisodeCompiler: Send + Sync {
+    async fn compile(
+        &self,
+        source: &RedactedEpisodeSource,
+        config: &EpisodeCompileConfig,
+    ) -> Result<EpisodeCompilerProposalV1, EpisodeCompilerError>;
+}

@@ -89,9 +89,9 @@ structured report is always present.
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |
 | `128` | `LBR-REPO-003` | `repo` | Repository state blocks the operation | no commits yet, detached state mismatch, missing configured remote |
 | `128` | `LBR-MEMORY-001` | `repo` | Repository Memory digest key is missing, invalid, or cannot be decrypted | missing encrypted `memory.keyed_digest.v1`, duplicate/plaintext entry, unsupported generation, unavailable repository vault key, or cached/persisted key mismatch |
-| `128` | `LBR-MEMORY-002` | `repo` | Memory proposal violates the persisted object contract | unsupported schema, malformed Episode envelope, or non-canonical note/event payload |
-| `128` | `LBR-MEMORY-003` | `repo` | Memory writer policy rejected the proposal | authenticated target mismatch, non-local Memory scope, or unknown repository digest key ID |
-| `128` | `LBR-MEMORY-004` | `repo` | Memory authority or its rebuildable projection is corrupt | invalid manifest, merge commit on the linear Memory ref, broken revision ancestry, or projection watermark mismatch |
+| `128` | `LBR-MEMORY-002` | `repo` | Memory proposal or bounded source exceeds the persisted contract | unsupported schema, malformed Episode envelope, non-canonical payload, or a required source fact exceeding its hard limit |
+| `128` | `LBR-MEMORY-003` | `repo` | Memory source or writer policy rejected the operation | authenticated repository/target mismatch, unreachable pinned source, non-local scope, or unknown repository digest key ID |
+| `128` | `LBR-MEMORY-004` | `repo` | Memory evidence, authority, or its rebuildable projection is corrupt | source manifest/fragment mismatch, invalid manifest, merge commit on the linear Memory ref, broken revision ancestry, or projection watermark mismatch |
 | `128` | `LBR-MEMORY-005` | `repo` | Memory writer could not commit an atomic revision | local object write failure, SQLite companion failure, or exhausted bounded ref-conflict retries |
 | `128` | `LBR-MEMORY-PROJECTION-STALE` | `repo` | Memory projection does not match the pinned repository Memory ref | the ref advanced after a frozen read, the projection is missing, or another replay won the transaction |
 | `128` | `LBR-WORKTREE-001` | `repo` | Pagination cursor is malformed, foreign, or expired | `libra worktree doctor --cursor <garbage>` |
@@ -170,9 +170,9 @@ structured report is always present.
 | `LBR-REPO-002` | Repository metadata is corrupt or incompatible |
 | `LBR-REPO-003` | Repository state blocks the operation |
 | `LBR-MEMORY-001` | Repository Memory digest key is missing, invalid, or cannot be decrypted; restore the original encrypted entry or repair the repository vault before writing new Memory data |
-| `LBR-MEMORY-002` | The Memory proposal is incompatible with the persisted contract; regenerate it with the supported schema and canonical fields |
-| `LBR-MEMORY-003` | The Memory proposal failed repository policy; use the authenticated target and the current repository digest key |
-| `LBR-MEMORY-004` | Memory authority and projection disagree or contain invalid history; stop writes and rebuild or repair the projection before retrying |
+| `LBR-MEMORY-002` | The Memory proposal or required source exceeds the persisted contract; regenerate it with supported schemas, canonical fields, and the configured source limits |
+| `LBR-MEMORY-003` | The Memory source or proposal failed repository policy; use the authenticated repository, trusted target, reachable pinned source, and current digest key |
+| `LBR-MEMORY-004` | Memory evidence, authority, and projection disagree or contain invalid history; stop writes and rebuild or repair the source/projection before retrying |
 | `LBR-MEMORY-005` | The Memory revision could not be committed atomically; fix local storage/SQLite health or retry after ref contention subsides |
 | `LBR-MEMORY-PROJECTION-STALE` | The Memory projection is not current for the pinned ref; freeze a new view or rebuild/advance the projection before reading it |
 | `LBR-WORKTREE-001` | The pagination cursor is malformed or expired; drop it and re-read the first page |
