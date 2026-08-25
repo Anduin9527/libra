@@ -369,7 +369,6 @@ impl EpisodeGenerationRunnerError {
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use git_internal::internal::object::{
         ObjectTrait,
         task::Task,
@@ -381,55 +380,71 @@ mod tests {
     use super::*;
     use crate::{
         internal::ai::{
-            context_budget::MemoryAnchorConfidence,
+            completion::{
+                AssistantContent, CompletionError, CompletionModel, CompletionRequest,
+                CompletionResponse, Message, OneOrMany, Text, UserContent,
+            },
             memory::{
-                compiler::{
-                    EpisodeClaimProposalV1, EpisodeCompilerError, EpisodeCompilerProposalV1,
+                compiler::task::{
+                    TASK_EPISODE_PROMPT_VERSION, TASK_EPISODE_RULES_VERSION, TaskEpisodeCompiler,
                 },
-                domain::{EpisodeRoot, EpistemicStatus},
+                domain::EpisodeRoot,
                 observer::EpisodeObserver,
                 policy::REPO_EPISODE_PRODUCER,
-                source::RedactedEpisodeSource,
                 writer::tests::fixture,
             },
         },
         utils::{object::write_git_object, storage::local::LocalStorage},
     };
 
-    struct FakeCompiler;
+    #[derive(Clone)]
+    struct TaskPromptModel;
 
-    #[async_trait]
-    impl EpisodeCompiler for FakeCompiler {
-        async fn compile(
+    impl CompletionModel for TaskPromptModel {
+        type Response = ();
+
+        async fn completion(
             &self,
-            source: &RedactedEpisodeSource,
-            _config: &EpisodeCompileConfig,
-        ) -> Result<EpisodeCompilerProposalV1, EpisodeCompilerError> {
-            let evidence_fragment_id = source
-                .fragments()
-                .first()
-                .expect("resolved source has a root fragment")
-                .fragment_id()
-                .to_string();
-            let observation = EpisodeClaimProposalV1 {
-                epistemic_status: EpistemicStatus::Observation,
-                claim: "the task reached a terminal state".to_string(),
-                confidence: None,
-                evidence_fragment_ids: vec![evidence_fragment_id.clone()],
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            let Message::User { content } = request
+                .chat_history
+                .last()
+                .expect("Task compiler emits one user message")
+            else {
+                panic!("Task compiler must emit a user message");
             };
-            let inference = EpisodeClaimProposalV1 {
-                epistemic_status: EpistemicStatus::Inference,
-                claim: "the terminal evidence is ready for reuse".to_string(),
-                confidence: Some(MemoryAnchorConfidence::Medium),
-                evidence_fragment_ids: vec![evidence_fragment_id],
+            let OneOrMany::One(UserContent::Text(input)) = content else {
+                panic!("Task compiler must emit one text input");
             };
-            Ok(EpisodeCompilerProposalV1 {
-                summary: inference.clone(),
-                observations: vec![observation],
-                inferences: vec![inference],
-                decisions: Vec::new(),
-                failed_attempts: Vec::new(),
-                unresolved: Vec::new(),
+            let input: serde_json::Value =
+                serde_json::from_str(&input.text).expect("parse Task prompt input");
+            let fragment_id = input["fragments"][0]["fragment_id"]
+                .as_str()
+                .expect("resolved source has a fragment ID");
+            let reply = serde_json::json!({
+                "summary": {
+                    "epistemic_status": "inference",
+                    "claim": "the terminal evidence is ready for reuse",
+                    "confidence": "medium",
+                    "evidence_fragment_ids": [fragment_id]
+                },
+                "observations": [{
+                    "epistemic_status": "observation",
+                    "claim": "the task reached a terminal state",
+                    "confidence": null,
+                    "evidence_fragment_ids": [fragment_id]
+                }],
+                "inferences": [],
+                "decisions": [],
+                "failed_attempts": [],
+                "unresolved": []
+            })
+            .to_string();
+            Ok(CompletionResponse {
+                content: vec![AssistantContent::Text(Text { text: reply })],
+                reasoning_content: None,
+                raw_response: (),
             })
         }
     }
@@ -480,11 +495,13 @@ mod tests {
             .expect("observe terminal Task event");
         let config = EpisodeCompileConfig::new(
             REPO_EPISODE_PRODUCER,
-            1,
-            "m2-08-fake-v1",
+            TASK_EPISODE_RULES_VERSION,
+            TASK_EPISODE_PROMPT_VERSION,
             "deterministic-fake",
         )
         .expect("construct compile config");
+        let compiler = TaskEpisodeCompiler::for_tests(TaskPromptModel, "deterministic-fake")
+            .expect("construct Task Episode compiler");
         let runner = EpisodeGenerationRunner::new(
             &history,
             fixture.database.as_ref(),
@@ -496,7 +513,7 @@ mod tests {
         .expect("construct generation runner");
         assert_eq!(
             runner
-                .run_one(&FakeCompiler, &config, "runner-a", 2_000_000_000_000)
+                .run_one(&compiler, &config, "runner-a", 2_000_000_000_000)
                 .await
                 .expect("run one generation"),
             GenerationRunOutcome::Committed {
@@ -543,6 +560,61 @@ mod tests {
         assert_eq!(
             memory.try_get::<String>("", "latest_review_state").unwrap(),
             "confirmed"
+        );
+        assert_eq!(
+            runner
+                .run_one(&compiler, &config, "runner-a", 2_000_000_000_001)
+                .await
+                .expect("repeat completed generation"),
+            GenerationRunOutcome::NoWork
+        );
+
+        let revised = TaskEvent::new(
+            ActorRef::agent("runner-test-agent").expect("test actor"),
+            task_id,
+            TaskEventKind::Failed,
+        )
+        .expect("construct revised terminal Task event");
+        append_object(
+            &history,
+            "task_event",
+            &revised.header().object_id().to_string(),
+            &revised,
+        )
+        .await;
+        EpisodeObserver::new(&history, fixture.database.as_ref(), &fixture.digest, "repo")
+            .expect("construct terminal observer")
+            .observe_terminal_events()
+            .await
+            .expect("observe revised terminal Task event");
+        assert_eq!(
+            runner
+                .run_one(&compiler, &config, "runner-a", 2_000_000_000_002)
+                .await
+                .expect("run revised generation"),
+            GenerationRunOutcome::Committed {
+                appended: true,
+                new_generation_pending: false,
+            }
+        );
+        let revision_count = fixture
+            .database
+            .query_one_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "SELECT COUNT(*) AS revision_count FROM memory_revision_index
+                 WHERE scope_key = 'repo' AND note_id = ?",
+                [EpisodeRoot::task(task_id.to_string())
+                    .unwrap()
+                    .note_id()
+                    .to_string()
+                    .into()],
+            ))
+            .await
+            .expect("query generated revisions")
+            .expect("revision count row exists");
+        assert_eq!(
+            revision_count.try_get::<i64>("", "revision_count").unwrap(),
+            2
         );
     }
 }

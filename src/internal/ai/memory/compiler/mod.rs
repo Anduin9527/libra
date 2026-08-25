@@ -1,9 +1,13 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
-use super::{domain::EpistemicStatus, source::RedactedEpisodeSource};
-use crate::internal::ai::context_budget::MemoryAnchorConfidence;
+use super::source::RedactedEpisodeSource;
+
+pub(crate) mod schema;
+pub(crate) mod task;
+
+pub(crate) use schema::{EpisodeClaimProposalV1, EpisodeCompilerProposalV1};
 
 const MAX_PRODUCER_BYTES: usize = 120;
 const MAX_VERSION_BYTES: usize = 80;
@@ -61,30 +65,14 @@ impl EpisodeCompileConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct EpisodeClaimProposalV1 {
-    pub(crate) epistemic_status: EpistemicStatus,
-    pub(crate) claim: String,
-    pub(crate) confidence: Option<MemoryAnchorConfidence>,
-    pub(crate) evidence_fragment_ids: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct EpisodeCompilerProposalV1 {
-    pub(crate) summary: EpisodeClaimProposalV1,
-    pub(crate) observations: Vec<EpisodeClaimProposalV1>,
-    pub(crate) inferences: Vec<EpisodeClaimProposalV1>,
-    pub(crate) decisions: Vec<EpisodeClaimProposalV1>,
-    pub(crate) failed_attempts: Vec<EpisodeClaimProposalV1>,
-    pub(crate) unresolved: Vec<EpisodeClaimProposalV1>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EpisodeCompilerErrorKind {
     InvalidConfig,
     ProviderFailed,
+    ProviderTimedOut,
     MalformedOutput,
     OutputLimitExceeded,
+    SensitiveOutput,
 }
 
 #[derive(Debug, Error)]

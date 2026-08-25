@@ -7,6 +7,7 @@ use super::{
     compiler::{
         EpisodeClaimProposalV1, EpisodeCompileConfig, EpisodeCompiler, EpisodeCompilerErrorKind,
         EpisodeCompilerProposalV1,
+        schema::{validate_claim as validate_claim_schema, validate_proposal},
     },
     domain::{
         CompileOriginV1, CompileRecordV1, EpisodeClaimV1, EpisodeOmissionsV1, EpisodePayloadV1,
@@ -22,10 +23,6 @@ use super::{
 use crate::internal::ai::{
     context_budget::MemoryAnchorConfidence, keyed_digest::RepositoryKeyedDigest,
 };
-
-const MAX_CLAIM_BYTES: usize = 4096;
-const MAX_CLAIMS_PER_SECTION: usize = 64;
-const MAX_EVIDENCE_PER_CLAIM: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EpisodeAdmissionErrorKind {
@@ -101,12 +98,14 @@ impl<'a> EpisodeAdmission<'a> {
                 .compile(&source, config)
                 .await
                 .map_err(|error| match error.kind() {
-                    EpisodeCompilerErrorKind::ProviderFailed => {
+                    EpisodeCompilerErrorKind::ProviderFailed
+                    | EpisodeCompilerErrorKind::ProviderTimedOut => {
                         EpisodeAdmissionError::new(EpisodeAdmissionErrorKind::CompilerTransient)
                     }
                     EpisodeCompilerErrorKind::InvalidConfig
                     | EpisodeCompilerErrorKind::MalformedOutput
-                    | EpisodeCompilerErrorKind::OutputLimitExceeded => {
+                    | EpisodeCompilerErrorKind::OutputLimitExceeded
+                    | EpisodeCompilerErrorKind::SensitiveOutput => {
                         EpisodeAdmissionError::new(EpisodeAdmissionErrorKind::CompilerStable)
                     }
                 })?;
@@ -122,17 +121,7 @@ impl<'a> EpisodeAdmission<'a> {
         source: &RedactedEpisodeSource,
         proposal: EpisodeCompilerProposalV1,
     ) -> Result<DeterministicMemoryProposal, EpisodeAdmissionError> {
-        for section in [
-            &proposal.observations,
-            &proposal.inferences,
-            &proposal.decisions,
-            &proposal.failed_attempts,
-            &proposal.unresolved,
-        ] {
-            if section.len() > MAX_CLAIMS_PER_SECTION {
-                return Err(invalid_proposal());
-            }
-        }
+        validate_proposal(&proposal).map_err(|_| invalid_proposal())?;
         let idempotency_input = serde_json::to_vec(&IdempotencyInput {
             manifest: source.manifest(),
             config,
@@ -284,16 +273,7 @@ fn claim(
     proposal: EpisodeClaimProposalV1,
     required_status: Option<EpistemicStatus>,
 ) -> Result<EpisodeClaimV1, EpisodeAdmissionError> {
-    if proposal.claim.is_empty()
-        || proposal.claim.len() > MAX_CLAIM_BYTES
-        || proposal.evidence_fragment_ids.is_empty()
-        || proposal.evidence_fragment_ids.len() > MAX_EVIDENCE_PER_CLAIM
-        || required_status.is_some_and(|status| status != proposal.epistemic_status)
-        || (proposal.epistemic_status == EpistemicStatus::Inference
-            && proposal.confidence.is_none())
-    {
-        return Err(invalid_proposal());
-    }
+    validate_claim_schema(&proposal, required_status).map_err(|_| invalid_proposal())?;
     let mut seen = BTreeSet::new();
     let mut evidence_refs = Vec::new();
     for fragment_id in proposal.evidence_fragment_ids {

@@ -205,6 +205,93 @@ impl RedactedEpisodeSource {
             .find(|fragment| fragment.fragment_id == fragment_id)
             .map(RedactedEpisodeFragment::evidence)
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_compiler_test(
+        root_kind: EpisodeRootKind,
+        fragments: &[(&str, &str, &str)],
+        completion_status: CompletionStatus,
+        code_change_status: CodeChangeStatus,
+    ) -> Self {
+        let limits = EpisodeSourceLimits::repo_v1();
+        let source_ref_oid = ObjectHash::new(b"compiler-test-source").to_string();
+        let mut manifest_fragments = Vec::new();
+        let mut redacted_fragments = Vec::new();
+        for (fragment_id, object_type, text) in fragments {
+            let object_oid = ObjectHash::new(fragment_id.as_bytes());
+            let fragment_digest = hex::encode(Sha256::digest(text.as_bytes()));
+            let evidence = EvidenceRefV1 {
+                schema_version: 1,
+                source_plane: EvidenceSourcePlane::AgentRuntime,
+                kind: EvidenceKind::Task,
+                object_id: fragment_id.to_string(),
+                source_ref_oid: source_ref_oid.clone(),
+                locator: EvidenceLocatorV1::Object,
+                fragment_digest: fragment_digest.clone(),
+                visibility: EvidenceVisibility::RepoLocal,
+                captured_at: None,
+                code_commit: None,
+            };
+            manifest_fragments.push(SourceManifestFragmentV1 {
+                fragment_id: fragment_id.to_string(),
+                object_type: object_type.to_string(),
+                object_id: fragment_id.to_string(),
+                object_oid: object_oid.to_string(),
+                locator: EvidenceLocatorV1::Object,
+                fragment_digest,
+                code_commit: None,
+            });
+            redacted_fragments.push(RedactedEpisodeFragment {
+                fragment_id: fragment_id.to_string(),
+                object_type: object_type.to_string(),
+                object_id: fragment_id.to_string(),
+                object_oid,
+                text: text.to_string(),
+                evidence,
+            });
+        }
+        let redacted_bytes = fragments.iter().map(|(_, _, text)| text.len()).sum();
+        let token_estimate = estimate_tokens(redacted_bytes);
+        let started_at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("fixed compiler test timestamp is valid");
+        let ended_at = DateTime::<Utc>::from_timestamp(1_700_000_001, 0)
+            .expect("fixed compiler test timestamp is valid");
+        Self {
+            manifest: EpisodeSourceManifestV1 {
+                schema_version: SOURCE_SCHEMA_VERSION,
+                policy_version: SOURCE_POLICY_VERSION.to_string(),
+                redaction_policy_version: REDACTION_POLICY_VERSION.to_string(),
+                root_kind,
+                root_id: "compiler-test-root".to_string(),
+                repository_id: "compiler-test-repository".to_string(),
+                principal_digest: "hmac-sha256:test".to_string(),
+                source_ref_oid,
+                limits: limits.into(),
+                object_count: redacted_fragments.len(),
+                redacted_bytes,
+                token_estimate,
+                fragments: manifest_fragments,
+                omissions: Vec::new(),
+            },
+            facts: EpisodeSourceFacts {
+                related_intent_ids: Vec::new(),
+                related_task_ids: vec!["compiler-test-root".to_string()],
+                related_run_ids: Vec::new(),
+                root_goal: "compile a bounded task episode".to_string(),
+                started_at,
+                ended_at,
+                completion_status,
+                code_change_status,
+                code: EpisodeCodeContextV1 {
+                    base_oid: None,
+                    result_oid: None,
+                    branch_ref: None,
+                    paths: Vec::new(),
+                },
+            },
+            fragments: redacted_fragments,
+        }
+    }
 }
 
 struct MemorySourceRedactor {

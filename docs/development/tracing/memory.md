@@ -613,7 +613,7 @@ M2 从现有 Intent / Task / Run / Evidence / Decision / PatchSet / Session 与�
 | 字段 | 所有者 | 约束 |
 |---|---|---|
 | `schema_version` | Writer | 固定为 `1` |
-| `root_kind` / `root_id` | Writer | `task \| intent`；编译器回显必须完全一致 |
+| `root_kind` / `root_id` | Writer | `task \| intent`；编译器不得输出，由 Writer 从受信任目标机械注入 |
 | `related_intent_ids` / `related_task_ids` / `related_run_ids` | Writer | 排序、去重、有界；Intent Episode 至少包含一个贡献 Task |
 | `started_at` / `ended_at` | Writer | 从来源事件时间计算，`started_at <= ended_at` |
 | `completion_status` | Writer | `completed \| failed \| cancelled`，来自终态事实 |
@@ -1493,6 +1493,34 @@ schema/auth/policy failure 进入 `failed`，直到新 generation 到来。job �
 扫描和模型；MCP runtime 构造时复用同一 repair seam 补齐崩溃窗口。
 
 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_projection_state`、`memory_episode_path` 是 M2-02 的可重建投影。`memory_compile_job` 与 `memory_compile_observer_state` 是有界本地运行状态。后续的 `memory_entity_index`、`memory_taxonomy_node` 仍是可重建投影；`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats`、`context_selection_receipt` 与 `context_selection_receipt_retention` 是本地有界账本及其保留水位，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
+
+#### 5.2.3 M2-09 Task Episode 编译合同
+
+Task Adapter 复用现有 provider-neutral `CompletionModel`，不创建第二套 Agent runtime。
+它只接受 `RedactedEpisodeSource::Task`、冻结的 rules/prompt/model 配置，并向 provider
+发送 `fragment_id + object_type + redacted text`，不额外发送 source manifest、repository
+ID、principal digest 或 trusted facts。片段正文仍可能包含来源对象自身的 ID、终态、时间、
+commit 或 path，模型只能把它们当证据理解，不能把这些值作为 proposal 的结构字段；proposal
+通过后，准入层会从受信任来源机械注入权威值。
+
+首个合同固定为 `rules_version=1`、`prompt_version=task-episode-v1`。模型只能输出
+`summary`、`observations`、`inferences`、`decisions`、`failed_attempts`、`unresolved`；
+proposal 与每条 claim 都拒绝未知字段，因此模型尝试加入 root、goal、status、time、
+related IDs、commit、branch 或 path 会整体失败。Observation 必须引用至少一个 resolver
+签发的 fragment 且不带 confidence；Inference 必须同时带 confidence 与 fragment 引用。
+每节最多 64 条、每条正文最多 4 KiB、每条最多 32 个不重复引用，整个 provider 文本与
+规范化 proposal 都不得超过 16 KiB。
+
+provider 调用固定 temperature 0、禁用 tools 与 streaming，默认 wall-clock timeout 为
+60 秒。只接受一个纯文本 JSON block；Markdown、tool call、多 block、malformed JSON、
+未知 enum、超限内容和 secret-like echo 都返回稳定的 typed failure。provider error 与
+timeout 归为可重试失败，其余合同错误归为稳定失败。错误、job 和 audit 不保存 provider
+原始响应或原始诊断。
+
+准入成功后，`CompileRecord` 保存 producer、rules/prompt/model/policy version、keyed
+source-manifest fingerprint 与幂等键。Task 的 `completed | failed | cancelled` 与代码的
+`changed | unchanged | unknown` 保持正交；两者均来自受信任 source facts，不由模型判断。
+同一 generation 重放时，既有 job/input fingerprint 和 Writer 幂等合同保证零新增事件。
 
 查询实现必须始终带上 `scope_key` 与 `namespace`，禁止只按 `path` 做全局查询后在内存中过滤。跨 scope / namespace 的检索只能由显式 `--all-namespaces` 或策略允许的 scope fallback 触发，并且必须在结果中保留原始 `scope` 与 `namespace`，防止 prompt 注入时发生来源混淆。
 
