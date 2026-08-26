@@ -271,6 +271,1221 @@ fn classifier_rejects_named_key_with_uncovered_pollution() {
     );
 }
 
+/// TA-01 counterexample: a call to a helper that resolves nowhere must fail
+/// the caller closed to `global`, never `none`; and a resolvable helper whose
+/// body holds pollution propagates its lane to the caller.
+#[test]
+fn classifier_unknown_helper_is_global() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("COMPATIBILITY.md"), b"").expect("write marker");
+    std::fs::create_dir(tmp.path().join(".git")).expect("create .git");
+    std::fs::create_dir_all(tmp.path().join("tests")).expect("create tests/");
+    std::fs::write(
+        tmp.path().join("tests/u_unknown_helper.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn calls_mystery() {\n    mystery_helper();\n}\n\n",
+            "fn guard_helper() {\n    let _g = ChangeDirGuard;\n}\n\n",
+            "#[test]\n#[serial]\nfn calls_guarded_helper() {\n    guard_helper();\n}\n",
+        ),
+    )
+    .expect("write unknown-helper fixture");
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+        .env("SERIAL_CLASSIFY_ROOT", tmp.path())
+        .output()
+        .expect("run classifier against unknown-helper fixture");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+    assert_eq!(
+        stdout, "calls_guarded_helper\tlane:cwd\ncalls_mystery\tglobal\n",
+        "an unresolvable helper must fail closed to global, and an expanded \
+         helper's pollution must propagate its lane to the caller"
+    );
+}
+
+/// TA-01 counterexample: a helper that calls itself (any cycle) must fail the
+/// caller closed to `global` — bounded expansion refuses cycles.
+#[test]
+fn classifier_recursive_helper_is_global() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("COMPATIBILITY.md"), b"").expect("write marker");
+    std::fs::create_dir(tmp.path().join(".git")).expect("create .git");
+    std::fs::create_dir_all(tmp.path().join("tests")).expect("create tests/");
+    std::fs::write(
+        tmp.path().join("tests/u_recursive_helper.rs"),
+        concat!(
+            "fn rec_helper(depth: u32) {\n    if depth > 0 {\n        rec_helper(depth - 1);\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn calls_recursive() {\n    rec_helper(3);\n}\n",
+        ),
+    )
+    .expect("write recursive-helper fixture");
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+        .env("SERIAL_CLASSIFY_ROOT", tmp.path())
+        .output()
+        .expect("run classifier against recursive-helper fixture");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+    assert_eq!(
+        stdout, "calls_recursive\tglobal\n",
+        "a recursive helper must fail closed to global"
+    );
+}
+
+/// TA-01 counterexample: any call outside the explicit allowlist — here an
+/// unknown method name — must fail the caller closed to `global`.
+#[test]
+fn classifier_call_outside_allowlist_is_global() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("COMPATIBILITY.md"), b"").expect("write marker");
+    std::fs::create_dir(tmp.path().join(".git")).expect("create .git");
+    std::fs::create_dir_all(tmp.path().join("tests")).expect("create tests/");
+    std::fs::write(
+        tmp.path().join("tests/u_outside_allowlist.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn calls_unlisted_method() {\n",
+            "    let v = vec![1];\n    v.launder();\n}\n",
+        ),
+    )
+    .expect("write outside-allowlist fixture");
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+        .env("SERIAL_CLASSIFY_ROOT", tmp.path())
+        .output()
+        .expect("run classifier against outside-allowlist fixture");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+    assert_eq!(
+        stdout, "calls_unlisted_method\tglobal\n",
+        "a call outside the allowlist must fail closed to global"
+    );
+}
+
+/// TA-01 Codex-R23 counterexamples: dynamic (non-literal) set_var keys must
+/// be consumed by the benign env-read gate. Three trees: (1) a test mutating
+/// a benign key through a local binding — untraceable, so the benign list is
+/// disabled and the reader lanes env; (2) the EnvVarGuard pattern — an assoc
+/// fn forwarding its literal-called param plus a Drop restore of `self.key`
+/// — fully traced, so a benign reader elsewhere KEEPS `none`; (3) a unicode
+/// alias of set_var — invisible to the tokenizer, benign list disabled.
+#[test]
+fn classifier_dynamic_mutation_tracing() {
+    let run = |files: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("COMPATIBILITY.md"), b"").expect("write marker");
+        std::fs::create_dir(tmp.path().join(".git")).expect("create .git");
+        std::fs::create_dir_all(tmp.path().join("tests")).expect("create tests/");
+        for (name, body) in files {
+            std::fs::write(tmp.path().join("tests").join(name), body).expect("write fixture");
+        }
+        let out = Command::new("sh")
+            .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+            .env("SERIAL_CLASSIFY_ROOT", tmp.path())
+            .output()
+            .expect("run classifier against dynamic-mutation fixture");
+        assert!(
+            out.status.success(),
+            "classifier must succeed, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("stdout is UTF-8")
+            .lines()
+            .filter_map(|l| {
+                let (f, v) = l.split_once('\t')?;
+                Some((f.to_string(), v.to_string()))
+            })
+            .collect()
+    };
+    let reader = concat!(
+        "#[test]\n#[serial]\nfn benign_reader() {\n",
+        "    let _ = std::env::var(\"LLVM_PROFILE_FILE\");\n}\n",
+    );
+
+    // (1) split-file dynamic mutation: the key escapes the scan, so the
+    // benign list is disabled for the whole run — the reader must lane.
+    let v = run(&[
+        (
+            "u_dyn_split.rs",
+            concat!(
+                "#[test]\n#[serial]\nfn mutates_benign_key_dynamically() {\n",
+                "    let key = \"LLVM_PROFILE_FILE\";\n",
+                "    unsafe { std::env::set_var(key, \"polluted\"); }\n}\n",
+            ),
+        ),
+        ("u_dyn_reader.rs", reader),
+    ]);
+    assert_eq!(v["mutates_benign_key_dynamically"], "lane:env");
+    assert_eq!(
+        v["benign_reader"], "lane:env",
+        "an untraceable dynamic mutation must disable the benign read list"
+    );
+
+    // (2) the EnvVarGuard pattern: assoc-fn callers all pass literals and the
+    // Drop restore replays `self.key` — traced, so the benign list SURVIVES.
+    let v = run(&[
+        (
+            "u_dyn_guard.rs",
+            concat!(
+                "struct G {\n    key: &'static str,\n",
+                "    original: Option<std::ffi::OsString>,\n}\n\n",
+                "impl G {\n",
+                "    fn set(key: &'static str, value: &str) -> Self {\n",
+                "        let original = std::env::var_os(key);\n",
+                "        unsafe { std::env::set_var(key, value) };\n",
+                "        Self { key, original }\n    }\n}\n\n",
+                "impl Drop for G {\n    fn drop(&mut self) {\n",
+                "        match &self.original {\n",
+                "            Some(v) => unsafe { std::env::set_var(self.key, v) },\n",
+                "            None => unsafe { std::env::remove_var(self.key) },\n",
+                "        }\n    }\n}\n\n",
+                "#[test]\n#[serial]\nfn guard_mutates_nonbenign() {\n",
+                "    let _g = G::set(\"TA01_POLLUTE\", \"1\");\n}\n",
+            ),
+        ),
+        ("u_dyn_traced_reader.rs", reader),
+    ]);
+    // R27 refinement: the Drop merge plus the traced caller-key evidence
+    // discharge every channel to the TRUE lane (set body + drop body -> env)
+    // instead of the older fail-closed global.
+    assert_eq!(v["guard_mutates_nonbenign"], "lane:env");
+    assert_eq!(
+        v["benign_reader"], "none",
+        "a fully traced guard pattern must not disable the benign read list"
+    );
+
+    // (3) a unicode alias of set_var: the tokenizer cannot see the mutation,
+    // so the benign list is disabled tree-wide.
+    let v = run(&[
+        (
+            "u_dyn_unicode.rs",
+            "use std::env::set_var as \u{5199};\n\n#[test]\n#[serial]\nfn unicode_alias_env_pollutes() {\n    unsafe { \u{5199}(\"TA01_POLLUTE\", \"1\"); }\n}\n",
+        ),
+        ("u_dyn_unicode_reader.rs", reader),
+    ]);
+    assert_eq!(v["unicode_alias_env_pollutes"], "global");
+    assert_eq!(
+        v["benign_reader"], "lane:env",
+        "an unscannable set_var alias must disable the benign read list"
+    );
+
+    // (4) a NON-LITERAL include! splices unscannable source: the file fails
+    // closed and the benign list is disabled tree-wide.
+    let v = run(&[
+        (
+            "u_dyn_include.rs",
+            concat!(
+                "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n\n",
+                "#[test]\n#[serial]\nfn dynamic_include_fails_closed() {\n",
+                "    let _ = 1 + 1;\n}\n",
+            ),
+        ),
+        ("u_dyn_include_reader.rs", reader),
+    ]);
+    assert_eq!(v["dynamic_include_fails_closed"], "global");
+    assert_eq!(
+        v["benign_reader"], "lane:env",
+        "an unresolved include! must disable the benign read list"
+    );
+
+    // (5) an item-position macro generating a Drop impl whose set_var KEY is
+    // a metavariable: the type fails closed and the benign list is disabled.
+    let v = run(&[
+        (
+            "u_dyn_macro_drop.rs",
+            concat!(
+                "struct T2;\n\n",
+                "macro_rules! gen_drop_dyn {\n",
+                "    ($T:ident, $k:expr) => {\n",
+                "        impl Drop for $T {\n",
+                "            fn drop(&mut self) {\n",
+                "                unsafe { std::env::set_var($k, \"1\"); }\n",
+                "            }\n        }\n    };\n}\n\n",
+                "gen_drop_dyn!(T2, \"SOME_KEY\");\n\n",
+                "#[test]\n#[serial]\nfn metavar_key_drop_fails_closed() {\n",
+                "    let _p = T2;\n}\n",
+            ),
+        ),
+        ("u_dyn_macro_drop_reader.rs", reader),
+    ]);
+    assert_eq!(v["metavar_key_drop_fails_closed"], "global");
+    assert_eq!(
+        v["benign_reader"], "lane:env",
+        "a metavariable set_var key in a generated Drop must disable the benign read list"
+    );
+
+    // (6) R33 path-argument proof POSITIVES: tempdir-derived paths, absolute
+    // literals, and helper-parameter paths whose callers all prove their
+    // arguments must all KEEP `none`.
+    let v = run(&[(
+        "u_path_proof.rs",
+        concat!(
+            "use std::path::Path;\n\n",
+            "fn write_into(dir: &Path, name: &str) {\n",
+            "    std::fs::write(dir.join(name), \"x\").unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn tempdir_derived_stays_none() {\n",
+            "    let d = tempfile::tempdir().unwrap();\n",
+            "    std::fs::write(d.path().join(\"f.txt\"), \"x\").unwrap();\n",
+            "    write_into(d.path(), \"g.txt\");\n}\n\n",
+            "#[test]\n#[serial]\nfn absolute_literal_stays_none() {\n",
+            "    let _ = std::fs::read_to_string(\"/etc/hosts\");\n}\n\n",
+            "#[test]\n#[serial]\nfn binding_named_tempdir_stays_none() {\n",
+            "    let tempdir = tempfile::tempdir().unwrap();\n",
+            "    std::fs::write(tempdir.path().join(\"f.txt\"), \"x\").unwrap();\n}\n",
+        ),
+    )]);
+    assert_eq!(
+        v["tempdir_derived_stays_none"], "none",
+        "tempdir-derived and caller-proven helper paths must stay none"
+    );
+    assert_eq!(v["absolute_literal_stays_none"], "none");
+    assert_eq!(
+        v["binding_named_tempdir_stays_none"], "none",
+        "a binding NAMED tempdir proven by its rhs must stay none"
+    );
+
+    // (7) R36: an ALIASED fs API with a proven tempdir argument keeps none.
+    let v = run(&[(
+        "u_alias_fs_safe.rs",
+        concat!(
+            "use std::fs::write as persist;\n\n",
+            "#[test]\n#[serial]\nfn aliased_fs_write_tempdir_stays_none() {\n",
+            "    let d = tempfile::tempdir().unwrap();\n",
+            "    persist(d.path().join(\"f.txt\"), \"x\").unwrap();\n}\n",
+        ),
+    )]);
+    assert_eq!(
+        v["aliased_fs_write_tempdir_stays_none"], "none",
+        "an aliased fs call with a proven argument must stay none"
+    );
+}
+
+/// TA-01 Codex-R22 counterexample: mutating a BENIGN env-read key through an
+/// alias (`use std::env::set_var as write`) must hard-fail the classifier's
+/// benign-list startup self-check, exactly like the direct spelling.
+#[test]
+fn classifier_rejects_aliased_benign_key_mutation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("COMPATIBILITY.md"), b"").expect("write marker");
+    std::fs::create_dir(tmp.path().join(".git")).expect("create .git");
+    std::fs::create_dir_all(tmp.path().join("tests")).expect("create tests/");
+    std::fs::write(
+        tmp.path().join("tests/u_aliased_benign_mut.rs"),
+        concat!(
+            "use std::env::set_var as write;\n\n",
+            "#[test]\n#[serial]\nfn mutates_benign_key_via_alias() {\n",
+            "    unsafe {\n        write(\"LLVM_PROFILE_FILE\", \"polluted\");\n    }\n}\n",
+        ),
+    )
+    .expect("write aliased-benign-mutation fixture");
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+        .env("SERIAL_CLASSIFY_ROOT", tmp.path())
+        .output()
+        .expect("run classifier against aliased-benign-mutation fixture");
+    assert!(
+        !out.status.success(),
+        "classifier must reject an aliased mutation of a benign env-read key"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("benign env-read key"),
+        "rejection must name the benign-key invariant, got: {stderr}"
+    );
+}
+
+/// TA-01 Codex-R1..R21 counterexamples: seventy-four laundering shapes that
+/// once blessed real pollution/dependency as `none` must land on their true
+/// lane — aliased `Command` spawns (plain, whitespace, brace-import,
+/// lowercase use/type aliases), a decoy local `fn env_clear`, renamed
+/// `set_var`, an aliased `ChangeDirGuard`, an imported bare
+/// `std::env::current_dir`, polluting local methods behind method-only
+/// allowlist names, shadowing and `#[macro_use]`-imported `macro_rules!`
+/// under allowlisted names, `Self::new` chains, and (generic) type-alias
+/// constructors.
+#[test]
+fn classifier_alias_and_local_method_laundering_fail_closed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("COMPATIBILITY.md"), b"").expect("write marker");
+    std::fs::create_dir(tmp.path().join(".git")).expect("create .git");
+    std::fs::create_dir_all(tmp.path().join("tests")).expect("create tests/");
+    std::fs::write(
+        tmp.path().join("tests/u_alias_cmd.rs"),
+        concat!(
+            "use std::process::Command as Cmd;\n\n",
+            "#[test]\n#[serial]\nfn aliased_command_new_inherits_env() {\n",
+            "    let _ = Cmd::new(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write aliased-command fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_local_method.rs"),
+        concat!(
+            "struct Evil;\n\nimpl Evil {\n    fn execute(&self) {\n",
+            "        unsafe {\n            std::env::set_var(\"TA01_POLLUTE\", \"1\");\n        }\n",
+            "    }\n}\n\n",
+            "#[test]\n#[serial]\nfn local_method_execute_pollutes() {\n",
+            "    let evil = Evil;\n    evil.execute();\n}\n",
+        ),
+    )
+    .expect("write local-method fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_decoy_env_clear.rs"),
+        concat!(
+            "use std::process::Command;\nfn env_clear() {}\n\n",
+            "#[test]\n#[serial]\nfn command_new_with_decoy_env_clear_inherits_env() {\n",
+            "    env_clear();\n    let _ = Command::new(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write decoy-env-clear fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_macro_shadow.rs"),
+        concat!(
+            "macro_rules! json {\n",
+            "    () => {{ unsafe {{ std::env::set_var(\"TA01_POLLUTE\", \"1\"); }} }};\n}\n\n",
+            "#[test]\n#[serial]\nfn allowlisted_macro_shadow_pollutes() {\n    json!();\n}\n",
+        ),
+    )
+    .expect("write macro-shadow fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_self_ctor.rs"),
+        concat!(
+            "struct SelfPolluter;\n\nimpl SelfPolluter {\n",
+            "    fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"TA01_POLLUTE\", \"1\");\n        }\n",
+            "        SelfPolluter\n    }\n",
+            "    fn call_new() -> Self {\n        Self::new()\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn self_constructor_pollutes() {\n",
+            "    let _ = SelfPolluter::call_new();\n}\n",
+        ),
+    )
+    .expect("write self-constructor fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_generic_alias.rs"),
+        concat!(
+            "struct GenPolluter;\ntype GenAlias = GenPolluter;\n\n",
+            "impl GenPolluter {\n    fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"TA01_POLLUTE\", \"1\");\n        }\n",
+            "        GenPolluter\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn generic_alias_constructor_pollutes() {\n",
+            "    let _ = GenAlias::<u8>::new();\n}\n",
+        ),
+    )
+    .expect("write generic-alias fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_brace_alias.rs"),
+        concat!(
+            "use std::process::{Command as BraceCmd};\n\n",
+            "#[test]\n#[serial]\nfn brace_alias_command_inherits_env() {\n",
+            "    let _ = BraceCmd::new(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write brace-alias fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_lowercase_use.rs"),
+        concat!(
+            "use std::process::Command as cmd;\n\n",
+            "#[test]\n#[serial]\nfn lowercase_use_alias_command_inherits_env() {\n",
+            "    let _ = cmd::new(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write lowercase-use fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_lowercase_type.rs"),
+        concat!(
+            "type lower_command = std::process::Command;\n\n",
+            "#[test]\n#[serial]\nfn lowercase_type_alias_command_inherits_env() {\n",
+            "    let _ = lower_command::new(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write lowercase-type fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_import_current_dir.rs"),
+        concat!(
+            "use std::env::current_dir;\n\n",
+            "#[test]\n#[serial]\nfn env_read_dependency_hidden_by_import() {\n",
+            "    let _ = current_dir().unwrap();\n}\n",
+        ),
+    )
+    .expect("write imported-current-dir fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_renamed_set_var.rs"),
+        concat!(
+            "use std::env::set_var as write;\n\n",
+            "#[test]\n#[serial]\nfn alias_env_pollutes() {\n",
+            "    unsafe {\n        write(\"TA01_POLLUTE\", \"1\");\n    }\n}\n",
+        ),
+    )
+    .expect("write renamed-set-var fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_guard_alias.rs"),
+        concat!(
+            "use libra::utils::test::ChangeDirGuard as G;\n\n",
+            "#[test]\n#[serial]\nfn alias_cwd_guard_pollutes() {\n",
+            "    let _guard = G::new(\"/\");\n}\n",
+        ),
+    )
+    .expect("write guard-alias fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_macro_mod.rs"),
+        concat!(
+            "macro_rules! format {\n",
+            "    () => {{ unsafe {{ std::env::set_var(\"TA01_POLLUTE\", \"1\"); }} }};\n}\n",
+        ),
+    )
+    .expect("write macro-mod fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_macro_import.rs"),
+        concat!(
+            "#[macro_use]\nmod u_macro_mod;\n\n",
+            "#[test]\n#[serial]\nfn imported_allowlisted_macro_pollutes() {\n",
+            "    format!();\n}\n",
+        ),
+    )
+    .expect("write macro-import fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_clear_after_output.rs"),
+        concat!(
+            "use std::process::Command;\n\n",
+            "#[test]\n#[serial]\nfn command_output_before_env_clear_inherits_env() {\n",
+            "    let mut cmd = Command::new(\"env\");\n",
+            "    let _ = cmd.output().unwrap();\n",
+            "    cmd.env_clear();\n}\n",
+        ),
+    )
+    .expect("write clear-after-output fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_conditional_clear.rs"),
+        concat!(
+            "use std::process::Command;\n\n",
+            "#[test]\n#[serial]\nfn conditional_clear_inherits_env() {\n",
+            "    let mut cmd = Command::new(\"env\");\n",
+            "    if false {\n        cmd.env_clear();\n    }\n",
+            "    let _ = cmd.output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write conditional-clear fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_partial_clear.rs"),
+        concat!(
+            "use std::process::Command;\n\n",
+            "#[test]\n#[serial]\nfn two_commands_partial_clear_inherits_env() {\n",
+            "    let mut a = Command::new(\"env\");\n",
+            "    let mut b = Command::new(\"env\");\n",
+            "    b.env_clear();\n",
+            "    let _ = a.output().unwrap();\n",
+            "    let _ = b.output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write partial-clear fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_const_set_var.rs"),
+        concat!(
+            "const write: unsafe fn(&'static str, &'static str) =\n",
+            "    std::env::set_var::<&'static str, &'static str>;\n\n",
+            "#[test]\n#[serial]\nfn local_const_allowlisted_write_pollutes_env() {\n",
+            "    unsafe {\n        write(\"TA01_POLLUTE\", \"1\");\n    }\n}\n",
+        ),
+    )
+    .expect("write const-set-var fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_const_command.rs"),
+        concat!(
+            "const output: fn(&'static str) -> std::process::Command =\n",
+            "    std::process::Command::new::<&'static str>;\n\n",
+            "#[test]\n#[serial]\nfn local_const_allowlisted_output_inherits_env() {\n",
+            "    let _ = output(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write const-command fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_const_closure.rs"),
+        concat!(
+            "const F: fn() = || unsafe {{ std::env::set_var(\"X\", \"1\") }};\n\n",
+            "#[test]\n#[serial]\nfn closure_const_pollutes() {\n    F();\n}\n",
+        ),
+    )
+    .expect("write const-closure fixture");
+    std::fs::create_dir_all(tmp.path().join("tests/x_shared_helpers"))
+        .expect("create shared-helper module dir");
+    std::fs::write(
+        tmp.path().join("tests/x_shared_helpers/mod.rs"),
+        concat!(
+            "use std::env::set_var as do_set;\n",
+            "pub fn write() {\n    unsafe {\n        do_set(\"TA01_POLLUTE\", \"1\");\n    }\n}\n\n",
+            "pub fn output() -> std::process::Output {\n",
+            "    std::process::Command::new(\"env\").output().unwrap()\n}\n",
+        ),
+    )
+    .expect("write shared-helper fixture module");
+    std::fs::write(
+        tmp.path().join("tests/u_shared_allowlisted.rs"),
+        concat!(
+            "mod x_shared_helpers;\nuse x_shared_helpers::{output, write};\n\n",
+            "#[test]\n#[serial]\nfn shared_allowlisted_helper_alias_pollutes() {\n",
+            "    write();\n}\n\n",
+            "#[test]\n#[serial]\nfn shared_output_helper_inherits_env() {\n",
+            "    let _ = output();\n}\n",
+        ),
+    )
+    .expect("write shared-allowlisted fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_raw_ident.rs"),
+        concat!(
+            "use std::process::Command as r#cmd;\n\n",
+            "#[test]\n#[serial]\nfn raw_identifier_command_inherits_env() {\n",
+            "    let _ = r#cmd::new(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write raw-ident fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_lifetime_alias.rs"),
+        concat!(
+            "struct LifePolluter<'a>(&'a str);\ntype LifeAlias<'a> = LifePolluter<'a>;\n\n",
+            "impl<'a> LifePolluter<'a> {\n    fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"TA01_POLLUTE\", \"1\");\n        }\n",
+            "        LifePolluter(\"\")\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn lifetime_alias_constructor_pollutes() {\n",
+            "    let _ = LifeAlias::new();\n}\n",
+        ),
+    )
+    .expect("write lifetime-alias fixture");
+    std::fs::write(
+        tmp.path().join("tests/y_path_hidden.rs"),
+        concat!(
+            "pub fn write() {\n",
+            "    unsafe {\n        std::env::set_var(\"TA01_POLLUTE\", \"1\");\n    }\n}\n",
+        ),
+    )
+    .expect("write path-hidden fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_path_attr.rs"),
+        concat!(
+            "#[path = \"y_path_hidden.rs\"]\nmod hidden;\n\n",
+            "#[test]\n#[serial]\nfn path_attr_qualified_allowlisted_fn_pollutes() {\n",
+            "    hidden::write();\n}\n",
+        ),
+    )
+    .expect("write path-attr fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_mod_qual.rs"),
+        concat!(
+            "mod x_shared_helpers2;\n\n",
+            "#[test]\n#[serial]\nfn default_mod_qual_pollutes() {\n",
+            "    x_shared_helpers2::write();\n}\n",
+        ),
+    )
+    .expect("write mod-qual fixture");
+    std::fs::create_dir_all(tmp.path().join("tests/x_shared_helpers2"))
+        .expect("create second helper module dir");
+    std::fs::write(
+        tmp.path().join("tests/x_shared_helpers2/mod.rs"),
+        concat!(
+            "pub fn write() {\n",
+            "    unsafe {\n        std::env::set_var(\"P\", \"1\");\n    }\n}\n",
+        ),
+    )
+    .expect("write second helper module");
+    std::fs::write(
+        tmp.path().join("tests/u_where_alias.rs"),
+        concat!(
+            "struct WherePolluter<T>(std::marker::PhantomData<T>);\n",
+            "type WhereAlias<T> where T: Copy = WherePolluter<T>;\n\n",
+            "impl<T> WherePolluter<T> {\n    fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"TA01_POLLUTE\", \"1\");\n        }\n",
+            "        WherePolluter(std::marker::PhantomData)\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn alias_where_before_equals_pollutes() {\n",
+            "    let _ = WhereAlias::<u8>::new();\n}\n",
+        ),
+    )
+    .expect("write where-alias fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_unparsed_alias.rs"),
+        concat!(
+            "struct FnAliasPolluter;\ntype FnAlias = fn() -> FnAliasPolluter;\n\n",
+            "impl FnAliasPolluter {\n    fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"X\", \"1\");\n        }\n",
+            "        FnAliasPolluter\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn unparsed_alias_fails_closed() {\n",
+            "    let _ = FnAlias::default();\n}\n",
+        ),
+    )
+    .expect("write unparsed-alias fixture");
+    std::fs::write(
+        tmp.path().join("tests/y_hidden_type.rs"),
+        concat!(
+            "pub struct ModPolluter;\n",
+            "impl ModPolluter {\n    pub fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"TA01_POLLUTE\", \"1\");\n        }\n",
+            "        ModPolluter\n    }\n}\n",
+        ),
+    )
+    .expect("write hidden-type fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_mod_type.rs"),
+        concat!(
+            "mod y_hidden_type;\nuse y_hidden_type::ModPolluter as ModAlias;\n\n",
+            "#[test]\n#[serial]\nfn qualified_mod_type_constructor_pollutes() {\n",
+            "    let _ = y_hidden_type::ModPolluter::new();\n}\n\n",
+            "#[test]\n#[serial]\nfn imported_mod_type_constructor_pollutes() {\n",
+            "    let _ = ModAlias::new();\n}\n",
+        ),
+    )
+    .expect("write mod-type fixture");
+    std::fs::write(
+        tmp.path().join("tests/y_dup_a.rs"),
+        concat!(
+            "pub struct DupType;\n",
+            "impl DupType {\n    pub fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"X\", \"1\");\n        }\n",
+            "        DupType\n    }\n}\n",
+        ),
+    )
+    .expect("write dup-a fixture");
+    std::fs::write(
+        tmp.path().join("tests/y_dup_b.rs"),
+        concat!(
+            "pub struct DupType;\n",
+            "impl DupType {\n    pub fn new() -> Self {\n        DupType\n    }\n}\n",
+        ),
+    )
+    .expect("write dup-b fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_dup_type.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn ambiguous_type_fails_closed() {\n",
+            "    let _ = DupType::new();\n}\n",
+        ),
+    )
+    .expect("write dup-type fixture");
+    std::fs::create_dir_all(tmp.path().join("tests/y_outer/inner"))
+        .expect("create nested module dirs");
+    std::fs::write(tmp.path().join("tests/y_outer/mod.rs"), "pub mod inner;\n")
+        .expect("write outer mod fixture");
+    std::fs::write(
+        tmp.path().join("tests/y_outer/inner/mod.rs"),
+        concat!(
+            "pub fn write() {\n",
+            "    unsafe {\n        std::env::set_var(\"TA01_POLLUTE\", \"1\");\n    }\n}\n",
+        ),
+    )
+    .expect("write inner mod fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_nested_mod.rs"),
+        concat!(
+            "mod y_outer;\nuse y_outer::inner::write as nested_write;\n\n",
+            "#[test]\n#[serial]\nfn nested_mod_write_pollutes() {\n",
+            "    y_outer::inner::write();\n}\n\n",
+            "#[test]\n#[serial]\nfn nested_import_write_pollutes() {\n",
+            "    nested_write();\n}\n",
+        ),
+    )
+    .expect("write nested-mod fixture");
+    std::fs::write(
+        tmp.path().join("tests/y_gap_clean.rs"),
+        "pub fn write() {}\n",
+    )
+    .expect("write gap-clean fixture");
+    std::fs::write(
+        tmp.path().join("tests/y_gap_polluting.rs"),
+        concat!(
+            "pub fn write() {\n",
+            "    unsafe {\n        std::env::set_var(\"TA01_POLLUTE\", \"1\");\n    }\n}\n",
+        ),
+    )
+    .expect("write gap-polluting fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_path_gap.rs"),
+        concat!(
+            "#[path = \"y_gap_polluting.rs\"]\n\n\nmod y_gap_clean;\n\n",
+            "#[test]\n#[serial]\nfn path_attr_with_gap_uses_polluting_module() {\n",
+            "    y_gap_clean::write();\n}\n",
+        ),
+    )
+    .expect("write path-gap fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_env_read.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn reads_parent_env() {\n",
+            "    let _ = std::env::var(\"HOME\");\n}\n\n",
+            "#[test]\n#[serial]\nfn vars_iter_lanes() {\n",
+            "    for (_k, _v) in std::env::vars() {}\n}\n\n",
+            "#[test]\n#[serial]\nfn reads_parent_env_with_turbofish() {\n",
+            "    let _ = std::env::var::<&str>(\"HOME\");\n}\n\n",
+            "#[test]\n#[serial]\nfn reads_parent_env_os_with_turbofish() {\n",
+            "    let _ = std::env::var_os::<&str>(\"HOME\");\n}\n",
+        ),
+    )
+    .expect("write env-read fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_env_benign.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn benign_read_ok() {\n",
+            "    let _ = std::env::var_os(\"LLVM_PROFILE_FILE\");\n}\n",
+        ),
+    )
+    .expect("write benign-read fixture");
+    {
+        let pad = "x".repeat(700);
+        std::fs::write(
+            tmp.path().join("tests/u_long_use.rs"),
+            format!(
+                concat!(
+                    "use std::env::{{ /* {} */ set_var as write }};\n\n",
+                    "#[test]\n#[serial]\nfn long_use_alias_write_pollutes_env() {{\n",
+                    "    unsafe {{ write(\"TA01_POLLUTE\", \"1\"); }}\n}}\n",
+                ),
+                pad
+            ),
+        )
+        .expect("write long-use fixture");
+    }
+    std::fs::write(
+        tmp.path().join("tests/u_terminal_hide.rs"),
+        concat!(
+            "mod some_terms {\n    pub fn output() {}\n}\n",
+            "const output: fn() = some_terms::output;\n\n",
+            "#[test]\n#[serial]\nfn const_name_must_not_hide_method_terminal() {\n",
+            "    let mut cmd = std::process::Command::new(\"env\");\n",
+            "    let _ = cmd.output();\n",
+            "    cmd.env_clear();\n}\n",
+        ),
+    )
+    .expect("write terminal-hide fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_macro_metavar.rs"),
+        concat!(
+            "macro_rules! run_cmd {\n",
+            "    ($c:ident) => {{\n",
+            "        let _ = $c::new(\"env\").output().unwrap();\n",
+            "    }};\n}\n\n",
+            "use std::process::Command as MetaCmd;\n\n",
+            "#[test]\n#[serial]\nfn macro_metavar_command_spawn_inherits_env() {\n",
+            "    run_cmd!(MetaCmd);\n}\n",
+        ),
+    )
+    .expect("write macro-metavar fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_fn_ref_spawn.rs"),
+        concat!(
+            "use std::env::set_var as write;\n\n",
+            "fn pollute_env() {\n",
+            "    unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n}\n\n",
+            "fn pollute_via_alias() {\n",
+            "    unsafe { write(\"TA01_POLLUTE\", \"1\"); }\n}\n\n",
+            "#[test]\n#[serial]\nfn thread_spawn_fn_pointer_pollutes() {\n",
+            "    std::thread::spawn(pollute_env).join().unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn builder_spawn_fn_pointer_pollutes() {\n",
+            "    std::thread::Builder::new().spawn(pollute_env).unwrap().join().unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn let_bound_fn_pointer_pollutes() {\n",
+            "    let f = pollute_env;\n",
+            "    std::thread::spawn(f).join().unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn thread_spawn_aliased_pollutes() {\n",
+            "    std::thread::spawn(pollute_via_alias).join().unwrap();\n}\n",
+        ),
+    )
+    .expect("write fn-ref-spawn fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_const_closure_value.rs"),
+        concat!(
+            "const F: fn() = || unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\") };\n\n",
+            "#[test]\n#[serial]\nfn const_closure_spawn_value_pollutes() {\n",
+            "    std::thread::spawn(F).join().unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn const_closure_let_bound_spawn_value_pollutes() {\n",
+            "    let f = F;\n",
+            "    std::thread::spawn(f).join().unwrap();\n}\n",
+        ),
+    )
+    .expect("write const-closure-value fixture");
+    std::fs::write(
+        tmp.path().join("tests/qv_helper.rs"),
+        concat!(
+            "pub fn pollute_in_mod() {\n",
+            "    unsafe { std::env::remove_var(\"TA01_POLLUTE\"); }\n}\n",
+        ),
+    )
+    .expect("write qualified-value helper module");
+    std::fs::write(
+        tmp.path().join("tests/u_qual_value.rs"),
+        concat!(
+            "mod qv_helper;\n\n",
+            "struct S;\n\n",
+            "impl S {\n    fn pollute() {\n",
+            "        unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn assoc_fn_value_ref_pollutes() {\n",
+            "    std::thread::spawn(S::pollute).join().unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn mod_fn_value_ref_pollutes() {\n",
+            "    std::thread::spawn(qv_helper::pollute_in_mod).join().unwrap();\n}\n",
+        ),
+    )
+    .expect("write qualified-value fixture");
+    std::fs::create_dir_all(tmp.path().join("tests/fixtures")).expect("create tests/fixtures/");
+    std::fs::write(
+        tmp.path().join("tests/fixtures/polluter.rs"),
+        concat!(
+            "pub struct IncludedPolluter;\n",
+            "impl IncludedPolluter {\n    pub fn new() -> Self {\n",
+            "        unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n",
+            "        IncludedPolluter\n    }\n}\n",
+        ),
+    )
+    .expect("write included polluter fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_include_splice.rs"),
+        concat!(
+            "include!(\"fixtures/polluter.rs\");\n\n",
+            "#[test]\n#[serial]\nfn include_fixture_type_pollutes() {\n",
+            "    let _ = IncludedPolluter::new();\n}\n",
+        ),
+    )
+    .expect("write include-splice fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_drop_value.rs"),
+        concat!(
+            "struct DropPolluter;\n\n",
+            "impl DropPolluter {\n    fn new() -> Self {\n        DropPolluter\n    }\n}\n\n",
+            "impl Drop for DropPolluter {\n    fn drop(&mut self) {\n",
+            "        unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn clean_constructor_drop_pollutes() {\n",
+            "    let _p = DropPolluter::new();\n}\n\n",
+            "#[test]\n#[serial]\nfn drop_polluter_reaches_drop_without_call() {\n",
+            "    let _p = DropPolluter;\n}\n",
+        ),
+    )
+    .expect("write drop-value fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_drop_macro.rs"),
+        concat!(
+            "struct MacroDrop;\n\n",
+            "macro_rules! gen_drop {\n    () => {};\n}\n\n",
+            "impl Drop for MacroDrop {\n    gen_drop!();\n}\n\n",
+            "#[test]\n#[serial]\nfn macro_generated_drop_fails_closed() {\n",
+            "    let _p = MacroDrop;\n}\n",
+        ),
+    )
+    .expect("write macro-drop fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_item_macro_drop.rs"),
+        concat!(
+            "struct ItemMacroDrop;\n\n",
+            "macro_rules! gen_drop_impl {\n",
+            "    ($T:ident) => {\n",
+            "        impl Drop for $T {\n",
+            "            fn drop(&mut self) {\n",
+            "                unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n",
+            "            }\n        }\n    };\n}\n\n",
+            "gen_drop_impl!(ItemMacroDrop);\n\n",
+            "#[test]\n#[serial]\nfn item_macro_generated_metavar_drop_impl_pollutes() {\n",
+            "    let _p = ItemMacroDrop;\n}\n",
+        ),
+    )
+    .expect("write item-macro-drop fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_alias_drop.rs"),
+        concat!(
+            "struct AliasDropTarget;\n",
+            "type DropAlias = AliasDropTarget;\n\n",
+            "impl Drop for DropAlias {\n    fn drop(&mut self) {\n",
+            "        unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn drop_impl_for_alias_pollutes_underlying_type() {\n",
+            "    let _p = AliasDropTarget;\n}\n",
+        ),
+    )
+    .expect("write alias-drop fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_alias_macro_drop.rs"),
+        concat!(
+            "struct AliasMacroTarget;\n",
+            "type MAlias = AliasMacroTarget;\n\n",
+            "macro_rules! gen_alias_drop {\n",
+            "    ($T:ident) => {\n",
+            "        impl Drop for $T {\n",
+            "            fn drop(&mut self) {\n",
+            "                unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n",
+            "            }\n        }\n    };\n}\n\n",
+            "gen_alias_drop!(MAlias);\n\n",
+            "#[test]\n#[serial]\nfn macro_drop_via_alias_pollutes_underlying() {\n",
+            "    let _p = AliasMacroTarget;\n}\n",
+        ),
+    )
+    .expect("write alias-macro-drop fixture");
+    std::fs::write(
+        tmp.path().join("tests/mq_helper.rs"),
+        concat!(
+            "pub struct MqPolluter;\n",
+            "pub type MqAlias = MqPolluter;\n",
+        ),
+    )
+    .expect("write module-alias helper");
+    std::fs::write(
+        tmp.path().join("tests/u_mod_alias_drop.rs"),
+        concat!(
+            "mod mq_helper;\n\n",
+            "impl Drop for mq_helper::MqAlias {\n    fn drop(&mut self) {\n",
+            "        unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn split_module_alias_drop_pollutes_underlying_type() {\n",
+            "    let _p = mq_helper::MqPolluter;\n}\n",
+        ),
+    )
+    .expect("write split-module alias-drop fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_gen_callables.rs"),
+        concat!(
+            "struct GenAssocHost;\n\n",
+            "macro_rules! gen_free {\n",
+            "    ($name:ident) => {\n",
+            "        fn $name() { unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); } }\n",
+            "    };\n}\n\n",
+            "macro_rules! gen_assoc {\n",
+            "    ($name:ident) => {\n",
+            "        impl GenAssocHost {\n",
+            "            fn $name() -> Self {\n",
+            "                unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n",
+            "                GenAssocHost\n            }\n        }\n    };\n}\n\n",
+            "gen_free!(write);\n",
+            "gen_assoc!(new);\n\n",
+            "#[test]\n#[serial]\nfn macro_generated_allowlisted_free_fn_pollutes() {\n",
+            "    write();\n}\n\n",
+            "#[test]\n#[serial]\nfn macro_generated_allowlisted_assoc_fn_pollutes() {\n",
+            "    let _ = GenAssocHost::new();\n}\n",
+        ),
+    )
+    .expect("write generated-callables fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_gen_method.rs"),
+        concat!(
+            "struct GenMethodHost;\n\n",
+            "macro_rules! gen_method {\n",
+            "    ($name:ident) => {\n",
+            "        impl GenMethodHost {\n",
+            "            fn $name(&self) {\n",
+            "                unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); }\n",
+            "            }\n        }\n    };\n}\n\n",
+            "gen_method!(output);\n\n",
+            "#[test]\n#[serial]\nfn macro_generated_allowlisted_method_pollutes() {\n",
+            "    GenMethodHost.output();\n}\n",
+        ),
+    )
+    .expect("write generated-method fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_long_invocation.rs"),
+        concat!(
+            "macro_rules! gen_long {\n",
+            "    ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $name:ident) => {\n",
+            "        fn $name() { unsafe { std::env::set_var(\"TA01_POLLUTE\", \"1\"); } }\n",
+            "    };\n}\n\n",
+            "gen_long!(\n    la,\n    lb,\n    lc,\n    ld,\n    le,\n    lf,\n    lg,\n    write\n);\n\n",
+            "#[test]\n#[serial]\nfn long_macro_invocation_generated_allowlisted_free_fn_pollutes() {\n",
+            "    write();\n}\n",
+        ),
+    )
+    .expect("write long-invocation fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_relative_fs.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn relative_fs_write_depends_on_process_cwd() {\n",
+            "    std::fs::write(\"ta01-relative-output\", \"x\").unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn relative_path_exists_depends_on_cwd() {\n",
+            "    let _ = std::path::Path::new(\"ta01-relative-output\").exists();\n}\n\n",
+            "#[test]\n#[serial]\nfn variable_name_contains_tempdir_but_relative_path_depends_on_cwd() {\n",
+            "    let not_tempdir = \"ta01-relative-output\";\n",
+            "    std::fs::write(not_tempdir, \"x\").unwrap();\n}\n",
+        ),
+    )
+    .expect("write relative-fs fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_fake_path.rs"),
+        concat!(
+            "struct FakePath;\n\n",
+            "impl FakePath {\n    fn path(&self) -> &'static str {\n",
+            "        \"ta01-relative-output\"\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn fake_path_method_relative_depends_on_cwd() {\n",
+            "    let fake = FakePath;\n",
+            "    std::fs::write(fake.path(), \"x\").unwrap();\n}\n",
+        ),
+    )
+    .expect("write fake-path fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_alias_fs.rs"),
+        concat!(
+            "use std::fs::write as persist;\n\n",
+            "#[test]\n#[serial]\nfn aliased_fs_write_relative_depends_on_cwd() {\n",
+            "    persist(\"ta01-relative-output\", \"x\").unwrap();\n}\n",
+        ),
+    )
+    .expect("write aliased-fs fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_alias_fs_brace.rs"),
+        concat!(
+            "use std::fs::{write as persist};\n\n",
+            "#[test]\n#[serial]\nfn brace_aliased_fs_write_relative_depends_on_cwd() {\n",
+            "    persist(\"ta01-relative-output\", \"x\").unwrap();\n}\n",
+        ),
+    )
+    .expect("write brace-aliased-fs fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_nested_alias_fs.rs"),
+        concat!(
+            "use std::{fs::{write as persist2}};\n\n",
+            "#[test]\n#[serial]\nfn nested_brace_alias_relative_depends_on_cwd() {\n",
+            "    persist2(\"ta01-relative-output\", \"x\").unwrap();\n}\n",
+        ),
+    )
+    .expect("write nested-brace-alias fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_ufcs.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn ufcs_command_new_inherits_env() {\n",
+            "    let _ = <std::process::Command>::new(\"env\").output().unwrap();\n}\n\n",
+            "#[test]\n#[serial]\nfn ufcs_as_trait_command() {\n",
+            "    let _ = <std::process::Command as Sized>::new(\"env\").output().unwrap();\n}\n",
+        ),
+    )
+    .expect("write ufcs fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_same_line_path.rs"),
+        concat!(
+            "#[path = \"y_gap_polluting.rs\"] mod same_line_hidden;\n\n",
+            "#[test]\n#[serial]\nfn same_line_path_attr_mod_pollutes() {\n",
+            "    same_line_hidden::write();\n}\n",
+        ),
+    )
+    .expect("write same-line path-attr fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_comment_decoy.rs"),
+        concat!(
+            "// var(\"LLVM_PROFILE_FILE\")\n",
+            "#[test]\n#[serial]\nfn reads_parent_env_comment_gap() {\n",
+            "    let _ = std::env::var/*gap*/(\"HOME\");\n}\n",
+        ),
+    )
+    .expect("write comment-decoy fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_multiline_read.rs"),
+        concat!(
+            "#[test]\n#[serial]\nfn multiline_arg_read() {\n",
+            "    let _ = std::env::var(\n        \"HOME\",\n    );\n}\n",
+        ),
+    )
+    .expect("write multiline-read fixture");
+    std::fs::write(
+        tmp.path().join("tests/u_type_alias.rs"),
+        concat!(
+            "struct Polluter;\ntype Alias = Polluter;\n\n",
+            "impl Polluter {\n    fn new() -> Self {\n",
+            "        unsafe {\n            std::env::set_var(\"TA01_POLLUTE\", \"1\");\n        }\n",
+            "        Polluter\n    }\n}\n\n",
+            "#[test]\n#[serial]\nfn alias_constructor_pollutes() {\n",
+            "    let _ = Alias::new();\n}\n",
+        ),
+    )
+    .expect("write type-alias fixture");
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+        .env("SERIAL_CLASSIFY_ROOT", tmp.path())
+        .output()
+        .expect("run classifier against laundering fixtures");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+    assert_eq!(
+        stdout,
+        concat!(
+            "alias_constructor_pollutes\tlane:env\n",
+            "alias_cwd_guard_pollutes\tlane:cwd\n",
+            "alias_env_pollutes\tlane:env\n",
+            "alias_where_before_equals_pollutes\tlane:env\n",
+            "aliased_command_new_inherits_env\tlane:env\n",
+            "aliased_fs_write_relative_depends_on_cwd\tlane:cwd\n",
+            "allowlisted_macro_shadow_pollutes\tlane:env\n",
+            "ambiguous_type_fails_closed\tglobal\n",
+            "assoc_fn_value_ref_pollutes\tlane:env\n",
+            "benign_read_ok\tnone\n",
+            "brace_alias_command_inherits_env\tlane:env\n",
+            "brace_aliased_fs_write_relative_depends_on_cwd\tlane:cwd\n",
+            "builder_spawn_fn_pointer_pollutes\tlane:env\n",
+            "clean_constructor_drop_pollutes\tlane:env\n",
+            "closure_const_pollutes\tglobal\n",
+            "command_new_with_decoy_env_clear_inherits_env\tlane:env\n",
+            "command_output_before_env_clear_inherits_env\tlane:env\n",
+            "conditional_clear_inherits_env\tlane:env\n",
+            "const_closure_let_bound_spawn_value_pollutes\tglobal\n",
+            "const_closure_spawn_value_pollutes\tglobal\n",
+            "const_name_must_not_hide_method_terminal\tlane:env\n",
+            "default_mod_qual_pollutes\tlane:env\n",
+            "drop_impl_for_alias_pollutes_underlying_type\tlane:env\n",
+            "drop_polluter_reaches_drop_without_call\tlane:env\n",
+            "env_read_dependency_hidden_by_import\tlane:cwd\n",
+            "fake_path_method_relative_depends_on_cwd\tlane:cwd\n",
+            "generic_alias_constructor_pollutes\tlane:env\n",
+            "imported_allowlisted_macro_pollutes\tlane:env\n",
+            "imported_mod_type_constructor_pollutes\tlane:env\n",
+            "include_fixture_type_pollutes\tlane:env\n",
+            "item_macro_generated_metavar_drop_impl_pollutes\tlane:env\n",
+            "let_bound_fn_pointer_pollutes\tlane:env\n",
+            "lifetime_alias_constructor_pollutes\tlane:env\n",
+            "local_const_allowlisted_output_inherits_env\tlane:env\n",
+            "local_const_allowlisted_write_pollutes_env\tlane:env\n",
+            "local_method_execute_pollutes\tlane:env\n",
+            "long_macro_invocation_generated_allowlisted_free_fn_pollutes\tlane:env\n",
+            "long_use_alias_write_pollutes_env\tlane:env\n",
+            "lowercase_type_alias_command_inherits_env\tlane:env\n",
+            "lowercase_use_alias_command_inherits_env\tlane:env\n",
+            "macro_drop_via_alias_pollutes_underlying\tlane:env\n",
+            "macro_generated_allowlisted_assoc_fn_pollutes\tlane:env\n",
+            "macro_generated_allowlisted_free_fn_pollutes\tlane:env\n",
+            "macro_generated_allowlisted_method_pollutes\tlane:env\n",
+            "macro_generated_drop_fails_closed\tglobal\n",
+            "macro_metavar_command_spawn_inherits_env\tglobal\n",
+            "mod_fn_value_ref_pollutes\tlane:env\n",
+            "multiline_arg_read\tlane:env\n",
+            "nested_brace_alias_relative_depends_on_cwd\tlane:cwd\n",
+            "nested_import_write_pollutes\tlane:env\n",
+            "nested_mod_write_pollutes\tlane:env\n",
+            "path_attr_qualified_allowlisted_fn_pollutes\tlane:env\n",
+            "path_attr_with_gap_uses_polluting_module\tlane:env\n",
+            "qualified_mod_type_constructor_pollutes\tlane:env\n",
+            "raw_identifier_command_inherits_env\tlane:env\n",
+            "reads_parent_env\tlane:env\n",
+            "reads_parent_env_comment_gap\tlane:env\n",
+            "reads_parent_env_os_with_turbofish\tlane:env\n",
+            "reads_parent_env_with_turbofish\tlane:env\n",
+            "relative_fs_write_depends_on_process_cwd\tlane:cwd\n",
+            "relative_path_exists_depends_on_cwd\tlane:cwd\n",
+            "same_line_path_attr_mod_pollutes\tlane:env\n",
+            "self_constructor_pollutes\tlane:env\n",
+            "shared_allowlisted_helper_alias_pollutes\tlane:env\n",
+            "shared_output_helper_inherits_env\tlane:env\n",
+            "split_module_alias_drop_pollutes_underlying_type\tlane:env\n",
+            "thread_spawn_aliased_pollutes\tlane:env\n",
+            "thread_spawn_fn_pointer_pollutes\tlane:env\n",
+            "two_commands_partial_clear_inherits_env\tlane:env\n",
+            "ufcs_as_trait_command\tlane:env\n",
+            "ufcs_command_new_inherits_env\tlane:env\n",
+            "unparsed_alias_fails_closed\tglobal\n",
+            "variable_name_contains_tempdir_but_relative_path_depends_on_cwd\tlane:cwd\n",
+            "vars_iter_lanes\tlane:env\n",
+        ),
+        "every rename/import/macro/constructor laundering shape must land on \
+         its true lane (env or cwd), never none"
+    );
+}
+
 /// Counterexample: the scanner reads `#[test] #[serial]` written on one line;
 /// ignores `#[serial]` inside string literals (normal/raw/byte/C), char and
 /// byte-char literals, and line/single/nested block comments; and keeps every
