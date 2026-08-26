@@ -77,7 +77,7 @@ impl<'a> EpisodeAdmission<'a> {
         Self { digest }
     }
 
-    pub(crate) async fn compile<C: EpisodeCompiler>(
+    pub(crate) async fn compile<C: EpisodeCompiler + ?Sized>(
         &self,
         compiler: &C,
         config: &EpisodeCompileConfig,

@@ -4,22 +4,24 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use git_internal::hash::ObjectHash;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement, TransactionTrait,
+};
 use uuid::Uuid;
 
 use super::{
     domain::{EpisodeRoot, MemoryEventAction, MemoryNoteV1},
-    error::{MemoryWriterError, MemoryWriterErrorKind},
+    error::{MemoryDamagePoint, MemoryWriterError, MemoryWriterErrorKind},
     fts_sql::{
-        EpisodeSearchDocument, EpisodeSearchText, MemoryWriteTransaction, rebuild_index,
-        upsert_document, upsert_document_in_linear_transaction,
+        EpisodeSearchDocument, EpisodeSearchText, MemoryWriteTransaction, delete_scope_documents,
+        rebuild_index, upsert_document, upsert_document_in_linear_transaction,
     },
     replay::{ProjectedNote, ProjectedReviewState, ReducedProjection, ReplayRecord},
     store::{
         enum_label, execute, insert_note, insert_revision, read_memory_ref_head,
         replace_episode_paths, replace_links, update_note,
     },
-    tree::{MemoryHistoryDelta, load_history_delta, parse_oid},
+    tree::{MemoryHistoryDelta, load_head_manifest, load_history_delta, parse_oid},
 };
 use crate::internal::ai::linear_ref::LinearRefWriteTransaction;
 
@@ -44,10 +46,28 @@ pub(crate) enum MemoryProjectionStatus {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MemoryRebuildPlan {
+    pub(crate) head: ObjectHash,
+    pub(crate) event_count: usize,
+    pub(crate) note_count: usize,
+    pub(crate) revision_count: usize,
+    pub(crate) last_event_seq: u64,
+}
+
 pub(crate) struct MemoryProjection {
     database: Arc<DatabaseConnection>,
     storage_path: PathBuf,
     policy_version: String,
+    #[cfg(test)]
+    status_snapshot_hook: Option<StatusSnapshotHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StatusSnapshotHook {
+    after_head_read: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
 }
 
 impl MemoryProjection {
@@ -60,7 +80,15 @@ impl MemoryProjection {
             database,
             storage_path,
             policy_version: policy_version.into(),
+            #[cfg(test)]
+            status_snapshot_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_status_snapshot_hook(mut self, hook: StatusSnapshotHook) -> Self {
+        self.status_snapshot_hook = Some(hook);
+        self
     }
 
     pub(crate) async fn status(
@@ -68,8 +96,41 @@ impl MemoryProjection {
         pinned_head: Option<ObjectHash>,
     ) -> Result<MemoryProjectionStatus, MemoryWriterError> {
         let row = projection_watermark(self.database.as_ref()).await?;
+        Ok(self.classify_status(pinned_head, row))
+    }
+
+    /// Read the authoritative ref and projection watermark from one SQLite
+    /// snapshot so diagnostics cannot combine two different writer commits.
+    pub(crate) async fn status_consistent(
+        &self,
+    ) -> Result<(Option<ObjectHash>, MemoryProjectionStatus), MemoryWriterError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|error| projection_storage("begin Memory status snapshot", error))?;
+        let head = read_memory_ref_head(&transaction).await?;
+        #[cfg(test)]
+        if let Some(hook) = &self.status_snapshot_hook {
+            hook.after_head_read.notify_one();
+            hook.resume.notified().await;
+        }
+        let row = projection_watermark(&transaction).await?;
+        let status = self.classify_status(head, row);
+        transaction
+            .commit()
+            .await
+            .map_err(|error| projection_storage("commit Memory status snapshot", error))?;
+        Ok((head, status))
+    }
+
+    fn classify_status(
+        &self,
+        pinned_head: Option<ObjectHash>,
+        row: Option<ProjectionWatermark>,
+    ) -> MemoryProjectionStatus {
         match (pinned_head, row) {
-            (None, None) => Ok(MemoryProjectionStatus::Empty),
+            (None, None) => MemoryProjectionStatus::Empty,
             (Some(head), Some(row)) => {
                 let projected = parse_oid(&row.projected_ref_oid).ok();
                 let last_event_seq = u64::try_from(row.last_event_seq).ok();
@@ -77,50 +138,45 @@ impl MemoryProjection {
                     || projected.is_none()
                     || last_event_seq.is_none()
                 {
-                    return Ok(MemoryProjectionStatus::Corrupt {
+                    return MemoryProjectionStatus::Corrupt {
                         head: Some(head),
                         projected: Some(row.projected_ref_oid),
                         last_event_seq: Some(row.last_event_seq),
-                    });
+                    };
                 }
                 if projected == Some(head) {
                     let last_event_seq = last_event_seq.unwrap_or_default();
-                    match load_history_delta(
-                        &self.storage_path,
-                        head,
-                        Some(head),
-                        &self.policy_version,
-                    ) {
-                        Ok(history) if history.manifest.last_event_seq == last_event_seq => {
-                            Ok(MemoryProjectionStatus::Current {
+                    match load_head_manifest(&self.storage_path, head, &self.policy_version) {
+                        Ok(manifest) if manifest.last_event_seq == last_event_seq => {
+                            MemoryProjectionStatus::Current {
                                 head,
                                 last_event_seq,
-                            })
+                            }
                         }
-                        _ => Ok(MemoryProjectionStatus::Corrupt {
+                        _ => MemoryProjectionStatus::Corrupt {
                             head: Some(head),
                             projected: Some(head.to_string()),
                             last_event_seq: i64::try_from(last_event_seq).ok(),
-                        }),
+                        },
                     }
                 } else {
-                    Ok(MemoryProjectionStatus::Stale {
+                    MemoryProjectionStatus::Stale {
                         head,
                         projected,
                         last_event_seq: last_event_seq.unwrap_or_default(),
-                    })
+                    }
                 }
             }
-            (Some(head), None) => Ok(MemoryProjectionStatus::Stale {
+            (Some(head), None) => MemoryProjectionStatus::Stale {
                 head,
                 projected: None,
                 last_event_seq: 0,
-            }),
-            (None, Some(row)) => Ok(MemoryProjectionStatus::Corrupt {
+            },
+            (None, Some(row)) => MemoryProjectionStatus::Corrupt {
                 head: None,
                 projected: Some(row.projected_ref_oid),
                 last_event_seq: Some(row.last_event_seq),
-            }),
+            },
         }
     }
 
@@ -190,17 +246,14 @@ impl MemoryProjection {
         rebuilt_at_ms: i64,
     ) -> Result<(), MemoryWriterError> {
         ensure_pinned_ref(self.database.as_ref(), pinned_head).await?;
-        let history =
-            load_history_delta(&self.storage_path, pinned_head, None, &self.policy_version)?;
-        let mut reduced = ReducedProjection::default();
-        apply_history(&mut reduced, history)?;
+        let (reduced, _) = self.reduce_full_history(pinned_head)?;
 
         let transaction = MemoryWriteTransaction::begin(self.database.as_ref())
             .await
             .map_err(fts_error)?;
         ensure_pinned_ref_in_transaction(transaction.as_database_transaction(), pinned_head)
             .await?;
-        clear_rebuildable_projection(transaction.as_database_transaction()).await?;
+        clear_rebuildable_projection(&transaction).await?;
         materialize(
             ProjectionTransaction::Standalone(&transaction),
             &reduced,
@@ -212,6 +265,38 @@ impl MemoryProjection {
         rebuild_index(&transaction).await.map_err(fts_error)?;
         transaction.commit().await.map_err(fts_error)
     }
+
+    /// Validate and reduce the complete authoritative history without writing
+    /// projection tables. The command adapter uses this for `--dry-run`.
+    pub(crate) async fn plan_rebuild(
+        &self,
+        pinned_head: ObjectHash,
+    ) -> Result<MemoryRebuildPlan, MemoryWriterError> {
+        ensure_pinned_ref(self.database.as_ref(), pinned_head).await?;
+        self.reduce_full_history(pinned_head).map(|(_, plan)| plan)
+    }
+
+    fn reduce_full_history(
+        &self,
+        pinned_head: ObjectHash,
+    ) -> Result<(ReducedProjection, MemoryRebuildPlan), MemoryWriterError> {
+        let history =
+            load_history_delta(&self.storage_path, pinned_head, None, &self.policy_version)
+                .map_err(|error| {
+                    error.with_damage_point(MemoryDamagePoint::MemoryHead { oid: pinned_head })
+                })?;
+        let event_count = history.records.len();
+        let mut reduced = ReducedProjection::default();
+        apply_history(&mut reduced, history)?;
+        let plan = MemoryRebuildPlan {
+            head: pinned_head,
+            event_count,
+            note_count: reduced.notes.len(),
+            revision_count: reduced.new_revisions.len(),
+            last_event_seq: reduced.last_event_seq,
+        };
+        Ok((reduced, plan))
+    }
 }
 
 fn apply_history(
@@ -219,17 +304,26 @@ fn apply_history(
     history: MemoryHistoryDelta,
 ) -> Result<(), MemoryWriterError> {
     for record in history.records {
-        reduced.apply(ReplayRecord {
-            event: record.event,
-            revision_oid: record.revision_oid,
-            note: record.note,
-        })?;
+        let damage_point = MemoryDamagePoint::EventIdentity {
+            event_seq: record.event.event_seq,
+            event_id: record.event.event_id,
+        };
+        reduced
+            .apply(ReplayRecord {
+                event: record.event,
+                revision_oid: record.revision_oid,
+                note: record.note,
+            })
+            .map_err(|error| error.with_damage_point(damage_point))?;
     }
     if reduced.last_event_seq != history.manifest.last_event_seq {
         return Err(MemoryWriterError::new(
             MemoryWriterErrorKind::CorruptHistory,
             "Memory replay sequence does not match the pinned manifest",
-        ));
+        )
+        .with_damage_point(MemoryDamagePoint::EventSequence {
+            event_seq: history.manifest.last_event_seq,
+        }));
     }
     Ok(())
 }
@@ -528,25 +622,47 @@ async fn ensure_transaction_snapshot(
     }
 }
 
-async fn clear_rebuildable_projection(txn: &DatabaseTransaction) -> Result<(), MemoryWriterError> {
-    txn.execute_unprepared(
-        "INSERT INTO memory_episode_fts(memory_episode_fts) VALUES('delete-all')",
-    )
-    .await
-    .map_err(|error| projection_storage("clear Memory FTS postings", error))?;
-    for table in [
-        "memory_link_index",
-        "memory_episode_path",
-        "memory_head",
-        "memory_path_summary",
-        "memory_episode_search_doc",
-        "memory_revision_index",
-        "memory_note_index",
-        "memory_projection_state",
+async fn clear_rebuildable_projection(
+    transaction: &MemoryWriteTransaction,
+) -> Result<(), MemoryWriterError> {
+    let txn = transaction.as_database_transaction();
+    let inbound = txn
+        .query_one_raw(Statement::from_string(
+            txn.get_database_backend(),
+            "SELECT 1 AS present
+             FROM memory_link_index AS link
+             INNER JOIN memory_note_index AS target
+                ON target.note_id = link.target_note_id
+             WHERE link.source_scope_key <> 'repo' AND target.scope_key = 'repo'
+             LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .map_err(|error| projection_storage("inspect cross-scope Memory links", error))?;
+    if inbound.is_some() {
+        return Err(MemoryWriterError::new(
+            MemoryWriterErrorKind::PolicyRejected,
+            "repository Memory projection has an inbound link from another scope; rebuild the dependent scopes together",
+        ));
+    }
+
+    delete_scope_documents(transaction, "repo")
+        .await
+        .map_err(fts_error)?;
+    for statement in [
+        "DELETE FROM memory_link_index WHERE source_scope_key = 'repo'",
+        "DELETE FROM memory_episode_path WHERE revision_oid IN (
+            SELECT revision_oid FROM memory_revision_index WHERE scope_key = 'repo'
+         )",
+        "DELETE FROM memory_head WHERE scope_key = 'repo'",
+        "DELETE FROM memory_path_summary WHERE scope_key = 'repo'",
+        "DELETE FROM memory_revision_index WHERE scope_key = 'repo'",
+        "DELETE FROM memory_note_index WHERE scope_key = 'repo'",
+        "DELETE FROM memory_projection_state WHERE scope_key = 'repo'",
     ] {
-        txn.execute_unprepared(&format!("DELETE FROM {table}"))
-            .await
-            .map_err(|error| projection_storage("clear rebuildable Memory projection", error))?;
+        txn.execute_unprepared(statement).await.map_err(|error| {
+            projection_storage("clear repository-scoped Memory projection", error)
+        })?;
     }
     Ok(())
 }
@@ -922,15 +1038,16 @@ fn fts_error(error: impl std::fmt::Display) -> MemoryWriterError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, time::Duration};
 
     use sea_orm::{ConnectionTrait, QueryResult};
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::internal::ai::memory::{
         domain::{MemoryLinkKind, MemoryLinkV1},
         policy::TrustedMemoryTarget,
-        writer::tests::{fixture, proposal},
+        writer::tests::{file_backed_fixture, fixture, proposal},
     };
 
     fn projection_for(fixture: &super::super::writer::tests::Fixture) -> MemoryProjection {
@@ -1026,7 +1143,7 @@ mod tests {
                     AS value
              FROM memory_episode_path ORDER BY note_id, revision_oid, code_path",
             "SELECT 'search|' || json_object(
-                    'rowid', rowid, 'note_id', note_id, 'revision_oid', revision_oid,
+                    'note_id', note_id, 'revision_oid', revision_oid,
                     'root_kind', root_kind, 'root_id', root_id,
                     'completion_status', completion_status,
                     'code_change_status', code_change_status, 'ended_at', ended_at,
@@ -1044,6 +1161,8 @@ mod tests {
              WHERE memory_episode_fts MATCH 'generation'",
             "SELECT 'fts-timing|' || COUNT(*) AS value FROM memory_episode_fts
              WHERE memory_episode_fts MATCH 'timing'",
+            "SELECT 'fts-other-scope|' || COUNT(*) AS value FROM memory_episode_fts
+             WHERE memory_episode_fts MATCH 'other'",
         ];
         let mut snapshot = Vec::new();
         for query in queries {
@@ -1063,6 +1182,80 @@ mod tests {
             .await
             .expect("move test Memory ref");
         assert_eq!(result.rows_affected(), 1);
+    }
+
+    async fn seed_other_scope_projection(database: &DatabaseConnection) {
+        for statement in [
+            "INSERT INTO memory_note_index (
+                note_id, scope_key, namespace, path, kind, lifecycle,
+                review_state, confidence, trust, sensitivity, visibility,
+                acl_policy_id, origin, idempotency_key, created_at
+             ) VALUES (
+                '11111111-1111-4111-8111-111111111111', 'repo-user', 'default',
+                'episodic.tasks.other-scope', 'episodic', 'accretive', 'confirmed',
+                'high', 'repo_evidence', 'internal', 'repo_local', 'repo-user-policy',
+                'episode_compiler', 'other-scope-key', '2026-08-25T00:00:00Z'
+             )",
+            "INSERT INTO memory_revision_index (
+                revision_oid, note_id, scope_key, namespace, origin, producer,
+                rules_version, policy_version, input_fingerprints_json, created_at
+             ) VALUES (
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                '11111111-1111-4111-8111-111111111111', 'repo-user', 'default',
+                'episode_compiler', 'other-scope-test', 1, 'repo-policy-v1', '[]',
+                '2026-08-25T00:00:00Z'
+             )",
+            "INSERT INTO memory_head (
+                scope_key, namespace, path, note_id, latest_revision_oid,
+                live_revision_oid, latest_action, latest_review_state, kind,
+                lifecycle, confidence, trust, sensitivity, visibility,
+                acl_policy_id, last_event_seq, updated_at
+             ) VALUES (
+                'repo-user', 'default', 'episodic.tasks.other-scope',
+                '11111111-1111-4111-8111-111111111111',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'created', 'confirmed',
+                'episodic', 'accretive', 'high', 'repo_evidence', 'internal',
+                'repo_local', 'repo-user-policy', 1, '2026-08-25T00:00:00Z'
+             )",
+            "INSERT INTO memory_path_summary (
+                scope_key, namespace, path, confirmed_count, quarantined_count,
+                child_count, prefix_count, preview, last_changed_at
+             ) VALUES (
+                'repo-user', 'default', 'episodic.tasks.other-scope', 1, 0, 0, 1,
+                'other scope', '2026-08-25T00:00:00Z'
+             )",
+            "INSERT INTO memory_episode_path (note_id, revision_oid, code_path)
+             VALUES (
+                '11111111-1111-4111-8111-111111111111',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'src/other_scope.rs'
+             )",
+            "INSERT INTO memory_episode_search_doc (
+                rowid, note_id, revision_oid, root_kind, root_id,
+                completion_status, code_change_status, ended_at, goal, summary,
+                decisions, failed_attempts, unresolved
+             ) VALUES (
+                -1, '11111111-1111-4111-8111-111111111111',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'task', 'other-scope-task',
+                'completed', 'unchanged', '2026-08-25T00:00:00Z',
+                'other scope goal', 'other scope summary', '', '', ''
+             )",
+            "INSERT INTO memory_episode_fts (
+                rowid, goal, summary, decisions, failed_attempts, unresolved
+             ) VALUES (-1, 'other scope goal', 'other scope summary', '', '', '')",
+            "INSERT INTO memory_projection_state (
+                scope_key, projected_ref_oid, last_event_seq, schema_version,
+                policy_version, rebuilt_at
+             ) VALUES (
+                'repo-user', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 1, 1,
+                'repo-policy-v1', 1
+             )",
+        ] {
+            database
+                .execute_unprepared(statement)
+                .await
+                .expect("seed unrelated Memory scope projection");
+        }
     }
 
     #[tokio::test]
@@ -1103,6 +1296,7 @@ mod tests {
             ))
             .await
             .expect("seed non-projection observer state");
+        seed_other_scope_projection(&fixture.database).await;
         let before = semantic_snapshot(&fixture.database).await;
         let projection = projection_for(&fixture);
 
@@ -1122,7 +1316,7 @@ mod tests {
             vec![format!("libra/memory/repo|{}|77", linked.commit_oid())],
         );
         assert_eq!(
-            read_memory_ref_head(&fixture.database)
+            read_memory_ref_head(fixture.database.as_ref())
                 .await
                 .expect("read Memory ref after rebuild"),
             Some(linked.commit_oid()),
@@ -1185,7 +1379,157 @@ mod tests {
             .await
             .expect_err("missing authority object stops rebuild");
         assert_eq!(error.kind(), MemoryWriterErrorKind::CorruptHistory);
+        assert_eq!(
+            error.damage_point(),
+            Some(&MemoryDamagePoint::MemoryHead {
+                oid: committed.commit_oid(),
+            })
+        );
         assert_eq!(semantic_snapshot(&fixture.database).await, before);
+    }
+
+    #[tokio::test]
+    async fn projection_status_is_constant_work_and_dry_run_owns_full_validation() {
+        let fixture = fixture().await;
+        let committed = commit_generation(&fixture, 1, None).await;
+        let projection = projection_for(&fixture);
+        let expected = projection
+            .status(Some(committed.commit_oid()))
+            .await
+            .expect("read current projection status");
+
+        let revision = committed.revision_oid().to_string();
+        let revision_path = fixture
+            ._temp
+            .path()
+            .join("objects")
+            .join(&revision[..2])
+            .join(&revision[2..]);
+        fs::remove_file(revision_path).expect("remove temporary revision object");
+
+        assert_eq!(
+            projection
+                .status(Some(committed.commit_oid()))
+                .await
+                .expect("status reads only head manifest and watermark"),
+            expected,
+        );
+        let error = projection
+            .plan_rebuild(committed.commit_oid())
+            .await
+            .expect_err("dry-run validation still traverses the full authority");
+        assert_eq!(error.kind(), MemoryWriterErrorKind::CorruptHistory);
+        assert!(
+            error
+                .damage_point()
+                .is_some_and(|point| point.to_string().contains("event_seq=")),
+            "full validation should identify the damaged event"
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_status_reads_ref_and_watermark_from_one_snapshot() {
+        let fixture = file_backed_fixture().await;
+        let first = commit_generation(&fixture, 1, None).await;
+        let second = commit_generation(&fixture, 2, Some(first.commit_oid())).await;
+        let first_seq =
+            load_head_manifest(fixture._temp.path(), first.commit_oid(), "repo-policy-v1")
+                .expect("load first Memory manifest")
+                .last_event_seq;
+        let second_seq =
+            load_head_manifest(fixture._temp.path(), second.commit_oid(), "repo-policy-v1")
+                .expect("load second Memory manifest")
+                .last_event_seq;
+
+        let reset = MemoryWriteTransaction::begin(fixture.database.as_ref())
+            .await
+            .expect("begin projection reset");
+        reset
+            .as_database_transaction()
+            .execute_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "UPDATE reference SET `commit` = ? WHERE kind = 'Branch' AND remote IS NULL AND name = 'libra/memory/repo'",
+                [first.commit_oid().to_string().into()],
+            ))
+            .await
+            .expect("reset Memory ref to first generation");
+        reset
+            .as_database_transaction()
+            .execute_raw(Statement::from_sql_and_values(
+                fixture.database.get_database_backend(),
+                "UPDATE memory_projection_state SET projected_ref_oid = ?, last_event_seq = ? WHERE scope_key = 'repo'",
+                [
+                    first.commit_oid().to_string().into(),
+                    i64::try_from(first_seq).expect("first sequence fits SQLite").into(),
+                ],
+            ))
+            .await
+            .expect("reset projection watermark to first generation");
+        reset.commit().await.expect("commit projection reset");
+
+        let hook = StatusSnapshotHook {
+            after_head_read: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        };
+        let after_head_read_signal = Arc::clone(&hook.after_head_read);
+        let after_head_read = after_head_read_signal.notified();
+        let resume = Arc::clone(&hook.resume);
+        let projection = projection_for(&fixture).with_status_snapshot_hook(hook);
+        let status_task = tokio::spawn(async move { projection.status_consistent().await });
+        tokio::time::timeout(Duration::from_secs(5), after_head_read)
+            .await
+            .expect("status read the first ref inside its snapshot");
+
+        let writer_database = crate::internal::db::open_database_without_migrations(
+            &fixture._temp.path().join("libra.db"),
+        )
+        .await
+        .expect("open independent writer connection");
+        let advance = crate::internal::db::begin_write_transaction(&writer_database)
+            .await
+            .expect("begin concurrent Memory advance");
+        advance
+            .execute_raw(Statement::from_sql_and_values(
+                writer_database.get_database_backend(),
+                "UPDATE reference SET `commit` = ? WHERE kind = 'Branch' AND remote IS NULL AND name = 'libra/memory/repo'",
+                [second.commit_oid().to_string().into()],
+            ))
+            .await
+            .expect("advance Memory ref");
+        advance
+            .execute_raw(Statement::from_sql_and_values(
+                writer_database.get_database_backend(),
+                "UPDATE memory_projection_state SET projected_ref_oid = ?, last_event_seq = ? WHERE scope_key = 'repo'",
+                [
+                    second.commit_oid().to_string().into(),
+                    i64::try_from(second_seq)
+                        .expect("second sequence fits SQLite")
+                        .into(),
+                ],
+            ))
+            .await
+            .expect("advance projection watermark");
+        advance.commit().await.expect("commit concurrent advance");
+        resume.notify_one();
+
+        let (head, status) = tokio::time::timeout(Duration::from_secs(5), status_task)
+            .await
+            .expect("status snapshot completed")
+            .expect("status task joined")
+            .expect("status read succeeded");
+        assert_eq!(head, Some(first.commit_oid()));
+        assert_eq!(
+            status,
+            MemoryProjectionStatus::Current {
+                head: first.commit_oid(),
+                last_event_seq: first_seq,
+            },
+            "status must not combine the old ref with the newly committed watermark"
+        );
+        writer_database
+            .close()
+            .await
+            .expect("close independent writer connection");
     }
 
     #[tokio::test]

@@ -1,15 +1,16 @@
 use git_internal::hash::ObjectHash;
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::{
     applicability::{
         CodeApplicability, CodeHistory, RepositoryCodeHistory, assess_code_applicability,
     },
-    domain::{MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust, MemoryVisibility},
+    domain::MemoryNoteV1,
     evidence::{EvidenceExpansionV1, EvidenceResolver},
     fts_sql::{EpisodeSearchCandidate, MemoryFtsError, search_candidates},
-    policy::{AuthenticatedMemoryContext, REPO_EPISODE_ACL_POLICY_ID, REPO_EPISODE_POLICY_VERSION},
+    policy::{AuthenticatedMemoryContext, authorizes_note_read},
     query::{EpisodeQueryError, EpisodeQueryV1},
     selector::{EPISODE_SELECTOR_VERSION, SelectableEpisode, select_episode_indexes},
     tree::load_note_bytes,
@@ -144,7 +145,7 @@ impl<'a> EpisodeReader<'a> {
         let mut relation_omissions = 0usize;
         for candidate in projected {
             let note = self.load_candidate(&candidate)?;
-            if !authorized_note(&note) {
+            if !authorizes_note_read(context, view.repository_id(), &note) {
                 continue;
             }
             let episode = note.episode.as_ref().ok_or_else(|| {
@@ -217,7 +218,12 @@ impl<'a> EpisodeReader<'a> {
             let evidence = if query.expand_evidence {
                 let expanded = self
                     .evidence
-                    .expand(&candidate.note, view.memory_ref_oid())
+                    .expand(
+                        context,
+                        view.repository_id(),
+                        &candidate.note,
+                        view.memory_ref_oid(),
+                    )
                     .await;
                 evidence_reads = evidence_reads
                     .saturating_add(expanded.resolved.len())
@@ -252,6 +258,109 @@ impl<'a> EpisodeReader<'a> {
         })
     }
 
+    /// Load one authorized Episode revision through the same frozen-view gate
+    /// as search. Without an explicit revision, only the current confirmed
+    /// revision is returned.
+    pub(crate) async fn show(
+        &self,
+        context: &AuthenticatedMemoryContext,
+        view: &ResolvedMemoryViewV1,
+        note_id: Uuid,
+        requested_revision: Option<ObjectHash>,
+        expand_evidence: bool,
+    ) -> Result<Option<EpisodeReadItemV1>, EpisodeReaderError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        view.revalidate(
+            &transaction,
+            self.history.repository_path(),
+            self.digest,
+            context,
+        )
+        .await
+        .map_err(EpisodeReaderError::from)?;
+        let revision_oid = resolve_show_revision(&transaction, note_id, requested_revision).await?;
+        let Some(revision_oid) = revision_oid else {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+            return Ok(None);
+        };
+        // SQLite repositories deliberately use a single pooled connection.
+        // Evidence expansion may resolve Agent-history objects through that
+        // same database, so keeping this transaction checked out would make
+        // every nested lookup wait for its own connection-acquire timeout.
+        // The selected revision is immutable; release the first view check,
+        // expand it, then revalidate the frozen view in a fresh transaction.
+        transaction
+            .commit()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        let bytes = load_note_bytes(self.history.repository_path(), revision_oid)
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))?;
+        let note = parse_memory_note_v1(&bytes)
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))?;
+        if note.note_id != note_id || !authorizes_note_read(context, view.repository_id(), &note) {
+            return Err(EpisodeReaderError::new(
+                EpisodeReaderErrorKind::Unauthorized,
+            ));
+        }
+        let episode = note
+            .episode
+            .as_ref()
+            .ok_or_else(|| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))?;
+        let assessment = assess_code_applicability(
+            &self.code_history,
+            view.code_anchor().commit_oid(),
+            &episode.code,
+        );
+        let evidence = if expand_evidence {
+            self.evidence
+                .expand(context, view.repository_id(), &note, view.memory_ref_oid())
+                .await
+        } else {
+            EvidenceExpansionV1::default()
+        };
+        let verification = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        view.revalidate(
+            &verification,
+            self.history.repository_path(),
+            self.digest,
+            context,
+        )
+        .await
+        .map_err(EpisodeReaderError::from)?;
+        verification
+            .commit()
+            .await
+            .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+        Ok(Some(EpisodeReadItemV1 {
+            note,
+            revision_oid,
+            bm25_score: 0.0,
+            applicability: assessment.applicability,
+            read_cost: EpisodeReadCostV1 {
+                projection_rows: 1,
+                note_objects: 1,
+                code_commits_visited: assessment.commits_visited,
+                code_paths_compared: assessment.paths_compared,
+                evidence_items: evidence
+                    .resolved
+                    .len()
+                    .saturating_add(evidence.omissions.len()),
+            },
+            evidence,
+        }))
+    }
+
     fn load_candidate(
         &self,
         candidate: &EpisodeSearchCandidate,
@@ -282,20 +391,59 @@ impl<'a> EpisodeReader<'a> {
     }
 }
 
+async fn resolve_show_revision<C: ConnectionTrait>(
+    database: &C,
+    note_id: Uuid,
+    requested_revision: Option<ObjectHash>,
+) -> Result<Option<ObjectHash>, EpisodeReaderError> {
+    let (sql, values) = match requested_revision {
+        Some(revision_oid) => (
+            "SELECT revision_oid
+             FROM memory_revision_index
+             WHERE scope_key = 'repo' AND namespace = 'default'
+               AND note_id = ? AND revision_oid = ? LIMIT 2",
+            vec![note_id.to_string().into(), revision_oid.to_string().into()],
+        ),
+        None => (
+            "SELECT live_revision_oid AS revision_oid
+             FROM memory_head
+             WHERE scope_key = 'repo' AND namespace = 'default'
+               AND note_id = ? AND latest_review_state = 'confirmed' LIMIT 2",
+            vec![note_id.to_string().into()],
+        ),
+    };
+    let rows = database
+        .query_all_raw(Statement::from_sql_and_values(
+            database.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await
+        .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::StorageUnavailable))?;
+    if rows.len() > 1 {
+        return Err(EpisodeReaderError::new(
+            EpisodeReaderErrorKind::CorruptProjection,
+        ));
+    }
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let value = row
+        .try_get::<Option<String>>("", "revision_oid")
+        .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))?;
+    value
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| EpisodeReaderError::new(EpisodeReaderErrorKind::CorruptProjection))
+        })
+        .transpose()
+}
+
 struct LoadedEpisode {
     selectable: SelectableEpisode,
     note: MemoryNoteV1,
     read_cost: EpisodeReadCostV1,
-}
-
-fn authorized_note(note: &MemoryNoteV1) -> bool {
-    note.namespace == "default"
-        && note.scope == MemoryScopeV1::Repo
-        && note.visibility == MemoryVisibility::RepoLocal
-        && note.acl_policy_id == REPO_EPISODE_ACL_POLICY_ID
-        && note.compile_record.policy_version == REPO_EPISODE_POLICY_VERSION
-        && note.trust == MemoryTrust::RepoEvidence
-        && note.sensitivity != MemorySensitivity::SecretLike
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -367,6 +515,11 @@ impl EpisodeReaderError {
         Self { kind }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn for_tests(kind: EpisodeReaderErrorKind) -> Self {
+        Self::new(kind)
+    }
+
     pub(crate) const fn kind(&self) -> EpisodeReaderErrorKind {
         self.kind
     }
@@ -409,7 +562,7 @@ impl From<ResolvedMemoryViewError> for EpisodeReaderError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use chrono::{TimeZone, Utc};
@@ -429,7 +582,7 @@ mod tests {
                 memory::MemoryContextAssembler,
             },
             memory::{
-                domain::{EpisodeRoot, EpisodeRootKind},
+                domain::{EpisodeRoot, EpisodeRootKind, MemorySensitivity},
                 policy::TrustedMemoryTarget,
                 writer::tests::{Fixture, fixture, proposal},
             },
@@ -440,7 +593,7 @@ mod tests {
 
     const CODE_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    fn history(fixture: &Fixture) -> HistoryManager {
+    pub(crate) fn history(fixture: &Fixture) -> HistoryManager {
         HistoryManager::new(
             Arc::new(LocalStorage::new(fixture._temp.path().join("objects"))),
             fixture._temp.path().to_path_buf(),
@@ -507,7 +660,7 @@ mod tests {
         .expect("write code commit")
     }
 
-    async fn seed_code_head(fixture: &Fixture) -> ObjectHash {
+    pub(crate) async fn seed_code_head(fixture: &Fixture) -> ObjectHash {
         let commit_oid = write_code_commit(fixture, Vec::new(), b"reader anchor\n");
         fixture
             .database
@@ -542,7 +695,7 @@ mod tests {
         commit_oid
     }
 
-    async fn commit_injectable_episode(
+    pub(crate) async fn commit_injectable_episode(
         fixture: &Fixture,
         code_commit: ObjectHash,
         task_id: &str,

@@ -30,17 +30,27 @@ pub(crate) fn schedule_observer_repair(history: Option<Arc<HistoryManager>>) {
 /// refs. Runtime startup and status paths can call this same idempotent seam;
 /// a crash before the short cursor transaction simply repeats the scan.
 pub(crate) async fn repair_observers(history: &HistoryManager) -> Result<(), ObserverRepairError> {
-    let database = history.database_connection();
     let digest =
         RepositoryKeyedDigest::load_or_initialize(&history.repository_path().join(DATABASE))
             .await
             .map_err(|_| ObserverRepairError::new(ObserverRepairErrorKind::DigestUnavailable))?;
-    EpisodeObserver::new(history, &database, &digest, "repo")
+    repair_observers_with_digest(history, digest.as_ref()).await
+}
+
+/// Runtime seam for callers that already own the repository-pinned digest.
+/// Reusing it avoids a second database open/cache lookup at every lifecycle
+/// wake and keeps observer/job receipts on one identity.
+pub(super) async fn repair_observers_with_digest(
+    history: &HistoryManager,
+    digest: &RepositoryKeyedDigest,
+) -> Result<(), ObserverRepairError> {
+    let database = history.database_connection();
+    EpisodeObserver::new(history, &database, digest, "repo")
         .map_err(|_| ObserverRepairError::configuration())?
         .observe_terminal_events()
         .await
         .map_err(|_| ObserverRepairError::observation())?;
-    MemoryDependencyObserver::new(history, &database, &digest, "repo")
+    MemoryDependencyObserver::new(history, &database, digest, "repo")
         .map_err(|_| ObserverRepairError::configuration())?
         .observe_task_revisions()
         .await

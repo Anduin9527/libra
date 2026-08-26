@@ -478,7 +478,7 @@ pub async fn upgrade_database_schema(db_path: &Path) -> io::Result<SchemaUpgrade
     apply_database_schema_upgrades(&conn).await
 }
 
-async fn inspect_database_schema_for_connection(
+pub(crate) async fn inspect_database_schema_for_connection(
     conn: &DatabaseConnection,
 ) -> io::Result<SchemaCompatibility> {
     let current = migration::current_builtin_schema_version_readonly(conn)

@@ -56,6 +56,12 @@ static REPOSITORY_KEYED_DIGEST_CACHE: Lazy<
     Mutex<HashMap<RepositoryCacheKey, Arc<RepositoryKeyedDigest>>>,
 > = Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[derive(Clone, Copy)]
+enum DigestLoadMode {
+    LoadOrInitialize,
+    ExistingOnly,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DigestPurpose {
@@ -384,7 +390,50 @@ impl RepositoryKeyedDigest {
         let database = db::get_db_conn_instance_for_path(&canonical_db_path)
             .await
             .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::RepositoryUnavailable))?;
-        let repository_id = repository_id(&database).await?;
+        Self::load_cached(
+            &database,
+            canonical_db_path,
+            DigestLoadMode::LoadOrInitialize,
+        )
+        .await
+    }
+
+    /// Load an existing repository digest key without creating one.
+    ///
+    /// Read-only command adapters use this entry so `search`, `show`, and
+    /// `status` cannot mutate repository configuration as a side effect.
+    pub(crate) async fn load_existing(
+        repository_db_path: &Path,
+    ) -> Result<Arc<Self>, KeyedDigestError> {
+        let canonical_db_path = tokio::fs::canonicalize(repository_db_path)
+            .await
+            .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::RepositoryUnavailable))?;
+        let database = db::open_database_without_migrations(&canonical_db_path)
+            .await
+            .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::RepositoryUnavailable))?;
+        Self::load_cached(&database, canonical_db_path, DigestLoadMode::ExistingOnly).await
+    }
+
+    /// Load an existing key through a caller-owned connection.
+    ///
+    /// Read-only adapters use this form so the same no-migration connection
+    /// serves Memory diagnostics and keyed-digest validation.
+    pub(crate) async fn load_existing_with_connection(
+        repository_db_path: &Path,
+        database: &DatabaseConnection,
+    ) -> Result<Arc<Self>, KeyedDigestError> {
+        let canonical_db_path = tokio::fs::canonicalize(repository_db_path)
+            .await
+            .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::RepositoryUnavailable))?;
+        Self::load_cached(database, canonical_db_path, DigestLoadMode::ExistingOnly).await
+    }
+
+    async fn load_cached(
+        database: &DatabaseConnection,
+        canonical_db_path: PathBuf,
+        mode: DigestLoadMode,
+    ) -> Result<Arc<Self>, KeyedDigestError> {
+        let repository_id = repository_id(database).await?;
         let cache_key = RepositoryCacheKey {
             canonical_db_path: canonical_db_path.clone(),
             repository_id,
@@ -396,23 +445,47 @@ impl RepositoryKeyedDigest {
         // one repository identity.
         let mut cache = REPOSITORY_KEYED_DIGEST_CACHE.lock().await;
         if let Some(provider) = cache.get(&cache_key) {
-            validate_cached_provider(&database, provider).await?;
+            validate_cached_provider(database, provider).await?;
             return Ok(Arc::clone(provider));
         }
         if cache.len() >= PROCESS_CACHE_CAPACITY {
             return Err(KeyedDigestError::new(KeyedDigestErrorKind::CacheCapacity));
         }
-
-        let provider = Arc::new(
-            Self::load_or_initialize_uncached(
-                &database,
-                &canonical_db_path,
-                &cache_key.repository_id,
-            )
-            .await?,
-        );
+        let provider = Arc::new(match mode {
+            DigestLoadMode::LoadOrInitialize => {
+                Self::load_or_initialize_uncached(
+                    database,
+                    &canonical_db_path,
+                    &cache_key.repository_id,
+                )
+                .await?
+            }
+            DigestLoadMode::ExistingOnly => {
+                Self::load_existing_uncached(database, &canonical_db_path, &cache_key.repository_id)
+                    .await?
+            }
+        });
         cache.insert(cache_key, Arc::clone(&provider));
         Ok(provider)
+    }
+
+    async fn load_existing_uncached(
+        database: &DatabaseConnection,
+        repository_db_path: &Path,
+        repository_id: &str,
+    ) -> Result<Self, KeyedDigestError> {
+        let rows = ConfigKv::get_all_with_conn(database, MEMORY_KEYED_DIGEST_CONFIG_KEY)
+            .await
+            .map_err(|_| KeyedDigestError::new(KeyedDigestErrorKind::StateQueryFailed))?;
+        match rows.as_slice() {
+            [row] => {
+                load_persisted_provider(database, repository_db_path, repository_id, row).await
+            }
+            [] => Err(KeyedDigestError::new(
+                KeyedDigestErrorKind::MissingAfterDurableUse,
+            )),
+            _ => Err(KeyedDigestError::new(KeyedDigestErrorKind::DuplicateConfig)),
+        }
     }
 
     async fn load_or_initialize_uncached(

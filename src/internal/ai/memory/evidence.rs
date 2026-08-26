@@ -6,10 +6,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     domain::{
-        EvidenceKind, EvidenceLocatorV1, EvidenceRefV1, EvidenceSourcePlane, EvidenceVisibility,
-        MemoryNoteV1, ToolCallPart,
+        EvidenceKind, EvidenceLocatorV1, EvidenceRefV1, EvidenceSourcePlane, MemoryNoteV1,
+        ToolCallPart,
     },
-    policy::REPO_EPISODE_POLICY_VERSION,
+    policy::{AuthenticatedMemoryContext, REPO_EPISODE_POLICY_VERSION, authorizes_evidence_read},
     replay::{ReducedProjection, ReplayRecord},
     source::{EpisodeSourceError, MemorySourceRedactor, compact_task_episode_bytes},
     tree::load_history_delta_bounded,
@@ -65,6 +65,8 @@ impl<'a> EvidenceResolver<'a> {
 
     pub(crate) async fn expand(
         &self,
+        context: &AuthenticatedMemoryContext,
+        view_repository_id: &str,
         note: &MemoryNoteV1,
         frozen_memory_head: Option<ObjectHash>,
     ) -> EvidenceExpansionV1 {
@@ -92,7 +94,16 @@ impl<'a> EvidenceResolver<'a> {
                 });
                 break;
             }
-            match self.resolve_one(evidence, frozen_memory_head).await {
+            match self
+                .resolve_one(
+                    context,
+                    view_repository_id,
+                    note,
+                    evidence,
+                    frozen_memory_head,
+                )
+                .await
+            {
                 Ok(text) if total_bytes.saturating_add(text.len()) <= MAX_EVIDENCE_TOTAL_BYTES => {
                     total_bytes = total_bytes.saturating_add(text.len());
                     expansion.resolved.push(ResolvedEvidenceV1 {
@@ -115,10 +126,13 @@ impl<'a> EvidenceResolver<'a> {
 
     async fn resolve_one(
         &self,
+        context: &AuthenticatedMemoryContext,
+        view_repository_id: &str,
+        note: &MemoryNoteV1,
         evidence: &EvidenceRefV1,
         frozen_memory_head: Option<ObjectHash>,
     ) -> Result<String, EvidenceOmissionReason> {
-        if evidence.visibility != EvidenceVisibility::RepoLocal {
+        if !authorizes_evidence_read(context, view_repository_id, note, evidence) {
             return Err(EvidenceOmissionReason::Unauthorized);
         }
         if !matches!(
@@ -305,7 +319,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        internal::ai::memory::writer::tests::{fixture, proposal},
+        internal::ai::memory::{
+            domain::EvidenceVisibility,
+            writer::tests::{fixture, proposal},
+        },
         utils::{object::write_git_object, storage::local::LocalStorage},
     };
 
@@ -408,7 +425,12 @@ mod tests {
         carrier.note_mut().evidence_refs = vec![runtime_ref, memory_ref, private_ref];
         let expansion = EvidenceResolver::new(&history)
             .expect("construct resolver")
-            .expand(carrier.note(), Some(committed.commit_oid()))
+            .expand(
+                &fixture.context,
+                fixture.context.repository_id(),
+                carrier.note(),
+                Some(committed.commit_oid()),
+            )
             .await;
         assert_eq!(expansion.resolved.len(), 2);
         assert_eq!(
@@ -428,6 +450,27 @@ mod tests {
                 object_id: "task-runtime-evidence".to_string(),
                 reason: EvidenceOmissionReason::Unauthorized,
             }],
+        );
+
+        let foreign_context =
+            AuthenticatedMemoryContext::new("foreign-repository", fixture.context.actor().clone())
+                .expect("construct foreign repository context");
+        let foreign = EvidenceResolver::new(&history)
+            .expect("construct foreign resolver")
+            .expand(
+                &foreign_context,
+                fixture.context.repository_id(),
+                carrier.note(),
+                Some(committed.commit_oid()),
+            )
+            .await;
+        assert!(foreign.resolved.is_empty());
+        assert_eq!(foreign.omissions.len(), 3);
+        assert!(
+            foreign
+                .omissions
+                .iter()
+                .all(|item| item.reason == EvidenceOmissionReason::Unauthorized)
         );
     }
 }

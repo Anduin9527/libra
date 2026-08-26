@@ -39,12 +39,19 @@ impl IntentIterationCompiler<AnyCompletionModel> {
 }
 
 impl<M> IntentIterationCompiler<M> {
+    pub(crate) fn with_model_id(
+        model: M,
+        model_id: impl Into<String>,
+    ) -> Result<Self, EpisodeCompilerError> {
+        Self::from_parts(model, model_id.into(), DEFAULT_PROVIDER_TIMEOUT)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests(
         model: M,
         model_id: impl Into<String>,
     ) -> Result<Self, EpisodeCompilerError> {
-        Self::from_parts(model, model_id.into(), DEFAULT_PROVIDER_TIMEOUT)
+        Self::with_model_id(model, model_id)
     }
 
     #[cfg(test)]

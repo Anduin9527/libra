@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use super::{
     domain::{
-        ActorRefV1, EpisodeClaimV1, EpisodeRoot, EvidenceRefV1, MemoryNoteV1, MemoryScopeV1,
-        MemorySensitivity, MemoryVisibility,
+        ActorKind, ActorRefV1, EpisodeClaimV1, EpisodeRoot, EvidenceRefV1, EvidenceVisibility,
+        MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust, MemoryVisibility,
     },
     error::{MemoryWriterError, MemoryWriterErrorKind},
 };
@@ -26,6 +26,38 @@ const REPO_EPISODE_POLICY_SNAPSHOT: &[u8] = br#"{
 pub(crate) struct AuthenticatedMemoryContext {
     repository_id: String,
     actor: ActorRefV1,
+}
+
+/// Apply the fixed repository-local read policy to one immutable note.
+///
+/// M2 has no user-maintained ACL service: any authenticated principal running
+/// inside the owning repository may read repo-local, non-secret Episode
+/// material. Keeping this check here still makes every read depend on the
+/// authenticated repository identity and the persisted policy labels.
+pub(super) fn authorizes_note_read(
+    context: &AuthenticatedMemoryContext,
+    view_repository_id: &str,
+    note: &MemoryNoteV1,
+) -> bool {
+    context.repository_id() == view_repository_id
+        && note.namespace == "default"
+        && note.scope == MemoryScopeV1::Repo
+        && note.visibility == MemoryVisibility::RepoLocal
+        && note.acl_policy_id == REPO_EPISODE_ACL_POLICY_ID
+        && note.compile_record.policy_version == REPO_EPISODE_POLICY_VERSION
+        && note.trust == MemoryTrust::RepoEvidence
+        && note.sensitivity != MemorySensitivity::SecretLike
+}
+
+/// Authorize one evidence reference independently before resolving its source.
+pub(super) fn authorizes_evidence_read(
+    context: &AuthenticatedMemoryContext,
+    view_repository_id: &str,
+    note: &MemoryNoteV1,
+    evidence: &EvidenceRefV1,
+) -> bool {
+    authorizes_note_read(context, view_repository_id, note)
+        && evidence.visibility == EvidenceVisibility::RepoLocal
 }
 
 impl AuthenticatedMemoryContext {
@@ -52,6 +84,21 @@ impl AuthenticatedMemoryContext {
 
     pub(crate) fn actor(&self) -> &ActorRefV1 {
         &self.actor
+    }
+
+    /// Build the repository-local system principal used by trusted Libra
+    /// maintenance and diagnostic adapters.
+    pub(crate) fn repository_system(
+        repository_id: impl Into<String>,
+        principal_id: impl Into<String>,
+    ) -> Result<Self, MemoryWriterError> {
+        Self::new(
+            repository_id,
+            ActorRefV1 {
+                kind: ActorKind::System,
+                principal_id: principal_id.into(),
+            },
+        )
     }
 }
 

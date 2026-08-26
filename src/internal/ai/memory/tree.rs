@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    error::{MemoryWriterError, MemoryWriterErrorKind},
+    error::{MemoryDamagePoint, MemoryWriterError, MemoryWriterErrorKind},
     policy::policy_snapshot_digest,
     validation::{parse_memory_event_v1, parse_memory_note_v1},
 };
@@ -168,6 +168,50 @@ pub(super) fn load_snapshot(
         root_items,
         manifest,
     })
+}
+
+/// Read only the current authoritative manifest for O(1) watermark checks.
+///
+/// This validates the head commit, root shape, manifest contract, and policy,
+/// but deliberately does not enumerate event or note trees. Full closure and
+/// replay validation belongs to `plan_rebuild` / `rebuild --dry-run`.
+pub(super) fn load_head_manifest(
+    storage_path: &Path,
+    head: ObjectHash,
+    policy_version: &str,
+) -> Result<MemoryManifestV1, MemoryWriterError> {
+    let head_damage = MemoryDamagePoint::MemoryHead { oid: head };
+    let commit =
+        load_commit(storage_path, head).map_err(|error| error.with_damage_point(head_damage))?;
+    if commit.parent_commit_ids.len() > 1 {
+        return Err(
+            corrupt("Memory history contains a merge commit").with_damage_point(head_damage)
+        );
+    }
+    let root_items = load_tree(storage_path, commit.tree_id)
+        .map_err(|error| error.with_damage_point(head_damage))?;
+    validate_root_shape(&root_items).map_err(|error| error.with_damage_point(head_damage))?;
+    let manifest = load_manifest(storage_path, &root_items, "head status")
+        .map_err(|error| error.with_damage_point(head_damage))?;
+    if manifest.commit_count == 0 {
+        return Err(
+            corrupt("persisted Memory manifest has no commits").with_damage_point(head_damage)
+        );
+    }
+    let expected_parent_count = usize::from(manifest.commit_count > 1);
+    if commit.parent_commit_ids.len() != expected_parent_count {
+        return Err(
+            corrupt("Memory commit parent count does not match its manifest")
+                .with_damage_point(head_damage),
+        );
+    }
+    if manifest.policy_version != policy_version {
+        return Err(MemoryWriterError::new(
+            MemoryWriterErrorKind::PolicyRejected,
+            "Memory status policy does not match the authoritative history",
+        ));
+    }
+    Ok(manifest)
 }
 
 fn validate_append_edge(
@@ -566,16 +610,22 @@ fn validate_event_edge(
 
     let mut event_ids = HashSet::with_capacity(events.len());
     for (index, item) in events.iter().enumerate() {
-        if item.mode != TreeItemMode::Blob {
-            return Err(corrupt("Memory event entry is not a blob"));
-        }
         let sequence = u64::try_from(index)
             .ok()
             .and_then(|index| index.checked_add(1))
             .ok_or_else(|| corrupt("Memory event index overflowed"))?;
-        let event_id = event_id_from_filename(&item.name, sequence)?;
+        let damage_point = MemoryDamagePoint::EventObject {
+            commit_oid: source_commit_oid,
+            event_seq: sequence,
+            event_oid: item.id,
+        };
+        if item.mode != TreeItemMode::Blob {
+            return Err(corrupt("Memory event entry is not a blob").with_damage_point(damage_point));
+        }
+        let event_id = event_id_from_filename(&item.name, sequence)
+            .map_err(|error| error.with_damage_point(damage_point))?;
         if !event_ids.insert(event_id) {
-            return Err(corrupt("Memory event ID is duplicated"));
+            return Err(corrupt("Memory event ID is duplicated").with_damage_point(damage_point));
         }
     }
 
@@ -600,39 +650,59 @@ fn validate_event_edge(
             .checked_add(u64::try_from(offset).map_err(|_| corrupt("Memory event overflowed"))?)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| corrupt("Memory event sequence overflowed"))?;
-        let event_id = event_id_from_filename(&item.name, sequence)?;
+        let damage_point = MemoryDamagePoint::EventObject {
+            commit_oid: source_commit_oid,
+            event_seq: sequence,
+            event_oid: item.id,
+        };
+        let event_id = event_id_from_filename(&item.name, sequence)
+            .map_err(|error| error.with_damage_point(damage_point))?;
         let (object_type, bytes) =
-            read_git_object_bounded_validated(storage_path, &item.id, 128 * 1024)
-                .map_err(|error| history_error("read MemoryEvent blob", error))?;
+            read_git_object_bounded_validated(storage_path, &item.id, 128 * 1024).map_err(
+                |error| {
+                    history_error("read MemoryEvent blob", error).with_damage_point(damage_point)
+                },
+            )?;
         if object_type != "blob" {
-            return Err(corrupt("Memory event OID does not name a blob"));
+            return Err(
+                corrupt("Memory event OID does not name a blob").with_damage_point(damage_point)
+            );
         }
         let event = parse_memory_event_v1(&bytes).map_err(|error| {
             MemoryWriterError::new(
                 MemoryWriterErrorKind::CorruptHistory,
                 format!("persisted MemoryEvent is invalid: {error}"),
             )
+            .with_damage_point(damage_point)
         })?;
         if event.event_seq != sequence || event.event_id != event_id {
-            return Err(corrupt(
-                "Memory event filename and payload identity disagree",
-            ));
+            return Err(
+                corrupt("Memory event filename and payload identity disagree")
+                    .with_damage_point(damage_point),
+            );
         }
         if event.action != super::domain::MemoryEventAction::TaxonomyExpanded {
-            let note_id = event
-                .note_id
-                .ok_or_else(|| corrupt("Memory revision event has no note ID"))?;
+            let note_id = event.note_id.ok_or_else(|| {
+                corrupt("Memory revision event has no note ID").with_damage_point(damage_point)
+            })?;
             let revision_oid = event
                 .revision_oid
                 .as_deref()
-                .ok_or_else(|| corrupt("Memory revision event has no revision OID"))
-                .and_then(parse_oid)?;
-            let note_bytes = load_note_bytes(storage_path, revision_oid)?;
+                .ok_or_else(|| {
+                    corrupt("Memory revision event has no revision OID")
+                        .with_damage_point(damage_point)
+                })
+                .and_then(|value| {
+                    parse_oid(value).map_err(|error| error.with_damage_point(damage_point))
+                })?;
+            let note_bytes = load_note_bytes(storage_path, revision_oid)
+                .map_err(|error| error.with_damage_point(damage_point))?;
             let note = parse_memory_note_v1(&note_bytes).map_err(|error| {
                 MemoryWriterError::new(
                     MemoryWriterErrorKind::CorruptHistory,
                     format!("event references an invalid MemoryNote revision: {error}"),
                 )
+                .with_damage_point(damage_point)
             })?;
             let expected_path = format!(
                 "{}/{}/{}.json",
@@ -643,7 +713,8 @@ fn validate_event_edge(
             if note.note_id != note_id || notes.blobs.get(&expected_path) != Some(&revision_oid) {
                 return Err(corrupt(
                     "MemoryEvent revision is not reachable from its canonical note path",
-                ));
+                )
+                .with_damage_point(damage_point));
             }
             if matches!(
                 event.action,
@@ -653,9 +724,10 @@ fn validate_event_edge(
                 .insert(expected_path, event.action)
                 .is_some()
             {
-                return Err(corrupt(
-                    "Memory revision is introduced by more than one transition",
-                ));
+                return Err(
+                    corrupt("Memory revision is introduced by more than one transition")
+                        .with_damage_point(damage_point),
+                );
             }
             records.push(MemoryHistoryRecord {
                 source_commit_oid,
@@ -684,9 +756,12 @@ fn validate_event_edge(
             .iter()
             .any(|path| !revision_events.contains_key(path))
     {
-        return Err(corrupt(
-            "Memory note tree additions do not match revision transitions",
-        ));
+        return Err(
+            corrupt("Memory note tree additions do not match revision transitions")
+                .with_damage_point(MemoryDamagePoint::Commit {
+                    oid: source_commit_oid,
+                }),
+        );
     }
     for (path, action) in revision_events {
         let note_prefix = path

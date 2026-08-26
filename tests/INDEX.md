@@ -166,7 +166,7 @@ targets with
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `harness_self_test` | 2 | Smoke-checks the Code UI Web harness (control files, SIGTERM port release) | `tests/harness/` |
-| `code_ui_scenarios` | 2 | End-to-end Web-harness scenarios, including W2-03 `plan_review_modify_next_plain_text_opens_replacement_plan_gate`, `plan_review_empty_revision_note_is_typed_and_preserves_authority`, `plan_review_repository_replacement_after_modify_keeps_revision_note_retryable`, `plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout`, `plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds`, `plan_review_head_drift_survives_resume_and_requires_explicit_modify`, `plan_review_repository_replacement_blocks_modify_and_preserves_gate`, `plan_review_network_allow_enters_runtime_queue`, `plan_review_network_allow_returns_conflict_and_preserves_pending_gate`, and network-gate crash/resume | `src/command/code.rs`, `src/internal/ai/web/`, `src/internal/ai/workflow_baseline.rs` |
+| `code_ui_scenarios` | 2 | End-to-end Web-harness scenarios, including W2-03 plan/review/network recovery and M2-13 `memory_public_cli_lifecycle_after_agent_terminal` (automatic Task Episode compilation, public search/show/status, projection fault injection, dry-run/rebuild, and post-rebuild retrieval) | `src/command/code.rs`, `src/command/memory.rs`, `src/internal/ai/web/`, `src/internal/ai/memory/`, `src/internal/ai/workflow_baseline.rs` |
 | `code_ui_remote_lease_matrix` | 2 | Browser/automation lease lifecycle matrix | `src/command/code.rs` controller, `src/command/code_control.rs` |
 | `code_ui_remote_sse_matrix` | 2 | SSE event stream matrix from web view | `src/internal/ai/web/`, `src/command/code.rs` (axum) |
 | `code_ui_remote_state_matrix` | 2 | Cross-surface state replication matrix, including mid-turn detach/cancel settling | `src/internal/ai/web/code_ui.rs`, `src/command/code_control.rs`, `src/internal/ai/workflow_baseline.rs` |
@@ -355,6 +355,7 @@ workdir on exit.
 | `ai_validation_decision_flow_test` | 2 | Phase D validation and decision derived-record tests | `src/internal/ai/orchestrator/` |
 | `diagnostics_redaction_test` | 2 | Diagnostics logs redaction and sanitization | `src/internal/ai/usage/` |
 | `local_client_test` | 2 | Local Git protocol client working directory restoration on error | `src/internal/protocol/` |
+| `memory_episode_test` | 2 | Repository Memory CLI JSON/error contract and projection rebuild dry-run zero-write checks | `src/command/memory.rs`, `src/internal/ai/memory/` |
 | `publish_ai_export_test` | 2 | Publish pipeline export representation for AI tasks | `src/internal/publish/` |
 | `publish_ai_object_model_contract_test` | 2 | Publish pipeline AI object model contract | `src/internal/publish/` |
 | `publish_incremental_test` | 2 | Publish pipeline incremental sync and state tracking | `src/internal/publish/` |

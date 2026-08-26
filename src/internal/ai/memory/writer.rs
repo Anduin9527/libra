@@ -557,7 +557,7 @@ pub(in crate::internal::ai::memory) mod tests {
     use std::{fs, sync::Arc};
 
     use chrono::{TimeZone, Utc};
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
     use serial_test::serial;
 
     use super::*;
@@ -616,20 +616,43 @@ pub(in crate::internal::ai::memory) mod tests {
     const TEST_CIPHERTEXT: &str = "memory-writer-test-ciphertext";
     const SOURCE_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    pub(in crate::internal::ai::memory) struct Fixture {
-        pub(in crate::internal::ai::memory) _temp: tempfile::TempDir,
-        pub(in crate::internal::ai::memory) database: Arc<DatabaseConnection>,
-        pub(in crate::internal::ai::memory) writer: Arc<MemoryWriter>,
-        pub(in crate::internal::ai::memory) digest: Arc<RepositoryKeyedDigest>,
-        pub(in crate::internal::ai::memory) context: AuthenticatedMemoryContext,
-        pub(in crate::internal::ai::memory) target: TrustedMemoryTarget,
-        pub(in crate::internal::ai::memory) key_id: Uuid,
+    pub(crate) struct Fixture {
+        pub(crate) _temp: tempfile::TempDir,
+        pub(crate) database: Arc<DatabaseConnection>,
+        pub(crate) writer: Arc<MemoryWriter>,
+        pub(crate) digest: Arc<RepositoryKeyedDigest>,
+        pub(crate) context: AuthenticatedMemoryContext,
+        pub(crate) target: TrustedMemoryTarget,
+        pub(crate) key_id: Uuid,
     }
 
-    pub(in crate::internal::ai::memory) async fn fixture() -> Fixture {
+    pub(crate) async fn fixture() -> Fixture {
         let database = Database::connect("sqlite::memory:")
             .await
             .expect("connect test database");
+        let temp = tempfile::tempdir().expect("create object store");
+        build_fixture(database, temp).await
+    }
+
+    pub(crate) async fn file_backed_fixture() -> Fixture {
+        let temp = tempfile::tempdir().expect("create file-backed object store");
+        let database_path = temp.path().join("libra.db");
+        let mut options = ConnectOptions::new(format!(
+            "sqlite://{}?mode=rwc",
+            database_path.to_string_lossy()
+        ));
+        options.max_connections(4);
+        let database = Database::connect(options)
+            .await
+            .expect("connect file-backed test database");
+        database
+            .execute_unprepared("PRAGMA journal_mode = WAL")
+            .await
+            .expect("enable WAL for snapshot concurrency test");
+        build_fixture(database, temp).await
+    }
+
+    async fn build_fixture(database: DatabaseConnection, temp: tempfile::TempDir) -> Fixture {
         database
             .execute_unprepared(include_str!("../../../../sql/sqlite_20260309_init.sql"))
             .await
@@ -659,7 +682,6 @@ pub(in crate::internal::ai::memory) mod tests {
             [7; 32],
             TEST_CIPHERTEXT,
         ));
-        let temp = tempfile::tempdir().expect("create object store");
         fs::create_dir_all(temp.path().join("objects")).expect("create objects directory");
         let writer = Arc::new(
             MemoryWriter::for_tests(

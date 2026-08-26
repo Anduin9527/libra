@@ -31,7 +31,7 @@ pub(super) struct ProjectedCell {
 }
 
 pub(super) async fn read_memory_ref_head(
-    database: &DatabaseConnection,
+    database: &impl ConnectionTrait,
 ) -> Result<Option<ObjectHash>, MemoryWriterError> {
     let rows = database
         .query_all_raw(Statement::from_sql_and_values(

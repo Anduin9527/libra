@@ -349,7 +349,17 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Repository,
         rationale: "approvals and append-only logs (repo-wide by design, §C.4.1.1)",
     },
-    // ── Memory projections and local compiler state (M2) ────────────────
+    // ── Shared context-selection audit and Memory state (M2) ────────────
+    MutableStateSurface {
+        table: "context_selection_receipt",
+        owner: StateOwner::Repository,
+        rationale: "append-only context-selection receipts audit repository-scoped Agent inputs",
+    },
+    MutableStateSurface {
+        table: "context_selection_receipt_retention",
+        owner: StateOwner::Repository,
+        rationale: "repository-wide retention watermark bounds the shared receipt ledger",
+    },
     MutableStateSurface {
         table: "memory_compile_job",
         owner: StateOwner::Repository,
@@ -563,6 +573,7 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "agent_usage_stats__rebuild",
     "approved_permission_provenance_down_guard",
     "bisect_state__down_guard_2026072301",
+    "context_selection_receipt_down_guard",
     "head_scope_unique_guard",
     "layer__down_guard_2026072303",
     "layer__legacy_rows_need_explicit_adopt_2026072303",

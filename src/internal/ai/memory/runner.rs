@@ -79,7 +79,7 @@ impl<'a> EpisodeGenerationRunner<'a> {
         })
     }
 
-    pub(crate) async fn run_one<T: EpisodeCompiler, I: EpisodeCompiler>(
+    pub(crate) async fn run_one<T: EpisodeCompiler + ?Sized, I: EpisodeCompiler + ?Sized>(
         &self,
         compilers: &EpisodeCompilerSet<'_, T, I>,
         owner: &str,

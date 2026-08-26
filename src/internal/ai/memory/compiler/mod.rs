@@ -106,14 +106,14 @@ pub(crate) trait EpisodeCompiler: Send + Sync {
 /// One repository worker consumes a mixed Task/Intent queue. This pair keeps
 /// each adapter's frozen configuration beside it so a claimed root can never
 /// be sent through the wrong prompt contract.
-pub(crate) struct EpisodeCompilerSet<'a, T, I> {
+pub(crate) struct EpisodeCompilerSet<'a, T: ?Sized, I: ?Sized> {
     task_compiler: &'a T,
     task_config: &'a EpisodeCompileConfig,
     intent_compiler: &'a I,
     intent_config: &'a EpisodeCompileConfig,
 }
 
-impl<'a, T, I> EpisodeCompilerSet<'a, T, I> {
+impl<'a, T: ?Sized, I: ?Sized> EpisodeCompilerSet<'a, T, I> {
     pub(crate) const fn new(
         task_compiler: &'a T,
         task_config: &'a EpisodeCompileConfig,

@@ -471,6 +471,16 @@ pub(crate) fn normalize_plain_text_v1(input: &str) -> Result<BoundMatchQuery, Me
     Ok(BoundMatchQuery(literals.join(" OR ")))
 }
 
+/// Validate the public plain-text search contract without touching SQLite.
+///
+/// Command adapters call this before checking whether a repository currently
+/// has any Memory. That keeps invalid-query behavior independent of repository
+/// contents while leaving the normalized FTS expression private to this
+/// module.
+pub(crate) fn validate_plain_text_query(input: &str) -> Result<(), MemoryFtsError> {
+    normalize_plain_text_v1(input).map(|_| ())
+}
+
 struct StoredSearchDocument {
     rowid: i64,
     goal: String,
@@ -588,6 +598,52 @@ pub(crate) async fn delete_document(
         return Err(MemoryFtsError::CorruptProjection);
     }
     Ok(true)
+}
+
+/// Remove only the FTS documents owned by one projection scope.
+///
+/// The FTS5 table is external-content, so deleting content rows directly would
+/// leave stale postings behind. Resolve the scope through the authoritative
+/// revision projection, issue one FTS5 delete command per stored document, and
+/// then remove the matching content row in the same transaction.
+pub(crate) async fn delete_scope_documents(
+    transaction: &MemoryWriteTransaction,
+    scope_key: &str,
+) -> Result<u64, MemoryFtsError> {
+    let database = transaction.as_database_transaction();
+    let rows = database
+        .query_all_raw(Statement::from_sql_and_values(
+            database.get_database_backend(),
+            "SELECT d.note_id, d.revision_oid
+             FROM memory_episode_search_doc AS d
+             INNER JOIN memory_revision_index AS r
+                ON r.note_id = d.note_id AND r.revision_oid = d.revision_oid
+             WHERE r.scope_key = ?
+             ORDER BY d.note_id, d.revision_oid",
+            [scope_key.into()],
+        ))
+        .await?;
+    let mut deleted = 0_u64;
+    for row in rows {
+        let note_id: String = row
+            .try_get("", "note_id")
+            .map_err(|_| MemoryFtsError::CorruptProjection)?;
+        let revision_oid: String = row
+            .try_get("", "revision_oid")
+            .map_err(|_| MemoryFtsError::CorruptProjection)?;
+        let note_id = note_id
+            .parse()
+            .map_err(|_| MemoryFtsError::CorruptProjection)?;
+        let revision_oid = revision_oid
+            .parse()
+            .map_err(|_| MemoryFtsError::CorruptProjection)?;
+        if delete_document(transaction, note_id, revision_oid).await? {
+            deleted = deleted
+                .checked_add(1)
+                .ok_or(MemoryFtsError::CorruptProjection)?;
+        }
+    }
+    Ok(deleted)
 }
 
 pub(crate) async fn rebuild_index(

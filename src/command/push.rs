@@ -3732,7 +3732,8 @@ mod test {
         assert!(matches!(
             validate_push_args(&args),
             Err(PushError::InvalidArguments(message))
-                if message == "repository-only push requires a refspec, --tags, or --mirror"
+                if message
+                    == "repository-only push requires a refspec, --tags, --all, or --mirror"
         ));
 
         let args = PushArgs::parse_from(["push", "-u", "origin", "main", "topic"]);

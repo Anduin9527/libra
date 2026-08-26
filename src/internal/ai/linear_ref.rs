@@ -18,7 +18,7 @@ use tokio::time::sleep;
 
 use crate::internal::{
     ai::history::AI_REF,
-    branch::{LEGACY_TRACES_BRANCH, TRACES_BRANCH},
+    branch::{INTENT_BRANCH, LEGACY_TRACES_BRANCH, TRACES_BRANCH},
     model::reference::{self, ConfigKind},
 };
 
@@ -128,7 +128,7 @@ impl OwnedRefSpec {
     /// Classify an exact name as stored in the local `reference` table.
     pub(crate) fn for_storage_name(name: &str) -> Option<Self> {
         match name {
-            AI_REF => Some(Self::AiHistory),
+            AI_REF | INTENT_BRANCH => Some(Self::AiHistory),
             TRACES_BRANCH => Some(Self::Traces),
             LEGACY_TRACES_BRANCH => Some(Self::LegacyTraces),
             "libra/memory/repo" => Some(Self::MemoryRepo),
@@ -139,7 +139,7 @@ impl OwnedRefSpec {
     /// Classify an exact fully-qualified ref name.
     pub(crate) fn for_full_ref(name: &str) -> Option<Self> {
         match name {
-            "refs/heads/libra/intent" => Some(Self::AiHistory),
+            "refs/heads/libra/intent" | "refs/heads/intent" => Some(Self::AiHistory),
             "refs/libra/traces" => Some(Self::Traces),
             "refs/libra/agent-traces" => Some(Self::LegacyTraces),
             "refs/heads/libra/memory/repo" => Some(Self::MemoryRepo),
@@ -487,6 +487,16 @@ mod tests {
             OwnedRefSpec::for_history_storage_name("libra/memory/repo-user"),
             None
         );
+        for name in [
+            INTENT_BRANCH,
+            "refs/heads/intent",
+            AI_REF,
+            "refs/heads/libra/intent",
+        ] {
+            let spec =
+                OwnedRefSpec::for_storage_name(name).or_else(|| OwnedRefSpec::for_full_ref(name));
+            assert_eq!(spec, Some(OwnedRefSpec::AiHistory));
+        }
     }
 
     #[test]
