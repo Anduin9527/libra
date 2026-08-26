@@ -406,6 +406,9 @@ jobs:
             --test code_codex_runtime_test \
             --test code_ui_remote_lease_matrix \
             --test code_ui_remote_sse_matrix \
+            --test code_ui_remote_state_matrix \
+            --test code_mcp_dual_entry_test \
+            --test code_ui_perf_smoke_test \
             -- --test-threads=1
 
       # lore.md 1.7: the OTLP wire test needs the feature compiled in

@@ -515,7 +515,10 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
         .context("build MCP consistency client")?;
     let mcp_session_id = mcp_initialize(&client, &mcp_url)?;
 
-    let mut events = session.open_event_stream()?;
+    // This assertion inspects the legacy full-session transcript envelope;
+    // DF-05 keeps it as an explicit v1 compatibility case while the SSE
+    // matrix owns default-v2 projection/cursor coverage.
+    let mut events = session.open_event_stream_v1()?;
     session.attach_automation("code-mcp-web-message-consistency")?;
 
     let marker = "mcp-dual-web-observe-marker";
@@ -569,7 +572,9 @@ fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
         .build()
         .context("build MCP consistency client")?;
     let mcp_session_id = mcp_initialize(&client, &mcp_url)?;
-    let mut events = session.open_event_stream()?;
+    // This reverse-direction assertion also needs the legacy full snapshot;
+    // keep the v1 request explicit so it cannot mask the harness v2 default.
+    let mut events = session.open_event_stream_v1()?;
 
     let marker = "mcp-originated-create-task-marker";
     let title = format!("MCP task {marker}");

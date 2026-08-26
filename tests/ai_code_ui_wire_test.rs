@@ -1356,14 +1356,23 @@ fn code_ui_browser_resume_contract() {
 #[test]
 fn sse_wire_version_negotiation() {
     use axum::http::{HeaderMap, HeaderValue, header};
-    use libra::internal::ai::web::sse_wire::{
-        CodeEventsQuery, CodeUiSseWireVersion, parse_code_events_wire_version,
+    use libra::{
+        command::code_control::BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
+        internal::ai::web::sse_wire::{
+            CodeEventsQuery, CodeUiSseWireVersion, parse_code_events_wire_version,
+        },
     };
 
     let headers = HeaderMap::new();
     assert_eq!(
+        BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
+        CodeUiSseWireVersion::V2.as_u8(),
+        "built-in automation must explicitly consume v2"
+    );
+    assert_eq!(
         parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
-        CodeUiSseWireVersion::V1
+        CodeUiSseWireVersion::V1,
+        "DF-05 must not change the server's omitted-wire default"
     );
     for (raw, expected) in [
         ("1", CodeUiSseWireVersion::V1),

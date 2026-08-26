@@ -100,7 +100,7 @@ The stdio client speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and maps 
 | JSON-RPC method | HTTP equivalent |
 |-----------------|-----------------|
 | `session.get` | `GET /api/code/session` |
-| `events.subscribe` | `GET /api/code/events` as JSON-RPC notifications |
+| `events.subscribe` | `GET /api/code/events?wire=2&cursor=<last>`; accepts optional params `{ "cursor": <last acknowledged v2 cursor> }` and acknowledges `{ subscribed, requestedWire, requestedCursor }` before forwarding events. `requestedWire` is the requested version, not a negotiated-version guarantee. Omitting params is the cursor-0 initial bootstrap. On `WIRE_V2_RESYNC_REQUIRED`, the client fetches `/session`, emits one enriched `resync` notification whose data includes `snapshot`, then reconnects at the server-provided `durableTail`. Exact `409 WIRE_V2_CURSOR_AHEAD` means the cursor belongs to a later/different session; the client emits the same snapshot recovery with code `WIRE_V2_CURSOR_AHEAD`, drops that cursor, and restarts v2 from 0. If the server instead returns exact `503 WIRE_V2_REQUIRES_DURABLE_SESSION`, the client retries once with `?wire=1` and forwards legacy snapshot notifications. |
 | `diagnostics.get` | `GET /api/code/diagnostics` |
 | `controller.attach` | `POST /api/code/controller/attach` |
 | `controller.detach` | `POST /api/code/controller/detach` |
@@ -113,6 +113,23 @@ The stdio client speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and maps 
 | `goal.cancel` | `POST /api/code/goal/cancel` |
 
 Malformed JSON maps to JSON-RPC `-32700`. Unknown methods map to `-32601`. Invalid params map to `-32602`. HTTP 4xx/5xx errors map to `-32000` with `data.status` and `data.code`, preserving Libra errors such as `INVALID_CONTROL_TOKEN`, `INVALID_CONTROLLER_TOKEN`, `CONTROLLER_CONFLICT`, and `INTERACTION_NOT_ACTIVE`.
+
+Automation that performs side effects from v2 notifications must persist the
+last acknowledged `params.data.cursor`, must deduplicate by `eventId`, and must
+pass that cursor to the next `events.subscribe` for the same `sessionId`.
+Cursors are session-scoped: after a session restart/change, discard the old
+cursor (the client also recovers exact `WIRE_V2_CURSOR_AHEAD` by snapshot plus
+cursor-0 restart). Omitting the cursor intentionally replays retained durable
+history from 0 and is only for initial bootstrap; treating replayed
+notifications as new actions can repeat downstream effects.
+
+A `resync` notification marks a workflow-event gap: events in
+`(lastCursor, durableTail]` are skipped when the client reconnects at
+`durableTail`. Its attached session snapshot represents current projected
+state; it does not reconstruct the skipped workflow kinds. Consumers must
+reconcile their state from that snapshot/`session.get`, must not assume cursor
+continuity across resync, and must not use this notification stream as an
+exactly-once side-effect log.
 
 ### Web Browser Control
 
@@ -268,10 +285,10 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 | Explicit v1 | `?wire=1` or `?wire=v1` |
 | Explicit v2 | `?wire=2` or `?wire=v2` |
 | Accept hint | `Accept: text/event-stream;libra-wire=2` (query `wire=` wins if both are set) |
-| Default (unspecified) | **v1** for clients that omit `wire` / `libra-wire`. The built-in SPA (W3-09) always requests `?wire=2`. |
+| Default (unspecified) | The server remains **v1** for clients that omit `wire` / `libra-wire`. The built-in SPA (W3-09) and `libra code --control stdio` automation client explicitly request `?wire=2`. |
 | Illegal values | fail-closed `400 INVALID_WIRE_VERSION` |
 
-**SSE v1** (default): `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and
+**SSE v1** (server default when unspecified): `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and
 `data`. Event `type` is `session_updated`, `status_changed`, or
 `controller_changed`; `session_updated` carries a full `CodeUiSessionSnapshot`.
 
@@ -421,13 +438,19 @@ release after wire v2 becomes the default and the built-in frontend/automation
 clients have migrated. Physical removal of v1 is **not** part of plan-20260715;
 see DEFER-08 / ADR-CODE-08. Removal preconditions (checklist; all required):
 
-1. Built-in frontend migrated to v2 (W3-09 evidence): the SPA
+1. [x] Built-in frontend migrated to v2 (W3-09 evidence): the SPA
    opens `GET /api/code/events?wire=2` from `sse-resilience` (`wrapClientForSseResilience`),
    reconnects with `cursor` from the wire, and treats `event: resync` /
    `WIRE_V2_RESYNC_REQUIRED` as one explicit snapshot pull (W2-15 UI). Cursor/seq
    are never invented client-side.
-2. Built-in automation clients migrated to v2.
-3. Compat / matrix tests consume v2 by default.
+2. [x] Built-in automation clients migrated to v2 (DF-05 evidence):
+   `libra code --control stdio` appends `?wire=2&cursor=<last>` for
+   `events.subscribe`, lets callers resume from an acknowledged cursor, and
+   handles `WIRE_V2_RESYNC_REQUIRED` / `WIRE_V2_CURSOR_AHEAD` with explicit
+   snapshot reconciliation and bounded reconnect behavior.
+3. [x] Compat / matrix tests consume v2 by default (DF-05 evidence):
+   `code_ui_remote_sse_matrix` defaults `openEvents` to wire v2, while the
+   initial-snapshot and controller-change compatibility cases explicitly use v1.
 4. Release notes name the last v1-supporting version and the upgrade path.
 5. At least one successful public patch release after (1)–(4) while v1 still works.
 

@@ -19,7 +19,10 @@ use anyhow::Result;
 #[cfg(feature = "test-provider")]
 use harness::CodeSession;
 #[cfg(feature = "test-provider")]
-use harness::matrix::{Case, CaseFile, build_session_options, find_case, load_case_file};
+use harness::matrix::{
+    Case, CaseFile, DEFAULT_SSE_WIRE_VERSION, Step, build_session_options, find_case,
+    load_case_file,
+};
 #[cfg(feature = "test-provider")]
 use serial_test::serial;
 
@@ -37,6 +40,37 @@ fn run_sse_case(case_name: &str) -> Result<()> {
     let shutdown = session.shutdown();
     outcome?;
     shutdown
+}
+
+#[cfg(feature = "test-provider")]
+#[test]
+fn sse_matrix_defaults_to_v2_and_keeps_explicit_v1_compatibility() -> Result<()> {
+    let file_path = harness::matrix::data_path(CASE_FILE_PATH);
+    let file: CaseFile = load_case_file(&file_path)?;
+    assert_eq!(DEFAULT_SSE_WIRE_VERSION, 2);
+
+    let v2_case = find_case(
+        &file,
+        "sse_emits_status_changed_when_submit_starts_thinking",
+    )?;
+    assert!(
+        v2_case
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::OpenEvents { wire: 2, .. }))
+    );
+
+    let v1_case = find_case(
+        &file,
+        "sse_initial_connect_replays_session_updated_with_full_snapshot",
+    )?;
+    assert!(
+        v1_case
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::OpenEvents { wire: 1, .. }))
+    );
+    Ok(())
 }
 
 #[cfg(feature = "test-provider")]
@@ -66,11 +100,11 @@ sse_case!(sse_initial_connect_replays_session_updated_with_full_snapshot);
 #[cfg(feature = "test-provider")]
 sse_case!(sse_emits_status_changed_when_submit_starts_thinking);
 #[cfg(feature = "test-provider")]
-sse_case!(sse_emits_session_updated_after_assistant_completion);
+sse_case!(sse_emits_code_workflow_after_assistant_completion);
 #[cfg(feature = "test-provider")]
 sse_case!(sse_emits_controller_changed_on_attach_and_detach);
 #[cfg(feature = "test-provider")]
-sse_case!(sse_two_concurrent_subscribers_receive_status_changed);
+sse_case!(sse_two_concurrent_subscribers_receive_code_workflow);
 #[cfg(feature = "test-provider")]
 sse_case!(sse_reconnect_initial_replay_contains_latest_transcript);
 #[cfg(feature = "test-provider")]

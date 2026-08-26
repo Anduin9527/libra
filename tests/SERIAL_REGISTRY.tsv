@@ -4,7 +4,7 @@ test_fn	lane	reason
 <site:tests/code_ui_remote_lease_matrix.rs:40>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 <site:tests/code_ui_remote_model_generation_matrix.rs:86>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 <site:tests/code_ui_remote_security_matrix.rs:57>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<site:tests/code_ui_remote_sse_matrix.rs:46>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_sse_matrix.rs:80>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 <site:tests/code_ui_remote_state_matrix.rs:52>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_checkpoint_subagent_scope_listed_and_linked	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -21,7 +21,6 @@ chunking_large_transcript_splits_line_safe	lane:env	mutates process-wide environ
 cloud_full_workflow_end_to_end	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 cloud_sync_name_conflict	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 cloud_tombstone_propagates_for_agent_capture	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
-concurrent_reclaims_hand_out_only_the_fence_they_wrote	lane:workspace_failpoints	installs process-wide failpoints
 d1_batch	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 d1_connection	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 d1_ensure_table	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests

@@ -20,7 +20,16 @@ endpoint from `.libra/code/control.json` by default:
 The JSON-RPC methods (`controller.attach`, `message.submit`,
 `events.subscribe`, `diagnostics.get`, …) and the JSON-RPC error mapping are
 unchanged; they are documented in [`code.md`](code.md) under "Local Automation
-Control". Do not confuse `--control stdio` with the deprecated MCP-only
+Control". `events.subscribe` explicitly requests SSE wire v2 and accepts an
+optional last-acknowledged cursor (`?wire=2&cursor=<last>`); omitted params are
+the cursor-0 bootstrap. Cursors are session-scoped. A v2 resync fetches one
+session snapshot and reconnects at the server-provided durable tail; this marks
+a workflow-event gap, so consumers must reconcile snapshot state and deduplicate
+side effects by event ID. An ahead cursor is dropped after the same snapshot
+recovery and v2 restarts from zero. If the server has no durable session store and returns
+`WIRE_V2_REQUIRES_DURABLE_SESSION`, the client retries once with explicit v1;
+the server's omitted-wire default remains v1 for compatibility. Do not confuse
+`--control stdio` with the deprecated MCP-only
 `libra code --stdio` transport (tools/resources; a dedicated
 `libra mcp --stdio` is planned after W5, DEFER-02).
 

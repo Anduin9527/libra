@@ -91,6 +91,7 @@
           "name": "open stream",
           "op": "openEvents",
           "stream": "events",
+          "wire": 1,
           "timeoutMs": 5000
         },
         {

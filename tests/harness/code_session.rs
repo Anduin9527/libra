@@ -464,7 +464,10 @@ impl CodeSession {
         self.get_json("/session")
     }
 
-    /// Open a blocking SSE subscription against `/api/code/events`.
+    /// Open the built-in compatibility client's default SSE v2 subscription.
+    ///
+    /// Tests that intentionally pin the legacy snapshot contract must call
+    /// [`Self::open_event_stream_v1`] explicitly.
     /// The returned [`super::EventStream`] reads events on a worker
     /// thread; per-event timeouts are configured by the caller.
     ///
@@ -473,6 +476,28 @@ impl CodeSession {
     /// (state / generation / approval) that need to observe runtime
     /// notifications without polling `/session`.
     pub fn open_event_stream(&self) -> Result<super::EventStream> {
+        self.open_event_stream_with_wire(2, None)
+    }
+
+    /// Explicit legacy snapshot-wire compatibility subscription.
+    pub fn open_event_stream_v1(&self) -> Result<super::EventStream> {
+        self.open_event_stream_with_wire(1, None)
+    }
+
+    /// Open a versioned SSE subscription, optionally resuming after a durable
+    /// v2 cursor. Matrix case files use this seam so omitted `wire` defaults to
+    /// v2 while the one compatibility case can name v1 explicitly.
+    pub fn open_event_stream_with_wire(
+        &self,
+        wire: u8,
+        cursor: Option<u64>,
+    ) -> Result<super::EventStream> {
+        if wire != 1 && wire != 2 {
+            bail!("test SSE wire must be 1 or 2 (got {wire})");
+        }
+        if wire == 1 && cursor.is_some() {
+            bail!("test SSE cursor is only valid with wire 2");
+        }
         // Use a dedicated client with no overall timeout so the SSE
         // long-poll isn't cut off by the harness's default 5 s
         // request budget. Per-event timeouts are enforced by
@@ -481,7 +506,10 @@ impl CodeSession {
             .timeout(None)
             .build()
             .context("failed to build SSE HTTP client")?;
-        let url = self.url("/events");
+        let mut url = format!("{}?wire={wire}", self.url("/events"));
+        if let Some(cursor) = cursor {
+            url.push_str(&format!("&cursor={cursor}"));
+        }
         super::EventStream::open(&client, &url, None)
     }
 

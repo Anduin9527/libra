@@ -245,7 +245,7 @@
       "fixture": {
         "path": "tests/data/code_ui_remote/provider_fixtures/tool_call_chat.json"
       },
-      "notes": "Use this only after the runner proves the fake tool-call fixture does not loop. If it is flaky, move the cancellation assertion to L1.",
+      "notes": "Registered by DF-05 to pin the deterministic fake tool-call fixture to its explicit wire-v1 status-event compatibility contract.",
       "steps": [
         {
           "name": "attach automation",
@@ -262,6 +262,7 @@
           "name": "open stream",
           "op": "openEvents",
           "stream": "events",
+          "wire": 1,
           "timeoutMs": 5000
         },
         {

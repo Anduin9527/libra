@@ -56,9 +56,9 @@ macro_rules! state_case {
     };
 }
 
-// Wave 7 — full P1 state matrix. The P2 tool-phase case is
-// deferred per the JSON `notes` block; flip it on once the tool
-// fixture stabilises.
+// Wave 7 — full P1 state matrix plus the deterministic P2 tool-phase
+// compatibility case. DF-05 wires the latter so its explicit v1 event-name
+// contract cannot drift when the shared OpenEvents default changes.
 #[cfg(feature = "test-provider")]
 state_case!(state_two_clients_attach_serial_ok_after_detach);
 #[cfg(feature = "test-provider")]
@@ -73,6 +73,8 @@ state_case!(state_payload_at_256_kib_boundary_is_accepted);
 state_case!(state_payload_at_257_kib_returns_413);
 #[cfg(feature = "test-provider")]
 state_case!(state_payload_at_drain_limit_1_mib_returns_413_without_hanging);
+#[cfg(feature = "test-provider")]
+state_case!(state_tool_call_fixture_reaches_tool_phase_or_deferred_l1);
 
 #[cfg(feature = "test-provider")]
 #[test]

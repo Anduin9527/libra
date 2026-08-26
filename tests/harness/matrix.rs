@@ -230,6 +230,10 @@ pub enum Step {
     OpenEvents {
         name: String,
         stream: String,
+        #[serde(default = "default_sse_wire_version")]
+        wire: u8,
+        #[serde(default)]
+        cursor: Option<u64>,
         #[serde(default = "default_event_timeout_ms", rename = "timeoutMs")]
         timeout_ms: u64,
         #[serde(default, rename = "closeImmediately")]
@@ -447,6 +451,14 @@ pub enum Step {
 
 fn default_event_timeout_ms() -> u64 {
     5_000
+}
+
+/// DF-05: compatibility matrices consume durable delta/cursor wire v2 unless
+/// a case explicitly opts into the legacy snapshot wire.
+pub const DEFAULT_SSE_WIRE_VERSION: u8 = 2;
+
+fn default_sse_wire_version() -> u8 {
+    DEFAULT_SSE_WIRE_VERSION
 }
 
 /// 10 s default for `Step::RunRepoCommand` — matches the smoke
@@ -881,9 +893,11 @@ impl CaseRuntime<'_> {
             Step::WaitSnapshot { expect, .. } => self.run_wait_snapshot(expect),
             Step::OpenEvents {
                 stream,
+                wire,
+                cursor,
                 close_immediately,
                 ..
-            } => self.run_open_events(stream, *close_immediately),
+            } => self.run_open_events(stream, *wire, *cursor, *close_immediately),
             Step::ExpectEvent {
                 stream,
                 event,
@@ -972,14 +986,20 @@ impl CaseRuntime<'_> {
         }
     }
 
-    fn run_open_events(&mut self, stream: &str, close_immediately: bool) -> Result<()> {
+    fn run_open_events(
+        &mut self,
+        stream: &str,
+        wire: u8,
+        cursor: Option<u64>,
+        close_immediately: bool,
+    ) -> Result<()> {
         // Open the SSE subscription. The downstream Wave 2 case
         // `sse_reconnect_initial_replay_contains_latest_transcript`
         // depends on `closeImmediately` to consume the initial
         // replay then drop the stream before any later submit.
         let mut event_stream = self
             .session
-            .open_event_stream()
+            .open_event_stream_with_wire(wire, cursor)
             .with_context(|| format!("failed to open SSE stream '{stream}'"))?;
         if close_immediately {
             event_stream.close();
@@ -1028,6 +1048,7 @@ impl CaseRuntime<'_> {
                 self.case_name, received.event
             )
         })?;
+        validate_v2_event_shape(&received, &payload)?;
         for assertion in &expect.assertions {
             evaluate_event_assertion(assertion, &received, &payload).with_context(|| {
                 format!(
@@ -1088,6 +1109,7 @@ impl CaseRuntime<'_> {
                 Some(event) => event,
                 None => continue,
             };
+            reject_v2_control_event(&event)?;
             if event.event != target_event {
                 continue;
             }
@@ -1097,6 +1119,7 @@ impl CaseRuntime<'_> {
                     self.case_name, event.event
                 )
             })?;
+            validate_v2_event_shape(&event, &payload)?;
             let mut all_ok = true;
             for assertion in &expect.assertions {
                 if let Err(error) = evaluate_event_assertion(assertion, &event, &payload) {
@@ -1127,22 +1150,16 @@ impl CaseRuntime<'_> {
             )
         })?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        // Wave 4 fix: the initial-replay `session_updated` is
-        // always emitted with the snapshot at subscription time —
-        // for a fresh session that's `status=idle, transcript=[]`.
-        // Treating that initial idle as terminal would exit before
-        // any streaming chunks arrive.
-        //
-        // Codex pass-1 P2 fix: the runtime emits `status_changed`
-        // for status flips (see code_ui.rs `set_status`), NOT
-        // `session_updated`. So the terminal "idle" signal we wait
-        // for is a `status_changed` event whose snapshot has
-        // `status == idle`, observed AFTER we've seen at least
-        // one non-idle status_changed (which marks the start of
-        // the turn). This avoids relying on timeout to terminate
-        // the collector and unblocks fast/no-op runtimes too.
+        // The initial replay can be idle before a submitted turn starts,
+        // so only treat idle as terminal after a non-idle status. Wire v1
+        // publishes the final transcript snapshot before its terminal idle
+        // event. Wire v2 projection deltas are independently persisted and
+        // can arrive in the opposite order, so v2 must also observe the
+        // completed assistant projection before collection finishes.
         let mut collected: Vec<Value> = Vec::new();
         let mut saw_non_idle = false;
+        let mut saw_idle = false;
+        let mut saw_completed_assistant = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1152,7 +1169,11 @@ impl CaseRuntime<'_> {
                 Some(event) => event,
                 None => break,
             };
-            if event.event != "session_updated" && event.event != "status_changed" {
+            reject_v2_control_event(&event)?;
+            if event.event != "session_updated"
+                && event.event != "status_changed"
+                && event.event != "code_workflow"
+            {
                 continue;
             }
             let payload = parse_event_data(&event).with_context(|| {
@@ -1161,31 +1182,48 @@ impl CaseRuntime<'_> {
                     self.case_name, event.event,
                 )
             })?;
-            let is_idle = payload
+            validate_v2_event_shape(&event, &payload)?;
+            let status = payload
                 .pointer("/data/status")
                 .and_then(Value::as_str)
-                .is_some_and(|status| status == "idle");
+                .or_else(|| projection_payload(&payload, "status").and_then(Value::as_str));
+            let is_idle = status.is_some_and(|status| status == "idle");
             // Track the turn lifecycle from BOTH event streams.
             // status_changed: thinking flips the gate; the
             // matching status_changed: idle (which fires after
             // every transcript mutation has already produced its
             // session_updated) closes the collection.
-            if !is_idle {
+            if status.is_some_and(|status| status != "idle") {
                 saw_non_idle = true;
             }
-            // Only collect session_updated payloads — that's the
-            // shape the multi-event assertions look at. The
-            // status_changed events are observed purely for the
-            // terminal-idle signal and dropped from the buffer.
-            if event.event == "session_updated" {
+            if is_idle {
+                saw_idle = true;
+            }
+            let transcript_projection = projection_payload(&payload, "transcript_upsert");
+            if transcript_projection.is_some_and(|entry| {
+                entry.pointer("/kind").and_then(Value::as_str) == Some("assistant_message")
+                    && entry.pointer("/status").and_then(Value::as_str) == Some("completed")
+                    && !entry
+                        .pointer("/content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .is_empty()
+            }) {
+                saw_completed_assistant = true;
+            }
+            let is_v1_snapshot = event.event == "session_updated";
+            if is_v1_snapshot || transcript_projection.is_some() {
                 collected.push(payload);
-            } else if is_idle && saw_non_idle {
+            }
+            if saw_non_idle
+                && ((is_v1_snapshot && is_idle) || (saw_idle && saw_completed_assistant))
+            {
                 break;
             }
         }
         if collected.is_empty() {
             bail!(
-                "case '{}' collected zero session_updated events on '{stream}' within {timeout_ms}ms",
+                "case '{}' collected zero transcript projection events on '{stream}' within {timeout_ms}ms",
                 self.case_name,
             );
         }
@@ -2048,6 +2086,40 @@ fn parse_event_data(event: &SseEvent) -> Result<Value> {
         .with_context(|| format!("failed to parse SSE data as JSON: {}", event.data))
 }
 
+fn reject_v2_control_event(event: &SseEvent) -> Result<()> {
+    if event.event == "resync" || event.event == "error" {
+        bail!(
+            "wire v2 stream emitted fail-closed control event '{}': {}",
+            event.event,
+            event.data
+        );
+    }
+    Ok(())
+}
+
+fn validate_v2_event_shape(event: &SseEvent, payload: &Value) -> Result<()> {
+    if event.event != "code_workflow" {
+        return Ok(());
+    }
+    let cursor = payload.get("cursor").and_then(Value::as_u64);
+    let kind = payload.get("kind").and_then(Value::as_str);
+    if cursor.is_none() || kind.is_none() {
+        bail!("wire v2 code_workflow event must carry numeric cursor and string kind: {payload}");
+    }
+    Ok(())
+}
+
+fn projection_payload<'a>(payload: &'a Value, projection: &str) -> Option<&'a Value> {
+    let expected = format!("code_ui_projection_delta:{projection}");
+    (payload.get("kind").and_then(Value::as_str) == Some(expected.as_str()))
+        .then(|| payload.pointer("/payload/payload"))
+        .flatten()
+}
+
+fn transcript_projection_entry(payload: &Value) -> Option<&Value> {
+    projection_payload(payload, "transcript_upsert")
+}
+
 fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) -> Result<()> {
     match assertion {
         "event_data_has_transcript_array" => {
@@ -2070,6 +2142,7 @@ fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) 
             let status = payload
                 .pointer("/data/status")
                 .and_then(Value::as_str)
+                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
                 .unwrap_or("");
             if status != "thinking" {
                 bail!("expected /data/status == 'thinking', got '{status}'");
@@ -2079,15 +2152,31 @@ fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) 
             let status = payload
                 .pointer("/data/status")
                 .and_then(Value::as_str)
+                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
                 .unwrap_or("");
             if status != "idle" {
                 bail!("expected /data/status == 'idle', got '{status}'");
+            }
+        }
+        "event_data_status_executing_tool" => {
+            let status = payload
+                .pointer("/data/status")
+                .and_then(Value::as_str)
+                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
+                .unwrap_or("");
+            if status != "executing_tool" {
+                bail!("expected /data/status == 'executing_tool', got '{status}'");
             }
         }
         "event_data_controller_kind_automation" => {
             let kind = payload
                 .pointer("/data/controller/kind")
                 .and_then(Value::as_str)
+                .or_else(|| {
+                    projection_payload(payload, "controller")?
+                        .get("kind")
+                        .and_then(Value::as_str)
+                })
                 .unwrap_or("");
             if kind != "automation" {
                 bail!("expected /data/controller.kind == 'automation', got '{kind}'");
@@ -2098,6 +2187,11 @@ fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) 
             let kind = payload
                 .pointer("/data/controller/kind")
                 .and_then(Value::as_str)
+                .or_else(|| {
+                    projection_payload(payload, "controller")?
+                        .get("kind")
+                        .and_then(Value::as_str)
+                })
                 .unwrap_or("");
             if kind != "none" {
                 bail!("expected /data/controller.kind 'none', got '{kind}'");
@@ -2105,11 +2199,18 @@ fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) 
         }
         other if other.starts_with("event_transcript_contains:") => {
             let needle = other.trim_start_matches("event_transcript_contains:");
-            let transcript = payload
+            let haystack = if let Some(transcript) = payload
                 .pointer("/data/transcript")
                 .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("payload missing /data/transcript array"))?;
-            let haystack = serde_json::to_string(transcript).unwrap_or_default();
+            {
+                serde_json::to_string(transcript).unwrap_or_default()
+            } else if let Some(entry) = transcript_projection_entry(payload) {
+                serde_json::to_string(entry).unwrap_or_default()
+            } else {
+                return Err(anyhow!(
+                    "payload missing a v1 transcript or v2 transcript_upsert projection"
+                ));
+            };
             if !haystack.contains(needle) {
                 bail!("transcript did not contain '{needle}'; serialised transcript:\n{haystack}");
             }
@@ -2140,21 +2241,34 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
             // streaming pipeline.
             let mut prev: Option<String> = None;
             for (idx, payload) in collected.iter().enumerate() {
-                let transcript = payload
+                let assistant_content = payload
                     .pointer("/data/transcript")
                     .and_then(Value::as_array)
-                    .ok_or_else(|| anyhow!("payload #{idx} missing /data/transcript array"))?;
-                let assistant_content = transcript.iter().rev().find_map(|entry| {
-                    let kind = entry.pointer("/kind").and_then(Value::as_str).unwrap_or("");
-                    if kind == "assistant_message" {
-                        entry
-                            .pointer("/content")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    } else {
-                        None
-                    }
-                });
+                    .and_then(|transcript| {
+                        transcript.iter().rev().find_map(|entry| {
+                            (entry.pointer("/kind").and_then(Value::as_str)
+                                == Some("assistant_message"))
+                            .then(|| {
+                                entry
+                                    .pointer("/content")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .flatten()
+                        })
+                    })
+                    .or_else(|| {
+                        let entry = transcript_projection_entry(payload)?;
+                        (entry.pointer("/kind").and_then(Value::as_str)
+                            == Some("assistant_message"))
+                        .then(|| {
+                            entry
+                                .pointer("/content")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .flatten()
+                    });
                 let Some(current) = assistant_content else {
                     // Snapshots before the first assistant chunk
                     // legitimately have no assistant message yet.
@@ -2184,11 +2298,17 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
                 anyhow!("event_transcript_contains assertion needs at least one collected event")
             })?;
             let needle = other.trim_start_matches("event_transcript_contains:");
-            let transcript = last
-                .pointer("/data/transcript")
-                .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("payload missing /data/transcript array"))?;
-            let haystack = serde_json::to_string(transcript).unwrap_or_default();
+            let haystack = if let Some(transcript) =
+                last.pointer("/data/transcript").and_then(Value::as_array)
+            {
+                serde_json::to_string(transcript).unwrap_or_default()
+            } else if let Some(entry) = transcript_projection_entry(last) {
+                serde_json::to_string(entry).unwrap_or_default()
+            } else {
+                return Err(anyhow!(
+                    "payload missing a v1 transcript or v2 transcript_upsert projection"
+                ));
+            };
             if !haystack.contains(needle) {
                 bail!("transcript did not contain '{needle}'; serialised transcript:\n{haystack}");
             }

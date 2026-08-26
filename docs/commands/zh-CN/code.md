@@ -100,7 +100,7 @@ Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方�
 | JSON-RPC 方法 | HTTP 等价接口 |
 |-----------------|-----------------|
 | `session.get` | `GET /api/code/session` |
-| `events.subscribe` | 作为 JSON-RPC 通知的 `GET /api/code/events` |
+| `events.subscribe` | 请求 `GET /api/code/events?wire=2&cursor=<last>`；接受可选参数 `{ "cursor": <最后确认的 v2 cursor> }`，先确认 `{ subscribed, requestedWire, requestedCursor }`，再转发事件。`requestedWire` 仅表示请求版本，不保证协商后的实际版本。省略参数为 cursor-0 首次 bootstrap。收到 `WIRE_V2_RESYNC_REQUIRED` 时，客户端拉取 `/session`，发出一条 data 含 `snapshot` 的增强 `resync` 通知，再从服务端给出的 `durableTail` 重连。精确的 `409 WIRE_V2_CURSOR_AHEAD` 表示 cursor 属于更晚/不同的 session；客户端会以该 code 发出同类 snapshot 恢复通知，丢弃旧 cursor，并从 0 重启 v2。若服务端返回精确的 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`，客户端会以 `?wire=1` 重试一次并转发遗留 snapshot 通知。 |
 | `diagnostics.get` | `GET /api/code/diagnostics` |
 | `controller.attach` | `POST /api/code/controller/attach` |
 | `controller.detach` | `POST /api/code/controller/detach` |
@@ -113,6 +113,19 @@ Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方�
 | `goal.cancel` | `POST /api/code/goal/cancel` |
 
 格式错误的 JSON 映射为 JSON-RPC `-32700`。未知方法映射为 `-32601`。无效参数映射为 `-32602`。HTTP 4xx/5xx 错误映射为带有 `data.status` 和 `data.code` 的 `-32000`，并保留 `INVALID_CONTROL_TOKEN`、`INVALID_CONTROLLER_TOKEN`、`CONTROLLER_CONFLICT` 和 `INTERACTION_NOT_ACTIVE` 等 Libra 错误。
+
+依据 v2 通知执行副作用的 automation 必须持久化最后确认的
+`params.data.cursor`，必须按 `eventId` 去重，并仅在同一 `sessionId` 的下一次
+`events.subscribe` 回传该 cursor。Cursor 是 session-scoped；session 重启/切换后
+必须丢弃旧 cursor（客户端也会用 snapshot + cursor-0 restart 恢复精确的
+`WIRE_V2_CURSOR_AHEAD`）。省略 cursor 会有意从 0 重放保留的 durable history，
+仅应用于首次 bootstrap；若把重放通知当成新动作，可能重复执行下游副作用。
+
+`resync` 通知表示 workflow-event gap：客户端从 `durableTail` 重连后不会再投递
+`(lastCursor, durableTail]` 内的事件。通知携带的 session snapshot 仅代表当前
+projection state，不能重建被跳过的 workflow kind。消费者必须用该
+snapshot/`session.get` 对账，不得假设 resync 前后 cursor 连续，也不得把此通知流
+当作 exactly-once side-effect log。
 
 ### Web Browser Control
 
@@ -251,10 +264,10 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | 显式 v1 | `?wire=1` 或 `?wire=v1` |
 | 显式 v2 | `?wire=2` 或 `?wire=v2` |
 | Accept 提示 | `Accept: text/event-stream;libra-wire=2`（若同时给出 query `wire=`，以 query 为准） |
-| 未指定默认 | 省略 `wire` / `libra-wire` 的客户端仍为 **v1**。内置 SPA（W3-09）始终请求 `?wire=2`。 |
+| 未指定默认 | 省略 `wire` / `libra-wire` 时，服务端仍默认为 **v1**。内置 SPA（W3-09）和 `libra code --control stdio` automation 客户端会显式请求 `?wire=2`。 |
 | 非法值 | fail-closed `400 INVALID_WIRE_VERSION` |
 
-**SSE v1**（默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
+**SSE v1**（未指定版本时的服务端默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
 
 **SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`）。Code UI **projection** 热窗口是同数值、独立命名的预算（`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`），两者不可相加。单事件 fold 只访问 suffix，不回放整段 session 历史（W3-14；10k events 下 release p95 ≤ 5 ms）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的默认 Web headless（非 Codex `HeadlessCodeRuntime`）；managed `--provider codex` Web 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
 
@@ -351,12 +364,17 @@ replay 因而不会重新打开该 gate。
 
 在 wire v2 成为默认、且内置前端/automation 客户端完成迁移之后，v1 snapshot SSE 仍至少保留一个成功的公开 patch release。v1 的物理移除**不属于** plan-20260715；见 DEFER-08 / ADR-CODE-08。移除前置条件清单（须全部满足）：
 
-1. 内置前端已迁移到 v2（W3-09 证据）：SPA 经 `sse-resilience` 的
+1. [x] 内置前端已迁移到 v2（W3-09 证据）：SPA 经 `sse-resilience` 的
    `wrapClientForSseResilience` 打开 `GET /api/code/events?wire=2`，用 wire cursor
    重连，并把 `event: resync` / `WIRE_V2_RESYNC_REQUIRED` 当作一次显式 snapshot
    拉取（复用 W2-15 UI）。cursor/序号不在客户端另行编号。
-2. 内置 automation 客户端已迁移到 v2。
-3. Compat / matrix 测试默认消费 v2。
+2. [x] 内置 automation 客户端已迁移到 v2（DF-05 证据）：
+   `libra code --control stdio` 的 `events.subscribe` 会追加
+   `?wire=2&cursor=<last>`，允许调用方从已确认 cursor 续接，并用显式 snapshot
+   对账和有界重连处理 `WIRE_V2_RESYNC_REQUIRED` / `WIRE_V2_CURSOR_AHEAD`。
+3. [x] Compat / matrix 测试默认消费 v2（DF-05 证据）：
+   `code_ui_remote_sse_matrix` 的 `openEvents` 默认为 wire v2；初始 snapshot
+   与 controller-change 兼容用例显式使用 v1。
 4. Release notes 写明最后支持 v1 的版本与升级路径。
 5. 在 (1)–(4) 之后、v1 仍可用时，至少有一次成功的公开 patch release。
 
