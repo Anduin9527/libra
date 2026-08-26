@@ -17,7 +17,9 @@
 #   none              only spawns subprocesses with an explicit cwd, and uses tempdirs
 #
 # Attributes inside a `macro_rules!` body cannot be attributed to one function;
-# they are emitted as `<site:<path>:<line>>` rows judged `global` (fail-closed).
+# they are emitted as CONTENT-ANCHORED rows judged `global` (fail-closed):
+# `<site:<path>:macro:<macro_name>#<ordinal>>` inside a macro_rules! body,
+# `<site:<path>:orphan#<ordinal>>` otherwise — never line numbers (TA-02).
 #
 # Judgement is by resource set: every matched process-wide resource contributes
 # one lane (`env` / `hash_kind` / `cwd`), and the attribute's own key(s) are
@@ -425,6 +427,13 @@ def code_only(lines):
     in_string = False      # normal "..." (also b"..." / c"...") with escapes
     raw_hashes = None      # inside r#*"..."#* with this many '#'
     for line in lines:
+        # fast path: outside every string/comment state, a line with no
+        # quote, char, or slash cannot change state or need blanking
+        if (block_comment == 0 and not in_string and raw_hashes is None
+                and '"' not in line and "'" not in line
+                and '/' not in line):
+            out.append(line)
+            continue
         buf = list(line)
         i, n = 0, len(line)
         while i < n:
@@ -566,7 +575,7 @@ def _load_rs(p):
     # Codex TA-01 R7 P0: raw identifiers (`r#cmd`) must resolve like their
     # plain spelling. Strings are already blanked, so a surviving `r#` is a
     # raw identifier — blank the sigil column-preservingly.
-    blanked = [RAW_IDENT.sub('  ', l) for l in blanked]
+    blanked = [RAW_IDENT.sub('  ', l) if 'r#' in l else l for l in blanked]
     return lines, blanked
 
 
@@ -2764,7 +2773,10 @@ for _p2, _c2 in FILES:
             _ok = _bm.group(1) in rename_index[_p2]
         (_exempt if _ok else _unres).update(range(_ln2, _l3 + 1))
         _ln2 = _l3 + 1
+    _gate2 = tuple(sorted(set(_names)))
     for _ln2, _bl2 in enumerate(_c2):
+        if not any(g in _bl2 for g in _gate2):
+            continue
         if not _ref.search(_bl2) or _ln2 in _exempt:
             continue
         if _ln2 in _unres:
@@ -3609,6 +3621,65 @@ def judge_body(text, scope_path, stack, test_fn, file_path=None):
     return True, lanes
 
 # ---------- pass 2: scan serial attributes and classify ---------------------
+# TA-02: site keys are CONTENT anchors, never line numbers. An attribute
+# inside a `macro_rules!` body keys as
+#   <site:<path>:macro:<macro_name>#<ordinal>>
+# (ordinal = 1-based position among that macro body's serial attributes);
+# an unattributable attribute outside any macro body keys as
+#   <site:<path>:orphan#<ordinal>> (per-file ordinal). Line drift above the
+# attribute can no longer invalidate the key (plan-20260824 DF-05 broke the
+# old line anchor by inserting cases above the site).
+_macro_spans = {}  # path -> [(name, start (line,col), end (line,col))]
+for _pS, _cS in FILES:
+    _spansS = []
+    for _iS, _lS in enumerate(_cS):
+        for _mS in MACRO_DEF.finditer(_lS):
+            _clS, _txS = delimit(_cS, _iS, _mS.start())
+            _endS = (len(_cS) - 1, 1 << 30)
+            if _clS:
+                # delimit is line-granular: locate the BALANCING close
+                # character to get a true (line, col) body end
+                _dS, _seenS, _offS = 0, False, None
+                for _qS, _chS in enumerate(_txS):
+                    if _chS == '{':
+                        _dS += 1
+                        _seenS = True
+                    elif _chS == '}':
+                        _dS -= 1
+                        if _seenS and _dS == 0:
+                            _offS = _qS
+                            break
+                if _offS is not None:
+                    _preS = _txS[:_offS + 1]
+                    _nlS = _preS.count('\n')
+                    _lstS = _preS.split('\n')[-1]
+                    _endS = (_iS + _nlS,
+                             (_mS.start() + len(_lstS)) if _nlS == 0
+                             else len(_lstS))
+            _spansS.append((_mS.group(1), (_iS, _mS.start()), _endS))
+    _macro_spans[_pS] = _spansS
+
+_site_counters = {}
+
+
+def _site_key(path, line_idx, col):
+    # COLUMN-AWARE containment (Codex TA-02 R1 P1): an attribute on the same
+    # line as a one-line macro body but AFTER its closing brace is outside.
+    pos = (line_idx, col)
+    inner = None
+    for _nmS, _stS, _enS in _macro_spans.get(path, ()):
+        if _stS < pos < _enS and (inner is None or _stS > inner[1]):
+            inner = (_nmS, _stS)
+    if inner is not None:
+        ck = (path, 'macro', inner[0], inner[1])
+        _site_counters[ck] = _site_counters.get(ck, 0) + 1
+        return '<site:%s:macro:%s#%d>' % (path, inner[0],
+                                          _site_counters[ck])
+    ck = (path, 'orphan')
+    _site_counters[ck] = _site_counters.get(ck, 0) + 1
+    return '<site:%s:orphan#%d>' % (path, _site_counters[ck])
+
+
 rows = []
 for path, code in FILES:
     for i, cline in enumerate(code):
@@ -3623,7 +3694,7 @@ for path, code in FILES:
                 continue          # not the attribute (identifier prefix)
             end_li, end_col, keys = read_attr_keys(code, i, m.start())
             if keys is None:
-                rows.append(('<site:%s:%d>' % (path, i + 1), 'global'))
+                rows.append((_site_key(path, i, m.start()), 'global'))
                 break
             fm = FN_INLINE.search(code[end_li], end_col)
             same_line = fm is not None
@@ -3637,7 +3708,7 @@ for path, code in FILES:
                         continue
                     break
             if fm is None:
-                rows.append(('<site:%s:%d>' % (path, i + 1), 'global'))
+                rows.append((_site_key(path, i, m.start()), 'global'))
             else:
                 fn = fm.group(1)
                 closed, text = delimit(code, i if same_line else j,

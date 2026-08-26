@@ -1,11 +1,11 @@
 test_fn	lane	reason
-<site:tests/code_ui_remote_approval_matrix.rs:56>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<site:tests/code_ui_remote_generation_matrix.rs:56>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<site:tests/code_ui_remote_lease_matrix.rs:40>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<site:tests/code_ui_remote_model_generation_matrix.rs:86>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<site:tests/code_ui_remote_security_matrix.rs:57>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<site:tests/code_ui_remote_sse_matrix.rs:80>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<site:tests/code_ui_remote_state_matrix.rs:52>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_approval_matrix.rs:macro:approval_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_generation_matrix.rs:macro:generation_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_lease_matrix.rs:macro:lease_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_model_generation_matrix.rs:macro:model_generation_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_security_matrix.rs:macro:security_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_sse_matrix.rs:macro:sse_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_state_matrix.rs:macro:state_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_checkpoint_subagent_scope_listed_and_linked	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_object_gc_findings_reachability	global	call surface not proven pollution-free (fail-closed TA-01); blocked by helper-local:object_index_repo_id

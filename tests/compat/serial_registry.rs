@@ -98,6 +98,33 @@ fn classify() -> BTreeMap<String, String> {
     parse_classify(&classify_raw())
 }
 
+/// Both-direction registry/classifier comparison, shared with the TA-02
+/// injection counterexamples: returns every violation instead of panicking.
+fn registry_diff(
+    expected: &BTreeMap<String, String>,
+    reg: &BTreeMap<String, (String, String)>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in expected.keys() {
+        if !reg.contains_key(k.as_str()) {
+            out.push(format!("missing registry row: {k}"));
+        }
+    }
+    for k in reg.keys() {
+        if !expected.contains_key(k.as_str()) {
+            out.push(format!("dangling registry row: {k}"));
+        }
+    }
+    for (k, v) in expected {
+        if let Some((lane, _)) = reg.get(k) {
+            if lane != v {
+                out.push(format!("{k}: registry says {lane}, classifier says {v}"));
+            }
+        }
+    }
+    out
+}
+
 /// The registry and the classifier must agree, in both directions.
 #[test]
 fn serial_registry_matches_the_classifier() {
@@ -108,37 +135,10 @@ fn serial_registry_matches_the_classifier() {
         .filter(|(_, v)| v.as_str() != "none")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-
-    let missing: Vec<&str> = expected
-        .keys()
-        .filter(|k| !reg.contains_key(k.as_str()))
-        .map(|k| k.as_str())
-        .collect();
+    let violations = registry_diff(&expected, &reg);
     assert!(
-        missing.is_empty(),
-        "these tests are still serialized but have no registry row: {missing:?}"
-    );
-
-    let dangling: Vec<&str> = reg
-        .keys()
-        .filter(|k| !expected.contains_key(k.as_str()))
-        .map(|k| k.as_str())
-        .collect();
-    assert!(
-        dangling.is_empty(),
-        "these registry rows name nothing that is serialized any more: {dangling:?}"
-    );
-
-    let drifted: Vec<String> = expected
-        .iter()
-        .filter_map(|(k, v)| {
-            let (lane, _) = reg.get(k)?;
-            (lane != v).then(|| format!("{k}: registry says {lane}, classifier says {v}"))
-        })
-        .collect();
-    assert!(
-        drifted.is_empty(),
-        "registry/classifier lane drift: {drifted:?}"
+        violations.is_empty(),
+        "registry/classifier disagreement: {violations:?}"
     );
 }
 
@@ -190,9 +190,44 @@ fn lane_validation_rejects_empty_and_malformed_keys() {
     assert!(!lane_is_valid("none"));
 }
 
-/// `<site:path:line>` rows (attributes inside `macro_rules!` bodies) must point
-/// at a real attribute site: the file exists, the line is in range, and that
-/// line still carries a serial attribute as its first token.
+/// Count the serial attributes inside one brace-delimited region starting at
+/// `open` (the byte offset of the region's opening `{`).
+fn serial_attrs_in_braces(text: &str, open: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    let mut end = text.len();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    text[open..end]
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("#[serial") || t.starts_with("#[serial_test::serial")
+        })
+        .count()
+}
+
+/// TA-02: site keys are CONTENT anchors —
+/// `<site:path:macro:<name>#<ordinal>>` for attributes inside `macro_rules!`
+/// bodies (the guard re-locates the macro by NAME and requires the body to
+/// still hold at least `ordinal` serial attributes), and
+/// `<site:path:orphan#<ordinal>>` for unattributable attributes outside any
+/// macro. Line numbers are banned from keys outright, so editing lines above
+/// an anchored attribute can never invalidate it (the failure mode that hit
+/// plan-20260824 DF-05).
 #[test]
 fn site_rows_point_at_real_attribute_sites() {
     let mut sites = 0;
@@ -201,23 +236,60 @@ fn site_rows_point_at_real_attribute_sites() {
             continue;
         };
         sites += 1;
-        let (path, line) = inner
-            .rsplit_once(':')
-            .unwrap_or_else(|| panic!("site key {key} is not <site:path:line>"));
-        let line: usize = line
-            .parse()
-            .unwrap_or_else(|_| panic!("site key {key} has a non-numeric line"));
-        let text = std::fs::read_to_string(repo_root().join(path))
-            .unwrap_or_else(|e| panic!("site key {key}: cannot read {path}: {e}"));
-        let row = text
-            .lines()
-            .nth(line - 1)
-            .unwrap_or_else(|| panic!("site key {key}: {path} has no line {line}"));
-        let attr = row.trim_start();
         assert!(
-            attr.starts_with("#[serial") || attr.starts_with("#[serial_test::serial"),
-            "site key {key}: line does not carry a serial attribute: {row}"
+            !inner
+                .rsplit_once(':')
+                .is_some_and(|(_, tail)| tail.parse::<usize>().is_ok()),
+            "site key {key} is line-anchored; TA-02 bans line numbers in keys"
         );
+        if let Some((path, rest)) = inner.split_once(":macro:") {
+            let (name, ordinal) = rest
+                .rsplit_once('#')
+                .unwrap_or_else(|| panic!("site key {key}: missing #ordinal"));
+            let ordinal: usize = ordinal
+                .parse()
+                .unwrap_or_else(|_| panic!("site key {key}: non-numeric ordinal"));
+            assert!(ordinal >= 1, "site key {key}: ordinal must be 1-based");
+            let text = std::fs::read_to_string(repo_root().join(path))
+                .unwrap_or_else(|e| panic!("site key {key}: cannot read {path}: {e}"));
+            let needle = format!("macro_rules! {name}");
+            let mut resolved = false;
+            let mut from = 0;
+            while let Some(pos) = text[from..].find(&needle) {
+                let at = from + pos;
+                if let Some(open) = text[at..].find('{') {
+                    if serial_attrs_in_braces(&text, at + open) >= ordinal {
+                        resolved = true;
+                        break;
+                    }
+                }
+                from = at + needle.len();
+            }
+            assert!(
+                resolved,
+                "site key {key}: no macro_rules! {name} body in {path} holds \
+                 {ordinal} serial attribute(s)"
+            );
+        } else if let Some((path, rest)) = inner.split_once(":orphan#") {
+            let ordinal: usize = rest
+                .parse()
+                .unwrap_or_else(|_| panic!("site key {key}: non-numeric ordinal"));
+            let text = std::fs::read_to_string(repo_root().join(path))
+                .unwrap_or_else(|e| panic!("site key {key}: cannot read {path}: {e}"));
+            let n = text
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("#[serial") || t.starts_with("#[serial_test::serial")
+                })
+                .count();
+            assert!(
+                n >= ordinal,
+                "site key {key}: {path} holds only {n} serial attribute(s)"
+            );
+        } else {
+            panic!("site key {key}: neither :macro: nor :orphan# form");
+        }
     }
     assert!(sites > 0, "expected at least one macro-body site row");
 }
@@ -569,6 +641,126 @@ fn classifier_dynamic_mutation_tracing() {
     assert_eq!(
         v["aliased_fs_write_tempdir_stays_none"], "none",
         "an aliased fs call with a proven argument must stay none"
+    );
+}
+
+/// TA-02: the content-anchored site key survives LINE DRIFT — inserting
+/// lines above the anchored attribute leaves the key byte-identical and
+/// still resolvable, exactly the failure mode that broke the old line
+/// anchor (plan-20260824 DF-05).
+#[test]
+fn site_key_survives_line_drift() {
+    let fixture = concat!(
+        "macro_rules! drift_case {\n",
+        "    ($name:ident) => {\n",
+        "        #[test]\n",
+        "        #[serial]\n",
+        "        fn $name() {\n",
+        "            unsafe { std::env::set_var(\"TA02_POLLUTE\", \"1\"); }\n",
+        "        }\n",
+        "    };\n",
+        "}\n\n",
+        "drift_case!(drift_a);\n",
+    );
+    let run = |body: &str| -> Vec<String> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("COMPATIBILITY.md"), b"").expect("write marker");
+        std::fs::create_dir(tmp.path().join(".git")).expect("create .git");
+        std::fs::create_dir_all(tmp.path().join("tests")).expect("create tests/");
+        std::fs::write(tmp.path().join("tests/u_drift.rs"), body).expect("write fixture");
+        let out = Command::new("sh")
+            .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+            .env("SERIAL_CLASSIFY_ROOT", tmp.path())
+            .output()
+            .expect("run classifier");
+        assert!(out.status.success(), "classifier failed");
+        String::from_utf8(out.stdout)
+            .expect("stdout is UTF-8")
+            .lines()
+            .filter(|l| l.starts_with("<site:"))
+            .map(str::to_string)
+            .collect()
+    };
+    let before = run(fixture);
+    assert!(
+        before
+            .iter()
+            .any(|l| l.starts_with("<site:tests/u_drift.rs:macro:drift_case#1>")),
+        "expected a content-anchored site key, got: {before:?}"
+    );
+    let drifted =
+        format!("// drift line one\n// drift line two\n\nfn unrelated_helper() {{}}\n\n{fixture}");
+    let after = run(&drifted);
+    assert_eq!(
+        before, after,
+        "inserting lines above the attribute must not move the site key"
+    );
+
+    // Codex TA-02 R1 P1: an attribute on the SAME LINE as a one-line macro
+    // body but AFTER its closing brace is OUTSIDE the macro — orphan form.
+    let same_line = concat!(
+        "macro_rules! done { () => {}; }#[serial]\n",
+        "const BAD: () = ();\n",
+    );
+    let keys = run(same_line);
+    assert!(
+        keys.iter()
+            .any(|l| l.starts_with("<site:tests/u_drift.rs:orphan#1>")),
+        "post-brace same-line attribute must key as orphan, got: {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|l| l.contains(":macro:done#")),
+        "post-brace attribute must not key into the closed macro: {keys:?}"
+    );
+}
+
+/// TA-02 injection counterexamples: a MISSING registry row, a DANGLING row,
+/// and a LANE-DRIFTED row must each be reported by the comparison the main
+/// guard runs — corruption cannot pass silently.
+#[test]
+fn registry_injection_counterexamples() {
+    let mut expected: BTreeMap<String, String> = BTreeMap::new();
+    expected.insert("alpha_test".into(), "global".into());
+    expected.insert("beta_test".into(), "lane:env".into());
+    let clean: BTreeMap<String, (String, String)> = [
+        (
+            "alpha_test".to_string(),
+            ("global".to_string(), "r".to_string()),
+        ),
+        (
+            "beta_test".to_string(),
+            ("lane:env".to_string(), "r".to_string()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert!(registry_diff(&expected, &clean).is_empty());
+
+    let mut missing = clean.clone();
+    missing.remove("beta_test");
+    let v = registry_diff(&expected, &missing);
+    assert!(
+        v.iter()
+            .any(|m| m.contains("missing registry row: beta_test")),
+        "a missing row must be reported: {v:?}"
+    );
+
+    let mut dangling = clean.clone();
+    dangling.insert("ghost_test".into(), ("global".into(), "r".into()));
+    let v = registry_diff(&expected, &dangling);
+    assert!(
+        v.iter()
+            .any(|m| m.contains("dangling registry row: ghost_test")),
+        "a dangling row must be reported: {v:?}"
+    );
+
+    let mut drifted = clean;
+    drifted.insert("beta_test".into(), ("lane:cwd".into(), "r".into()));
+    let v = registry_diff(&expected, &drifted);
+    assert!(
+        v.iter()
+            .any(|m| m.contains("registry says lane:cwd, classifier says lane:env")),
+        "a lane drift must be reported: {v:?}"
     );
 }
 
@@ -1580,10 +1772,10 @@ fn classifier_ignores_string_literals_and_reads_same_line_attributes() {
     assert_eq!(
         stdout,
         concat!(
-            "<site:tests/w_mismatched.rs:1>\tglobal\n",
-            "<site:tests/x_missing_bracket.rs:1>\tglobal\n",
-            "<site:tests/y_unclosed_bare.rs:1>\tglobal\n",
-            "<site:tests/z_unclosed.rs:1>\tglobal\n",
+            "<site:tests/w_mismatched.rs:orphan#1>\tglobal\n",
+            "<site:tests/x_missing_bracket.rs:orphan#1>\tglobal\n",
+            "<site:tests/y_unclosed_bare.rs:orphan#1>\tglobal\n",
+            "<site:tests/z_unclosed.rs:orphan#1>\tglobal\n",
             "already_named_composite\tlane:hash_kind+cwd\n",
             "blank_line_before_bracket\tlane:a\n",
             "crate_config_only\tnone\n",
