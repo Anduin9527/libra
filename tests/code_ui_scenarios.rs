@@ -20,7 +20,7 @@ use serial_test::serial;
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn basic_chat_submit_updates_transcript() -> Result<()> {
     let mut session = CodeSession::spawn(CodeSessionOptions::new("basic", fixture("basic_chat")))?;
     {
@@ -41,7 +41,7 @@ fn basic_chat_submit_updates_transcript() -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn cancel_running_turn_returns_session_to_idle() -> Result<()> {
     let mut session =
         CodeSession::spawn(CodeSessionOptions::new("cancel", fixture("delayed_chat")))?;
@@ -61,7 +61,7 @@ fn cancel_running_turn_returns_session_to_idle() -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn oversized_message_is_rejected_before_reaching_runtime() -> Result<()> {
     let mut session =
         CodeSession::spawn(CodeSessionOptions::new("oversize", fixture("basic_chat")))?;
@@ -74,7 +74,7 @@ fn oversized_message_is_rejected_before_reaching_runtime() -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn unknown_interaction_id_is_rejected_without_state_change() -> Result<()> {
     let mut session = CodeSession::spawn(CodeSessionOptions::new(
         "unknown-interaction",
@@ -95,7 +95,7 @@ fn unknown_interaction_id_is_rejected_without_state_change() -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn default_control_paths_reject_second_live_instance() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("multi-instance", fixture("basic_chat"))
@@ -115,7 +115,7 @@ fn default_control_paths_reject_second_live_instance() -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn default_control_paths_restart_after_stale_pid_takeover() -> Result<()> {
     let mut first = CodeSession::spawn(
         CodeSessionOptions::new("stale-pid-first", fixture("basic_chat"))
@@ -165,7 +165,7 @@ fn default_control_paths_restart_after_stale_pid_takeover() -> Result<()> {
 /// Ends with a clean detach.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_static_app_loads_and_submit_updates_snapshot() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-static-submit", fixture("basic_chat"))
@@ -215,7 +215,7 @@ fn browser_static_app_loads_and_submit_updates_snapshot() -> Result<()> {
 /// tab as a conflicting second browser.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_same_client_reconnect_renews_existing_lease() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-reconnect", fixture("basic_chat"))
@@ -251,7 +251,7 @@ fn browser_same_client_reconnect_renews_existing_lease() -> Result<()> {
 /// `BROWSER_CONTROL_DISABLED` and no browser controller may be published.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_attach_rejected_when_control_disabled() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-disabled", fixture("basic_chat"))
@@ -273,7 +273,7 @@ fn browser_attach_rejected_when_control_disabled() -> Result<()> {
 /// reject the stale token and publish the reclaimed controller state.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-expired-token", fixture("basic_chat"))
@@ -304,7 +304,7 @@ fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Resul
 /// automation), so a malicious or buggy browser cannot starve the agent.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_oversized_message_returns_payload_too_large() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-oversize", fixture("basic_chat"))
@@ -330,7 +330,7 @@ fn browser_oversized_message_returns_payload_too_large() -> Result<()> {
 /// 10-second window to fire the cancel mid-stream.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_cancel_turn_aborts_in_flight_turn_without_automation_token() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-cancel", fixture("delayed_chat"))
@@ -400,7 +400,7 @@ fn browser_cancel_turn_aborts_in_flight_turn_without_automation_token() -> Resul
 /// scenario `unknown_interaction_id_is_rejected_without_state_change`.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_unknown_interaction_id_is_rejected_without_state_change() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-unknown-interaction", fixture("basic_chat"))
@@ -430,7 +430,7 @@ fn browser_unknown_interaction_id_is_rejected_without_state_change() -> Result<(
 /// turn cancel all use the lease token without an automation control token.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn browser_write_appends_redacted_control_audit() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-write-audit", fixture("delayed_chat"))
@@ -492,7 +492,7 @@ fn browser_write_appends_redacted_control_audit() -> Result<()> {
 /// first. Mirrors the multi-tab scenario the frontend has to defend against.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn second_browser_attach_with_different_client_returns_conflict() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-conflict", fixture("basic_chat"))
@@ -637,7 +637,7 @@ fn plan_workflow_intent_review_respond(name: &str, selected_option: &str) -> Res
 /// `awaiting_interaction` and releases the mutation fence (worker-owned).
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_workflow_intent_review_confirm_transitions_session_past_review() -> Result<()> {
     plan_workflow_intent_review_respond("plan-intent-review-confirm", "confirm")
 }
@@ -646,7 +646,7 @@ fn plan_workflow_intent_review_confirm_transitions_session_past_review() -> Resu
 /// review interaction so a follow-up revise prompt can be admitted.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_workflow_intent_review_modify_clears_review_interaction() -> Result<()> {
     plan_workflow_intent_review_respond("plan-intent-review-modify", "modify")
 }
@@ -655,7 +655,7 @@ fn plan_workflow_intent_review_modify_clears_review_interaction() -> Result<()> 
 /// session idle without an open IntentSpec review interaction.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_workflow_intent_review_cancel_clears_review_interaction() -> Result<()> {
     plan_workflow_intent_review_respond("plan-intent-review-cancel", "cancel")
 }
@@ -665,7 +665,7 @@ fn plan_workflow_intent_review_cancel_clears_review_interaction() -> Result<()> 
 /// resolved through `/api/code/interactions/{id}`.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<()> {
     use std::process::Command;
 
@@ -936,7 +936,7 @@ fn assert_plan_review_has_no_execution_side_effects(
 /// network or execution paths.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_modify_next_plain_text_opens_replacement_plan_gate() -> Result<()> {
     let repo_root = initialize_plan_review_repo("plan-review-modify")?;
     let repo_dir = repo_root.path().join("repo");
@@ -1068,7 +1068,7 @@ fn plan_review_modify_next_plain_text_opens_replacement_plan_gate() -> Result<()
 /// and a later valid note must still produce the replacement Plan.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_empty_revision_note_is_typed_and_preserves_authority() -> Result<()> {
     let repo_root = initialize_plan_review_repo("plan-review-empty-revision")?;
     let repo_dir = repo_root.path().join("repo");
@@ -1148,7 +1148,7 @@ fn plan_review_empty_revision_note_is_typed_and_preserves_authority() -> Result<
 /// workspace mutation.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_repository_replacement_after_modify_keeps_revision_note_retryable() -> Result<()> {
     let case_name = "plan-review-repository-replaced-after-modify";
     let repo_root = initialize_plan_review_repo(case_name)?;
@@ -1248,7 +1248,7 @@ fn plan_review_repository_replacement_after_modify_keeps_revision_note_retryable
 /// current checkout without mutating the user's edit.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout() -> Result<()> {
     let case_name = "plan-review-workspace-drift";
     let repo_root = initialize_plan_review_repo(case_name)?;
@@ -1363,7 +1363,7 @@ fn plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkou
 /// network-policy gate.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds() -> Result<()> {
     let case_name = "plan-review-metadata-only-drift";
     let repo_root = initialize_plan_review_repo(case_name)?;
@@ -1484,7 +1484,7 @@ fn plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds() ->
 /// repository identity is unchanged.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_head_drift_survives_resume_and_requires_explicit_modify() -> Result<()> {
     let case_name = "plan-review-head-drift";
     let repo_root = initialize_plan_review_repo(case_name)?;
@@ -1605,7 +1605,7 @@ fn plan_review_head_drift_survives_resume_and_requires_explicit_modify() -> Resu
 /// typed and leaves the original gate pending so the user can Cancel safely.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_repository_replacement_blocks_modify_and_preserves_gate() -> Result<()> {
     let case_name = "plan-review-repository-replaced";
     let repo_root = initialize_plan_review_repo(case_name)?;
@@ -1665,7 +1665,7 @@ fn plan_review_repository_replacement_blocks_modify_and_preserves_gate() -> Resu
 /// completes without apply_patch/shell).
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_network_allow_enters_runtime_queue() -> Result<()> {
     let repo_root = initialize_plan_review_repo("plan-review-network-allow")?;
     let repo_dir = repo_root.path().join("repo");
@@ -1750,7 +1750,7 @@ fn plan_review_network_allow_enters_runtime_queue() -> Result<()> {
 /// boundary was replaced by W2-04 Web confirmed-plan admission.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_network_allow_returns_conflict_and_preserves_pending_gate() -> Result<()> {
     plan_review_network_allow_enters_runtime_queue()
 }
@@ -1760,7 +1760,7 @@ fn plan_review_network_allow_returns_conflict_and_preserves_pending_gate() -> Re
 /// `--resume` so the network gate is restored before Deny.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn plan_review_network_policy_survives_web_resume_and_can_be_denied() -> Result<()> {
     let case_name = "plan-review-network-resume";
     let repo_root = initialize_plan_review_repo(case_name)?;

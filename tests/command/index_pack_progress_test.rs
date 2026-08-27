@@ -40,7 +40,6 @@ fn copy_pack_to_dir(prefix: &str, dir: &Path) -> PathBuf {
 }
 
 #[test]
-#[serial]
 fn index_pack_accepts_progress_flag() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -66,7 +65,6 @@ fn index_pack_accepts_progress_flag() {
 }
 
 #[test]
-#[serial]
 fn index_pack_accepts_no_progress_flag() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());

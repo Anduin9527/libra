@@ -109,7 +109,7 @@ fn wait_for_session_status(session: &CodeSession, expected: &str, timeout: Durat
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "perf smoke; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_threads_endpoint_handles_10_concurrent_readers_within_2s() -> Result<()> {
     if !perf_mode_enabled() {
         // The `#[ignore]` already skips by default, but check
@@ -186,7 +186,7 @@ fn perf_threads_endpoint_handles_10_concurrent_readers_within_2s() -> Result<()>
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "perf smoke; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_session_snapshot_serialises_100k_entry_transcript_under_200ms() -> Result<()> {
     use chrono::Utc;
     use libra::internal::ai::web::code_ui::{
@@ -299,7 +299,7 @@ fn perf_session_snapshot_serialises_100k_entry_transcript_under_200ms() -> Resul
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "perf smoke; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_sse_broadcast_delivers_1k_events_in_monotonic_seq_order() -> Result<()> {
     use libra::internal::ai::web::code_ui::{
         CodeUiCapabilities, CodeUiEventType, CodeUiProviderInfo, CodeUiSession, initial_snapshot,
@@ -412,7 +412,7 @@ fn perf_sse_broadcast_delivers_1k_events_in_monotonic_seq_order() -> Result<()> 
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "HTTP/SSE soak; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_sse_http_stream_survives_configured_soak_duration() -> Result<()> {
     if !perf_mode_enabled() {
         bail!(

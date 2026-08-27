@@ -313,7 +313,7 @@ fn wait_for_mcp_task(
 ///     break automation.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_writes_mcp_url_into_control_info_file() -> Result<()> {
     let session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-control-info",
@@ -417,7 +417,7 @@ fn libra_code_web_only_flag_is_rejected_at_arg_parse() -> Result<()> {
 /// proving both surfaces are reachable on the SAME process.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()> {
     let session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-dual-reachability",
@@ -499,7 +499,7 @@ fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()>
 /// roadmap work rather than an overclaimed test assertion.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> {
     let mut session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-web-message-consistency",
@@ -557,7 +557,7 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
 ///      transcript entry for the MCP-created task.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
     let session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-write-web-sse",
@@ -851,7 +851,7 @@ fn http_tool_names(
 /// are driven over the real stdio transport in one session.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Result<()> {
     let repo = init_stdio_repo()?;
 
@@ -962,7 +962,7 @@ fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Resul
 /// dual-entry regression this test guards.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn mcp_http_and_stdio_expose_identical_tool_set() -> Result<()> {
     // HTTP side — reuse the harness-spawned `libra code` MCP HTTP transport.
     let session = CodeSession::spawn(CodeSessionOptions::new(

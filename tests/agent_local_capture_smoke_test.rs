@@ -63,7 +63,7 @@ fn check_agent_set() {
 #[test]
 #[ignore = "drives a real paid codex session; set LIBRA_RUN_LOCAL_AGENTS=1 and run with \
             --ignored --test-threads=1 (plan.md §0.3.6)"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn local_capture_smoke_codex() {
     check_agent_set();
     smoke::run_slug("codex");
@@ -72,7 +72,7 @@ fn local_capture_smoke_codex() {
 #[test]
 #[ignore = "drives a real paid claude session; set LIBRA_RUN_LOCAL_AGENTS=1 and run with \
             --ignored --test-threads=1 (plan.md §0.3.6)"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn local_capture_smoke_claude_code() {
     check_agent_set();
     smoke::run_slug("claude-code");
@@ -81,7 +81,7 @@ fn local_capture_smoke_claude_code() {
 #[test]
 #[ignore = "drives a real paid opencode session; set LIBRA_RUN_LOCAL_AGENTS=1 and run with \
             --ignored --test-threads=1 (plan.md §0.3.6)"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn local_capture_smoke_opencode() {
     check_agent_set();
     smoke::run_slug("opencode");

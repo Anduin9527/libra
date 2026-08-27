@@ -49,7 +49,7 @@ fn run_state_case(case_name: &str) -> Result<()> {
 macro_rules! state_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_state_case(stringify!($name))
         }
@@ -78,7 +78,7 @@ state_case!(state_tool_call_fixture_reaches_tool_phase_or_deferred_l1);
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn state_detach_while_thinking_allows_turn_to_settle() -> Result<()> {
     let client_id = "state-detach-thinking";
     let mut session = CodeSession::spawn(CodeSessionOptions::new(
@@ -112,7 +112,7 @@ fn state_detach_while_thinking_allows_turn_to_settle() -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn state_cancel_while_executing_tool_settles_running_tool_call() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("state-cancel-executing-tool", fixture("slow_shell_tool"))

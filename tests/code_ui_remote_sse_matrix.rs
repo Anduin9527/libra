@@ -77,7 +77,7 @@ fn sse_matrix_defaults_to_v2_and_keeps_explicit_v1_compatibility() -> Result<()>
 macro_rules! sse_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_sse_case(stringify!($name))
         }
@@ -114,7 +114,7 @@ sse_case!(sse_streaming_fixture_transcript_content_grows_monotonically);
 /// with `event: resync`; tip-cursor reconnect continues without dup/loss.
 #[cfg(feature = "test-provider")]
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn sse_slow_consumer() -> Result<()> {
     libra::internal::ai::web::assert_sse_slow_consumer_contract().await
 }

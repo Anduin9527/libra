@@ -17,7 +17,7 @@ use serial_test::serial;
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn code_session_starts_web_and_cleans_control_files() -> Result<()> {
     let mut session = CodeSession::spawn(CodeSessionOptions::new("self", fixture("basic_chat")))?;
     let snapshot = session.snapshot()?;
@@ -41,7 +41,7 @@ fn code_session_starts_web_and_cleans_control_files() -> Result<()> {
 
 #[cfg(all(unix, feature = "test-provider"))]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn code_session_sigterm_exits_and_releases_ports() -> Result<()> {
     let mut session = CodeSession::spawn(CodeSessionOptions::new(
         "sigterm-web",

@@ -294,6 +294,29 @@ fn site_rows_point_at_real_attribute_sites() {
     assert!(sites > 0, "expected at least one macro-body site row");
 }
 
+/// TA-03 standing invariant (ADR-TA-02): after the mechanical conversion,
+/// `tests/**` holds ZERO unkeyed `#[serial]` — the classifier must emit no
+/// `none` verdict. An unkeyed attribute locks only serial_test's
+/// empty-string key, so it recreates the accidental global convoy the
+/// conversion removed.
+#[test]
+fn no_unkeyed_serial_attributes_remain() {
+    let offenders: Vec<String> = classify()
+        .into_iter()
+        .filter(|(_, v)| v == "none")
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "unkeyed #[serial] found on: {offenders:?}\n\
+         Two legal fixes:\n\
+         1. the test does not touch process-global state -> drop the \
+         #[serial] attribute entirely; or\n\
+         2. it does -> name the lane(s), e.g. #[serial(cwd)], and add the \
+         matching row (lane + reason) to tests/SERIAL_REGISTRY.tsv."
+    );
+}
+
 /// The classifier is a pure function of the tree: two runs agree byte for byte
 /// on raw stdout, so order or duplication drift cannot hide behind a map.
 #[test]

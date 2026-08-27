@@ -40,7 +40,6 @@ fn copy_pack_to_dir(prefix: &str, dir: &Path) -> PathBuf {
 }
 
 #[test]
-#[serial]
 fn index_pack_keep_message_writes_keep_file_and_reports_json_path() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -72,7 +71,6 @@ fn index_pack_keep_message_writes_keep_file_and_reports_json_path() {
 }
 
 #[test]
-#[serial]
 fn index_pack_keep_without_message_writes_empty_keep_file() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -100,7 +98,6 @@ fn index_pack_keep_without_message_writes_empty_keep_file() {
 /// successfully had no external delta bases to complete — matching Git, where
 /// `--fix-thin` on a complete pack does nothing.
 #[test]
-#[serial]
 fn index_pack_fix_thin_is_noop_on_complete_pack() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());

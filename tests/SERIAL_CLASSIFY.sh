@@ -3681,6 +3681,11 @@ def _site_key(path, line_idx, col):
 
 
 rows = []
+# TA-03: the converter consumes the FROZEN manifest for verdicts and this
+# machine-readable SITE MAP for attribute locations — one lexer, one
+# attribution contract. stdout (the manifest surface) is unchanged.
+_sites_out = os.environ.get('SERIAL_CLASSIFY_SITES_FILE')
+_sites_rows = []
 for path, code in FILES:
     for i, cline in enumerate(code):
         pos = 0
@@ -3694,7 +3699,11 @@ for path, code in FILES:
                 continue          # not the attribute (identifier prefix)
             end_li, end_col, keys = read_attr_keys(code, i, m.start())
             if keys is None:
-                rows.append((_site_key(path, i, m.start()), 'global'))
+                _k = _site_key(path, i, m.start())
+                rows.append((_k, 'global'))
+                if _sites_out:
+                    _sites_rows.append((_k, path, i, m.start(), i,
+                                        len(code[i])))
                 break
             fm = FN_INLINE.search(code[end_li], end_col)
             same_line = fm is not None
@@ -3708,7 +3717,11 @@ for path, code in FILES:
                         continue
                     break
             if fm is None:
-                rows.append((_site_key(path, i, m.start()), 'global'))
+                _k = _site_key(path, i, m.start())
+                rows.append((_k, 'global'))
+                if _sites_out:
+                    _sites_rows.append((_k, path, i, m.start(),
+                                        end_li, end_col))
             else:
                 fn = fm.group(1)
                 closed, text = delimit(code, i if same_line else j,
@@ -3751,6 +3764,9 @@ for path, code in FILES:
                         else:
                             verdict = 'none'
                 rows.append((fn, verdict))
+                if _sites_out:
+                    _sites_rows.append((fn, path, i, m.start(),
+                                        end_li, end_col))
             if end_li == i:
                 pos = end_col if end_col > m.end() else m.end()
             else:
@@ -3759,4 +3775,9 @@ for path, code in FILES:
 rows.sort()
 for fn, v in rows:
     print('%s\t%s' % (fn, v))
+if _sites_out:
+    with open(_sites_out, 'w', encoding='utf-8') as _sf:
+        for _k, _p, _sl, _sc, _el, _ec in sorted(_sites_rows):
+            _sf.write('%s\t%s\t%d\t%d\t%d\t%d\n'
+                      % (_k, _p, _sl, _sc, _el, _ec))
 CLASSIFY_PY
