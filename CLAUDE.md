@@ -157,6 +157,17 @@ A change is considered done only when all three of the following pass locally wi
 
 These mirror the `compat-rustfmt`, `compat-clippy`, and `compat-offline-core` CI jobs, so passing them locally is the precondition for opening a PR. Run all three before reporting work as complete.
 
+### Layered test execution for plan-driven work (ER-13)
+
+When the work is driven by a task-card plan under `docs/development/plan/`, the **test** gate above is layered per [`plan-template.md`](docs/development/plan/plan-template.md) **ER-13**. Formatting and lint are *not* layered — every card that gets pushed still runs both.
+
+- **Task-card execution phase** — run only the tests related to that card: the ER-04 A-group focused commands for the surfaces the card actually touched, plus the card's own `Verification` cases. A full `source .env.test && cargo test --all` is required on a card only when it hits an ER-13 trigger: `T-1` cross-cutting surfaces (`sql/**`, `src/cli.rs` command registration or global flags, stable error codes and `docs/error-codes.md`, shared single-source-of-truth helpers, `build.rs`, non-version `Cargo.toml` lines, `rustfmt.toml`, `.github/workflows/**`, `install.sh` / `install.ps1`), `T-2` release / aggregation cards, `T-3` removals or renames of public surfaces, `T-4` shared test infrastructure (`tests/harness/`, `tests/helpers/`, `tests/command/mod.rs`), `T-5` an explicit request to run the full suite, `T-6` focused failures that cannot be attributed.
+- **Closeout phase (after every task card is done)** — the full three-gate run above is **mandatory**, and every bug it exposes must be fixed: forward-fix (already-pushed commits and published artifacts are never rolled back), then **re-run the full suite to green**. A failure judged pre-existing needs reproduction evidence on the plan's baseline commit plus a `FIX-*` / `DEFER-*` entry — "it was already red" is not an accepted disposition.
+
+Tradeoff to be aware of: `.github/workflows/base.yml` runs on `pull_request` only, so a direct push to `main` has no remote full-suite safety net; the closeout gate is the only backstop.
+
+Changes made outside a plan (one-off fixes, ad-hoc work) still run all three gates before being reported complete.
+
 ## Commit & PR Conventions
 
 ### Commit Messages
