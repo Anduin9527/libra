@@ -1821,8 +1821,11 @@ fn classifier_ignores_string_literals_and_reads_same_line_attributes() {
 /// artifact — regenerating it from `tests/SERIAL_REGISTRY.tsv` must reproduce
 /// the committed file byte for byte, and the `external` union group must hold
 /// exactly the registry-derived membership: every fn row whose lane keys
-/// include an external key (cloud_live / workspace_failpoints) as a
-/// `test(=<fn>)` filter, plus every pure-global site row's host target as a
+/// include an external key (cloud_live / workspace_failpoints) as an
+/// anchored last-segment regex filter `test(/(^|::)<fn>$/)` — full nextest
+/// names in aggregated binaries carry module paths, and fn names are
+/// tree-unique, so the anchor is exact — plus every pure-global site row's
+/// host target as a
 /// `binary(=<target>)` filter. nextest test-groups are exclusive-membership,
 /// so the union group is the only faithful mechanical derivation.
 #[test]
@@ -1887,7 +1890,7 @@ fn nextest_groups_toml_matches_generator_and_registry() {
 
     assert_eq!(
         toml_fns, expected_fns,
-        "external group test(=..) members must equal the registry-derived \
+        "external group test(/(^|::)fn$/) members must equal the registry-derived \
          union of cloud_live/workspace_failpoints fn rows"
     );
     assert_eq!(
