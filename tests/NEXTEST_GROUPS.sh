@@ -7,7 +7,13 @@
 # only, so overlapping per-key groups cannot express compound rows).
 # Members:
 #   - every fn row whose lane key set contains cloud_live or
-#     workspace_failpoints            -> filter = 'test(=<fn>)'
+#     workspace_failpoints            -> filter = 'test(/(^|::)<fn>$/)'
+#     (anchored regex, not test(=..): aggregated binaries nest modules, so
+#     the full nextest name is e.g. command::blame_test::<fn>; fn names are
+#     tree-unique — the registry guard rejects duplicates — so matching the
+#     last path segment is exact. Over-match against a hypothetical
+#     same-named non-serial test would only add it to the exclusion group,
+#     which is the safe direction.)
 #   - every pure-global site row's host target (whole test binary)
 #                                     -> filter = 'binary(=<target>)'
 # cwd/env/hash_kind never generate groups (in-process locks dissolve
@@ -61,7 +67,7 @@ emit() {
     LC_ALL=C sort "$TMP" | while IFS="$(printf '\t')" read -r kind name; do
         printf '\n%s\n' "[[profile.default.overrides]]"
         if [ "$kind" = "F" ]; then
-            printf "filter = 'test(=%s)'\n" "$name"
+            printf "filter = 'test(/(^|::)%s$/)'\n" "$name"
         else
             printf "filter = 'binary(=%s)'\n" "$name"
         fi
@@ -74,7 +80,7 @@ if [ "${1:-}" = "--stdout" ]; then
 else
     mkdir -p "$ROOT/.config"
     emit > "$OUT"
-    fn_n=$(grep -c "^filter = 'test(=" "$OUT")
+    fn_n=$(grep -c "^filter = 'test(/" "$OUT")
     bin_n=$(grep -c "^filter = 'binary(=" "$OUT")
     echo "wrote $OUT (external group: $fn_n test filters + $bin_n binary filters)"
 fi

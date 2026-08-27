@@ -1874,8 +1874,8 @@ fn nextest_groups_toml_matches_generator_and_registry() {
 
     let mut toml_fns: Vec<String> = committed
         .lines()
-        .filter_map(|l| l.strip_prefix("filter = 'test(="))
-        .map(|l| l.trim_end_matches(")'").to_string())
+        .filter_map(|l| l.strip_prefix("filter = 'test(/(^|::)"))
+        .map(|l| l.trim_end_matches("$/)'").to_string())
         .collect();
     let mut toml_bins: Vec<String> = committed
         .lines()
