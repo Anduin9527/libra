@@ -165,7 +165,7 @@ targets with
 
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
-| `harness_self_test` | 2 | Smoke-checks the Code UI Web harness (control files, SIGTERM port release) | `tests/harness/` |
+| `harness_self_test` | 2 | Smoke-checks the Code UI Web harness (control files; SIGTERM release asserted through natural exit + control token/info removal — TA-04 dropped the racy rebind-specific-address probe) | `tests/harness/` |
 | `code_ui_scenarios` | 2 | End-to-end Web-harness scenarios, including W2-03 `plan_review_modify_next_plain_text_opens_replacement_plan_gate`, `plan_review_empty_revision_note_is_typed_and_preserves_authority`, `plan_review_repository_replacement_after_modify_keeps_revision_note_retryable`, `plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout`, `plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds`, `plan_review_head_drift_survives_resume_and_requires_explicit_modify`, `plan_review_repository_replacement_blocks_modify_and_preserves_gate`, `plan_review_network_allow_enters_runtime_queue`, `plan_review_network_allow_returns_conflict_and_preserves_pending_gate`, and network-gate crash/resume | `src/command/code.rs`, `src/internal/ai/web/`, `src/internal/ai/workflow_baseline.rs` |
 | `code_ui_remote_lease_matrix` | 2 | Browser/automation lease lifecycle matrix | `src/command/code.rs` controller, `src/command/code_control.rs` |
 | `code_ui_remote_sse_matrix` | 2 | SSE event stream matrix from web view, defaulting consumers to wire v2 with explicit v1 initial-snapshot/controller compatibility cases | `src/internal/ai/web/`, `src/command/code.rs` (axum), `src/command/code_control.rs` |
@@ -296,7 +296,7 @@ workdir on exit.
 |---|---|---|---|
 | `pnpm --dir web test:e2e` | 2 | Playwright main-chain: submit → approval/user-input → goal/task/skill → usage → execution/repair → resume/cancel → SSE reconnect | `web/e2e/`, `web/playwright.config.ts`, `web/e2e/scripts/start-deterministic-runtime.sh` |
 | `intent_flow_test` | 2 | IntentSpec → Plan → Run pipeline (no live LLM) | `src/internal/ai/intentspec/`, `src/internal/ai/orchestrator/` |
-| `e2e_mcp_flow` | 2 | End-to-end MCP server flow | `src/internal/ai/mcp/` |
+| `e2e_mcp_flow` | 2 | End-to-end MCP server flow (TA-04: launches with OS-assigned ports `--port 0 --mcp-port 0`, endpoints read back from the startup banner; shutdown asserted by connect-refused, not rebind) | `src/internal/ai/mcp/` |
 | `mcp_integration_test` | 2 | MCP integration tests | `src/internal/ai/mcp/` |
 | `ai_automation_test` | 2 | `.libra/automations.toml` rule execution | `src/internal/ai/automation/`, `src/command/automation.rs` |
 | `ai_dag_tool_loop_test` | 2 | DAG-based tool loop regression | `src/internal/ai/agent/` |
