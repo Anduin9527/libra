@@ -1816,3 +1816,85 @@ fn classifier_ignores_string_literals_and_reads_same_line_attributes() {
         "string/char/comment literals must not produce rows, same-line attributes must be read, mixed pollution keeps both lanes, inner_attrs is not a lock key, prefixed keys are kept, multi-line attributes parse across lines, and malformed attributes (missing/mismatched delimiters) fail closed as global sites"
     );
 }
+
+/// plan-20260827 NP-01 (ADR-NP-01): `.config/nextest.toml` is a generated
+/// artifact — regenerating it from `tests/SERIAL_REGISTRY.tsv` must reproduce
+/// the committed file byte for byte, and the `external` union group must hold
+/// exactly the registry-derived membership: every fn row whose lane keys
+/// include an external key (cloud_live / workspace_failpoints) as a
+/// `test(=<fn>)` filter, plus every pure-global site row's host target as a
+/// `binary(=<target>)` filter. nextest test-groups are exclusive-membership,
+/// so the union group is the only faithful mechanical derivation.
+#[test]
+fn nextest_groups_toml_matches_generator_and_registry() {
+    let committed = std::fs::read_to_string(repo_root().join(".config/nextest.toml"))
+        .expect("read .config/nextest.toml");
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/NEXTEST_GROUPS.sh"))
+        .arg("--stdout")
+        .current_dir(repo_root())
+        .output()
+        .expect("run tests/NEXTEST_GROUPS.sh --stdout");
+    assert!(
+        out.status.success(),
+        "NEXTEST_GROUPS.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let regenerated = String::from_utf8(out.stdout).expect("generator output is UTF-8");
+    assert_eq!(
+        regenerated, committed,
+        ".config/nextest.toml drifted from its generator; \
+         run: sh tests/NEXTEST_GROUPS.sh"
+    );
+
+    let external_key = |lane: &str| {
+        lane.strip_prefix("lane:").is_some_and(|keys| {
+            keys.split('+')
+                .any(|k| k == "cloud_live" || k == "workspace_failpoints")
+        })
+    };
+    let mut expected_fns = Vec::new();
+    let mut expected_bins = Vec::new();
+    for (key, (lane, _)) in registry() {
+        if let Some(rest) = key.strip_prefix("<site:") {
+            if lane == "global" {
+                let path = rest.split(':').next().expect("site key has a path");
+                let target = path
+                    .strip_prefix("tests/")
+                    .and_then(|p| p.strip_suffix(".rs"))
+                    .unwrap_or_else(|| panic!("unexpected site path shape: {path}"));
+                expected_bins.push(target.to_string());
+            }
+        } else if external_key(&lane) {
+            expected_fns.push(key);
+        }
+    }
+    expected_fns.sort();
+    expected_bins.sort();
+
+    let mut toml_fns: Vec<String> = committed
+        .lines()
+        .filter_map(|l| l.strip_prefix("filter = 'test(="))
+        .map(|l| l.trim_end_matches(")'").to_string())
+        .collect();
+    let mut toml_bins: Vec<String> = committed
+        .lines()
+        .filter_map(|l| l.strip_prefix("filter = 'binary(="))
+        .map(|l| l.trim_end_matches(")'").to_string())
+        .collect();
+    toml_fns.sort();
+    toml_bins.sort();
+
+    assert_eq!(
+        toml_fns, expected_fns,
+        "external group test(=..) members must equal the registry-derived \
+         union of cloud_live/workspace_failpoints fn rows"
+    );
+    assert_eq!(
+        toml_bins, expected_bins,
+        "external group binary(=..) members must equal the pure-global site \
+         rows' host targets"
+    );
+    assert_eq!(toml_fns.len(), 208, "union fn member count drifted");
+    assert_eq!(toml_bins.len(), 7, "site host target count drifted");
+}
