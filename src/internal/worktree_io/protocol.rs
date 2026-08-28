@@ -490,27 +490,91 @@ fn validate_absolute_root(bytes: &[u8], kind: &str) -> io::Result<()> {
             format!("{kind} capability root must be an absolute path"),
         ));
     }
-    if root.components().any(|component| {
-        matches!(
-            component,
-            Component::CurDir | Component::ParentDir | Component::Prefix(_)
-        )
-    }) {
+    validate_absolute_root_units(bytes, kind)?;
+    if root
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{kind} capability root must be lexically canonical"),
         ));
     }
+    Ok(())
+}
+
+fn validate_absolute_root_units(bytes: &[u8], kind: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = root.as_os_str().as_bytes();
+        let has_dot_segment = bytes
+            .split(|byte| *byte == b'/')
+            .any(|segment| segment == b"." || segment == b"..");
+        if has_dot_segment {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{kind} capability root must be lexically canonical"),
+            ));
+        }
         if bytes.windows(2).any(|pair| pair == b"//") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{kind} capability root must not contain duplicate separators"),
             ));
         }
+    }
+    #[cfg(windows)]
+    {
+        if bytes.len() % 2 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{kind} capability root has invalid platform path encoding"),
+            ));
+        }
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        let is_separator = |unit: u16| unit == u16::from(b'\\') || unit == u16::from(b'/');
+        let allows_unc_prefix =
+            units.len() >= 2 && is_separator(units[0]) && is_separator(units[1]);
+        let is_dot_segment = |segment: &[u16]| {
+            (segment.len() == 1 && segment[0] == u16::from(b'.'))
+                || (segment.len() == 2
+                    && segment[0] == u16::from(b'.')
+                    && segment[1] == u16::from(b'.'))
+        };
+        let mut segment_start = 0;
+        let mut previous_separator = false;
+        for (index, unit) in units.iter().copied().enumerate() {
+            if !is_separator(unit) {
+                previous_separator = false;
+                continue;
+            }
+            if previous_separator && !(allows_unc_prefix && index == 1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{kind} capability root must not contain duplicate separators"),
+                ));
+            }
+            if is_dot_segment(&units[segment_start..index]) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{kind} capability root must be lexically canonical"),
+                ));
+            }
+            segment_start = index + 1;
+            previous_separator = true;
+        }
+        if is_dot_segment(&units[segment_start..]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{kind} capability root must be lexically canonical"),
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (bytes, kind);
     }
     Ok(())
 }
@@ -829,6 +893,47 @@ mod tests {
             capability
                 .relative_from_absolute(Path::new("/tmp/escape"))
                 .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn request_validation_accepts_windows_absolute_roots_only() {
+        for root in [Path::new("C:\\"), Path::new(r"\\server\share")] {
+            let request = IoRequest::MarkerProbe {
+                dir: b"nested".to_vec(),
+                root: path_to_bytes(root),
+            };
+            assert!(
+                request.validate().is_ok(),
+                "absolute Windows root must be lexically valid: {root:?}"
+            );
+        }
+
+        for root in [
+            Path::new(r"C:\worktree\..\escape"),
+            Path::new(r"C:\worktree\.\nested"),
+            Path::new(r"C:\worktree\\nested"),
+            Path::new(r"\\server\share\\nested"),
+            Path::new(r"worktree"),
+        ] {
+            let request = IoRequest::MarkerProbe {
+                dir: b"nested".to_vec(),
+                root: path_to_bytes(root),
+            };
+            assert!(
+                request.validate().is_err(),
+                "non-canonical or relative Windows root must fail: {root:?}"
+            );
+        }
+
+        let request = IoRequest::MarkerProbe {
+            dir: path_to_bytes(Path::new(r"C:\escape")),
+            root: path_to_bytes(Path::new(r"C:\worktree")),
+        };
+        assert!(
+            request.validate().is_err(),
+            "absolute request path must remain rejected"
         );
     }
 
