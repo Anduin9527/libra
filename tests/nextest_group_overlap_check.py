@@ -41,21 +41,53 @@ def _overlap_count(intervals):
     )
 
 
+def _synthetic_junit(cases):
+    rows = "".join(
+        f'<testcase classname="libra::agent_bridge_vcs_test" '
+        f'name="case{i}::commit_create_refuses_on_head_drift" '
+        f'timestamp="{ts}" time="{dur}"/>'
+        for i, (ts, dur) in enumerate(cases)
+    )
+    return f"<testsuites><testsuite>{rows}</testsuite></testsuites>"
+
+
 def selftest() -> int:
+    import tempfile
+
     perfect_handoff = [(0.000, 0.450, "a"), (0.450, 0.985, "b")]
     ms_jitter = [(0.000, 0.4512, "a"), (0.4508, 0.985, "b")]      # < 2 ms phantom
     short_full_overlap = [(0.000, 0.007, "a"), (0.001, 0.008, "b")]  # 7 ms tests
     long_partial_overlap = [(0.000, 0.500, "a"), (0.300, 0.900, "b")]
-    nan_is_rejected = not (
-        math.isfinite(float("nan")) and True
-    )  # guard the guard: the finite check above must reject NaN durations
-    ok = (
+    interval_ok = (
         _overlap_count(perfect_handoff) == 0
         and _overlap_count(ms_jitter) == 0
         and _overlap_count(short_full_overlap) == 1
         and _overlap_count(long_partial_overlap) == 1
-        and nan_is_rejected
     )
+
+    # feed genuinely malformed durations through the real XML parse path and
+    # require the parse-rejection exit code (2) — a regression that drops the
+    # finite-value check must turn this red.
+    base = "2026-08-28T20:47:42.497+08:00"
+    parse_ok = True
+    for bad in ("NaN", "inf", "-1.0"):
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as f:
+            f.write(_synthetic_junit([(base, bad)]))
+            path = f.name
+        rc = check_file(path)
+        if rc != 2:
+            print(f"SELFTEST parse-rejection failed for time={bad}: rc={rc}")
+            parse_ok = False
+    # and a well-formed overlapping pair through the same real path must be
+    # detected as a genuine overlap (exit 1)
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as f:
+        f.write(
+            _synthetic_junit([(base, "0.500"), (base, "0.500")])
+        )
+        path = f.name
+    parse_ok = parse_ok and check_file(path) == 1
+
+    ok = interval_ok and parse_ok
     print("SELFTEST", "OK" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -88,7 +120,11 @@ def main() -> int:
     if len(sys.argv) != 3 or sys.argv[2] != "external":
         print(__doc__, file=sys.stderr)
         return 2
-    junit = Path(sys.argv[1])
+    return check_file(sys.argv[1])
+
+
+def check_file(junit_path) -> int:
+    junit = Path(junit_path)
     root = Path(__file__).resolve().parent.parent
     fns, targets = registry_membership(root)
 
