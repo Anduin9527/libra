@@ -13,7 +13,6 @@
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    ffi::{OsStr, OsString},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -24,8 +23,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use serde::{Deserialize, Serialize};
 
 /// Hidden argv token. Must be the second argv element; parsed in `main` before CLI.
 pub const STATUS_IO_WORKER_ARG: &str = "--libra-internal-status-io-worker";
@@ -39,437 +36,13 @@ const MAX_INFLIGHT: usize = 8;
 /// (not fail-fast at 8), but timed-out / excess jobs must not grow without
 /// bound in a long-lived host.
 const MAX_PENDING: usize = 64;
-const FRAME_CAP: usize = 8 * 1024 * 1024;
 
-/// Serializable worktree stat (Metadata cannot cross the process boundary).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct CapturedStat {
-    pub is_symlink: bool,
-    pub is_dir: bool,
-    pub is_file: bool,
-    pub len: u64,
-    pub mode: u32,
-    pub ctime_sec: i64,
-    pub ctime_nsec: i64,
-    pub mtime_sec: i64,
-    pub mtime_nsec: i64,
-}
-
-impl CapturedStat {
-    fn from_metadata(meta: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let ft = meta.file_type();
-            Self {
-                is_symlink: ft.is_symlink(),
-                is_dir: meta.is_dir(),
-                is_file: meta.is_file() && !ft.is_symlink(),
-                len: meta.len(),
-                mode: meta.mode(),
-                ctime_sec: meta.ctime(),
-                ctime_nsec: meta.ctime_nsec(),
-                mtime_sec: meta.mtime(),
-                mtime_nsec: meta.mtime_nsec(),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let ft = meta.file_type();
-            let mtime = meta.modified().ok();
-            let ctime = meta.created().ok().or(mtime);
-            let (ctime_sec, ctime_nsec) = system_time_parts(ctime);
-            let (mtime_sec, mtime_nsec) = system_time_parts(mtime);
-            Self {
-                is_symlink: ft.is_symlink(),
-                is_dir: meta.is_dir(),
-                is_file: meta.is_file() && !ft.is_symlink(),
-                len: meta.len(),
-                mode: 0,
-                ctime_sec,
-                ctime_nsec,
-                mtime_sec,
-                mtime_nsec,
-            }
-        }
-    }
-
-    pub(crate) fn is_symlink(&self) -> bool {
-        self.is_symlink
-    }
-
-    pub(crate) fn is_dir(&self) -> bool {
-        self.is_dir
-    }
-
-    pub(crate) fn is_file(&self) -> bool {
-        self.is_file
-    }
-
-    pub(crate) fn len(&self) -> u64 {
-        self.len
-    }
-
-    fn from_raw_lstat(raw: &crate::utils::beneath::RawLstat) -> Self {
-        Self {
-            is_symlink: raw.is_symlink,
-            is_dir: raw.is_dir,
-            is_file: raw.is_file,
-            len: raw.len,
-            mode: raw.mode,
-            ctime_sec: raw.ctime_sec,
-            ctime_nsec: raw.ctime_nsec,
-            mtime_sec: raw.mtime_sec,
-            mtime_nsec: raw.mtime_nsec,
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn system_time_parts(time: Option<std::time::SystemTime>) -> (i64, i64) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let Some(time) = time else {
-        return (0, 0);
-    };
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => (
-            duration.as_secs() as i64,
-            i64::from(duration.subsec_nanos()),
-        ),
-        Err(_) => (0, 0),
-    }
-}
-
-/// One `read_dir` name plus the worker-side `file_type()` (d_type / lstat).
-/// Callers must not issue a follow-up IPC stat for the common typed case.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Dirent {
-    pub name: Vec<u8>,
-    pub is_dir: bool,
-    pub is_symlink: bool,
-    pub is_file: bool,
-    /// `false` when `DirEntry::file_type()` failed; caller may fall back to
-    /// a killable `deadline_stat` for this one name.
-    pub type_ok: bool,
-}
-
-impl Dirent {
-    fn from_dir_entry(entry: &std::fs::DirEntry) -> Self {
-        let name = path_to_bytes(&PathBuf::from(entry.file_name()));
-        match entry.file_type() {
-            Ok(file_type) => Self {
-                name,
-                is_dir: file_type.is_dir(),
-                is_symlink: file_type.is_symlink(),
-                is_file: file_type.is_file() && !file_type.is_symlink(),
-                type_ok: true,
-            },
-            Err(_) => Self {
-                name,
-                is_dir: false,
-                is_symlink: false,
-                is_file: false,
-                type_ok: false,
-            },
-        }
-    }
-
-    fn from_fd_dirent(entry: &crate::utils::beneath::FdDirent) -> Self {
-        let name = path_to_bytes(&PathBuf::from(&entry.name));
-        // `d_type` values match libc DT_* / Windows FILE_ATTRIBUTE mapping.
-        const DT_UNKNOWN: u8 = 0;
-        const DT_DIR: u8 = 4;
-        const DT_REG: u8 = 8;
-        const DT_LNK: u8 = 10;
-        match entry.d_type {
-            DT_DIR => Self {
-                name,
-                is_dir: true,
-                is_symlink: false,
-                is_file: false,
-                type_ok: true,
-            },
-            DT_LNK => Self {
-                name,
-                is_dir: false,
-                is_symlink: true,
-                is_file: false,
-                type_ok: true,
-            },
-            DT_REG => Self {
-                name,
-                is_dir: false,
-                is_symlink: false,
-                is_file: true,
-                type_ok: true,
-            },
-            DT_UNKNOWN => Self {
-                name,
-                is_dir: false,
-                is_symlink: false,
-                is_file: false,
-                type_ok: false,
-            },
-            _ => Self {
-                name,
-                is_dir: false,
-                is_symlink: false,
-                is_file: false,
-                type_ok: true,
-            },
-        }
-    }
-}
-
-/// Cheap classify result from a `Dirent` or a fallback `CapturedStat`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DirentKind {
-    is_dir: bool,
-    is_file: bool,
-    is_symlink: bool,
-}
-
-impl DirentKind {
-    pub(crate) fn is_dir(self) -> bool {
-        self.is_dir
-    }
-
-    pub(crate) fn is_file(self) -> bool {
-        self.is_file
-    }
-
-    pub(crate) fn is_symlink(self) -> bool {
-        self.is_symlink
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ReadDirListing {
-    pub entries: Vec<Dirent>,
-    pub error_kinds: Vec<(u8, Option<i32>)>,
-    pub taken: usize,
-    pub hit_cap: bool,
-    /// Set by the parent when the worker was killed mid-stream; not sent
-    /// on the wire (`#[serde(default)]`).
-    #[serde(default)]
-    pub timed_out: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct CapRequest {
-    cap: String,
-    request: IoRequest,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum IoRequest {
-    SymlinkMetadata {
-        path: Vec<u8>,
-        /// Worktree root. Empty → legacy path lstat (library callers).
-        root: Vec<u8>,
-    },
-    CanonicalizePair {
-        left: Vec<u8>,
-        right: Vec<u8>,
-    },
-    ReadDir {
-        path: Vec<u8>,
-        /// Worktree root. Empty → legacy path `read_dir` (library callers).
-        root: Vec<u8>,
-        remaining: usize,
-        checkpoint_every: u32,
-    },
-    FileBlobHash {
-        path: Vec<u8>,
-        hash_kind: String,
-        /// Worktree root for LFS/attributes discovery. Recycled helpers keep
-        /// the spawn CWD; the parent always sends the request repo here.
-        workdir: Vec<u8>,
-    },
-    /// Local object-store blob read (WIO-03). Parent peels replace refs;
-    /// worker opens `objects_root` with a local-only backend and never
-    /// hydrates or writes.
-    ReadObjectBlob {
-        oid: String,
-        objects_root: Vec<u8>,
-        byte_limit: u64,
-        hash_kind: String,
-    },
-    MarkerProbe {
-        dir: Vec<u8>,
-        /// Worktree root. Empty → legacy path marker probe (library callers).
-        root: Vec<u8>,
-    },
-    Shutdown,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum IoEvent {
-    Ready,
-    Begin,
-    RecordDirent(Dirent),
-    RecordError {
-        kind: u8,
-        raw_os: Option<i32>,
-    },
-    Checkpoint {
-        seq: u64,
-        records: u64,
-    },
-    DoneStat {
-        result: WireResult<CapturedStat>,
-    },
-    DoneCanonicalize {
-        left: WireResult<Vec<u8>>,
-        right: WireResult<Vec<u8>>,
-    },
-    DoneReadDir {
-        listing: ReadDirListing,
-    },
-    DoneHash {
-        hex: WireResult<String>,
-    },
-    DoneObjectBlob {
-        status: ObjectBlobStatus,
-        /// Filled by the parent after a trailing binary frame when
-        /// `status == Ok`. Never JSON-encoded (WIO-03 ≤20% overhead).
-        #[serde(skip)]
-        bytes: Option<Vec<u8>>,
-    },
-    DoneMarker {
-        present: Option<bool>,
-        err_kind: Option<u8>,
-        err_raw_os: Option<i32>,
-    },
-    Error {
-        message: String,
-    },
-}
-
-/// Compact object-read status on the wire (bytes travel in a raw frame).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ObjectBlobStatus {
-    Ok,
-    Missing,
-    Corrupt,
-    Unavailable,
-    TooLarge,
-    Failed,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum WireResult<T> {
-    Ok(T),
-    Err { kind: u8, raw_os: Option<i32> },
-}
-
-fn kind_to_u8(kind: io::ErrorKind) -> u8 {
-    match kind {
-        io::ErrorKind::NotFound => 0,
-        io::ErrorKind::PermissionDenied => 1,
-        io::ErrorKind::TimedOut => 2,
-        _ => 3,
-    }
-}
-
-pub(crate) fn io_from_wire(kind: u8, raw_os: Option<i32>) -> io::Error {
-    if let Some(code) = raw_os {
-        return io::Error::from_raw_os_error(code);
-    }
-    let kind = match kind {
-        0 => io::ErrorKind::NotFound,
-        1 => io::ErrorKind::PermissionDenied,
-        2 => io::ErrorKind::TimedOut,
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::new(kind, "status io worker")
-}
-
-fn wire_result<T>(result: io::Result<T>) -> WireResult<T> {
-    match result {
-        Ok(value) => WireResult::Ok(value),
-        Err(error) => WireResult::Err {
-            kind: kind_to_u8(error.kind()),
-            raw_os: error.raw_os_error(),
-        },
-    }
-}
-
-fn unwrap_wire<T>(result: WireResult<T>) -> io::Result<T> {
-    match result {
-        WireResult::Ok(value) => Ok(value),
-        WireResult::Err { kind, raw_os } => Err(io_from_wire(kind, raw_os)),
-    }
-}
-
-fn path_to_bytes(path: &Path) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        path.as_os_str()
-            .encode_wide()
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect()
-    }
-}
-
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        PathBuf::from(OsStr::from_bytes(bytes))
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStringExt;
-        let mut wide = Vec::with_capacity(bytes.len() / 2);
-        let mut chunks = bytes.chunks_exact(2);
-        for chunk in &mut chunks {
-            wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-        }
-        PathBuf::from(OsString::from_wide(&wide))
-    }
-}
-
-pub(crate) fn dirent_os(bytes: &[u8]) -> OsString {
-    bytes_to_path(bytes).into_os_string()
-}
-
-fn write_frame(writer: &mut impl Write, event: &IoEvent) -> io::Result<()> {
-    let payload = serde_json::to_vec(event)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if payload.len() > FRAME_CAP {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "status io worker frame too large",
-        ));
-    }
-    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
-    writer.write_all(&payload)?;
-    writer.flush()
-}
-
-fn read_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<T> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > FRAME_CAP {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "status io worker frame length invalid",
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
+pub(crate) use crate::internal::worktree_io::protocol::{
+    CapRequest, CapturedStat, Dirent, DirentKind, FRAME_CAP, IoEvent, IoRequest, ObjectBlobStatus,
+    ObjectStoreCapability, ReadDirListing, WireResult, WorktreeRootCapability, bytes_to_path,
+    dirent_os, io_from_wire, kind_to_u8, path_to_bytes, read_frame, unwrap_wire, wire_result,
+    write_frame,
+};
 
 fn parent_still_alive(ppid: u32) -> bool {
     #[cfg(unix)]
@@ -554,6 +127,9 @@ pub fn run_worker() -> i32 {
 }
 
 fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<bool> {
+    // Requests can be supplied by the helper's pipe peer, so validate the
+    // sealed root and canonical relative paths again after deserialization.
+    request.validate()?;
     match request {
         IoRequest::Shutdown => return Ok(false),
         IoRequest::SymlinkMetadata { path, root } => {
@@ -563,15 +139,27 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
             let result = lstat_request(&path, &root_path);
             write_frame(stdout, &IoEvent::DoneStat { result })?;
         }
-        IoRequest::CanonicalizePair { left, right } => {
+        IoRequest::CanonicalizePair { left, right, root } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let left_path = bytes_to_path(&left);
             let right_path = bytes_to_path(&right);
+            let root_path = bytes_to_path(&root);
+            let capability = WorktreeRootCapability::seal(&root_path)?;
             write_frame(
                 stdout,
                 &IoEvent::DoneCanonicalize {
-                    left: wire_result(left_path.canonicalize().map(|p| path_to_bytes(&p))),
-                    right: wire_result(right_path.canonicalize().map(|p| path_to_bytes(&p))),
+                    left: wire_result(
+                        capability
+                            .resolve(&left_path)
+                            .and_then(|path| path.canonicalize())
+                            .map(|p| path_to_bytes(&p)),
+                    ),
+                    right: wire_result(
+                        capability
+                            .resolve(&right_path)
+                            .and_then(|path| path.canonicalize())
+                            .map(|p| path_to_bytes(&p)),
+                    ),
                 },
             )?;
         }
@@ -590,40 +178,29 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
         IoRequest::FileBlobHash {
             path,
             hash_kind,
-            workdir,
+            root,
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
-            let mut path = bytes_to_path(&path);
-            // Only the helper process may chdir: in-process dispatch shares
-            // the caller's CWD (tests / `execute_to`) and must not move it.
-            if std::env::var_os(STATUS_IO_WORKER_CAP_ENV).is_some() {
-                let workdir = bytes_to_path(&workdir);
-                if let Err(error) = std::env::set_current_dir(&workdir) {
-                    write_frame(
-                        stdout,
-                        &IoEvent::DoneHash {
-                            hex: WireResult::Err {
-                                kind: kind_to_u8(error.kind()),
-                                raw_os: error.raw_os_error(),
-                            },
-                        },
-                    )?;
-                    return Ok(true);
-                }
-                // `chdir` resolves symlinks, so the process CWD can differ
-                // textually from the request's workdir (stock macOS puts
-                // `TMPDIR` under `/var -> private/var`). Attribute lookup
-                // anchors on the resolved CWD and drops any path that does not
-                // look like its descendant, so an absolute request path in the
-                // unresolved spelling would silently lose `.gitattributes` and
-                // hash an LFS-tracked file as raw content. Re-anchor the path
-                // on the workdir we just entered.
-                if let Ok(relative) = path.strip_prefix(&workdir)
-                    && !relative.as_os_str().is_empty()
-                {
-                    path = relative.to_path_buf();
-                }
-            }
+            let path = bytes_to_path(&path);
+            let root_path = bytes_to_path(&root);
+            let capability = WorktreeRootCapability::seal(&root_path)?;
+            let relative = capability.relative(&path)?;
+            // Validate all parent components through the no-follow beneath
+            // walker before handing the path to the existing hash routine.
+            // A symlink leaf is intentionally retained: Git hashes its link
+            // target bytes, while an interior symlink is rejected.
+            let root_fd = crate::utils::beneath::open_root(capability.root())?;
+            crate::utils::beneath::lstat_beneath(&root_fd, &relative)?;
+            let path = if std::env::var_os(STATUS_IO_WORKER_CAP_ENV).is_some() {
+                // The standalone helper has an isolated process, so changing
+                // its CWD lets Git's attribute lookup discover the request's
+                // `.gitattributes` without exposing an absolute path to the
+                // hash routine. In-process callers keep their CWD untouched.
+                std::env::set_current_dir(capability.root())?;
+                relative
+            } else {
+                capability.resolve(&relative)?
+            };
             apply_hash_kind(&hash_kind);
             let result = match crate::command::calc_file_blob_hash(&path) {
                 Ok(hash) => WireResult::Ok(hash.to_string()),
@@ -688,6 +265,23 @@ fn request_root_bytes() -> io::Result<Vec<u8>> {
     })
 }
 
+/// Convert the status layer's historical absolute paths into the strict
+/// relative representation carried on the wire. This is deliberately done at
+/// submission time as well as in the helper after decoding, so malformed
+/// requests never enter the queue or get serialized.
+fn request_worktree_relative(root: &[u8], path: &Path, allow_root: bool) -> io::Result<Vec<u8>> {
+    let root_path = bytes_to_path(root);
+    let capability = WorktreeRootCapability::seal(&root_path)?;
+    let relative = if path.is_absolute() {
+        capability.relative_from_absolute(path)?
+    } else if allow_root {
+        capability.relative_or_root(path)?
+    } else {
+        capability.relative(path)?
+    };
+    Ok(path_to_bytes(&relative))
+}
+
 thread_local! {
     /// Parent-side worktree root for beneath requests. Resolved once per
     /// status session so `deadline_stat` / `read_dir` do not re-walk the
@@ -735,26 +329,26 @@ pub(crate) fn begin_status_io_root_session() -> io::Result<StatusIoRootGuard> {
 }
 
 fn lstat_request(path: &Path, root: &Path) -> WireResult<CapturedStat> {
-    if root.as_os_str().is_empty() {
-        return match std::fs::symlink_metadata(path) {
-            Ok(meta) => WireResult::Ok(CapturedStat::from_metadata(&meta)),
-            Err(error) => WireResult::Err {
+    let capability = match WorktreeRootCapability::seal(root) {
+        Ok(capability) => capability,
+        Err(error) => {
+            return WireResult::Err {
                 kind: kind_to_u8(error.kind()),
                 raw_os: error.raw_os_error(),
-            },
-        };
-    }
-    let rel = match path.strip_prefix(root) {
-        Ok(rel) => rel,
-        Err(_) => {
-            return WireResult::Err {
-                kind: kind_to_u8(io::ErrorKind::Other),
-                raw_os: None,
             };
         }
     };
-    match crate::utils::beneath::open_root(root)
-        .and_then(|fd| crate::utils::beneath::lstat_beneath(&fd, rel))
+    let rel = match capability.relative_or_root(path) {
+        Ok(rel) => rel,
+        Err(error) => {
+            return WireResult::Err {
+                kind: kind_to_u8(error.kind()),
+                raw_os: error.raw_os_error(),
+            };
+        }
+    };
+    match crate::utils::beneath::open_root(capability.root())
+        .and_then(|fd| crate::utils::beneath::lstat_beneath(&fd, &rel))
     {
         Ok(raw) => WireResult::Ok(CapturedStat::from_raw_lstat(&raw)),
         Err(error) => WireResult::Err {
@@ -765,28 +359,16 @@ fn lstat_request(path: &Path, root: &Path) -> WireResult<CapturedStat> {
 }
 
 fn marker_probe_request(dir: &Path, root: &Path) -> (Option<bool>, Option<u8>, Option<i32>) {
-    if root.as_os_str().is_empty() {
-        let mut present = false;
-        for marker in [crate::utils::util::ROOT_DIR, crate::utils::util::GIT_DIR] {
-            match dir.join(marker).symlink_metadata() {
-                Ok(_) => {
-                    present = true;
-                    break;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return (None, Some(kind_to_u8(error.kind())), error.raw_os_error());
-                }
-            }
-        }
-        return (Some(present), None, None);
-    }
-    let rel = match dir.strip_prefix(root) {
-        Ok(rel) => rel,
-        Err(_) => return (None, Some(kind_to_u8(io::ErrorKind::Other)), None),
+    let capability = match WorktreeRootCapability::seal(root) {
+        Ok(capability) => capability,
+        Err(error) => return (None, Some(kind_to_u8(error.kind())), error.raw_os_error()),
     };
-    match crate::utils::beneath::open_root(root)
-        .and_then(|fd| crate::utils::beneath::marker_present_beneath(&fd, rel))
+    let rel = match capability.relative(dir) {
+        Ok(rel) => rel,
+        Err(error) => return (None, Some(kind_to_u8(error.kind())), error.raw_os_error()),
+    };
+    match crate::utils::beneath::open_root(capability.root())
+        .and_then(|fd| crate::utils::beneath::marker_present_beneath(&fd, &rel))
     {
         Ok(present) => (Some(present), None, None),
         Err(error) => (None, Some(kind_to_u8(error.kind())), error.raw_os_error()),
@@ -807,39 +389,28 @@ fn read_dir_request(
         hit_cap: false,
         timed_out: false,
     };
-    if root.as_os_str().is_empty() {
-        match std::fs::read_dir(path) {
-            Err(error) => {
-                listing
-                    .error_kinds
-                    .push((kind_to_u8(error.kind()), error.raw_os_error()));
-            }
-            Ok(reader) => {
-                emit_read_dir(
-                    reader.map(|entry| entry.map(|entry| Dirent::from_dir_entry(&entry))),
-                    path,
-                    remaining,
-                    checkpoint_every,
-                    &mut listing,
-                    stdout,
-                )?;
-            }
-        }
-        listing.entries.clear();
-        return Ok(listing);
-    }
-    let rel = match path.strip_prefix(root) {
-        Ok(rel) => rel,
-        Err(_) => {
+    let capability = match WorktreeRootCapability::seal(root) {
+        Ok(capability) => capability,
+        Err(error) => {
             listing
                 .error_kinds
-                .push((kind_to_u8(io::ErrorKind::Other), None));
+                .push((kind_to_u8(error.kind()), error.raw_os_error()));
             listing.entries.clear();
             return Ok(listing);
         }
     };
-    match crate::utils::beneath::open_root(root)
-        .and_then(|fd| crate::utils::beneath::open_beneath(&fd, rel))
+    let rel = match capability.relative_or_root(path) {
+        Ok(rel) => rel,
+        Err(error) => {
+            listing
+                .error_kinds
+                .push((kind_to_u8(error.kind()), error.raw_os_error()));
+            listing.entries.clear();
+            return Ok(listing);
+        }
+    };
+    match crate::utils::beneath::open_root(capability.root())
+        .and_then(|fd| crate::utils::beneath::open_beneath(&fd, &rel))
         .and_then(crate::utils::beneath::read_dir_fd)
     {
         Err(error) => {
@@ -850,7 +421,7 @@ fn read_dir_request(
         Ok(reader) => {
             emit_read_dir(
                 reader.map(|entry| entry.map(|entry| Dirent::from_fd_dirent(&entry))),
-                path,
+                &capability.resolve(&rel)?,
                 remaining,
                 checkpoint_every,
                 &mut listing,
@@ -1002,12 +573,19 @@ fn read_object_blob_request(
 ) -> Result<Vec<u8>, ObjectBlobStatus> {
     use crate::utils::client_storage::{ClientStorage, ObjectReadFailure};
 
+    // Seal the object-store root before handing it to the local-only storage
+    // backend. This keeps the object capability distinct from worktree roots
+    // and prevents a malformed helper request from creating/hydrating a path.
+    let Ok(object_capability) = ObjectStoreCapability::seal(objects_root) else {
+        return Err(ObjectBlobStatus::Unavailable);
+    };
     let Ok(hash) = oid.parse::<git_internal::hash::ObjectHash>() else {
         return Err(ObjectBlobStatus::Failed);
     };
     // Local-only + alternates, no directory creation / remote hydrate
     // (WIO-03 security AC).
-    let storage = ClientStorage::init_local_existing_with_alternates(objects_root.to_path_buf());
+    let storage =
+        ClientStorage::init_local_existing_with_alternates(object_capability.root().to_path_buf());
     match storage.get_with_limit(&hash, byte_limit) {
         Ok(bytes) => Ok(bytes),
         Err(error) => Err(match ClientStorage::classify_read_failure(&error) {
@@ -1062,32 +640,11 @@ fn write_object_blob_outcome(
 }
 
 fn write_raw_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    if payload.len() > FRAME_CAP {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "status io worker binary frame too large",
-        ));
-    }
-    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
-    writer.write_all(payload)?;
-    writer.flush()
+    crate::internal::worktree_io::protocol::write_raw_frame(writer, payload)
 }
 
 fn read_raw_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > FRAME_CAP {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "status io worker binary frame length invalid",
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut payload)?;
-    }
-    Ok(payload)
+    crate::internal::worktree_io::protocol::read_raw_frame(reader)
 }
 
 fn current_hash_kind() -> String {
@@ -1477,44 +1034,8 @@ fn run_in_process(request: IoRequest) -> JobOutcome {
     }
 }
 
-fn parse_event_frames(mut data: &[u8]) -> Option<Vec<IoEvent>> {
-    let mut events = Vec::new();
-    while !data.is_empty() {
-        if data.len() < 4 {
-            return None;
-        }
-        let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        data = &data[4..];
-        if len == 0 || len > FRAME_CAP || data.len() < len {
-            return None;
-        }
-        let event: IoEvent = serde_json::from_slice(&data[..len]).ok()?;
-        data = &data[len..];
-        let event = if let IoEvent::DoneObjectBlob {
-            status: ObjectBlobStatus::Ok,
-            bytes: None,
-        } = &event
-        {
-            if data.len() < 4 {
-                return None;
-            }
-            let raw_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            data = &data[4..];
-            if raw_len > FRAME_CAP || data.len() < raw_len {
-                return None;
-            }
-            let bytes = data[..raw_len].to_vec();
-            data = &data[raw_len..];
-            IoEvent::DoneObjectBlob {
-                status: ObjectBlobStatus::Ok,
-                bytes: Some(bytes),
-            }
-        } else {
-            event
-        };
-        events.push(event);
-    }
-    Some(events)
+fn parse_event_frames(data: &[u8]) -> Option<Vec<IoEvent>> {
+    crate::internal::worktree_io::protocol::parse_event_frames(data)
 }
 
 fn take_worker(token: &str) -> Result<WorkerProc, ()> {
@@ -1723,21 +1244,7 @@ fn drive_worker(
 }
 
 fn write_request(writer: &mut impl Write, token: &str, request: IoRequest) -> io::Result<()> {
-    let wrapped = CapRequest {
-        cap: token.to_string(),
-        request,
-    };
-    let payload = serde_json::to_vec(&wrapped)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if payload.len() > FRAME_CAP {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "status io worker request too large",
-        ));
-    }
-    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
-    writer.write_all(&payload)?;
-    writer.flush()
+    crate::internal::worktree_io::protocol::write_request(writer, token, request)
 }
 
 pub(crate) fn deadline_stat(path: &Path) -> Result<io::Result<CapturedStat>, ()> {
@@ -1745,9 +1252,13 @@ pub(crate) fn deadline_stat(path: &Path) -> Result<io::Result<CapturedStat>, ()>
         Ok(root) => root,
         Err(error) => return Ok(Err(error)),
     };
+    let relative = match request_worktree_relative(&root, path, true) {
+        Ok(relative) => relative,
+        Err(error) => return Ok(Err(error)),
+    };
     let events = submit(
         IoRequest::SymlinkMetadata {
-            path: path_to_bytes(path),
+            path: relative,
             root,
         },
         path_to_bytes(path),
@@ -1765,10 +1276,34 @@ pub(crate) fn deadline_canonicalize_pair(
     left: &Path,
     right: &Path,
 ) -> Result<(io::Result<PathBuf>, io::Result<PathBuf>), ()> {
+    let root = match request_root_bytes() {
+        Ok(root) => root,
+        Err(error) => {
+            return Ok((
+                Err(error),
+                Err(io::Error::other("worktree root unavailable")),
+            ));
+        }
+    };
+    let left_relative = match request_worktree_relative(&root, left, true) {
+        Ok(relative) => relative,
+        Err(error) => {
+            let second = io::Error::new(error.kind(), error.to_string());
+            return Ok((Err(error), Err(second)));
+        }
+    };
+    let right_relative = match request_worktree_relative(&root, right, true) {
+        Ok(relative) => relative,
+        Err(error) => {
+            let first = io::Error::new(error.kind(), error.to_string());
+            return Ok((Err(first), Err(error)));
+        }
+    };
     let events = submit(
         IoRequest::CanonicalizePair {
-            left: path_to_bytes(left),
-            right: path_to_bytes(right),
+            left: left_relative,
+            right: right_relative,
+            root,
         },
         path_to_bytes(left),
         crate::command::status_probe::io_op_timeout(),
@@ -1793,9 +1328,13 @@ pub(crate) fn deadline_read_dir(
         Ok(root) => root,
         Err(error) => return Ok(Err(error)),
     };
+    let relative = match request_worktree_relative(&root, path, true) {
+        Ok(relative) => relative,
+        Err(error) => return Ok(Err(error)),
+    };
     let events = submit(
         IoRequest::ReadDir {
-            path: path_to_bytes(path),
+            path: relative,
             root,
             remaining,
             checkpoint_every: 32,
@@ -1890,11 +1429,16 @@ pub(crate) fn deadline_file_blob_hash(
     path: &Path,
     workdir: &Path,
 ) -> Result<io::Result<git_internal::hash::ObjectHash>, ()> {
+    let root = path_to_bytes(workdir);
+    let relative = match request_worktree_relative(&root, path, false) {
+        Ok(relative) => relative,
+        Err(error) => return Ok(Err(error)),
+    };
     let events = submit(
         IoRequest::FileBlobHash {
-            path: path_to_bytes(path),
+            path: relative,
+            root,
             hash_kind: current_hash_kind(),
-            workdir: path_to_bytes(workdir),
         },
         path_to_bytes(path),
         crate::command::status_probe::io_op_timeout(),
@@ -1991,9 +1535,13 @@ pub(crate) fn deadline_marker_probe(dir: &Path) -> Result<Result<bool, io::Error
         Ok(root) => root,
         Err(error) => return Ok(Err(error)),
     };
+    let relative = match request_worktree_relative(&root, dir, true) {
+        Ok(relative) => relative,
+        Err(error) => return Ok(Err(error)),
+    };
     let events = submit(
         IoRequest::MarkerProbe {
-            dir: path_to_bytes(dir),
+            dir: relative,
             root,
         },
         path_to_bytes(dir),
@@ -2028,6 +1576,24 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(wire.is_empty(), "oversized frame must not write a header");
+    }
+
+    #[test]
+    fn helper_rejects_absolute_worktree_request_paths() {
+        let root = tempfile::tempdir().expect("create worktree root");
+        let request = super::IoRequest::ReadDir {
+            path: super::path_to_bytes(&root.path().join("outside")),
+            root: super::path_to_bytes(root.path()),
+            remaining: 1,
+            checkpoint_every: 1,
+        };
+        let mut wire = Vec::new();
+
+        let error = super::handle_request(request, &mut wire)
+            .expect_err("helper must reject absolute worktree paths");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(wire.is_empty(), "invalid requests must not emit events");
     }
 
     #[test]
@@ -2144,7 +1710,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn file_blob_hash_helper_uses_request_workdir_not_spawn_cwd() {
-        use std::ffi::OsString;
+        use std::{ffi::OsString, path::Path};
 
         use git_internal::internal::object::blob::Blob;
 
@@ -2192,9 +1758,9 @@ mod tests {
         }
 
         let request = super::IoRequest::FileBlobHash {
-            path: super::path_to_bytes(&file_b),
+            path: super::path_to_bytes(Path::new("tracked.bin")),
+            root: super::path_to_bytes(repo_b.path()),
             hash_kind: "sha1".to_string(),
-            workdir: super::path_to_bytes(repo_b.path()),
         };
         let mut buf = Vec::new();
         super::handle_request(request, &mut buf).expect("handle_request");
