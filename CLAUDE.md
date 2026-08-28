@@ -61,6 +61,10 @@ cargo test --all
 cargo install cargo-nextest --version 0.9.143 --locked   # verify: cargo nextest --version
 cargo nextest run --all
 
+# Local test evidence/driver artifacts (junit archives, batch logs) should go
+# to a persistent scratch dir surviving reboots — set LIBRA_TEST_SCRATCH_DIR
+# to a directory on durable media (system /tmp is wiped on reboot).
+
 # Run specific tests
 cargo test command::init_test
 cargo test add_test
