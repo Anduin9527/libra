@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serial_test::serial;
 use tempfile::tempdir;
 
 use super::{assert_cli_success, init_repo_via_cli, run_libra_command};
