@@ -6,7 +6,7 @@
 
 use std::{
     collections::VecDeque,
-    io::{self, BufReader},
+    io::{self, Read},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -17,8 +17,8 @@ use std::{
 };
 
 use super::protocol::{
-    IoEvent, IoRequest, ObjectBlobStatus, parse_event_frames as parse_protocol_event_frames,
-    read_frame, read_raw_frame, write_request,
+    FRAME_CAP, IoEvent, IoRequest, ObjectBlobStatus,
+    parse_event_frames as parse_protocol_event_frames, write_request,
 };
 
 pub(crate) const MAX_INFLIGHT: usize = 8;
@@ -115,7 +115,7 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 struct WorkerProc {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: ChildStdout,
 }
 
 struct Pool {
@@ -348,8 +348,19 @@ fn cancel_job(pool: &Pool, job: &Arc<Job>) {
         .take();
 }
 
-fn spawn_worker(config: WorkerConfig, token: &str) -> io::Result<WorkerProc> {
-    let exe = std::env::current_exe()?;
+fn spawn_worker(
+    config: WorkerConfig,
+    token: &str,
+    deadline: Instant,
+    cancel_token: &CancellationToken,
+) -> Result<WorkerProc, ExecutorError> {
+    if cancel_token.is_cancelled() {
+        return Err(ExecutorError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ExecutorError::DeadlineExpired);
+    }
+    let exe = std::env::current_exe().map_err(ExecutorError::WorkerUnavailable)?;
     let mut command = Command::new(exe);
     command
         .arg(config.worker_arg)
@@ -381,17 +392,20 @@ fn spawn_worker(config: WorkerConfig, token: &str) -> io::Result<WorkerProc> {
             }
         }
     }
-    let mut child = command.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("status io worker missing stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("status io worker missing stdout"))?;
-    let mut stdout = BufReader::new(stdout);
-    let ready: IoEvent = match read_frame(&mut stdout) {
+    let mut child = command.spawn().map_err(ExecutorError::WorkerUnavailable)?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        ExecutorError::WorkerUnavailable(io::Error::other("status io worker missing stdin"))
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        ExecutorError::WorkerUnavailable(io::Error::other("status io worker missing stdout"))
+    })?;
+    if let Err(error) = set_stdout_nonblocking(&stdout) {
+        kill_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ExecutorError::WorkerUnavailable(error));
+    }
+    let ready = match read_worker_frame(&mut stdout, deadline, cancel_token) {
         Ok(event) => event,
         Err(error) => {
             kill_pid(child.id());
@@ -404,7 +418,9 @@ fn spawn_worker(config: WorkerConfig, token: &str) -> io::Result<WorkerProc> {
         kill_pid(child.id());
         let _ = child.kill();
         let _ = child.wait();
-        return Err(io::Error::other("status io worker handshake failed"));
+        return Err(ExecutorError::Protocol(io::Error::other(
+            "status io worker handshake failed",
+        )));
     }
     Ok(WorkerProc {
         child,
@@ -512,44 +528,54 @@ fn run_job(pool: &Pool, job: Arc<Job>) {
         }
         return;
     }
-    let outcome = match take_worker(pool) {
-        // CLI helper spawn/handshake failed (EMFILE, process limit). Do not
-        // fall back to an unkillable in-process syscall — that would pin a
-        // dispatcher forever and exhaust the pool. Absolute object reads
-        // (WIO-03) are the same: never `run_in_process` them on a pool
-        // thread. Library/test binaries keep in-process only for relative
-        // (no-progress) probe opcodes (R0).
-        Err(error) if helper_exe_is_cli(pool.config) || job.absolute => JobOutcome::Error(error),
-        Err(_error) => run_in_process(pool.config.in_process_handler, request),
-        Ok(mut worker) => {
-            let drive = drive_worker(
-                &mut worker,
-                &pool.token,
-                request,
-                job.deadline,
-                job.window,
-                job.absolute,
-                &job.cancel_token,
-            );
-            if job.cancel_token.is_cancelled() || drive.timed_out || !drive.reuse {
-                kill_worker(&mut worker);
-            } else {
-                recycle_worker(pool, worker);
+    let worker_deadline = if job.absolute {
+        Some(job.deadline)
+    } else {
+        Instant::now().checked_add(job.window)
+    };
+    let outcome = match worker_deadline {
+        None => JobOutcome::Error(ExecutorError::DeadlineExpired),
+        Some(worker_deadline) => match take_worker(pool, worker_deadline, &job.cancel_token) {
+            // CLI helper spawn/handshake failed (EMFILE, process limit). Do not
+            // fall back to an unkillable in-process syscall — that would pin a
+            // dispatcher forever and exhaust the pool. Absolute object reads
+            // (WIO-03) are the same: never `run_in_process` them on a pool
+            // thread. Library/test binaries keep in-process only for relative
+            // (no-progress) probe opcodes (R0).
+            Err(error) if helper_exe_is_cli(pool.config) || job.absolute => {
+                JobOutcome::Error(error)
             }
-            if drive.events.is_empty() {
-                if let Some(error) = drive.error {
-                    JobOutcome::Error(error)
-                } else if drive.timed_out {
-                    JobOutcome::Error(ExecutorError::DeadlineExpired)
+            Err(_error) => run_in_process(pool.config.in_process_handler, request),
+            Ok(mut worker) => {
+                let drive = drive_worker(
+                    &mut worker,
+                    &pool.token,
+                    request,
+                    job.deadline,
+                    job.window,
+                    job.absolute,
+                    &job.cancel_token,
+                );
+                if job.cancel_token.is_cancelled() || drive.timed_out || !drive.reuse {
+                    kill_worker(&mut worker);
                 } else {
-                    JobOutcome::Error(ExecutorError::Protocol(io::Error::other(
-                        "status io worker returned no terminal event",
-                    )))
+                    recycle_worker(pool, worker);
                 }
-            } else {
-                JobOutcome::Events(drive.events)
+                if drive.events.is_empty() {
+                    if let Some(error) = drive.error {
+                        JobOutcome::Error(error)
+                    } else if drive.timed_out {
+                        JobOutcome::Error(ExecutorError::DeadlineExpired)
+                    } else {
+                        JobOutcome::Error(ExecutorError::Protocol(io::Error::other(
+                            "status io worker returned no terminal event",
+                        )))
+                    }
+                } else {
+                    JobOutcome::Events(drive.events)
+                }
             }
-        }
+        },
     };
     if job.cancel_token.is_cancelled() {
         return;
@@ -588,7 +614,11 @@ fn parse_event_frames(data: &[u8]) -> Option<Vec<IoEvent>> {
     parse_protocol_event_frames(data)
 }
 
-fn take_worker(pool: &Pool) -> Result<WorkerProc, ExecutorError> {
+fn take_worker(
+    pool: &Pool,
+    deadline: Instant,
+    cancel_token: &CancellationToken,
+) -> Result<WorkerProc, ExecutorError> {
     if !helper_exe_is_cli(pool.config) {
         return Err(ExecutorError::WorkerUnavailable(io::Error::other(
             "status helper is not available in this executable",
@@ -603,7 +633,7 @@ fn take_worker(pool: &Pool) -> Result<WorkerProc, ExecutorError> {
             return Ok(worker);
         }
     }
-    spawn_worker(pool.config, &pool.token).map_err(ExecutorError::WorkerUnavailable)
+    spawn_worker(pool.config, &pool.token, deadline, cancel_token)
 }
 
 fn recycle_worker(pool: &Pool, worker: WorkerProc) {
@@ -625,8 +655,63 @@ fn recycle_worker(pool: &Pool, worker: WorkerProc) {
  * for the in-process test/library fallback.
  */
 
+#[cfg(unix)]
+type StdoutWaitHandle = std::os::fd::RawFd;
+#[cfg(windows)]
+type StdoutWaitHandle = windows_sys::Win32::Foundation::HANDLE;
+#[cfg(not(any(unix, windows)))]
+type StdoutWaitHandle = ();
+
+fn stdout_wait_handle(stdout: &ChildStdout) -> StdoutWaitHandle {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        stdout.as_raw_fd()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        stdout.as_raw_handle() as StdoutWaitHandle
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stdout;
+        ()
+    }
+}
+
+fn set_stdout_nonblocking(stdout: &ChildStdout) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = stdout.as_raw_fd();
+        // SAFETY: `fd` is borrowed from a live ChildStdout and the fcntl
+        // operations only read and update its descriptor flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: same descriptor remains owned by `stdout` for this call.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        // PeekNamedPipe below prevents blocking reads on anonymous pipes.
+        let _ = stdout;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stdout;
+        Ok(())
+    }
+}
+
 fn wait_stdout_readable(
-    worker: &mut WorkerProc,
+    handle: StdoutWaitHandle,
     timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> io::Result<()> {
@@ -636,22 +721,19 @@ fn wait_stdout_readable(
             "worktree I/O request cancelled",
         ));
     }
-    if !worker.stdout.buffer().is_empty() {
-        return Ok(());
-    }
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
-        let fd = worker.stdout.get_ref().as_raw_fd();
         let mut pollfd = libc::pollfd {
-            fd,
+            fd: handle,
             events: libc::POLLIN,
             revents: 0,
         };
-        let millis = timeout
-            .min(CANCEL_POLL_INTERVAL)
-            .as_millis()
-            .min(i32::MAX as u128) as libc::c_int;
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "status io worker timeout",
+            ));
+        };
         loop {
             if cancel_token.is_cancelled() {
                 return Err(io::Error::new(
@@ -659,6 +741,18 @@ fn wait_stdout_readable(
                     "worktree I/O request cancelled",
                 ));
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "status io worker timeout",
+                ));
+            }
+            let millis = remaining
+                .min(CANCEL_POLL_INTERVAL)
+                .as_millis()
+                .max(1)
+                .min(i32::MAX as u128) as libc::c_int;
             let n = unsafe { libc::poll(&mut pollfd, 1, millis) };
             if n < 0 {
                 let error = io::Error::last_os_error();
@@ -667,19 +761,10 @@ fn wait_stdout_readable(
                 }
                 return Err(error);
             }
-            if n == 0 {
-                if timeout <= CANCEL_POLL_INTERVAL {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "status io worker timeout",
-                    ));
-                }
-                return wait_stdout_readable(worker, timeout - CANCEL_POLL_INTERVAL, cancel_token);
-            }
-            if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            if n > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 return Ok(());
             }
-            return Err(io::Error::other("status io worker poll"));
+            pollfd.revents = 0;
         }
     }
     #[cfg(windows)]
@@ -694,8 +779,13 @@ fn wait_stdout_readable(
             System::Pipes::PeekNamedPipe,
         };
         const POLL_SLICE: Duration = Duration::from_millis(5);
-        let deadline = std::time::Instant::now() + timeout;
-        let handle = worker.stdout.get_ref().as_raw_handle() as HANDLE;
+        let Some(deadline) = std::time::Instant::now().checked_add(timeout) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "status io worker timeout",
+            ));
+        };
+        let handle = handle as HANDLE;
         loop {
             if cancel_token.is_cancelled() {
                 return Err(io::Error::new(
@@ -741,11 +831,193 @@ fn wait_stdout_readable(
     }
 }
 
+fn read_exact_bounded<R, F>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    deadline: Instant,
+    cancel_token: &CancellationToken,
+    mut wait_readable: F,
+) -> io::Result<()>
+where
+    R: Read,
+    F: FnMut(Duration, &CancellationToken) -> io::Result<()>,
+{
+    let mut offset = 0usize;
+    while offset < buffer.len() {
+        if cancel_token.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "worktree I/O request cancelled",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "status io worker frame timeout",
+            ));
+        }
+        wait_readable(remaining, cancel_token)?;
+        match reader.read(&mut buffer[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "status io worker frame ended before its payload",
+                ));
+            }
+            Ok(read) => offset += read,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn classify_frame_error(error: io::Error, cancel_token: &CancellationToken) -> ExecutorError {
+    if cancel_token.is_cancelled() || error.kind() == io::ErrorKind::Interrupted {
+        ExecutorError::Cancelled
+    } else if error.kind() == io::ErrorKind::TimedOut {
+        ExecutorError::DeadlineExpired
+    } else {
+        ExecutorError::Protocol(error)
+    }
+}
+
+fn read_frame_bounded<R, F>(
+    reader: &mut R,
+    deadline: Instant,
+    cancel_token: &CancellationToken,
+    wait_readable: F,
+) -> Result<IoEvent, ExecutorError>
+where
+    R: Read,
+    F: FnMut(Duration, &CancellationToken) -> io::Result<()>,
+{
+    let mut len_buf = [0u8; 4];
+    let mut wait_readable = wait_readable;
+    if let Err(error) = read_exact_bounded(
+        reader,
+        &mut len_buf,
+        deadline,
+        cancel_token,
+        &mut wait_readable,
+    ) {
+        return Err(classify_frame_error(error, cancel_token));
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > FRAME_CAP {
+        return Err(ExecutorError::Protocol(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "status io worker frame length invalid",
+        )));
+    }
+    let mut payload = vec![0u8; len];
+    if let Err(error) = read_exact_bounded(
+        reader,
+        &mut payload,
+        deadline,
+        cancel_token,
+        &mut wait_readable,
+    ) {
+        return Err(classify_frame_error(error, cancel_token));
+    }
+    serde_json::from_slice(&payload)
+        .map_err(|error| ExecutorError::Protocol(io::Error::new(io::ErrorKind::InvalidData, error)))
+}
+
+fn read_raw_frame_bounded<R, F>(
+    reader: &mut R,
+    deadline: Instant,
+    cancel_token: &CancellationToken,
+    wait_readable: F,
+) -> Result<Vec<u8>, ExecutorError>
+where
+    R: Read,
+    F: FnMut(Duration, &CancellationToken) -> io::Result<()>,
+{
+    let mut len_buf = [0u8; 4];
+    let mut wait_readable = wait_readable;
+    if let Err(error) = read_exact_bounded(
+        reader,
+        &mut len_buf,
+        deadline,
+        cancel_token,
+        &mut wait_readable,
+    ) {
+        return Err(classify_frame_error(error, cancel_token));
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > FRAME_CAP {
+        return Err(ExecutorError::Protocol(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "status io worker binary frame length invalid",
+        )));
+    }
+    let mut payload = vec![0u8; len];
+    if let Err(error) = read_exact_bounded(
+        reader,
+        &mut payload,
+        deadline,
+        cancel_token,
+        &mut wait_readable,
+    ) {
+        return Err(classify_frame_error(error, cancel_token));
+    }
+    Ok(payload)
+}
+
+fn read_worker_frame(
+    stdout: &mut ChildStdout,
+    deadline: Instant,
+    cancel_token: &CancellationToken,
+) -> Result<IoEvent, ExecutorError> {
+    let handle = stdout_wait_handle(stdout);
+    read_frame_bounded(stdout, deadline, cancel_token, |timeout, cancel| {
+        wait_stdout_readable(handle, timeout, cancel)
+    })
+}
+
+fn read_worker_raw_frame(
+    stdout: &mut ChildStdout,
+    deadline: Instant,
+    cancel_token: &CancellationToken,
+) -> Result<Vec<u8>, ExecutorError> {
+    let handle = stdout_wait_handle(stdout);
+    read_raw_frame_bounded(stdout, deadline, cancel_token, |timeout, cancel| {
+        wait_stdout_readable(handle, timeout, cancel)
+    })
+}
+
 struct DriveResult {
     events: Vec<IoEvent>,
     timed_out: bool,
     reuse: bool,
     error: Option<ExecutorError>,
+}
+
+fn drive_frame_error(events: Vec<IoEvent>, error: ExecutorError) -> DriveResult {
+    match error {
+        ExecutorError::Cancelled => DriveResult {
+            events,
+            timed_out: false,
+            reuse: false,
+            error: Some(ExecutorError::Cancelled),
+        },
+        ExecutorError::DeadlineExpired => DriveResult {
+            events,
+            timed_out: true,
+            reuse: false,
+            error: None,
+        },
+        error => DriveResult {
+            events,
+            timed_out: false,
+            reuse: false,
+            error: Some(error),
+        },
+    }
 }
 
 fn drive_worker(
@@ -775,7 +1047,7 @@ fn drive_worker(
     }
     let mut events = Vec::new();
     loop {
-        let wait = if absolute {
+        let frame_deadline = if absolute {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return DriveResult {
@@ -785,65 +1057,23 @@ fn drive_worker(
                     error: None,
                 };
             }
-            remaining
+            deadline
         } else {
             // No-progress: each frame gets a fresh window so a wide
             // progressing `read_dir` is not cut by an absolute job clock.
-            window
+            let Some(frame_deadline) = Instant::now().checked_add(window) else {
+                return DriveResult {
+                    events,
+                    timed_out: true,
+                    reuse: false,
+                    error: None,
+                };
+            };
+            frame_deadline
         };
-        if let Err(error) = wait_stdout_readable(worker, wait, cancel_token) {
-            if cancel_token.is_cancelled() {
-                return DriveResult {
-                    events,
-                    timed_out: false,
-                    reuse: false,
-                    error: Some(ExecutorError::Cancelled),
-                };
-            }
-            if error.kind() == io::ErrorKind::TimedOut {
-                return DriveResult {
-                    events,
-                    timed_out: true,
-                    reuse: false,
-                    error: None,
-                };
-            }
-            return DriveResult {
-                events,
-                timed_out: false,
-                reuse: false,
-                error: Some(ExecutorError::Protocol(error)),
-            };
-        }
-        if cancel_token.is_cancelled() {
-            return DriveResult {
-                events,
-                timed_out: false,
-                reuse: false,
-                error: Some(ExecutorError::Cancelled),
-            };
-        }
-        let event = match read_frame::<IoEvent>(&mut worker.stdout) {
+        let event = match read_worker_frame(&mut worker.stdout, frame_deadline, cancel_token) {
             Ok(event) => event,
-            Err(error)
-                if error.kind() == io::ErrorKind::TimedOut
-                    || error.kind() == io::ErrorKind::WouldBlock =>
-            {
-                return DriveResult {
-                    events,
-                    timed_out: true,
-                    reuse: false,
-                    error: None,
-                };
-            }
-            Err(error) => {
-                return DriveResult {
-                    events,
-                    timed_out: false,
-                    reuse: false,
-                    error: Some(ExecutorError::Protocol(error)),
-                };
-            }
+            Err(error) => return drive_frame_error(events, error),
         };
         if cancel_token.is_cancelled() {
             return DriveResult {
@@ -862,7 +1092,7 @@ fn drive_worker(
             bytes: None,
         } = &event
         {
-            let wait = if absolute {
+            let raw_deadline = if absolute {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return DriveResult {
@@ -872,66 +1102,24 @@ fn drive_worker(
                         error: None,
                     };
                 }
-                remaining
+                deadline
             } else {
-                window
-            };
-            if let Err(error) = wait_stdout_readable(worker, wait, cancel_token) {
-                if cancel_token.is_cancelled() {
-                    return DriveResult {
-                        events,
-                        timed_out: false,
-                        reuse: false,
-                        error: Some(ExecutorError::Cancelled),
-                    };
-                }
-                if error.kind() == io::ErrorKind::TimedOut {
+                let Some(raw_deadline) = Instant::now().checked_add(window) else {
                     return DriveResult {
                         events,
                         timed_out: true,
                         reuse: false,
                         error: None,
                     };
-                }
-                return DriveResult {
-                    events,
-                    timed_out: false,
-                    reuse: false,
-                    error: Some(ExecutorError::Protocol(error)),
                 };
-            }
-            if cancel_token.is_cancelled() {
-                return DriveResult {
-                    events,
-                    timed_out: false,
-                    reuse: false,
-                    error: Some(ExecutorError::Cancelled),
-                };
-            }
-            match read_raw_frame(&mut worker.stdout) {
+                raw_deadline
+            };
+            match read_worker_raw_frame(&mut worker.stdout, raw_deadline, cancel_token) {
                 Ok(bytes) => IoEvent::DoneObjectBlob {
                     status: ObjectBlobStatus::Ok,
                     bytes: Some(bytes),
                 },
-                Err(error)
-                    if error.kind() == io::ErrorKind::TimedOut
-                        || error.kind() == io::ErrorKind::WouldBlock =>
-                {
-                    return DriveResult {
-                        events,
-                        timed_out: true,
-                        reuse: false,
-                        error: None,
-                    };
-                }
-                Err(error) => {
-                    return DriveResult {
-                        events,
-                        timed_out: false,
-                        reuse: false,
-                        error: Some(ExecutorError::Protocol(error)),
-                    };
-                }
+                Err(error) => return drive_frame_error(events, error),
             }
         } else {
             event
@@ -960,7 +1148,64 @@ fn drive_worker(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, io::Read};
+
     use super::*;
+
+    struct ChunkedReader {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "unit-test reader is stalled",
+                ));
+            };
+            let count = buffer.len().min(chunk.len());
+            buffer[..count].copy_from_slice(&chunk[..count]);
+            if count < chunk.len() {
+                self.chunks.push_front(chunk[count..].to_vec());
+            }
+            Ok(count)
+        }
+    }
+
+    fn wait_until_stalled(
+        calls: &mut usize,
+        stop_after: usize,
+    ) -> impl FnMut(Duration, &CancellationToken) -> io::Result<()> + '_ {
+        move |_timeout, cancel_token| {
+            *calls += 1;
+            if cancel_token.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "unit-test cancellation",
+                ));
+            }
+            if *calls >= stop_after {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "unit-test frame timeout",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn frame_wire(event: &IoEvent) -> Vec<u8> {
+        let mut wire = Vec::new();
+        super::super::protocol::write_frame(&mut wire, event).expect("frame encoding");
+        wire
+    }
+
+    fn raw_frame_wire(bytes: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        super::super::protocol::write_raw_frame(&mut wire, bytes).expect("raw frame encoding");
+        wire
+    }
 
     fn test_config(handler: InProcessHandler) -> WorkerConfig {
         WorkerConfig {
@@ -1120,6 +1365,118 @@ mod tests {
             protocol,
             JobOutcome::Error(ExecutorError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn partial_length_header_returns_typed_deadline() {
+        let wire = frame_wire(&IoEvent::Ready);
+        let mut reader = ChunkedReader {
+            chunks: VecDeque::from([wire[..1].to_vec()]),
+        };
+        let token = CancellationToken::new();
+        let started = Instant::now();
+        let mut calls = 0;
+        let result = read_frame_bounded(
+            &mut reader,
+            Instant::now() + Duration::from_millis(25),
+            &token,
+            wait_until_stalled(&mut calls, 2),
+        );
+        assert!(matches!(result, Err(ExecutorError::DeadlineExpired)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn partial_json_payload_returns_typed_deadline() {
+        let wire = frame_wire(&IoEvent::Ready);
+        let mut reader = ChunkedReader {
+            chunks: VecDeque::from([wire[..4].to_vec(), wire[4..5].to_vec()]),
+        };
+        let token = CancellationToken::new();
+        let mut calls = 0;
+        let result = read_frame_bounded(
+            &mut reader,
+            Instant::now() + Duration::from_millis(25),
+            &token,
+            wait_until_stalled(&mut calls, 2),
+        );
+        assert!(matches!(result, Err(ExecutorError::DeadlineExpired)));
+    }
+
+    #[test]
+    fn partial_object_blob_payload_returns_typed_deadline() {
+        let event_wire = frame_wire(&IoEvent::DoneObjectBlob {
+            status: ObjectBlobStatus::Ok,
+            bytes: None,
+        });
+        let raw_wire = raw_frame_wire(b"partial");
+        let mut reader = ChunkedReader {
+            chunks: VecDeque::from([event_wire, raw_wire[..4].to_vec(), raw_wire[4..5].to_vec()]),
+        };
+        let token = CancellationToken::new();
+        let mut calls = 0;
+        let mut waiter = wait_until_stalled(&mut calls, 5);
+        let event = read_frame_bounded(
+            &mut reader,
+            Instant::now() + Duration::from_millis(25),
+            &token,
+            &mut waiter,
+        );
+        assert!(matches!(
+            event,
+            Ok(IoEvent::DoneObjectBlob {
+                status: ObjectBlobStatus::Ok,
+                bytes: None
+            })
+        ));
+        let result = read_raw_frame_bounded(
+            &mut reader,
+            Instant::now() + Duration::from_millis(25),
+            &token,
+            &mut waiter,
+        );
+        assert!(matches!(result, Err(ExecutorError::DeadlineExpired)));
+    }
+
+    #[test]
+    fn stalled_ready_handshake_returns_typed_deadline() {
+        let wire = frame_wire(&IoEvent::Ready);
+        let mut reader = ChunkedReader {
+            chunks: VecDeque::from([wire[..4].to_vec(), wire[4..5].to_vec()]),
+        };
+        let token = CancellationToken::new();
+        let mut calls = 0;
+        let result = read_frame_bounded(
+            &mut reader,
+            Instant::now() + Duration::from_millis(25),
+            &token,
+            wait_until_stalled(&mut calls, 2),
+        );
+        assert!(matches!(result, Err(ExecutorError::DeadlineExpired)));
+    }
+
+    #[test]
+    fn partial_frame_observes_cancellation() {
+        let wire = frame_wire(&IoEvent::Ready);
+        let mut reader = ChunkedReader {
+            chunks: VecDeque::from([wire[..1].to_vec()]),
+        };
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+        let mut calls = 0;
+        let result = read_frame_bounded(
+            &mut reader,
+            Instant::now() + Duration::from_secs(5),
+            &token,
+            move |_timeout, _| {
+                calls += 1;
+                if calls >= 2 {
+                    cancel_token.cancel();
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(ExecutorError::Cancelled)));
     }
 
     #[test]
