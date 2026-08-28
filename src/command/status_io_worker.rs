@@ -234,30 +234,15 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
                 return Err(io::Error::other("missing worktree capability"));
             };
             let relative = capability.relative(&path)?;
-            // Validate all parent components through the no-follow beneath
-            // walker before handing the path to the existing hash routine.
-            // A symlink leaf is intentionally retained: Git hashes its link
-            // target bytes, while an interior symlink is rejected.
             let root_fd = crate::utils::beneath::open_root(capability.root())?;
-            crate::utils::beneath::lstat_beneath(&root_fd, &relative)?;
-            let path = if std::env::var_os(STATUS_IO_WORKER_CAP_ENV).is_some() {
-                // The standalone helper has an isolated process, so changing
-                // its CWD lets Git's attribute lookup discover the request's
-                // `.gitattributes` without exposing an absolute path to the
-                // hash routine. In-process callers keep their CWD untouched.
-                std::env::set_current_dir(capability.root())?;
-                relative
-            } else {
-                capability.resolve(&relative)?
-            };
-            apply_hash_kind(&hash_kind);
-            let result = match crate::command::calc_file_blob_hash(&path) {
-                Ok(hash) => WireResult::Ok(hash.to_string()),
-                Err(error) => WireResult::Err {
-                    kind: kind_to_u8(error.kind()),
-                    raw_os: error.raw_os_error(),
-                },
-            };
+            let result =
+                match hash_file_blob_beneath(capability.root(), &root_fd, &relative, &hash_kind) {
+                    Ok(hash) => WireResult::Ok(hash.to_string()),
+                    Err(error) => WireResult::Err {
+                        kind: kind_to_u8(error.kind()),
+                        raw_os: error.raw_os_error(),
+                    },
+                };
             write_frame(stdout, &IoEvent::DoneHash { hex: result })?;
         }
         IoRequest::ReadObjectBlob {
@@ -544,6 +529,97 @@ where
         }
     }
     Ok(())
+}
+
+fn hash_file_blob_beneath(
+    root_path: &Path,
+    root: &std::fs::File,
+    relative: &Path,
+    hash_kind: &str,
+) -> io::Result<git_internal::hash::ObjectHash> {
+    apply_hash_kind(hash_kind);
+    let stat = crate::utils::beneath::lstat_beneath(root, relative)?;
+    if stat.is_symlink {
+        let target = crate::utils::beneath::read_symlink_beneath(root, relative)?;
+        return Ok(git_internal::internal::object::blob::Blob::from_content_bytes(target).id);
+    }
+    if !stat.is_file {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worktree blob path is not a regular file or symlink",
+        ));
+    }
+
+    // Open once through the pinned root and hash the descriptor. Neither the
+    // content nor its LFS attributes are rediscovered through a pathname
+    // after this point, so a rename/symlink swap cannot redirect the read.
+    let file = crate::utils::beneath::open_file_beneath(root, relative)?;
+    let length = file.metadata()?.len();
+    if crate::utils::attributes::is_lfs_tracked_beneath(root_path, root, relative)? {
+        let (oid, total) = hash_lfs_file_handle(&file, length)?;
+        if total != length || file.metadata()?.len() != length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LFS file changed while it was being hashed",
+            ));
+        }
+        let pointer = crate::utils::lfs::format_pointer_string(&oid, length);
+        return Ok(git_internal::internal::object::blob::Blob::from_content(&pointer).id);
+    }
+    hash_regular_file_handle(file, length)
+}
+
+fn hash_regular_file_handle(
+    mut file: std::fs::File,
+    length: u64,
+) -> io::Result<git_internal::hash::ObjectHash> {
+    let mut hasher = git_internal::utils::HashAlgorithm::new();
+    hasher.update(b"blob ");
+    hasher.update(length.to_string().as_bytes());
+    hasher.update(b"\0");
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "worktree file length overflow")
+        })?;
+        let read = std::io::Read::read(&mut file, &mut buffer[..requested])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "worktree file shrank while it was being hashed",
+            ));
+        }
+        remaining -= read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    if file.metadata()?.len() != length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worktree file changed while it was being hashed",
+        ));
+    }
+    git_internal::hash::ObjectHash::from_bytes(&hasher.finalize()).map_err(io::Error::other)
+}
+
+fn hash_lfs_file_handle(file: &std::fs::File, length: u64) -> io::Result<(String, u64)> {
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut reader = file.try_clone()?;
+    let mut remaining = length;
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "LFS file length overflow"))?;
+        let read = std::io::Read::read(&mut reader, &mut buffer[..requested])?;
+        if read == 0 {
+            break;
+        }
+        remaining -= read as u64;
+        total = total.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    Ok((hex::encode(hasher.finish().as_ref()), total))
 }
 
 fn apply_hash_kind(kind: &str) {
@@ -1273,5 +1349,99 @@ mod tests {
             "helper must hash via B's LFS attrs, not spawn CWD A"
         );
         assert_ne!(lfs_hash, content_hash, "sanity: LFS pointer ≠ content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_regular_hash_does_not_reopen_replaced_root_path() {
+        use git_internal::internal::object::blob::Blob;
+
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("root");
+        let retired = parent.path().join("retired");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("tracked.txt"), b"inside\n").expect("inside file");
+        std::fs::write(outside.path().join("tracked.txt"), b"outside\n").expect("outside file");
+        let root_fd = crate::utils::beneath::open_root(&root).expect("pin root");
+
+        std::fs::rename(&root, &retired).expect("retire original root");
+        std::os::unix::fs::symlink(outside.path(), &root).expect("replace root with symlink");
+        let hash = super::hash_file_blob_beneath(
+            &root,
+            &root_fd,
+            std::path::Path::new("tracked.txt"),
+            "sha1",
+        )
+        .expect("hash pinned file");
+        let expected = Blob::from_content_bytes(b"inside\n".to_vec()).id;
+        let outside_hash = Blob::from_content_bytes(b"outside\n".to_vec()).id;
+        assert_eq!(hash, expected, "hash must come from the pinned root file");
+        assert_ne!(hash, outside_hash, "hash must not follow replacement root");
+
+        std::fs::remove_file(&root).expect("remove replacement symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_symlink_hash_reads_leaf_target_relative_to_root() {
+        use git_internal::internal::object::blob::Blob;
+
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("target.txt"), b"target content\n").expect("target");
+        std::os::unix::fs::symlink("target.txt", root.join("link.txt")).expect("symlink");
+        let root_fd = crate::utils::beneath::open_root(&root).expect("pin root");
+
+        let hash = super::hash_file_blob_beneath(
+            &root,
+            &root_fd,
+            std::path::Path::new("link.txt"),
+            "sha1",
+        )
+        .expect("hash symlink leaf");
+        let expected = Blob::from_content_bytes(b"target.txt".to_vec()).id;
+        assert_eq!(
+            hash, expected,
+            "Git symlink blob uses the link target bytes"
+        );
+    }
+
+    #[test]
+    fn pinned_lfs_hash_binds_content_and_attributes_to_same_root() {
+        use git_internal::internal::object::blob::Blob;
+
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("root");
+        let retired = parent.path().join("retired");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join(".gitattributes"), b"*.bin filter=lfs\n").expect("LFS attrs");
+        let original = b"original LFS payload\n";
+        std::fs::write(root.join("tracked.bin"), original).expect("original payload");
+        let root_fd = crate::utils::beneath::open_root(&root).expect("pin root");
+
+        std::fs::rename(&root, &retired).expect("retire original root");
+        std::fs::create_dir(&root).expect("replacement root");
+        std::fs::write(root.join(".gitattributes"), b"*.txt filter=lfs\n")
+            .expect("replacement attrs");
+        std::fs::write(root.join("tracked.bin"), b"replacement payload\n")
+            .expect("replacement payload");
+
+        let hash = super::hash_file_blob_beneath(
+            &root,
+            &root_fd,
+            std::path::Path::new("tracked.bin"),
+            "sha1",
+        )
+        .expect("hash pinned LFS file");
+        let oid = crate::utils::lfs::calc_lfs_file_hash(retired.join("tracked.bin"))
+            .expect("original LFS oid");
+        let pointer = crate::utils::lfs::format_pointer_string(&oid, original.len() as u64);
+        let expected = Blob::from_content(&pointer).id;
+        assert_eq!(
+            hash, expected,
+            "LFS decision and bytes must use pinned root"
+        );
     }
 }

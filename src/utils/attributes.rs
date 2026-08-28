@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::SystemTime,
@@ -120,6 +120,128 @@ pub fn is_lfs_tracked(path: &Path) -> bool {
         attribute_state_for_path("filter", path),
         Some(AttributeState::Value(value)) if value == "lfs"
     )
+}
+
+/// Resolve `filter=lfs` using only files beneath an already-pinned worktree
+/// descriptor.  The absolute root is used as a lexical base for the ignore
+/// matcher; it is never probed or opened by this function.  In particular,
+/// this must not call [`attribute_sources_for_path`], whose configured and
+/// worktree-info paths may point outside the descriptor supplied by status.
+pub(crate) fn is_lfs_tracked_beneath(
+    root_path: &Path,
+    root: &fs::File,
+    relative: &Path,
+) -> io::Result<bool> {
+    if relative.is_absolute() || relative.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LFS attribute lookup requires a non-empty relative file path",
+        ));
+    }
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LFS attribute lookup path must be canonical and relative",
+        ));
+    }
+
+    let target = root_path.join(relative);
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let mut directories = vec![PathBuf::new()];
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LFS attribute lookup parent must be canonical and relative",
+            ));
+        };
+        current.push(name);
+        directories.push(current.clone());
+    }
+
+    let mut filter = None;
+    for directory in directories {
+        for name in [GIT_ATTRIBUTES_FILE, LIBRA_ATTRIBUTES_FILE] {
+            let source = if directory.as_os_str().is_empty() {
+                PathBuf::from(name)
+            } else {
+                directory.join(name)
+            };
+            apply_beneath_attribute_source(
+                root,
+                &source,
+                &root_path.join(&directory),
+                &target,
+                &mut filter,
+            )?;
+        }
+    }
+
+    // `worktree_info_file_paths` can resolve a gitdir-file to a directory
+    // outside the worktree.  Only the two literal, root-contained layouts are
+    // eligible here; a `.git` file or a symlink is rejected by beneath I/O
+    // and cannot redirect attribute reads.
+    for source in [
+        Path::new(crate::utils::util::ROOT_DIR)
+            .join("info")
+            .join("attributes"),
+        Path::new(crate::utils::util::GIT_DIR)
+            .join("info")
+            .join("attributes"),
+    ] {
+        apply_beneath_attribute_source(root, &source, root_path, &target, &mut filter)?;
+    }
+
+    Ok(matches!(
+        filter,
+        Some(AttributeState::Value(value)) if value == "lfs"
+    ))
+}
+
+fn apply_beneath_attribute_source(
+    root: &fs::File,
+    source: &Path,
+    base: &Path,
+    target: &Path,
+    filter: &mut Option<AttributeState>,
+) -> io::Result<()> {
+    let contents = match crate::utils::beneath::read_file_beneath(root, source) {
+        Ok(contents) => contents,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("read attributes source '{}': {error}", source.display()),
+            ));
+        }
+    };
+    let contents = String::from_utf8_lossy(&contents);
+    for rule in parse_attribute_contents(&contents, base).iter() {
+        if !attribute_rule_matches_file(rule, target) {
+            continue;
+        }
+        for assignment in &rule.assignments {
+            if assignment.name == "filter" {
+                *filter = Some(assignment.state.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn diff_driver_for_path(path: &Path) -> Option<String> {
@@ -318,4 +440,8 @@ fn compile_attribute_pattern(pattern: &str, base: &Path) -> Option<Gitignore> {
 
 fn attribute_rule_matches(rule: &AttributeRule, path: &Path) -> bool {
     !matches!(rule.matcher.matched(path, path.is_dir()), Match::None)
+}
+
+fn attribute_rule_matches_file(rule: &AttributeRule, path: &Path) -> bool {
+    !matches!(rule.matcher.matched(path, false), Match::None)
 }
