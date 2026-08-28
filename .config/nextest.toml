@@ -1,9 +1,20 @@
 # generated — do not edit
 # regenerate: sh tests/NEXTEST_GROUPS.sh  (source of truth: tests/SERIAL_REGISTRY.tsv)
 # plan-20260827 NP-01 / ADR-NP-01: union external-resource mutual-exclusion group.
+# plan-20260827 NP-02: profiles carry runner behavior only (groups/threads/junit);
+# Cargo features and env always travel with the command line.
 
 [test-groups.external]
 max-threads = 1
+
+[profile.default.junit]
+path = "junit.xml"
+
+# test-provider scenario runs (base.yml provider section): overrides are
+# inherited from profile.default; only the junit artifact path differs.
+
+[profile.test-provider.junit]
+path = "junit.xml"
 
 [[profile.default.overrides]]
 filter = 'binary(=code_ui_remote_approval_matrix)'
