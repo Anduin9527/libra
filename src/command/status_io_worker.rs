@@ -2018,6 +2018,103 @@ pub(crate) fn deadline_marker_probe(dir: &Path) -> Result<Result<bool, io::Error
 #[cfg(test)]
 mod tests {
     #[test]
+    fn json_frame_rejects_payload_above_cap_without_writing() {
+        let event = super::IoEvent::Error {
+            message: "x".repeat(super::FRAME_CAP),
+        };
+        let mut wire = Vec::new();
+
+        let error = super::write_frame(&mut wire, &event).expect_err("frame must be capped");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(wire.is_empty(), "oversized frame must not write a header");
+    }
+
+    #[test]
+    fn raw_frame_rejects_payload_above_cap_before_writing_or_reading() {
+        let oversized = vec![0u8; super::FRAME_CAP + 1];
+        let mut wire = Vec::new();
+
+        let write_error =
+            super::write_raw_frame(&mut wire, &oversized).expect_err("raw frame must be capped");
+        assert_eq!(write_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            wire.is_empty(),
+            "oversized raw frame must not write a header"
+        );
+
+        let invalid_wire = (super::FRAME_CAP as u32 + 1).to_le_bytes().to_vec();
+        let read_error = super::read_raw_frame(&mut &invalid_wire[..])
+            .expect_err("raw frame reader must reject an oversized length");
+        assert_eq!(read_error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn oversized_object_blob_is_reported_without_an_ok_raw_frame() {
+        let mut wire = Vec::new();
+        super::write_object_blob_outcome(&mut wire, Ok(vec![0u8; super::FRAME_CAP + 1]))
+            .expect("oversized object must produce a status event");
+
+        let events = super::parse_event_frames(&wire).expect("status event must remain framed");
+        assert!(matches!(
+            events.as_slice(),
+            [super::IoEvent::DoneObjectBlob {
+                status: super::ObjectBlobStatus::TooLarge,
+                bytes: None,
+            }]
+        ));
+    }
+
+    #[test]
+    fn wire_errors_preserve_kind_and_raw_os_error() {
+        let kind_only = super::wire_result::<()>(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+        let super::WireResult::Err { kind, raw_os } = &kind_only else {
+            panic!("permission error must be encoded as an error");
+        };
+        assert_eq!(*kind, 1);
+        assert_eq!(*raw_os, None);
+        let decoded = super::unwrap_wire(kind_only).expect_err("wire error must decode");
+        assert_eq!(decoded.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(decoded.raw_os_error(), None);
+
+        let source = std::io::Error::from_raw_os_error(2);
+        let source_kind = source.kind();
+        let with_raw = super::wire_result::<()>(Err(source));
+        let super::WireResult::Err { kind, raw_os } = &with_raw else {
+            panic!("raw OS error must be encoded as an error");
+        };
+        assert_eq!(*kind, super::kind_to_u8(source_kind));
+        assert_eq!(*raw_os, Some(2));
+        let decoded = super::unwrap_wire(with_raw).expect_err("wire error must decode");
+        assert_eq!(decoded.kind(), source_kind);
+        assert_eq!(decoded.raw_os_error(), Some(2));
+    }
+
+    #[test]
+    fn absolute_deadline_cancels_job_without_leaking_pending_entry() {
+        let path_key = b"unit-test-expired-status-io-job".to_vec();
+        let outcome = super::submit_absolute(
+            super::IoRequest::Shutdown,
+            path_key.clone(),
+            std::time::Duration::ZERO,
+        );
+
+        assert!(
+            outcome.is_err(),
+            "an expired absolute job must not complete"
+        );
+        let pool = super::pool();
+        let pending = pool
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!pending.iter().any(|job| job.path_key == path_key));
+    }
+
+    #[test]
     fn captured_stat_round_trips_a_regular_file() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let meta = std::fs::metadata(&manifest).expect("Cargo.toml");
