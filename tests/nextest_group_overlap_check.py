@@ -82,9 +82,13 @@ def main() -> int:
 
     intervals.sort()
     overlaps = 0
+    # junit timestamps carry millisecond precision while durations are float
+    # seconds, so reconstructed interval endpoints jitter by ~1-2 ms around a
+    # perfect serial handoff. 10 ms tolerance is orders of magnitude below any
+    # real concurrency violation (member tests run for 100 ms+).
+    EPS = 0.010
     for (s1, e1, n1), (s2, e2, n2) in zip(intervals, intervals[1:]):
-        # strictly-positive overlap; equal boundaries are fine
-        if s2 < e1 - 1e-9:
+        if s2 < e1 - EPS:
             print(f"OVERLAP: {n1} [{s1:.3f},{e1:.3f}] with {n2} [{s2:.3f},{e2:.3f}]",
                   file=sys.stderr)
             overlaps += 1

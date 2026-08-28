@@ -53,6 +53,14 @@ LIBRA_SKIP_WEB_BUILD=1 cargo build
 # Run full test suite (L1 only by default; L2/L3 auto-skip when env vars are unset)
 cargo test --all
 
+# Faster full suite via cargo-nextest (one process per test; external-resource
+# mutual exclusion comes from the generated .config/nextest.toml — regenerate
+# with `sh tests/NEXTEST_GROUPS.sh` after touching tests/SERIAL_REGISTRY.tsv).
+# The authoritative acceptance gate remains `cargo test --all` (plan-20260827
+# ADR-NP-04); nextest is the additional fast execution face. Pinned install:
+cargo install cargo-nextest --version 0.9.143 --locked   # verify: cargo nextest --version
+cargo nextest run --all
+
 # Run specific tests
 cargo test command::init_test
 cargo test add_test

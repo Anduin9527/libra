@@ -78,8 +78,10 @@ emit() {
     printf '\n%s\n%s\n' "[test-groups.external]" "max-threads = 1"
     printf '\n%s\n%s\n' "[profile.default.junit]" 'path = "junit.xml"'
     printf '\n%s\n' "# test-provider scenario runs (base.yml provider section): overrides are"
-    printf '%s\n' "# inherited from profile.default; only the junit artifact path differs."
-    printf '\n%s\n%s\n' "[profile.test-provider.junit]" 'path = "junit.xml"'
+    printf '%s\n' "# inherited from profile.default. test-threads = 1 preserves the CI"
+    printf '%s\n' "# section's --test-threads=1 semantic verbatim: provider scenario tests"
+    printf '%s\n' "# are calibrated for single-threaded timing (lease-release sleeps)."
+    printf '\n%s\n%s\n%s\n' "[profile.test-provider]" "test-threads = 1" 'junit = { path = "junit.xml" }'
     LC_ALL=C sort "$TMP" | while IFS="$(printf '\t')" read -r kind name; do
         printf '\n%s\n' "[[profile.default.overrides]]"
         if [ "$kind" = "F" ]; then

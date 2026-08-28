@@ -11,10 +11,13 @@ max-threads = 1
 path = "junit.xml"
 
 # test-provider scenario runs (base.yml provider section): overrides are
-# inherited from profile.default; only the junit artifact path differs.
+# inherited from profile.default. test-threads = 1 preserves the CI
+# section's --test-threads=1 semantic verbatim: provider scenario tests
+# are calibrated for single-threaded timing (lease-release sleeps).
 
-[profile.test-provider.junit]
-path = "junit.xml"
+[profile.test-provider]
+test-threads = 1
+junit = { path = "junit.xml" }
 
 [[profile.default.overrides]]
 filter = 'binary(=code_ui_remote_approval_matrix)'
