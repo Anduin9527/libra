@@ -70,22 +70,35 @@ def selftest() -> int:
     # finite-value check must turn this red.
     base = "2026-08-28T20:47:42.497+08:00"
     parse_ok = True
+    import os
+
+    def _check_synthetic(cases, expect_rc, label):
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".xml", delete=False
+            ) as f:
+                f.write(_synthetic_junit(cases))
+                path = f.name
+            rc = check_file(path)
+            if rc != expect_rc:
+                print(f"SELFTEST {label} failed: rc={rc} (want {expect_rc})")
+                return False
+            return True
+        finally:
+            if path is not None:
+                os.unlink(path)
+
     for bad in ("NaN", "inf", "-1.0"):
-        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as f:
-            f.write(_synthetic_junit([(base, bad)]))
-            path = f.name
-        rc = check_file(path)
-        if rc != 2:
-            print(f"SELFTEST parse-rejection failed for time={bad}: rc={rc}")
-            parse_ok = False
-    # and a well-formed overlapping pair through the same real path must be
-    # detected as a genuine overlap (exit 1)
-    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as f:
-        f.write(
-            _synthetic_junit([(base, "0.500"), (base, "0.500")])
+        parse_ok &= _check_synthetic(
+            [(base, bad)], 2, f"parse-rejection time={bad}"
         )
-        path = f.name
-    parse_ok = parse_ok and check_file(path) == 1
+    # a well-formed overlapping pair through the same real path must be
+    # detected as a genuine overlap (exit 1)
+    parse_ok &= _check_synthetic(
+        [(base, "0.500"), (base, "0.500")], 1, "same-start overlap"
+    )
+    parse_ok = bool(parse_ok)
 
     ok = interval_ok and parse_ok
     print("SELFTEST", "OK" if ok else "FAIL")
