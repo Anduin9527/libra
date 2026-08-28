@@ -597,6 +597,39 @@ fn validate_worktree_path(
     Ok(path)
 }
 
+/// Convert a status caller's absolute or relative path into the strict
+/// relative representation carried on the wire without probing the root.
+/// The helper process seals the root before it performs any I/O.
+pub(crate) fn relative_worktree_path(
+    root_bytes: &[u8],
+    path: &Path,
+    allow_root: bool,
+) -> io::Result<PathBuf> {
+    validate_absolute_root(root_bytes, "worktree")?;
+    let root = bytes_to_path(root_bytes);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(&root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worktree request path is outside its root",
+            )
+        })?
+    } else {
+        path
+    };
+    if relative.as_os_str().is_empty() {
+        if allow_root {
+            return Ok(PathBuf::new());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worktree request path must be a non-empty canonical relative path",
+        ));
+    }
+    validate_relative_path(relative)?;
+    Ok(relative.to_path_buf())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum IoEvent {
     Ready,

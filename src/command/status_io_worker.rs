@@ -321,14 +321,8 @@ fn request_root_bytes() -> io::Result<Vec<u8>> {
 /// submission time as well as in the helper after decoding, so malformed
 /// requests never enter the queue or get serialized.
 fn request_worktree_relative(root: &[u8], path: &Path, allow_root: bool) -> io::Result<Vec<u8>> {
-    let capability = request_worktree_capability(root)?;
-    let relative = if path.is_absolute() {
-        capability.relative_from_absolute(path)?
-    } else if allow_root {
-        capability.relative_or_root(path)?
-    } else {
-        capability.relative(path)?
-    };
+    let relative =
+        crate::internal::worktree_io::protocol::relative_worktree_path(root, path, allow_root)?;
     Ok(path_to_bytes(&relative))
 }
 
@@ -339,53 +333,25 @@ thread_local! {
     /// A different wire root cannot reuse the previous capability.
     static HELPER_WORKTREE_CAPABILITY:
         RefCell<Option<(Vec<u8>, WorktreeRootCapability)>> = const { RefCell::new(None) };
-    /// Parent-side worktree root for beneath requests. Resolved once per
-    /// status session so `deadline_stat` / `read_dir` do not re-walk the
-    /// repository ancestry for every path.
+    /// Parent-side worktree root bytes for beneath requests. This is only a
+    /// lexical session value; it is never sealed or opened in the parent.
     static STATUS_IO_ROOT_BYTES: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
-    /// Sealed once at session start and reused for lexical path conversion.
-    /// Actual reads still open a fresh root through `beneath`.
-    static STATUS_IO_ROOT_CAPABILITY: RefCell<Option<WorktreeRootCapability>> =
-        const { RefCell::new(None) };
-}
-
-fn request_worktree_capability(root: &[u8]) -> io::Result<WorktreeRootCapability> {
-    STATUS_IO_ROOT_CAPABILITY.with(|slot| {
-        if let Some(capability) = slot.borrow().as_ref().cloned()
-            && path_to_bytes(capability.root()) == root
-        {
-            return Ok(capability);
-        }
-        let capability = WorktreeRootCapability::seal(&bytes_to_path(root))?;
-        *slot.borrow_mut() = Some(capability.clone());
-        Ok(capability)
-    })
 }
 
 /// Prime the parent-side worktree-root cache for a status/probe session.
 pub(crate) fn prime_status_io_root_cache(root: &Path) {
-    let capability = WorktreeRootCapability::seal(root).ok();
-    let bytes = capability
-        .as_ref()
-        .map(|capability| path_to_bytes(capability.root()))
-        .unwrap_or_else(|| path_to_bytes(root));
+    let bytes = path_to_bytes(root);
     if bytes.is_empty() {
         return;
     }
     STATUS_IO_ROOT_BYTES.with(|slot| {
         *slot.borrow_mut() = Some(bytes);
     });
-    STATUS_IO_ROOT_CAPABILITY.with(|slot| {
-        *slot.borrow_mut() = capability;
-    });
 }
 
 /// Drop the parent-side worktree-root cache at the end of a status session.
 pub(crate) fn clear_status_io_root_cache() {
     STATUS_IO_ROOT_BYTES.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
-    STATUS_IO_ROOT_CAPABILITY.with(|slot| {
         *slot.borrow_mut() = None;
     });
 }
@@ -1093,6 +1059,35 @@ mod tests {
 
         assert_eq!(probe(root_a.path()), Some(true));
         assert_eq!(probe(root_b.path()), Some(false));
+    }
+
+    #[test]
+    fn parent_root_session_validation_is_lexical_for_missing_root() {
+        let parent = tempfile::tempdir().expect("create parent directory");
+        let missing_root = parent.path().join("missing-worktree-root");
+        super::clear_status_io_root_cache();
+        super::prime_status_io_root_cache(&missing_root);
+        let root = super::path_to_bytes(&missing_root);
+
+        let nested_absolute = missing_root.join("nested");
+        let nested = super::request_worktree_relative(&root, &nested_absolute, false)
+            .expect("absolute path beneath a missing root remains lexical");
+        assert_eq!(
+            super::bytes_to_path(&nested),
+            std::path::Path::new("nested")
+        );
+
+        let nested = super::request_worktree_relative(&root, std::path::Path::new("nested"), false)
+            .expect("relative path beneath a missing root remains lexical");
+        assert_eq!(
+            super::bytes_to_path(&nested),
+            std::path::Path::new("nested")
+        );
+
+        let root_relative = super::request_worktree_relative(&root, &missing_root, true)
+            .expect("the missing root itself remains lexical");
+        assert!(root_relative.is_empty());
+        super::clear_status_io_root_cache();
     }
 
     #[test]
