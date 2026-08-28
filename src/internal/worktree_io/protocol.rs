@@ -445,7 +445,11 @@ pub(crate) enum IoRequest {
 
 impl IoRequest {
     /// Validate an incoming request before it is serialized or dispatched.
-    /// The helper repeats this check after decoding untrusted wire data.
+    ///
+    /// This is deliberately lexical only: validating a request must not probe
+    /// the filesystem because it runs once in the parent and again after wire
+    /// decoding in the helper. The handler seals the root once, then every
+    /// read uses the beneath no-follow operations for TOCTOU enforcement.
     pub(crate) fn validate(&self) -> io::Result<()> {
         match self {
             Self::SymlinkMetadata { path, root } | Self::ReadDir { path, root, .. } => {
@@ -462,15 +466,7 @@ impl IoRequest {
             Self::ReadObjectBlob {
                 oid, objects_root, ..
             } => {
-                let objects_root = validate_absolute_root(objects_root, "object-store")?;
-                // A missing objects directory is a normal `Unavailable`
-                // outcome for status/diff callers; all other root failures
-                // are rejected before a request can cross the pipe.
-                match ObjectStoreCapability::seal(&objects_root) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
+                validate_absolute_root(objects_root, "object-store")?;
                 if !matches!(oid.len(), 40 | 64)
                     || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
                 {
@@ -486,7 +482,7 @@ impl IoRequest {
     }
 }
 
-fn validate_absolute_root(bytes: &[u8], kind: &str) -> io::Result<PathBuf> {
+fn validate_absolute_root(bytes: &[u8], kind: &str) -> io::Result<()> {
     let root = bytes_to_path(bytes);
     if !root.is_absolute() || root.as_os_str().is_empty() {
         return Err(io::Error::new(
@@ -494,23 +490,47 @@ fn validate_absolute_root(bytes: &[u8], kind: &str) -> io::Result<PathBuf> {
             format!("{kind} capability root must be an absolute path"),
         ));
     }
-    Ok(root)
+    if root.components().any(|component| {
+        matches!(
+            component,
+            Component::CurDir | Component::ParentDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} capability root must be lexically canonical"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = root.as_os_str().as_bytes();
+        if bytes.windows(2).any(|pair| pair == b"//") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{kind} capability root must not contain duplicate separators"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_worktree_path(
     root_bytes: &[u8],
     path_bytes: &[u8],
     allow_root: bool,
-) -> io::Result<(WorktreeRootCapability, PathBuf)> {
-    let root = validate_absolute_root(root_bytes, "worktree")?;
-    let capability = WorktreeRootCapability::seal(&root)?;
+) -> io::Result<PathBuf> {
+    validate_absolute_root(root_bytes, "worktree")?;
     let path = bytes_to_path(path_bytes);
-    let relative = if allow_root {
-        capability.relative_or_root(&path)?
+    if allow_root {
+        if path.as_os_str().is_empty() {
+            return Ok(PathBuf::new());
+        }
+        validate_relative_path(&path)?;
     } else {
-        capability.relative(&path)?
-    };
-    Ok((capability, relative))
+        validate_relative_path(&path)?;
+    }
+    Ok(path)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -810,6 +830,26 @@ mod tests {
                 .relative_from_absolute(Path::new("/tmp/escape"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn request_validation_is_lexical_and_does_not_probe_root() {
+        let root = tempdir()
+            .expect("create temporary parent")
+            .path()
+            .to_path_buf();
+        let missing_root = root.join("missing-worktree-root");
+        let request = IoRequest::MarkerProbe {
+            dir: b".libra".to_vec(),
+            root: path_to_bytes(&missing_root),
+        };
+
+        // The root has been removed with the temporary parent, but lexical
+        // validation is still expected to pass. The helper seals it later.
+        assert!(request.validate().is_ok());
+        let mut wire = Vec::new();
+        write_request(&mut wire, "test-cap", request).expect("lexically valid request encodes");
+        assert!(!wire.is_empty());
     }
 
     #[test]

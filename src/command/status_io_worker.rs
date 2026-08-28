@@ -53,6 +53,39 @@ fn handle_request_to_buffer(request: IoRequest, stdout: &mut Vec<u8>) -> io::Res
     handle_request(request, stdout)
 }
 
+fn seal_worktree_capability(request: &IoRequest) -> io::Result<Option<WorktreeRootCapability>> {
+    let root = match request {
+        IoRequest::SymlinkMetadata { root, .. }
+        | IoRequest::CanonicalizePair { root, .. }
+        | IoRequest::ReadDir { root, .. }
+        | IoRequest::FileBlobHash { root, .. }
+        | IoRequest::MarkerProbe { root, .. } => root,
+        IoRequest::ReadObjectBlob { .. } | IoRequest::Shutdown => return Ok(None),
+    };
+    HELPER_WORKTREE_CAPABILITY.with(|slot| {
+        if let Some((cached_root, capability)) = slot.borrow().as_ref()
+            && cached_root == root
+        {
+            return Ok(Some(capability.clone()));
+        }
+        let capability = WorktreeRootCapability::seal(&bytes_to_path(root))?;
+        *slot.borrow_mut() = Some((root.clone(), capability.clone()));
+        Ok(Some(capability))
+    })
+}
+
+fn seal_object_store_capability(request: &IoRequest) -> io::Result<Option<ObjectStoreCapability>> {
+    let objects_root = match request {
+        IoRequest::ReadObjectBlob { objects_root, .. } => objects_root,
+        _ => return Ok(None),
+    };
+    match ObjectStoreCapability::seal(&bytes_to_path(objects_root)) {
+        Ok(capability) => Ok(Some(capability)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn parent_still_alive(ppid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -137,23 +170,29 @@ pub fn run_worker() -> i32 {
 
 fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<bool> {
     // Requests can be supplied by the helper's pipe peer, so validate the
-    // sealed root and canonical relative paths again after deserialization.
+    // lexical root and relative paths again after deserialization. Root
+    // sealing is intentionally done once below, before the read operation.
     request.validate()?;
+    let worktree_capability = seal_worktree_capability(&request)?;
+    let object_store_capability = seal_object_store_capability(&request)?;
     match request {
         IoRequest::Shutdown => return Ok(false),
-        IoRequest::SymlinkMetadata { path, root } => {
+        IoRequest::SymlinkMetadata { path, .. } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let path = bytes_to_path(&path);
-            let root_path = bytes_to_path(&root);
-            let result = lstat_request(&path, &root_path);
+            let Some(capability) = worktree_capability.as_ref() else {
+                return Err(io::Error::other("missing worktree capability"));
+            };
+            let result = lstat_request(&path, capability);
             write_frame(stdout, &IoEvent::DoneStat { result })?;
         }
-        IoRequest::CanonicalizePair { left, right, root } => {
+        IoRequest::CanonicalizePair { left, right, .. } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let left_path = bytes_to_path(&left);
             let right_path = bytes_to_path(&right);
-            let root_path = bytes_to_path(&root);
-            let capability = WorktreeRootCapability::seal(&root_path)?;
+            let Some(capability) = worktree_capability.as_ref() else {
+                return Err(io::Error::other("missing worktree capability"));
+            };
             write_frame(
                 stdout,
                 &IoEvent::DoneCanonicalize {
@@ -174,25 +213,26 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
         }
         IoRequest::ReadDir {
             path,
-            root,
             remaining,
             checkpoint_every,
+            ..
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let path = bytes_to_path(&path);
-            let root_path = bytes_to_path(&root);
-            let listing = read_dir_request(&path, &root_path, remaining, checkpoint_every, stdout)?;
+            let Some(capability) = worktree_capability.as_ref() else {
+                return Err(io::Error::other("missing worktree capability"));
+            };
+            let listing = read_dir_request(&path, capability, remaining, checkpoint_every, stdout)?;
             write_frame(stdout, &IoEvent::DoneReadDir { listing })?;
         }
         IoRequest::FileBlobHash {
-            path,
-            hash_kind,
-            root,
+            path, hash_kind, ..
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let path = bytes_to_path(&path);
-            let root_path = bytes_to_path(&root);
-            let capability = WorktreeRootCapability::seal(&root_path)?;
+            let Some(capability) = worktree_capability.as_ref() else {
+                return Err(io::Error::other("missing worktree capability"));
+            };
             let relative = capability.relative(&path)?;
             // Validate all parent components through the no-follow beneath
             // walker before handing the path to the existing hash routine.
@@ -222,24 +262,26 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
         }
         IoRequest::ReadObjectBlob {
             oid,
-            objects_root,
             byte_limit,
             hash_kind,
+            ..
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
             maybe_test_slow_object_read(&oid);
             apply_hash_kind(&hash_kind);
-            let objects_root = bytes_to_path(&objects_root);
-            write_object_blob_outcome(
-                stdout,
-                read_object_blob_request(&oid, &objects_root, byte_limit),
-            )?;
+            let outcome = match object_store_capability.as_ref() {
+                Some(capability) => read_object_blob_request(&oid, capability, byte_limit),
+                None => Err(ObjectBlobStatus::Unavailable),
+            };
+            write_object_blob_outcome(stdout, outcome)?;
         }
-        IoRequest::MarkerProbe { dir, root } => {
+        IoRequest::MarkerProbe { dir, .. } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let dir = bytes_to_path(&dir);
-            let root_path = bytes_to_path(&root);
-            let (present, err_kind, err_raw_os) = marker_probe_request(&dir, &root_path);
+            let Some(capability) = worktree_capability.as_ref() else {
+                return Err(io::Error::other("missing worktree capability"));
+            };
+            let (present, err_kind, err_raw_os) = marker_probe_request(&dir, capability);
             write_frame(
                 stdout,
                 &IoEvent::DoneMarker {
@@ -279,8 +321,7 @@ fn request_root_bytes() -> io::Result<Vec<u8>> {
 /// submission time as well as in the helper after decoding, so malformed
 /// requests never enter the queue or get serialized.
 fn request_worktree_relative(root: &[u8], path: &Path, allow_root: bool) -> io::Result<Vec<u8>> {
-    let root_path = bytes_to_path(root);
-    let capability = WorktreeRootCapability::seal(&root_path)?;
+    let capability = request_worktree_capability(root)?;
     let relative = if path.is_absolute() {
         capability.relative_from_absolute(path)?
     } else if allow_root {
@@ -292,26 +333,59 @@ fn request_worktree_relative(root: &[u8], path: &Path, allow_root: bool) -> io::
 }
 
 thread_local! {
+    /// The helper is a long-lived single-threaded request loop. Cache the
+    /// lexical root key and its sealed capability between requests, while
+    /// keeping every actual read behind a fresh `beneath::open_root` call.
+    /// A different wire root cannot reuse the previous capability.
+    static HELPER_WORKTREE_CAPABILITY:
+        RefCell<Option<(Vec<u8>, WorktreeRootCapability)>> = const { RefCell::new(None) };
     /// Parent-side worktree root for beneath requests. Resolved once per
     /// status session so `deadline_stat` / `read_dir` do not re-walk the
     /// repository ancestry for every path.
     static STATUS_IO_ROOT_BYTES: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// Sealed once at session start and reused for lexical path conversion.
+    /// Actual reads still open a fresh root through `beneath`.
+    static STATUS_IO_ROOT_CAPABILITY: RefCell<Option<WorktreeRootCapability>> =
+        const { RefCell::new(None) };
+}
+
+fn request_worktree_capability(root: &[u8]) -> io::Result<WorktreeRootCapability> {
+    STATUS_IO_ROOT_CAPABILITY.with(|slot| {
+        if let Some(capability) = slot.borrow().as_ref().cloned()
+            && path_to_bytes(capability.root()) == root
+        {
+            return Ok(capability);
+        }
+        let capability = WorktreeRootCapability::seal(&bytes_to_path(root))?;
+        *slot.borrow_mut() = Some(capability.clone());
+        Ok(capability)
+    })
 }
 
 /// Prime the parent-side worktree-root cache for a status/probe session.
 pub(crate) fn prime_status_io_root_cache(root: &Path) {
-    let bytes = path_to_bytes(root);
+    let capability = WorktreeRootCapability::seal(root).ok();
+    let bytes = capability
+        .as_ref()
+        .map(|capability| path_to_bytes(capability.root()))
+        .unwrap_or_else(|| path_to_bytes(root));
     if bytes.is_empty() {
         return;
     }
     STATUS_IO_ROOT_BYTES.with(|slot| {
         *slot.borrow_mut() = Some(bytes);
     });
+    STATUS_IO_ROOT_CAPABILITY.with(|slot| {
+        *slot.borrow_mut() = capability;
+    });
 }
 
 /// Drop the parent-side worktree-root cache at the end of a status session.
 pub(crate) fn clear_status_io_root_cache() {
     STATUS_IO_ROOT_BYTES.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    STATUS_IO_ROOT_CAPABILITY.with(|slot| {
         *slot.borrow_mut() = None;
     });
 }
@@ -337,16 +411,7 @@ pub(crate) fn begin_status_io_root_session() -> io::Result<StatusIoRootGuard> {
     Ok(StatusIoRootGuard)
 }
 
-fn lstat_request(path: &Path, root: &Path) -> WireResult<CapturedStat> {
-    let capability = match WorktreeRootCapability::seal(root) {
-        Ok(capability) => capability,
-        Err(error) => {
-            return WireResult::Err {
-                kind: kind_to_u8(error.kind()),
-                raw_os: error.raw_os_error(),
-            };
-        }
-    };
+fn lstat_request(path: &Path, capability: &WorktreeRootCapability) -> WireResult<CapturedStat> {
     let rel = match capability.relative_or_root(path) {
         Ok(rel) => rel,
         Err(error) => {
@@ -367,11 +432,10 @@ fn lstat_request(path: &Path, root: &Path) -> WireResult<CapturedStat> {
     }
 }
 
-fn marker_probe_request(dir: &Path, root: &Path) -> (Option<bool>, Option<u8>, Option<i32>) {
-    let capability = match WorktreeRootCapability::seal(root) {
-        Ok(capability) => capability,
-        Err(error) => return (None, Some(kind_to_u8(error.kind())), error.raw_os_error()),
-    };
+fn marker_probe_request(
+    dir: &Path,
+    capability: &WorktreeRootCapability,
+) -> (Option<bool>, Option<u8>, Option<i32>) {
     let rel = match capability.relative(dir) {
         Ok(rel) => rel,
         Err(error) => return (None, Some(kind_to_u8(error.kind())), error.raw_os_error()),
@@ -386,7 +450,7 @@ fn marker_probe_request(dir: &Path, root: &Path) -> (Option<bool>, Option<u8>, O
 
 fn read_dir_request(
     path: &Path,
-    root: &Path,
+    capability: &WorktreeRootCapability,
     remaining: usize,
     checkpoint_every: u32,
     stdout: &mut impl Write,
@@ -397,16 +461,6 @@ fn read_dir_request(
         taken: 0,
         hit_cap: false,
         timed_out: false,
-    };
-    let capability = match WorktreeRootCapability::seal(root) {
-        Ok(capability) => capability,
-        Err(error) => {
-            listing
-                .error_kinds
-                .push((kind_to_u8(error.kind()), error.raw_os_error()));
-            listing.entries.clear();
-            return Ok(listing);
-        }
     };
     let rel = match capability.relative_or_root(path) {
         Ok(rel) => rel,
@@ -577,17 +631,11 @@ fn maybe_test_slow_object_read(oid: &str) {
 
 fn read_object_blob_request(
     oid: &str,
-    objects_root: &Path,
+    object_capability: &ObjectStoreCapability,
     byte_limit: u64,
 ) -> Result<Vec<u8>, ObjectBlobStatus> {
     use crate::utils::client_storage::{ClientStorage, ObjectReadFailure};
 
-    // Seal the object-store root before handing it to the local-only storage
-    // backend. This keeps the object capability distinct from worktree roots
-    // and prevents a malformed helper request from creating/hydrating a path.
-    let Ok(object_capability) = ObjectStoreCapability::seal(objects_root) else {
-        return Err(ObjectBlobStatus::Unavailable);
-    };
     let Ok(hash) = oid.parse::<git_internal::hash::ObjectHash>() else {
         return Err(ObjectBlobStatus::Failed);
     };
@@ -903,11 +951,11 @@ pub(crate) fn deadline_read_object_blob(
         return Err(());
     }
     if !worktree_io().helper_available() {
-        return Ok(object_blob_outcome_from_status(read_object_blob_request(
-            &oid.to_string(),
-            objects_root,
-            byte_limit,
-        )));
+        let outcome = match ObjectStoreCapability::seal(objects_root) {
+            Ok(capability) => read_object_blob_request(&oid.to_string(), &capability, byte_limit),
+            Err(_) => Err(ObjectBlobStatus::Unavailable),
+        };
+        return Ok(object_blob_outcome_from_status(outcome));
     }
     let oid_hex = oid.to_string();
     let events = worktree_io()
@@ -1018,6 +1066,33 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(wire.is_empty(), "invalid requests must not emit events");
+    }
+
+    #[test]
+    fn helper_reseals_when_the_wire_root_changes() {
+        let root_a = tempfile::tempdir().expect("create first worktree root");
+        std::fs::create_dir(root_a.path().join("nested")).expect("first nested directory");
+        std::fs::create_dir(root_a.path().join("nested/.libra")).expect("first marker");
+        let root_b = tempfile::tempdir().expect("create second worktree root");
+        std::fs::create_dir(root_b.path().join("nested")).expect("second nested directory");
+
+        fn probe(root: &std::path::Path) -> Option<bool> {
+            let request = super::IoRequest::MarkerProbe {
+                dir: b"nested".to_vec(),
+                root: super::path_to_bytes(root),
+            };
+            let mut wire = Vec::new();
+            super::handle_request(request, &mut wire).expect("marker probe");
+            let events = crate::internal::worktree_io::protocol::parse_event_frames(&wire)
+                .expect("marker probe frames");
+            events.into_iter().find_map(|event| match event {
+                super::IoEvent::DoneMarker { present, .. } => present,
+                _ => None,
+            })
+        }
+
+        assert_eq!(probe(root_a.path()), Some(true));
+        assert_eq!(probe(root_b.path()), Some(false));
     }
 
     #[test]
