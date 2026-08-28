@@ -393,31 +393,32 @@ fn spawn_worker(
         }
     }
     let mut child = command.spawn().map_err(ExecutorError::WorkerUnavailable)?;
-    let stdin = child.stdin.take().ok_or_else(|| {
-        ExecutorError::WorkerUnavailable(io::Error::other("status io worker missing stdin"))
-    })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        ExecutorError::WorkerUnavailable(io::Error::other("status io worker missing stdout"))
-    })?;
+    let Some(stdin) = child.stdin.take() else {
+        let stdout = child.stdout.take();
+        retire_spawned_child(child, None, stdout);
+        return Err(ExecutorError::WorkerUnavailable(io::Error::other(
+            "status io worker missing stdin",
+        )));
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        retire_spawned_child(child, Some(stdin), None);
+        return Err(ExecutorError::WorkerUnavailable(io::Error::other(
+            "status io worker missing stdout",
+        )));
+    };
     if let Err(error) = set_stdout_nonblocking(&stdout) {
-        kill_pid(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
+        retire_spawned_child(child, Some(stdin), Some(stdout));
         return Err(ExecutorError::WorkerUnavailable(error));
     }
     let ready = match read_worker_frame(&mut stdout, deadline, cancel_token) {
         Ok(event) => event,
         Err(error) => {
-            kill_pid(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
+            retire_spawned_child(child, Some(stdin), Some(stdout));
             return Err(error);
         }
     };
     if !matches!(ready, IoEvent::Ready) {
-        kill_pid(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
+        retire_spawned_child(child, Some(stdin), Some(stdout));
         return Err(ExecutorError::Protocol(io::Error::other(
             "status io worker handshake failed",
         )));
@@ -454,10 +455,42 @@ fn kill_pid(pid: u32) {
     }
 }
 
-fn kill_worker(worker: &mut WorkerProc) {
-    kill_pid(worker.child.id());
-    let _ = worker.child.kill();
-    let _ = worker.child.wait();
+fn handoff_to_reaper<T, F>(item: T, wait: F) -> bool
+where
+    T: Send + 'static,
+    F: FnOnce(T) + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("libra-status-io-reaper".to_string())
+        .spawn(move || wait(item))
+        .is_ok()
+}
+
+fn reap_child_async(child: Child) {
+    let _ = handoff_to_reaper(child, |mut child| {
+        let _ = child.wait();
+    });
+}
+
+fn retire_spawned_child(mut child: Child, stdin: Option<ChildStdin>, stdout: Option<ChildStdout>) {
+    // Close both pipe ends before signalling the child, then leave all wait
+    // work to the independent reaper. If thread creation is exhausted,
+    // dropping Child is still preferable to blocking this dispatcher; the
+    // process-group kill above and the Linux PDEATHSIG remain best effort.
+    drop(stdin);
+    drop(stdout);
+    kill_pid(child.id());
+    let _ = child.kill();
+    reap_child_async(child);
+}
+
+fn kill_worker(worker: WorkerProc) {
+    let WorkerProc {
+        child,
+        stdin,
+        stdout,
+    } = worker;
+    retire_spawned_child(child, Some(stdin), Some(stdout));
 }
 
 fn dispatcher_loop(pool: Arc<Pool>) {
@@ -557,7 +590,7 @@ fn run_job(pool: &Pool, job: Arc<Job>) {
                     &job.cancel_token,
                 );
                 if job.cancel_token.is_cancelled() || drive.timed_out || !drive.reuse {
-                    kill_worker(&mut worker);
+                    kill_worker(worker);
                 } else {
                     recycle_worker(pool, worker);
                 }
@@ -644,8 +677,8 @@ fn recycle_worker(pool: &Pool, worker: WorkerProc) {
     if idle.len() < pool.limits.max_inflight {
         idle.push(worker);
     } else {
-        let mut worker = worker;
-        kill_worker(&mut worker);
+        let worker = worker;
+        kill_worker(worker);
     }
 }
 
@@ -1365,6 +1398,29 @@ mod tests {
             protocol,
             JobOutcome::Error(ExecutorError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn reaper_handoff_does_not_block_dispatcher_when_wait_stalls() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(0);
+        let (next_tx, next_rx) = mpsc::sync_channel(1);
+        let started = Instant::now();
+        let handed_off = handoff_to_reaper((), move |_| {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        });
+        assert!(handed_off, "reaper thread should be available in tests");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("reaper must begin waiting independently");
+
+        next_tx
+            .send(())
+            .expect("dispatcher slot must remain available");
+        assert!(next_rx.recv_timeout(Duration::from_millis(200)).is_ok());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(release_tx);
     }
 
     #[test]
