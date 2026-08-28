@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""nextest_group_overlap_check.py — assert a nextest test-group really ran
+with max-threads = 1 (plan-20260827 NP-02).
+
+Reads a nextest junit.xml, projects the testcases belonging to the group's
+member set onto (start, end) wall-clock intervals, and fails if any two
+intervals overlap. Membership is derived the same way the generator derives
+it (tests/SERIAL_REGISTRY.tsv key membership): fn rows whose lane keys
+include an external key match by last name segment; pure-global site rows
+match every test of the host target (junit classname).
+
+usage: python3 tests/nextest_group_overlap_check.py <junit.xml> external
+exit codes: 0 ok; 1 overlap found; 2 usage/parse error.
+"""
+
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+
+# External = any named key outside the in-process closed set; a newly named
+# key counts as external by default (same rule as the generator and guard).
+INTERNAL_KEYS = {"cwd", "env", "hash_kind"}
+
+
+def registry_membership(root: Path):
+    fns, targets = set(), set()
+    lines = (root / "tests/SERIAL_REGISTRY.tsv").read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0] != "test_fn\tlane\treason":
+        print("FAIL: unexpected registry header", file=sys.stderr)
+        sys.exit(2)
+    for line in lines[1:]:
+        key, lane, _reason = line.split("\t", 2)
+        if key.startswith("<site:"):
+            if lane == "global":
+                path = key[len("<site:"):].split(":", 1)[0]
+                if not (path.startswith("tests/") and path.endswith(".rs")):
+                    print(f"FAIL: unexpected site path {path}", file=sys.stderr)
+                    sys.exit(2)
+                targets.add(path[len("tests/"):-len(".rs")])
+        else:
+            keys = lane[len("lane:"):].split("+") if lane.startswith("lane:") else []
+            if any(k not in INTERNAL_KEYS for k in keys):
+                fns.add(key)
+    return fns, targets
+
+
+def main() -> int:
+    if len(sys.argv) != 3 or sys.argv[2] != "external":
+        print(__doc__, file=sys.stderr)
+        return 2
+    junit = Path(sys.argv[1])
+    root = Path(__file__).resolve().parent.parent
+    fns, targets = registry_membership(root)
+
+    try:
+        tree = ET.parse(junit)
+    except (OSError, ET.ParseError) as e:
+        print(f"FAIL: cannot parse {junit}: {e}", file=sys.stderr)
+        return 2
+
+    intervals = []
+    for case in tree.getroot().iter("testcase"):
+        name = case.get("name") or ""
+        classname = case.get("classname") or ""
+        # classname is "<crate>::<binary>" or just the binary/target name
+        target = classname.split("::")[-1]
+        last_segment = name.split("::")[-1]
+        if not (last_segment in fns or target in targets):
+            continue
+        ts, dur = case.get("timestamp"), case.get("time")
+        if ts is None or dur is None:
+            print(f"FAIL: member testcase without timestamp/time: {classname} {name}",
+                  file=sys.stderr)
+            return 2
+        start = datetime.fromisoformat(ts).timestamp()
+        intervals.append((start, start + float(dur), f"{classname}::{name}"))
+
+    if not intervals:
+        print("FAIL: junit contains no external-group member testcases", file=sys.stderr)
+        return 2
+
+    intervals.sort()
+    overlaps = 0
+    for (s1, e1, n1), (s2, e2, n2) in zip(intervals, intervals[1:]):
+        # strictly-positive overlap; equal boundaries are fine
+        if s2 < e1 - 1e-9:
+            print(f"OVERLAP: {n1} [{s1:.3f},{e1:.3f}] with {n2} [{s2:.3f},{e2:.3f}]",
+                  file=sys.stderr)
+            overlaps += 1
+    if overlaps:
+        print(f"FAIL: {overlaps} overlapping pair(s) in group external "
+              f"({len(intervals)} member cases)", file=sys.stderr)
+        return 1
+    print(f"OK: {len(intervals)} external-group cases, no wall-clock overlap")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
