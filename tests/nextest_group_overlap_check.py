@@ -22,6 +22,38 @@ from pathlib import Path
 # key counts as external by default (same rule as the generator and guard).
 INTERNAL_KEYS = {"cwd", "env", "hash_kind"}
 
+# Interval-endpoint tolerance. junit timestamps are millisecond-truncated
+# (<=1 ms error per endpoint) while durations are float-precise, so a perfect
+# serial handoff can reconstruct with < 2 ms of phantom overlap — and no more.
+# 2 ms therefore rejects any real concurrency (even 5-10 ms member tests
+# overlap by >= their duration minus scheduling skew) while absorbing the
+# encoding jitter. Verified by --selftest below.
+EPS = 0.002
+
+
+def _overlap_count(intervals):
+    intervals = sorted(intervals)
+    return sum(
+        1
+        for (s1, e1, _), (s2, e2, _) in zip(intervals, intervals[1:])
+        if s2 < e1 - EPS
+    )
+
+
+def selftest() -> int:
+    perfect_handoff = [(0.000, 0.450, "a"), (0.450, 0.985, "b")]
+    ms_jitter = [(0.000, 0.4512, "a"), (0.4508, 0.985, "b")]      # < 2 ms phantom
+    short_full_overlap = [(0.000, 0.007, "a"), (0.001, 0.008, "b")]  # 7 ms tests
+    long_partial_overlap = [(0.000, 0.500, "a"), (0.300, 0.900, "b")]
+    ok = (
+        _overlap_count(perfect_handoff) == 0
+        and _overlap_count(ms_jitter) == 0
+        and _overlap_count(short_full_overlap) == 1
+        and _overlap_count(long_partial_overlap) == 1
+    )
+    print("SELFTEST", "OK" if ok else "FAIL")
+    return 0 if ok else 1
+
 
 def registry_membership(root: Path):
     fns, targets = set(), set()
@@ -46,6 +78,8 @@ def registry_membership(root: Path):
 
 
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
+        return selftest()
     if len(sys.argv) != 3 or sys.argv[2] != "external":
         print(__doc__, file=sys.stderr)
         return 2
@@ -82,11 +116,6 @@ def main() -> int:
 
     intervals.sort()
     overlaps = 0
-    # junit timestamps carry millisecond precision while durations are float
-    # seconds, so reconstructed interval endpoints jitter by ~1-2 ms around a
-    # perfect serial handoff. 10 ms tolerance is orders of magnitude below any
-    # real concurrency violation (member tests run for 100 ms+).
-    EPS = 0.010
     for (s1, e1, n1), (s2, e2, n2) in zip(intervals, intervals[1:]):
         if s2 < e1 - EPS:
             print(f"OVERLAP: {n1} [{s1:.3f},{e1:.3f}] with {n2} [{s2:.3f},{e2:.3f}]",
