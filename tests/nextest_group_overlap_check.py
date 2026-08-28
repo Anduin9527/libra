@@ -13,6 +13,7 @@ usage: python3 tests/nextest_group_overlap_check.py <junit.xml> external
 exit codes: 0 ok; 1 overlap found; 2 usage/parse error.
 """
 
+import math
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -45,11 +46,15 @@ def selftest() -> int:
     ms_jitter = [(0.000, 0.4512, "a"), (0.4508, 0.985, "b")]      # < 2 ms phantom
     short_full_overlap = [(0.000, 0.007, "a"), (0.001, 0.008, "b")]  # 7 ms tests
     long_partial_overlap = [(0.000, 0.500, "a"), (0.300, 0.900, "b")]
+    nan_is_rejected = not (
+        math.isfinite(float("nan")) and True
+    )  # guard the guard: the finite check above must reject NaN durations
     ok = (
         _overlap_count(perfect_handoff) == 0
         and _overlap_count(ms_jitter) == 0
         and _overlap_count(short_full_overlap) == 1
         and _overlap_count(long_partial_overlap) == 1
+        and nan_is_rejected
     )
     print("SELFTEST", "OK" if ok else "FAIL")
     return 0 if ok else 1
@@ -107,8 +112,20 @@ def main() -> int:
             print(f"FAIL: member testcase without timestamp/time: {classname} {name}",
                   file=sys.stderr)
             return 2
-        start = datetime.fromisoformat(ts).timestamp()
-        intervals.append((start, start + float(dur), f"{classname}::{name}"))
+        try:
+            start = datetime.fromisoformat(ts).timestamp()
+            dur_s = float(dur)
+        except ValueError as e:
+            print(f"FAIL: unparseable timestamp/time on {classname}::{name}: {e}",
+                  file=sys.stderr)
+            return 2
+        # NaN compares false everywhere and would silently disable the overlap
+        # comparison; Inf/negative durations are equally meaningless.
+        if not (math.isfinite(start) and math.isfinite(dur_s)) or dur_s < 0:
+            print(f"FAIL: non-finite or negative interval on {classname}::{name}: "
+                  f"start={start} dur={dur}", file=sys.stderr)
+            return 2
+        intervals.append((start, start + dur_s, f"{classname}::{name}"))
 
     if not intervals:
         print("FAIL: junit contains no external-group member testcases", file=sys.stderr)
