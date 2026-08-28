@@ -130,6 +130,7 @@ impl ObjectStoreCapability {
     /// Return the loose-object pathname for an OID without opening it. This
     /// is intentionally read-only and accepts only canonical SHA-1/SHA-256
     /// hexadecimal object names.
+    #[allow(dead_code)]
     pub(crate) fn object_path(&self, oid: &str) -> io::Result<PathBuf> {
         if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(io::Error::new(
@@ -164,15 +165,15 @@ fn has_empty_component(path: &Path) -> bool {
     {
         use std::os::unix::ffi::OsStrExt;
         let bytes = path.as_os_str().as_bytes();
-        return bytes.split(|byte| *byte == b'/').any(<[u8]>::is_empty);
+        bytes.split(|byte| *byte == b'/').any(<[u8]>::is_empty)
     }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         let units: Vec<u16> = path.as_os_str().encode_wide().collect();
-        return units
+        units
             .split(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
-            .any(<[u16]>::is_empty);
+            .any(<[u16]>::is_empty)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -196,6 +197,7 @@ pub(crate) struct CapturedStat {
 }
 
 impl CapturedStat {
+    #[cfg(test)]
     pub(crate) fn from_metadata(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         {
@@ -291,6 +293,7 @@ pub(crate) struct Dirent {
 }
 
 impl Dirent {
+    #[cfg(test)]
     pub(crate) fn from_dir_entry(entry: &std::fs::DirEntry) -> Self {
         let name = path_to_bytes(&PathBuf::from(entry.file_name()));
         match entry.file_type() {

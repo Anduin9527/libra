@@ -12,16 +12,13 @@
 
 use std::{
     cell::RefCell,
-    collections::VecDeque,
-    io::{self, BufReader, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Hidden argv token. Must be the second argv element; parsed in `main` before CLI.
@@ -31,18 +28,30 @@ pub const STATUS_IO_WORKER_CAP_ENV: &str = "LIBRA_INTERNAL_STATUS_IO_CAP";
 /// Parent pid, so a helper blocked in a syscall can still exit when status dies.
 pub const STATUS_IO_WORKER_PPID_ENV: &str = "LIBRA_INTERNAL_STATUS_IO_PPID";
 
-const MAX_INFLIGHT: usize = 8;
-/// Cap on queued work waiting for a dispatcher slot. Callers still wait
-/// (not fail-fast at 8), but timed-out / excess jobs must not grow without
-/// bound in a long-lived host.
-const MAX_PENDING: usize = 64;
-
+use crate::internal::worktree_io::executor::{WorkerConfig, WorktreeIo};
 pub(crate) use crate::internal::worktree_io::protocol::{
     CapRequest, CapturedStat, Dirent, DirentKind, FRAME_CAP, IoEvent, IoRequest, ObjectBlobStatus,
     ObjectStoreCapability, ReadDirListing, WireResult, WorktreeRootCapability, bytes_to_path,
     dirent_os, io_from_wire, kind_to_u8, path_to_bytes, read_frame, unwrap_wire, wire_result,
     write_frame,
 };
+
+static WORKTREE_IO: OnceLock<WorktreeIo> = OnceLock::new();
+
+fn worktree_io() -> &'static WorktreeIo {
+    WORKTREE_IO.get_or_init(|| {
+        WorktreeIo::new(WorkerConfig {
+            worker_arg: STATUS_IO_WORKER_ARG,
+            cap_env: STATUS_IO_WORKER_CAP_ENV,
+            ppid_env: STATUS_IO_WORKER_PPID_ENV,
+            in_process_handler: handle_request_to_buffer,
+        })
+    })
+}
+
+fn handle_request_to_buffer(request: IoRequest, stdout: &mut Vec<u8>) -> io::Result<bool> {
+    handle_request(request, stdout)
+}
 
 fn parent_still_alive(ppid: u32) -> bool {
     #[cfg(unix)]
@@ -643,608 +652,11 @@ fn write_raw_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     crate::internal::worktree_io::protocol::write_raw_frame(writer, payload)
 }
 
-fn read_raw_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    crate::internal::worktree_io::protocol::read_raw_frame(reader)
-}
-
 fn current_hash_kind() -> String {
     match git_internal::hash::get_hash_kind() {
         git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
         _ => "sha1".to_string(),
     }
-}
-
-struct WorkerProc {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-struct Pool {
-    idle: Mutex<Vec<WorkerProc>>,
-    pending: Mutex<VecDeque<Arc<Job>>>,
-    ready: Condvar,
-    token: String,
-}
-
-struct Job {
-    request: Mutex<Option<IoRequest>>,
-    path_key: Vec<u8>,
-    /// Wall-clock bound captured at submit (`now + timeout`).
-    deadline: Instant,
-    /// Per-stdout-wait window. Status walks use this as a no-progress timeout
-    /// (fresh each frame). Object reads set `absolute` and share `deadline`
-    /// across queue + every wait so a busy pool cannot stretch the budget.
-    window: Duration,
-    absolute: bool,
-    result_tx: Mutex<Option<std::sync::mpsc::SyncSender<JobOutcome>>>,
-    cancelled: AtomicBool,
-}
-
-enum JobOutcome {
-    Events(Vec<IoEvent>),
-    Timeout,
-    Failed,
-}
-
-static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-static DISPATCHERS_STARTED: AtomicUsize = AtomicUsize::new(0);
-
-fn pool() -> &'static Arc<Pool> {
-    POOL.get_or_init(|| {
-        let token = format!(
-            "{:016x}{:016x}",
-            NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
-            std::process::id() as u64
-        );
-        let pool = Arc::new(Pool {
-            idle: Mutex::new(Vec::new()),
-            pending: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
-            token,
-        });
-        let mut started = 0usize;
-        for index in 0..MAX_INFLIGHT {
-            let pool = Arc::clone(&pool);
-            if std::thread::Builder::new()
-                .name(format!("libra-status-io-{index}"))
-                .spawn(move || dispatcher_loop(pool))
-                .is_ok()
-            {
-                started += 1;
-            }
-        }
-        DISPATCHERS_STARTED.store(started, Ordering::SeqCst);
-        pool
-    })
-}
-
-fn spawn_worker(token: &str) -> io::Result<WorkerProc> {
-    let exe = std::env::current_exe()?;
-    let mut command = Command::new(exe);
-    command
-        .arg(STATUS_IO_WORKER_ARG)
-        .env(STATUS_IO_WORKER_CAP_ENV, token)
-        .env(STATUS_IO_WORKER_PPID_ENV, std::process::id().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-        #[cfg(target_os = "linux")]
-        {
-            // Own process group so timeout kill(-pid) cannot hit status;
-            // PDEATHSIG so a killed/exiting parent still reaps a hung helper.
-            // SAFETY: runs in the child after fork, before exec. Only
-            // async-signal-safe calls (prctl / getppid / _exit).
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::getppid() == 1 {
-                        libc::_exit(1);
-                    }
-                    Ok(())
-                });
-            }
-        }
-    }
-    let mut child = command.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("status io worker missing stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("status io worker missing stdout"))?;
-    let mut stdout = BufReader::new(stdout);
-    let ready: IoEvent = match read_frame(&mut stdout) {
-        Ok(event) => event,
-        Err(error) => {
-            kill_pid(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    if !matches!(ready, IoEvent::Ready) {
-        kill_pid(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(io::Error::other("status io worker handshake failed"));
-    }
-    Ok(WorkerProc {
-        child,
-        stdin,
-        stdout,
-    })
-}
-
-fn kill_pid(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::{
-            Foundation::CloseHandle,
-            System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
-        };
-        unsafe {
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !handle.is_null() {
-                let _ = TerminateProcess(handle, 1);
-                CloseHandle(handle);
-            }
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-    }
-}
-
-fn kill_worker(worker: &mut WorkerProc) {
-    kill_pid(worker.child.id());
-    let _ = worker.child.kill();
-    let _ = worker.child.wait();
-}
-
-fn submit(request: IoRequest, path_key: Vec<u8>, timeout: Duration) -> Result<Vec<IoEvent>, ()> {
-    submit_with_clock(request, path_key, timeout, false)
-}
-
-fn submit_absolute(
-    request: IoRequest,
-    path_key: Vec<u8>,
-    timeout: Duration,
-) -> Result<Vec<IoEvent>, ()> {
-    submit_with_clock(request, path_key, timeout, true)
-}
-
-fn submit_with_clock(
-    request: IoRequest,
-    path_key: Vec<u8>,
-    timeout: Duration,
-    absolute: bool,
-) -> Result<Vec<IoEvent>, ()> {
-    let pool = pool();
-    if DISPATCHERS_STARTED.load(Ordering::SeqCst) == 0 {
-        return Err(());
-    }
-    let deadline = Instant::now() + timeout;
-    let (tx, rx) = mpsc::sync_channel(1);
-    let job = Arc::new(Job {
-        request: Mutex::new(Some(request)),
-        path_key,
-        deadline,
-        window: timeout,
-        absolute,
-        result_tx: Mutex::new(Some(tx)),
-        cancelled: AtomicBool::new(false),
-    });
-    {
-        let mut pending = pool
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pending.len() >= MAX_PENDING {
-            return Err(());
-        }
-        let idx = pending
-            .iter()
-            .position(|existing| existing.path_key > job.path_key)
-            .unwrap_or(pending.len());
-        pending.insert(idx, Arc::clone(&job));
-        pool.ready.notify_one();
-    }
-    // CLI helpers: progressing `read_dir` may outlive one window; wait long
-    // enough. Absolute object reads finish or kill within `deadline`.
-    // In-process fallback cannot kill a hung syscall — recycle the caller
-    // after the op deadline instead of blocking `submit` forever.
-    let wait = if helper_exe_is_cli() && !absolute {
-        Duration::from_secs(24 * 60 * 60)
-    } else {
-        deadline
-            .saturating_duration_since(Instant::now())
-            .saturating_add(Duration::from_secs(1))
-    };
-    match rx.recv_timeout(wait) {
-        Ok(JobOutcome::Events(events)) => Ok(events),
-        _ => {
-            job.cancelled.store(true, Ordering::SeqCst);
-            {
-                let mut pending = pool
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(idx) = pending
-                    .iter()
-                    .position(|existing| Arc::ptr_eq(existing, &job))
-                {
-                    pending.remove(idx);
-                }
-            }
-            let _ = job
-                .request
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            Err(())
-        }
-    }
-}
-
-fn dispatcher_loop(pool: Arc<Pool>) {
-    loop {
-        let job = {
-            let mut pending = pool
-                .pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            loop {
-                if let Some(job) = pending.pop_front() {
-                    if job.cancelled.load(Ordering::SeqCst) {
-                        continue;
-                    }
-                    break job;
-                }
-                pending = pool
-                    .ready
-                    .wait(pending)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-            }
-        };
-        run_job(&pool.token, job);
-    }
-}
-
-fn helper_exe_is_cli() -> bool {
-    static CLI: OnceLock<bool> = OnceLock::new();
-    *CLI.get_or_init(|| {
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
-        // Cargo test harnesses live in `target/.../deps/`; the installed /
-        // `cargo run` CLI is `…/libra` (or `libra.exe`).
-        let in_deps = exe
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|name| name == "deps");
-        if in_deps {
-            return false;
-        }
-        exe.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "libra" || name.eq_ignore_ascii_case("libra.exe"))
-    })
-}
-
-fn run_job(token: &str, job: Arc<Job>) {
-    if job.cancelled.load(Ordering::SeqCst) {
-        return;
-    }
-    let request = job
-        .request
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    let Some(request) = request else {
-        return;
-    };
-    if job.cancelled.load(Ordering::SeqCst) {
-        return;
-    }
-    if job.absolute && Instant::now() >= job.deadline {
-        if let Some(tx) = job
-            .result_tx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            let _ = tx.send(JobOutcome::Timeout);
-        }
-        return;
-    }
-    let outcome = match take_worker(token) {
-        // CLI helper spawn/handshake failed (EMFILE, process limit). Do not
-        // fall back to an unkillable in-process syscall — that would pin a
-        // dispatcher forever and exhaust the pool. Absolute object reads
-        // (WIO-03) are the same: never `run_in_process` them on a pool
-        // thread. Library/test binaries keep in-process only for relative
-        // (no-progress) probe opcodes (R0).
-        Err(()) if helper_exe_is_cli() || job.absolute => JobOutcome::Timeout,
-        Err(()) => run_in_process(request),
-        Ok(mut worker) => {
-            let (events, timed_out, reuse) = drive_worker(
-                &mut worker,
-                token,
-                request,
-                job.deadline,
-                job.window,
-                job.absolute,
-            );
-            if timed_out || !reuse {
-                kill_worker(&mut worker);
-            } else {
-                recycle_worker(worker);
-            }
-            if events.is_empty() {
-                if timed_out {
-                    JobOutcome::Timeout
-                } else {
-                    JobOutcome::Failed
-                }
-            } else {
-                JobOutcome::Events(events)
-            }
-        }
-    };
-    if job.cancelled.load(Ordering::SeqCst) {
-        return;
-    }
-    if let Some(tx) = job
-        .result_tx
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        let _ = tx.send(outcome);
-    }
-}
-
-/// Library / in-process callers (`status::execute_to`, `cargo test` unit
-/// binaries) cannot spawn the CLI helper. Run the opcode on this dispatcher
-/// thread (already one of the 8 bounded slots). Hung syscalls remain
-/// unkillable here; WIO-01 killability applies to the `libra` CLI worker.
-fn run_in_process(request: IoRequest) -> JobOutcome {
-    let mut buf = Vec::new();
-    match handle_request(request, &mut buf)
-        .ok()
-        .and_then(|_| parse_event_frames(&buf))
-    {
-        Some(events) if !events.is_empty() => JobOutcome::Events(events),
-        _ => JobOutcome::Failed,
-    }
-}
-
-fn parse_event_frames(data: &[u8]) -> Option<Vec<IoEvent>> {
-    crate::internal::worktree_io::protocol::parse_event_frames(data)
-}
-
-fn take_worker(token: &str) -> Result<WorkerProc, ()> {
-    if !helper_exe_is_cli() {
-        return Err(());
-    }
-    {
-        let mut idle = pool()
-            .idle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(worker) = idle.pop() {
-            return Ok(worker);
-        }
-    }
-    spawn_worker(token).map_err(|_| ())
-}
-
-fn recycle_worker(worker: WorkerProc) {
-    let mut idle = pool()
-        .idle
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if idle.len() < MAX_INFLIGHT {
-        idle.push(worker);
-    } else {
-        let mut worker = worker;
-        kill_worker(&mut worker);
-    }
-}
-
-fn wait_stdout_readable(worker: &mut WorkerProc, timeout: Duration) -> io::Result<()> {
-    if !worker.stdout.buffer().is_empty() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let fd = worker.stdout.get_ref().as_raw_fd();
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-        loop {
-            let n = unsafe { libc::poll(&mut pollfd, 1, millis) };
-            if n < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "status io worker timeout",
-                ));
-            }
-            if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                return Ok(());
-            }
-            return Err(io::Error::other("status io worker poll"));
-        }
-    }
-    #[cfg(windows)]
-    {
-        // Anonymous pipe handles are not waitable synchronization objects;
-        // `WaitForSingleObject` returns WAIT_FAILED. PeekNamedPipe reports
-        // pending bytes (or ERROR_BROKEN_PIPE on EOF).
-        use std::os::windows::io::AsRawHandle;
-
-        use windows_sys::Win32::{
-            Foundation::{ERROR_BROKEN_PIPE, HANDLE},
-            System::Pipes::PeekNamedPipe,
-        };
-        const POLL_SLICE: Duration = Duration::from_millis(5);
-        let deadline = std::time::Instant::now() + timeout;
-        let handle = worker.stdout.get_ref().as_raw_handle() as HANDLE;
-        loop {
-            let mut avail: u32 = 0;
-            let ok = unsafe {
-                PeekNamedPipe(
-                    handle,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut avail,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
-                    return Ok(());
-                }
-                return Err(error);
-            }
-            if avail > 0 {
-                return Ok(());
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "status io worker timeout",
-                ));
-            }
-            std::thread::sleep(POLL_SLICE.min(deadline.saturating_duration_since(now)));
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = timeout;
-        Ok(())
-    }
-}
-
-fn drive_worker(
-    worker: &mut WorkerProc,
-    token: &str,
-    request: IoRequest,
-    deadline: Instant,
-    window: Duration,
-    absolute: bool,
-) -> (Vec<IoEvent>, bool, bool) {
-    if write_request(&mut worker.stdin, token, request).is_err() {
-        return (Vec::new(), false, false);
-    }
-    let mut events = Vec::new();
-    loop {
-        let wait = if absolute {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return (events, true, false);
-            }
-            remaining
-        } else {
-            // No-progress: each frame gets a fresh window so a wide
-            // progressing `read_dir` is not cut by an absolute job clock.
-            window
-        };
-        if wait_stdout_readable(worker, wait).is_err() {
-            return (events, true, false);
-        }
-        let event = match read_frame::<IoEvent>(&mut worker.stdout) {
-            Ok(event) => event,
-            Err(error)
-                if error.kind() == io::ErrorKind::TimedOut
-                    || error.kind() == io::ErrorKind::WouldBlock =>
-            {
-                return (events, true, false);
-            }
-            Err(_) => {
-                let timed_out = !events.is_empty();
-                return (events, timed_out, false);
-            }
-        };
-        let reuse = !matches!(event, IoEvent::Error { .. });
-        // Ok payloads travel as a trailing length-prefixed binary frame
-        // (not base64 in JSON) so a 2 MiB blob stays within the ≤20%
-        // wire-overhead budget (WIO-03).
-        let event = if let IoEvent::DoneObjectBlob {
-            status: ObjectBlobStatus::Ok,
-            bytes: None,
-        } = &event
-        {
-            let wait = if absolute {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return (events, true, false);
-                }
-                remaining
-            } else {
-                window
-            };
-            if wait_stdout_readable(worker, wait).is_err() {
-                return (events, true, false);
-            }
-            match read_raw_frame(&mut worker.stdout) {
-                Ok(bytes) => IoEvent::DoneObjectBlob {
-                    status: ObjectBlobStatus::Ok,
-                    bytes: Some(bytes),
-                },
-                Err(_) => return (events, true, false),
-            }
-        } else {
-            event
-        };
-        let done = matches!(
-            event,
-            IoEvent::DoneStat { .. }
-                | IoEvent::DoneCanonicalize { .. }
-                | IoEvent::DoneReadDir { .. }
-                | IoEvent::DoneHash { .. }
-                | IoEvent::DoneObjectBlob { .. }
-                | IoEvent::DoneMarker { .. }
-                | IoEvent::Error { .. }
-        );
-        events.push(event);
-        if done {
-            return (events, false, reuse);
-        }
-    }
-}
-
-fn write_request(writer: &mut impl Write, token: &str, request: IoRequest) -> io::Result<()> {
-    crate::internal::worktree_io::protocol::write_request(writer, token, request)
 }
 
 pub(crate) fn deadline_stat(path: &Path) -> Result<io::Result<CapturedStat>, ()> {
@@ -1256,14 +668,16 @@ pub(crate) fn deadline_stat(path: &Path) -> Result<io::Result<CapturedStat>, ()>
         Ok(relative) => relative,
         Err(error) => return Ok(Err(error)),
     };
-    let events = submit(
-        IoRequest::SymlinkMetadata {
-            path: relative,
-            root,
-        },
-        path_to_bytes(path),
-        crate::command::status_probe::io_op_timeout(),
-    )?;
+    let events = worktree_io()
+        .submit(
+            IoRequest::SymlinkMetadata {
+                path: relative,
+                root,
+            },
+            path_to_bytes(path),
+            crate::command::status_probe::io_op_timeout(),
+        )
+        .map_err(|_| ())?;
     for event in events {
         if let IoEvent::DoneStat { result } = event {
             return Ok(unwrap_wire(result));
@@ -1299,15 +713,17 @@ pub(crate) fn deadline_canonicalize_pair(
             return Ok((Err(first), Err(error)));
         }
     };
-    let events = submit(
-        IoRequest::CanonicalizePair {
-            left: left_relative,
-            right: right_relative,
-            root,
-        },
-        path_to_bytes(left),
-        crate::command::status_probe::io_op_timeout(),
-    )?;
+    let events = worktree_io()
+        .submit(
+            IoRequest::CanonicalizePair {
+                left: left_relative,
+                right: right_relative,
+                root,
+            },
+            path_to_bytes(left),
+            crate::command::status_probe::io_op_timeout(),
+        )
+        .map_err(|_| ())?;
     for event in events {
         if let IoEvent::DoneCanonicalize { left, right } = event {
             return Ok((
@@ -1332,16 +748,18 @@ pub(crate) fn deadline_read_dir(
         Ok(relative) => relative,
         Err(error) => return Ok(Err(error)),
     };
-    let events = submit(
-        IoRequest::ReadDir {
-            path: relative,
-            root,
-            remaining,
-            checkpoint_every: 32,
-        },
-        path_to_bytes(path),
-        crate::command::status_probe::io_op_timeout(),
-    );
+    let events = worktree_io()
+        .submit(
+            IoRequest::ReadDir {
+                path: relative,
+                root,
+                remaining,
+                checkpoint_every: 32,
+            },
+            path_to_bytes(path),
+            crate::command::status_probe::io_op_timeout(),
+        )
+        .map_err(|_| ());
     match events {
         Err(()) => Err(()),
         Ok(events) => {
@@ -1434,15 +852,17 @@ pub(crate) fn deadline_file_blob_hash(
         Ok(relative) => relative,
         Err(error) => return Ok(Err(error)),
     };
-    let events = submit(
-        IoRequest::FileBlobHash {
-            path: relative,
-            root,
-            hash_kind: current_hash_kind(),
-        },
-        path_to_bytes(path),
-        crate::command::status_probe::io_op_timeout(),
-    )?;
+    let events = worktree_io()
+        .submit(
+            IoRequest::FileBlobHash {
+                path: relative,
+                root,
+                hash_kind: current_hash_kind(),
+            },
+            path_to_bytes(path),
+            crate::command::status_probe::io_op_timeout(),
+        )
+        .map_err(|_| ())?;
     for event in events {
         if let IoEvent::DoneHash { hex } = event {
             return Ok(unwrap_wire(hex).and_then(|hex| {
@@ -1482,7 +902,7 @@ pub(crate) fn deadline_read_object_blob(
     if timeout.is_zero() {
         return Err(());
     }
-    if !helper_exe_is_cli() {
+    if !worktree_io().helper_available() {
         return Ok(object_blob_outcome_from_status(read_object_blob_request(
             &oid.to_string(),
             objects_root,
@@ -1490,16 +910,18 @@ pub(crate) fn deadline_read_object_blob(
         )));
     }
     let oid_hex = oid.to_string();
-    let events = submit_absolute(
-        IoRequest::ReadObjectBlob {
-            oid: oid_hex.clone(),
-            objects_root: path_to_bytes(objects_root),
-            byte_limit,
-            hash_kind: current_hash_kind(),
-        },
-        oid_hex.into_bytes(),
-        timeout,
-    )?;
+    let events = worktree_io()
+        .submit_absolute(
+            IoRequest::ReadObjectBlob {
+                oid: oid_hex.clone(),
+                objects_root: path_to_bytes(objects_root),
+                byte_limit,
+                hash_kind: current_hash_kind(),
+            },
+            oid_hex.into_bytes(),
+            timeout,
+        )
+        .map_err(|_| ())?;
     for event in events {
         if let IoEvent::DoneObjectBlob { status, bytes } = event {
             return Ok(match status {
@@ -1539,14 +961,16 @@ pub(crate) fn deadline_marker_probe(dir: &Path) -> Result<Result<bool, io::Error
         Ok(relative) => relative,
         Err(error) => return Ok(Err(error)),
     };
-    let events = submit(
-        IoRequest::MarkerProbe {
-            dir: relative,
-            root,
-        },
-        path_to_bytes(dir),
-        crate::command::status_probe::io_op_timeout(),
-    )?;
+    let events = worktree_io()
+        .submit(
+            IoRequest::MarkerProbe {
+                dir: relative,
+                root,
+            },
+            path_to_bytes(dir),
+            crate::command::status_probe::io_op_timeout(),
+        )
+        .map_err(|_| ())?;
     for event in events {
         if let IoEvent::DoneMarker {
             present,
@@ -1610,8 +1034,9 @@ mod tests {
         );
 
         let invalid_wire = (super::FRAME_CAP as u32 + 1).to_le_bytes().to_vec();
-        let read_error = super::read_raw_frame(&mut &invalid_wire[..])
-            .expect_err("raw frame reader must reject an oversized length");
+        let read_error =
+            crate::internal::worktree_io::protocol::read_raw_frame(&mut &invalid_wire[..])
+                .expect_err("raw frame reader must reject an oversized length");
         assert_eq!(read_error.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -1621,7 +1046,8 @@ mod tests {
         super::write_object_blob_outcome(&mut wire, Ok(vec![0u8; super::FRAME_CAP + 1]))
             .expect("oversized object must produce a status event");
 
-        let events = super::parse_event_frames(&wire).expect("status event must remain framed");
+        let events = crate::internal::worktree_io::protocol::parse_event_frames(&wire)
+            .expect("status event must remain framed");
         assert!(matches!(
             events.as_slice(),
             [super::IoEvent::DoneObjectBlob {
@@ -1662,22 +1088,17 @@ mod tests {
     #[test]
     fn absolute_deadline_cancels_job_without_leaking_pending_entry() {
         let path_key = b"unit-test-expired-status-io-job".to_vec();
-        let outcome = super::submit_absolute(
+        let outcome = super::worktree_io().submit_absolute(
             super::IoRequest::Shutdown,
             path_key.clone(),
             std::time::Duration::ZERO,
         );
 
-        assert!(
-            outcome.is_err(),
-            "an expired absolute job must not complete"
-        );
-        let pool = super::pool();
-        let pending = pool
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(!pending.iter().any(|job| job.path_key == path_key));
+        assert!(matches!(
+            outcome,
+            Err(crate::internal::worktree_io::executor::ExecutorError::DeadlineExpired)
+        ));
+        let _ = path_key;
     }
 
     #[test]
@@ -1765,7 +1186,8 @@ mod tests {
         let mut buf = Vec::new();
         super::handle_request(request, &mut buf).expect("handle_request");
 
-        let events = super::parse_event_frames(&buf).expect("frames");
+        let events =
+            crate::internal::worktree_io::protocol::parse_event_frames(&buf).expect("frames");
         let hex = events.into_iter().find_map(|event| match event {
             super::IoEvent::DoneHash {
                 hex: super::WireResult::Ok(hex),

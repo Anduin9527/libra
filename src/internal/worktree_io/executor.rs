@@ -1,0 +1,1163 @@
+//! Bounded executor for read-only worktree I/O requests.
+//!
+//! This module owns scheduling and helper-process lifecycle only. Filesystem
+//! operations remain in the read-only protocol handler supplied by the command
+//! adapter; no arbitrary command or write capability is exposed here.
+
+use std::{
+    collections::VecDeque,
+    io::{self, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
+
+use super::protocol::{
+    IoEvent, IoRequest, ObjectBlobStatus, parse_event_frames as parse_protocol_event_frames,
+    read_frame, read_raw_frame, write_request,
+};
+
+pub(crate) const MAX_INFLIGHT: usize = 8;
+pub(crate) const MAX_PENDING: usize = 64;
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+pub(crate) type InProcessHandler = fn(IoRequest, &mut Vec<u8>) -> io::Result<bool>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct WorkerConfig {
+    pub(crate) worker_arg: &'static str,
+    pub(crate) cap_env: &'static str,
+    pub(crate) ppid_env: &'static str,
+    pub(crate) in_process_handler: InProcessHandler,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Scheduler bounds. Per-request byte, frame, and entry budgets are carried
+/// by [`IoRequest`] and enforced by the protocol codec/handlers, so they are
+/// deliberately not duplicated in this executor limit type.
+pub(crate) struct IoLimits {
+    pub(crate) max_inflight: usize,
+    pub(crate) max_pending: usize,
+}
+
+impl Default for IoLimits {
+    fn default() -> Self {
+        Self {
+            max_inflight: MAX_INFLIGHT,
+            max_pending: MAX_PENDING,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ExecutorError {
+    Cancelled,
+    DeadlineExpired,
+    QueueFull,
+    WorkerUnavailable(io::Error),
+    Protocol(io::Error),
+    Handler(io::Error),
+}
+
+impl std::fmt::Display for ExecutorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("worktree I/O request was cancelled"),
+            Self::DeadlineExpired => formatter.write_str("worktree I/O request deadline expired"),
+            Self::QueueFull => formatter.write_str("worktree I/O queue is full"),
+            Self::WorkerUnavailable(error) => {
+                write!(formatter, "worktree I/O worker unavailable: {error}")
+            }
+            Self::Protocol(error) => write!(formatter, "worktree I/O protocol error: {error}"),
+            Self::Handler(error) => write!(formatter, "worktree I/O handler error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WorkerUnavailable(error) | Self::Protocol(error) | Self::Handler(error) => {
+                Some(error)
+            }
+            Self::Cancelled | Self::DeadlineExpired | Self::QueueFull => None,
+        }
+    }
+}
+
+pub(crate) struct WorktreeIo {
+    pool: Arc<Pool>,
+}
+
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+struct WorkerProc {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+struct Pool {
+    idle: Mutex<Vec<WorkerProc>>,
+    pending: Mutex<PendingQueue>,
+    ready: Condvar,
+    token: String,
+    config: WorkerConfig,
+    limits: IoLimits,
+    dispatchers_started: AtomicUsize,
+}
+
+struct PendingQueue {
+    jobs: VecDeque<Arc<Job>>,
+    capacity: usize,
+}
+
+impl PendingQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            jobs: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn insert(&mut self, job: Arc<Job>) -> Result<(), ExecutorError> {
+        if self.jobs.len() >= self.capacity {
+            return Err(ExecutorError::QueueFull);
+        }
+        let idx = self
+            .jobs
+            .iter()
+            .position(|existing| existing.path_key > job.path_key)
+            .unwrap_or(self.jobs.len());
+        self.jobs.insert(idx, job);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<Arc<Job>> {
+        while let Some(job) = self.jobs.pop_front() {
+            if !job.cancel_token.is_cancelled() {
+                return Some(job);
+            }
+        }
+        None
+    }
+
+    fn remove(&mut self, target: &Arc<Job>) -> bool {
+        let Some(index) = self.jobs.iter().position(|job| Arc::ptr_eq(job, target)) else {
+            return false;
+        };
+        self.jobs.remove(index);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.jobs.len()
+    }
+}
+
+struct Job {
+    request: Mutex<Option<IoRequest>>,
+    path_key: Vec<u8>,
+    /// Wall-clock bound captured at submit (`now + timeout`).
+    deadline: Instant,
+    /// Per-stdout-wait window. Status walks use this as a no-progress timeout
+    /// (fresh each frame). Object reads set `absolute` and share `deadline`
+    /// across queue + every wait so a busy pool cannot stretch the budget.
+    window: Duration,
+    absolute: bool,
+    result_tx: Mutex<Option<std::sync::mpsc::SyncSender<JobOutcome>>>,
+    cancel_token: CancellationToken,
+}
+
+enum JobOutcome {
+    Events(Vec<IoEvent>),
+    Error(ExecutorError),
+}
+
+impl WorktreeIo {
+    pub(crate) fn new(config: WorkerConfig) -> Self {
+        Self::new_with_limits(config, IoLimits::default(), true)
+    }
+
+    fn new_with_limits(config: WorkerConfig, limits: IoLimits, start_dispatchers: bool) -> Self {
+        let token = format!(
+            "{:016x}{:016x}",
+            NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+            std::process::id() as u64
+        );
+        let pool = Arc::new(Pool {
+            idle: Mutex::new(Vec::new()),
+            pending: Mutex::new(PendingQueue::new(limits.max_pending)),
+            ready: Condvar::new(),
+            token,
+            config,
+            limits,
+            dispatchers_started: AtomicUsize::new(0),
+        });
+        if start_dispatchers {
+            let mut started = 0usize;
+            for index in 0..limits.max_inflight {
+                let pool = Arc::clone(&pool);
+                if std::thread::Builder::new()
+                    .name(format!("libra-status-io-{index}"))
+                    .spawn(move || dispatcher_loop(pool))
+                    .is_ok()
+                {
+                    started += 1;
+                }
+            }
+            pool.dispatchers_started.store(started, Ordering::SeqCst);
+        }
+        Self { pool }
+    }
+
+    pub(crate) fn submit(
+        &self,
+        request: IoRequest,
+        path_key: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<IoEvent>, ExecutorError> {
+        self.submit_with_token(request, path_key, timeout, false, CancellationToken::new())
+    }
+
+    pub(crate) fn submit_absolute(
+        &self,
+        request: IoRequest,
+        path_key: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<IoEvent>, ExecutorError> {
+        self.submit_with_token(request, path_key, timeout, true, CancellationToken::new())
+    }
+
+    pub(crate) fn submit_with_token(
+        &self,
+        request: IoRequest,
+        path_key: Vec<u8>,
+        timeout: Duration,
+        absolute: bool,
+        cancel_token: CancellationToken,
+    ) -> Result<Vec<IoEvent>, ExecutorError> {
+        if cancel_token.is_cancelled() {
+            return Err(ExecutorError::Cancelled);
+        }
+        if timeout.is_zero() {
+            return Err(ExecutorError::DeadlineExpired);
+        }
+        request.validate().map_err(ExecutorError::Protocol)?;
+        let pool = &self.pool;
+        if pool.dispatchers_started.load(Ordering::SeqCst) == 0 {
+            return Err(ExecutorError::WorkerUnavailable(io::Error::other(
+                "no status I/O dispatcher could be started",
+            )));
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(ExecutorError::DeadlineExpired)?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let job = Arc::new(Job {
+            request: Mutex::new(Some(request)),
+            path_key,
+            deadline,
+            window: timeout,
+            absolute,
+            result_tx: Mutex::new(Some(tx)),
+            cancel_token,
+        });
+        {
+            let mut pending = pool
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.insert(Arc::clone(&job))?;
+            pool.ready.notify_one();
+        }
+        let wait = if helper_exe_is_cli(pool.config) && !absolute {
+            Duration::from_secs(24 * 60 * 60)
+        } else {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_add(Duration::from_secs(1))
+        };
+        let wait_deadline = Instant::now().checked_add(wait);
+        loop {
+            if job.cancel_token.is_cancelled() {
+                cancel_job(pool, &job);
+                return Err(ExecutorError::Cancelled);
+            }
+            let Some(wait_deadline) = wait_deadline else {
+                cancel_job(pool, &job);
+                return Err(ExecutorError::DeadlineExpired);
+            };
+            let remaining = wait_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                cancel_job(pool, &job);
+                return Err(ExecutorError::DeadlineExpired);
+            }
+            match rx.recv_timeout(remaining.min(CANCEL_POLL_INTERVAL)) {
+                Ok(JobOutcome::Events(events)) => return Ok(events),
+                Ok(JobOutcome::Error(error)) => return Err(error),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    cancel_job(pool, &job);
+                    return Err(ExecutorError::WorkerUnavailable(io::Error::other(
+                        "worktree I/O dispatcher dropped the request result",
+                    )));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn helper_available(&self) -> bool {
+        helper_exe_is_cli(self.pool.config)
+    }
+}
+
+fn cancel_job(pool: &Pool, job: &Arc<Job>) {
+    job.cancel_token.cancel();
+    let mut pending = pool
+        .pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.remove(job);
+    let _ = job
+        .request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+}
+
+fn spawn_worker(config: WorkerConfig, token: &str) -> io::Result<WorkerProc> {
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg(config.worker_arg)
+        .env(config.cap_env, token)
+        .env(config.ppid_env, std::process::id().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        #[cfg(target_os = "linux")]
+        {
+            // Own process group so timeout kill(-pid) cannot hit status;
+            // PDEATHSIG so a killed/exiting parent still reaps a hung helper.
+            // SAFETY: runs in the child after fork, before exec. Only
+            // async-signal-safe calls (prctl / getppid / _exit).
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::getppid() == 1 {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("status io worker missing stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("status io worker missing stdout"))?;
+    let mut stdout = BufReader::new(stdout);
+    let ready: IoEvent = match read_frame(&mut stdout) {
+        Ok(event) => event,
+        Err(error) => {
+            kill_pid(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if !matches!(ready, IoEvent::Ready) {
+        kill_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("status io worker handshake failed"));
+    }
+    Ok(WorkerProc {
+        child,
+        stdin,
+        stdout,
+    })
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                let _ = TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
+
+fn kill_worker(worker: &mut WorkerProc) {
+    kill_pid(worker.child.id());
+    let _ = worker.child.kill();
+    let _ = worker.child.wait();
+}
+
+fn dispatcher_loop(pool: Arc<Pool>) {
+    loop {
+        let job = {
+            let mut pending = pool
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if let Some(job) = pending.pop() {
+                    break job;
+                }
+                pending = pool
+                    .ready
+                    .wait(pending)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        run_job(&pool, job);
+    }
+}
+
+fn helper_exe_is_cli(_config: WorkerConfig) -> bool {
+    static CLI: OnceLock<bool> = OnceLock::new();
+    *CLI.get_or_init(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        // Cargo test harnesses live in `target/.../deps/`; the installed /
+        // `cargo run` CLI is `…/libra` (or `libra.exe`).
+        let in_deps = exe
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == "deps");
+        if in_deps {
+            return false;
+        }
+        exe.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "libra" || name.eq_ignore_ascii_case("libra.exe"))
+    })
+}
+
+fn run_job(pool: &Pool, job: Arc<Job>) {
+    if job.cancel_token.is_cancelled() {
+        return;
+    }
+    let request = job
+        .request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(request) = request else {
+        return;
+    };
+    if job.cancel_token.is_cancelled() {
+        return;
+    }
+    if job.absolute && Instant::now() >= job.deadline {
+        if let Some(tx) = job
+            .result_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = tx.send(JobOutcome::Error(ExecutorError::DeadlineExpired));
+        }
+        return;
+    }
+    let outcome = match take_worker(pool) {
+        // CLI helper spawn/handshake failed (EMFILE, process limit). Do not
+        // fall back to an unkillable in-process syscall — that would pin a
+        // dispatcher forever and exhaust the pool. Absolute object reads
+        // (WIO-03) are the same: never `run_in_process` them on a pool
+        // thread. Library/test binaries keep in-process only for relative
+        // (no-progress) probe opcodes (R0).
+        Err(error) if helper_exe_is_cli(pool.config) || job.absolute => JobOutcome::Error(error),
+        Err(_error) => run_in_process(pool.config.in_process_handler, request),
+        Ok(mut worker) => {
+            let drive = drive_worker(
+                &mut worker,
+                &pool.token,
+                request,
+                job.deadline,
+                job.window,
+                job.absolute,
+                &job.cancel_token,
+            );
+            if job.cancel_token.is_cancelled() || drive.timed_out || !drive.reuse {
+                kill_worker(&mut worker);
+            } else {
+                recycle_worker(pool, worker);
+            }
+            if drive.events.is_empty() {
+                if let Some(error) = drive.error {
+                    JobOutcome::Error(error)
+                } else if drive.timed_out {
+                    JobOutcome::Error(ExecutorError::DeadlineExpired)
+                } else {
+                    JobOutcome::Error(ExecutorError::Protocol(io::Error::other(
+                        "status io worker returned no terminal event",
+                    )))
+                }
+            } else {
+                JobOutcome::Events(drive.events)
+            }
+        }
+    };
+    if job.cancel_token.is_cancelled() {
+        return;
+    }
+    if let Some(tx) = job
+        .result_tx
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        let _ = tx.send(outcome);
+    }
+}
+
+/// Library / in-process callers (`status::execute_to`, `cargo test` unit
+/// binaries) cannot spawn the CLI helper. Run the opcode on this dispatcher
+/// thread (already one of the 8 bounded slots). Hung syscalls remain
+/// unkillable here; WIO-01 killability applies to the `libra` CLI worker.
+fn run_in_process(handler: InProcessHandler, request: IoRequest) -> JobOutcome {
+    let mut buf = Vec::new();
+    match handler(request, &mut buf) {
+        Ok(true) => match parse_event_frames(&buf) {
+            Some(events) if !events.is_empty() => JobOutcome::Events(events),
+            _ => JobOutcome::Error(ExecutorError::Protocol(io::Error::other(
+                "in-process status I/O handler returned no events",
+            ))),
+        },
+        Ok(false) => JobOutcome::Error(ExecutorError::Handler(io::Error::other(
+            "in-process status I/O handler shut down",
+        ))),
+        Err(error) => JobOutcome::Error(ExecutorError::Handler(error)),
+    }
+}
+
+fn parse_event_frames(data: &[u8]) -> Option<Vec<IoEvent>> {
+    parse_protocol_event_frames(data)
+}
+
+fn take_worker(pool: &Pool) -> Result<WorkerProc, ExecutorError> {
+    if !helper_exe_is_cli(pool.config) {
+        return Err(ExecutorError::WorkerUnavailable(io::Error::other(
+            "status helper is not available in this executable",
+        )));
+    }
+    {
+        let mut idle = pool
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(worker) = idle.pop() {
+            return Ok(worker);
+        }
+    }
+    spawn_worker(pool.config, &pool.token).map_err(ExecutorError::WorkerUnavailable)
+}
+
+fn recycle_worker(pool: &Pool, worker: WorkerProc) {
+    let mut idle = pool
+        .idle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if idle.len() < pool.limits.max_inflight {
+        idle.push(worker);
+    } else {
+        let mut worker = worker;
+        kill_worker(&mut worker);
+    }
+}
+
+/*
+ * The executor owns the remaining stdout polling and framed protocol drive
+ * below. Keeping these routines here ensures status only supplies a handler
+ * for the in-process test/library fallback.
+ */
+
+fn wait_stdout_readable(
+    worker: &mut WorkerProc,
+    timeout: Duration,
+    cancel_token: &CancellationToken,
+) -> io::Result<()> {
+    if cancel_token.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "worktree I/O request cancelled",
+        ));
+    }
+    if !worker.stdout.buffer().is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = worker.stdout.get_ref().as_raw_fd();
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = timeout
+            .min(CANCEL_POLL_INTERVAL)
+            .as_millis()
+            .min(i32::MAX as u128) as libc::c_int;
+        loop {
+            if cancel_token.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "worktree I/O request cancelled",
+                ));
+            }
+            let n = unsafe { libc::poll(&mut pollfd, 1, millis) };
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if n == 0 {
+                if timeout <= CANCEL_POLL_INTERVAL {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "status io worker timeout",
+                    ));
+                }
+                return wait_stdout_readable(worker, timeout - CANCEL_POLL_INTERVAL, cancel_token);
+            }
+            if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(());
+            }
+            return Err(io::Error::other("status io worker poll"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Anonymous pipe handles are not waitable synchronization objects;
+        // `WaitForSingleObject` returns WAIT_FAILED. PeekNamedPipe reports
+        // pending bytes (or ERROR_BROKEN_PIPE on EOF).
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::{
+            Foundation::{ERROR_BROKEN_PIPE, HANDLE},
+            System::Pipes::PeekNamedPipe,
+        };
+        const POLL_SLICE: Duration = Duration::from_millis(5);
+        let deadline = std::time::Instant::now() + timeout;
+        let handle = worker.stdout.get_ref().as_raw_handle() as HANDLE;
+        loop {
+            if cancel_token.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "worktree I/O request cancelled",
+                ));
+            }
+            let mut avail: u32 = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut avail,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            if avail > 0 {
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "status io worker timeout",
+                ));
+            }
+            std::thread::sleep(POLL_SLICE.min(deadline.saturating_duration_since(now)));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (timeout, cancel_token);
+        Ok(())
+    }
+}
+
+struct DriveResult {
+    events: Vec<IoEvent>,
+    timed_out: bool,
+    reuse: bool,
+    error: Option<ExecutorError>,
+}
+
+fn drive_worker(
+    worker: &mut WorkerProc,
+    token: &str,
+    request: IoRequest,
+    deadline: Instant,
+    window: Duration,
+    absolute: bool,
+    cancel_token: &CancellationToken,
+) -> DriveResult {
+    if cancel_token.is_cancelled() {
+        return DriveResult {
+            events: Vec::new(),
+            timed_out: false,
+            reuse: false,
+            error: Some(ExecutorError::Cancelled),
+        };
+    }
+    if let Err(error) = write_request(&mut worker.stdin, token, request) {
+        return DriveResult {
+            events: Vec::new(),
+            timed_out: false,
+            reuse: false,
+            error: Some(ExecutorError::Protocol(error)),
+        };
+    }
+    let mut events = Vec::new();
+    loop {
+        let wait = if absolute {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return DriveResult {
+                    events,
+                    timed_out: true,
+                    reuse: false,
+                    error: None,
+                };
+            }
+            remaining
+        } else {
+            // No-progress: each frame gets a fresh window so a wide
+            // progressing `read_dir` is not cut by an absolute job clock.
+            window
+        };
+        if let Err(error) = wait_stdout_readable(worker, wait, cancel_token) {
+            if cancel_token.is_cancelled() {
+                return DriveResult {
+                    events,
+                    timed_out: false,
+                    reuse: false,
+                    error: Some(ExecutorError::Cancelled),
+                };
+            }
+            if error.kind() == io::ErrorKind::TimedOut {
+                return DriveResult {
+                    events,
+                    timed_out: true,
+                    reuse: false,
+                    error: None,
+                };
+            }
+            return DriveResult {
+                events,
+                timed_out: false,
+                reuse: false,
+                error: Some(ExecutorError::Protocol(error)),
+            };
+        }
+        if cancel_token.is_cancelled() {
+            return DriveResult {
+                events,
+                timed_out: false,
+                reuse: false,
+                error: Some(ExecutorError::Cancelled),
+            };
+        }
+        let event = match read_frame::<IoEvent>(&mut worker.stdout) {
+            Ok(event) => event,
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                return DriveResult {
+                    events,
+                    timed_out: true,
+                    reuse: false,
+                    error: None,
+                };
+            }
+            Err(error) => {
+                return DriveResult {
+                    events,
+                    timed_out: false,
+                    reuse: false,
+                    error: Some(ExecutorError::Protocol(error)),
+                };
+            }
+        };
+        if cancel_token.is_cancelled() {
+            return DriveResult {
+                events,
+                timed_out: false,
+                reuse: false,
+                error: Some(ExecutorError::Cancelled),
+            };
+        }
+        let reuse = !matches!(event, IoEvent::Error { .. });
+        // Ok payloads travel as a trailing length-prefixed binary frame
+        // (not base64 in JSON) so a 2 MiB blob stays within the ≤20%
+        // wire-overhead budget (WIO-03).
+        let event = if let IoEvent::DoneObjectBlob {
+            status: ObjectBlobStatus::Ok,
+            bytes: None,
+        } = &event
+        {
+            let wait = if absolute {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return DriveResult {
+                        events,
+                        timed_out: true,
+                        reuse: false,
+                        error: None,
+                    };
+                }
+                remaining
+            } else {
+                window
+            };
+            if let Err(error) = wait_stdout_readable(worker, wait, cancel_token) {
+                if cancel_token.is_cancelled() {
+                    return DriveResult {
+                        events,
+                        timed_out: false,
+                        reuse: false,
+                        error: Some(ExecutorError::Cancelled),
+                    };
+                }
+                if error.kind() == io::ErrorKind::TimedOut {
+                    return DriveResult {
+                        events,
+                        timed_out: true,
+                        reuse: false,
+                        error: None,
+                    };
+                }
+                return DriveResult {
+                    events,
+                    timed_out: false,
+                    reuse: false,
+                    error: Some(ExecutorError::Protocol(error)),
+                };
+            }
+            if cancel_token.is_cancelled() {
+                return DriveResult {
+                    events,
+                    timed_out: false,
+                    reuse: false,
+                    error: Some(ExecutorError::Cancelled),
+                };
+            }
+            match read_raw_frame(&mut worker.stdout) {
+                Ok(bytes) => IoEvent::DoneObjectBlob {
+                    status: ObjectBlobStatus::Ok,
+                    bytes: Some(bytes),
+                },
+                Err(error)
+                    if error.kind() == io::ErrorKind::TimedOut
+                        || error.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    return DriveResult {
+                        events,
+                        timed_out: true,
+                        reuse: false,
+                        error: None,
+                    };
+                }
+                Err(error) => {
+                    return DriveResult {
+                        events,
+                        timed_out: false,
+                        reuse: false,
+                        error: Some(ExecutorError::Protocol(error)),
+                    };
+                }
+            }
+        } else {
+            event
+        };
+        let done = matches!(
+            event,
+            IoEvent::DoneStat { .. }
+                | IoEvent::DoneCanonicalize { .. }
+                | IoEvent::DoneReadDir { .. }
+                | IoEvent::DoneHash { .. }
+                | IoEvent::DoneObjectBlob { .. }
+                | IoEvent::DoneMarker { .. }
+                | IoEvent::Error { .. }
+        );
+        events.push(event);
+        if done {
+            return DriveResult {
+                events,
+                timed_out: false,
+                reuse,
+                error: None,
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(handler: InProcessHandler) -> WorkerConfig {
+        WorkerConfig {
+            worker_arg: "unused-in-unit-test",
+            cap_env: "LIBRA_TEST_UNUSED_CAP",
+            ppid_env: "LIBRA_TEST_UNUSED_PPID",
+            in_process_handler: handler,
+        }
+    }
+
+    fn test_job(path_key: &[u8], cancel_token: CancellationToken) -> Arc<Job> {
+        let (result_tx, _result_rx) = mpsc::sync_channel(1);
+        Arc::new(Job {
+            request: Mutex::new(Some(IoRequest::Shutdown)),
+            path_key: path_key.to_vec(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            window: Duration::from_secs(1),
+            absolute: false,
+            result_tx: Mutex::new(Some(result_tx)),
+            cancel_token,
+        })
+    }
+
+    fn write_marker(request: IoRequest, output: &mut Vec<u8>) -> io::Result<bool> {
+        let _ = request;
+        super::super::protocol::write_frame(
+            output,
+            &IoEvent::DoneMarker {
+                present: Some(true),
+                err_kind: None,
+                err_raw_os: None,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn write_marker_after_delay(request: IoRequest, output: &mut Vec<u8>) -> io::Result<bool> {
+        std::thread::sleep(Duration::from_millis(25));
+        write_marker(request, output)
+    }
+
+    fn fail_handler(_request: IoRequest, _output: &mut Vec<u8>) -> io::Result<bool> {
+        Err(io::Error::other("unit-test handler failure"))
+    }
+
+    fn malformed_handler(_request: IoRequest, output: &mut Vec<u8>) -> io::Result<bool> {
+        output.extend_from_slice(b"not a framed event");
+        Ok(true)
+    }
+
+    #[test]
+    fn default_limits_pin_existing_bounds() {
+        let limits = IoLimits::default();
+        assert_eq!(limits.max_inflight, MAX_INFLIGHT);
+        assert_eq!(limits.max_pending, MAX_PENDING);
+        assert_eq!(MAX_INFLIGHT, 8);
+        assert_eq!(MAX_PENDING, 64);
+    }
+
+    #[test]
+    fn pending_queue_is_stably_sorted_and_bounded() {
+        let mut queue = PendingQueue::new(MAX_PENDING);
+        let first_equal = test_job(b"same", CancellationToken::new());
+        let second_equal = test_job(b"same", CancellationToken::new());
+        queue
+            .insert(test_job(b"z", CancellationToken::new()))
+            .expect("z fits");
+        queue
+            .insert(first_equal.clone())
+            .expect("first equal key fits");
+        queue
+            .insert(test_job(b"a", CancellationToken::new()))
+            .expect("a fits");
+        queue
+            .insert(second_equal.clone())
+            .expect("second equal key fits");
+
+        assert_eq!(queue.pop().expect("a is first").path_key, b"a");
+        let next = queue.pop().expect("same key is next");
+        assert!(Arc::ptr_eq(&next, &first_equal));
+        let next = queue.pop().expect("same key retains FIFO");
+        assert!(Arc::ptr_eq(&next, &second_equal));
+        assert_eq!(queue.pop().expect("z is last").path_key, b"z");
+        assert_eq!(queue.len(), 0);
+
+        let mut full = PendingQueue::new(MAX_PENDING);
+        for index in 0..MAX_PENDING {
+            full.insert(test_job(
+                format!("{index:03}").as_bytes(),
+                CancellationToken::new(),
+            ))
+            .expect("queue must accept up to its cap");
+        }
+        assert!(matches!(
+            full.insert(test_job(b"overflow", CancellationToken::new())),
+            Err(ExecutorError::QueueFull)
+        ));
+        assert_eq!(full.len(), MAX_PENDING);
+    }
+
+    #[test]
+    fn zero_deadline_is_rejected_before_enqueue() {
+        let executor =
+            WorktreeIo::new_with_limits(test_config(write_marker), IoLimits::default(), false);
+        let result = executor.submit(IoRequest::Shutdown, b"expired".to_vec(), Duration::ZERO);
+        assert!(matches!(result, Err(ExecutorError::DeadlineExpired)));
+        let pending = executor
+            .pool
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn pre_cancelled_request_is_rejected_before_enqueue() {
+        let executor =
+            WorktreeIo::new_with_limits(test_config(write_marker), IoLimits::default(), false);
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = executor.submit_with_token(
+            IoRequest::Shutdown,
+            b"cancelled".to_vec(),
+            Duration::from_secs(1),
+            false,
+            token,
+        );
+        assert!(matches!(result, Err(ExecutorError::Cancelled)));
+        let pending = executor
+            .pool
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn cancelled_pending_job_is_removed_when_dispatched() {
+        let mut queue = PendingQueue::new(MAX_PENDING);
+        let token = CancellationToken::new();
+        let job = test_job(b"cancelled", token.clone());
+        queue.insert(job).expect("cancelled job fits");
+        token.cancel();
+        assert!(queue.pop().is_none());
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn handler_and_protocol_failures_remain_typed() {
+        let handler = run_in_process(fail_handler, IoRequest::Shutdown);
+        assert!(matches!(
+            handler,
+            JobOutcome::Error(ExecutorError::Handler(_))
+        ));
+        let protocol = run_in_process(malformed_handler, IoRequest::Shutdown);
+        assert!(matches!(
+            protocol,
+            JobOutcome::Error(ExecutorError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn cancelled_running_job_releases_dispatcher_slot() {
+        let executor = WorktreeIo::new_with_limits(
+            test_config(write_marker_after_delay),
+            IoLimits {
+                max_inflight: 1,
+                max_pending: MAX_PENDING,
+            },
+            true,
+        );
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            cancel_token.cancel();
+        });
+        let started = Instant::now();
+        let first = executor.submit_with_token(
+            IoRequest::Shutdown,
+            b"first".to_vec(),
+            Duration::from_secs(5),
+            false,
+            token,
+        );
+        cancel_thread.join().expect("cancellation thread");
+        assert!(matches!(first, Err(ExecutorError::Cancelled)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "external cancellation must not wait for the request deadline"
+        );
+
+        let second = executor.submit(
+            IoRequest::Shutdown,
+            b"second".to_vec(),
+            Duration::from_secs(1),
+        );
+        assert!(matches!(second, Ok(events) if !events.is_empty()));
+    }
+}
