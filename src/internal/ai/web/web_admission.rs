@@ -219,6 +219,13 @@ pub struct WebCodeUiAdmission {
     /// Serializes the full prepare/respond/park transition for one runtime
     /// interaction so retries cannot revoke another request's durable gate.
     pub(crate) interaction_transition: Arc<Mutex<()>>,
+    /// DF-07: adapter-bound pending skill activations. Composed into the
+    /// provider-facing turn input at this admission's submit seam only —
+    /// revision notes, transcripts, durable intents, and retry identity
+    /// keep the raw user text. `None` until the adapter binds it.
+    pub(crate) pending_skills: Arc<
+        std::sync::Mutex<Option<Arc<Mutex<super::agent_runtime_adapter::PendingSkillContext>>>>,
+    >,
 }
 
 pub(crate) struct WebCodeUiAdmissionInit {
@@ -270,6 +277,7 @@ impl WebCodeUiAdmission {
             runtime_session_id,
             working_dir,
             phase1_tx,
+            pending_skills: Arc::new(std::sync::Mutex::new(None)),
             interaction_transition,
         })
     }
@@ -948,15 +956,51 @@ impl WebCodeUiAdmission {
         *self.pre_start_turn.lock().await =
             Some((runtime_turn_id.clone(), pre_start_state.clone()));
 
+        // DF-07: definitive provider-turn seam — routing decided this text
+        // is a real provider turn (revision notes and control paths have
+        // already returned above), the slot is reserved, and a failed
+        // submission restores the consumed activations. Only the
+        // provider-facing input is composed; the durable intent, the
+        // transcript user entry, and `in_flight.input` keep the raw text.
+        let composed_skills = if mode == WebTurnMode::PlanPhase0 && claiming_revision.is_none() {
+            let bound = self
+                .pending_skills
+                .lock()
+                .expect("pending-skill binding lock poisoned")
+                .clone();
+            match bound {
+                Some(pending) => Some(pending.lock().await.compose(
+                    &text,
+                    browser_command_id_supplied.then_some(runtime_turn_id.as_str()),
+                )),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let provider_input = composed_skills
+            .as_ref()
+            .map(|composed| composed.input.clone())
+            .unwrap_or_else(|| text.clone());
         let submission = runtime
             .submit(TurnRequest::new(
                 self.runtime_session_id.clone(),
                 runtime_turn_id.clone(),
-                text.clone(),
+                provider_input,
                 true,
             ))
             .await;
         if let Err(error) = submission {
+            if let Some(composed) = composed_skills {
+                let bound = self
+                    .pending_skills
+                    .lock()
+                    .expect("pending-skill binding lock poisoned")
+                    .clone();
+                if let Some(pending) = bound {
+                    pending.lock().await.restore(composed);
+                }
+            }
             *slot = None;
             if let Some((pending, claim)) = claiming_revision.as_ref() {
                 match self.persistence.as_ref().map(|persistence| {

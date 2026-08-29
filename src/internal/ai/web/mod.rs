@@ -4023,6 +4023,138 @@ mod tests {
         assert_eq!(value["error"]["code"], "INVALID_SKILL_PROVIDER");
     }
 
+    /// DF-07 (terra R1): the public activate contract end to end — success
+    /// acknowledgment shape from an adapter with a live in-process
+    /// activation path, plus the two stable 400s for an unknown provider
+    /// slug and an undiscoverable name (which never reach the adapter).
+    #[tokio::test]
+    async fn code_skill_activate_http_contract_success_and_stable_400s() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        use super::code_ui::{
+            CodeUiCommandAdapter, CodeUiInteractionResponse, CodeUiReadModel,
+            CodeUiSkillActivationAck, ReadOnlyCodeUiAdapter,
+        };
+
+        /// Read-only shell whose `activate_skill` acks like a live adapter.
+        struct AckingSkillAdapter(Arc<ReadOnlyCodeUiAdapter>);
+        #[async_trait::async_trait]
+        impl CodeUiReadModel for AckingSkillAdapter {
+            fn session(&self) -> Arc<CodeUiSession> {
+                self.0.session()
+            }
+        }
+        #[async_trait::async_trait]
+        impl CodeUiCommandAdapter for AckingSkillAdapter {
+            fn capabilities(&self) -> CodeUiCapabilities {
+                self.0.capabilities()
+            }
+            async fn submit_message(&self, _text: String) -> anyhow::Result<()> {
+                Err(anyhow::anyhow!("not under test"))
+            }
+            async fn respond_interaction(
+                &self,
+                _interaction_id: &str,
+                _response: CodeUiInteractionResponse,
+            ) -> anyhow::Result<()> {
+                Err(anyhow::anyhow!("not under test"))
+            }
+            async fn activate_skill(
+                &self,
+                provider: &str,
+                name: &str,
+            ) -> anyhow::Result<CodeUiSkillActivationAck> {
+                Ok(CodeUiSkillActivationAck {
+                    provider: provider.to_string(),
+                    name: name.to_string(),
+                    pending: 1,
+                })
+            }
+        }
+
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        ));
+        let adapter = Arc::new(AckingSkillAdapter(ReadOnlyCodeUiAdapter::new(
+            session,
+            CodeUiCapabilities::default(),
+        )));
+        let runtime =
+            CodeUiRuntimeHandle::build(adapter, true, CodeUiInitialController::Unclaimed).await;
+        let attach = runtime
+            .attach_browser_controller("browser-skill-ack")
+            .await
+            .expect("browser controller should attach");
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                browser_bootstrap_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let activate = |body: &'static str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/skills/activate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "http://127.0.0.1:4317")
+                .header("X-Code-Controller-Token", attach.controller_token.clone())
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(activate(r#"{"provider":"claude-code","name":"/review"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["accepted"], true);
+        assert_eq!(value["provider"], "claude-code");
+        assert_eq!(value["name"], "/review");
+        assert_eq!(value["pending"], 1);
+        assert_eq!(value["consumedOn"], "next-plain-turn");
+
+        let response = app
+            .clone()
+            .oneshot(activate(r#"{"provider":"not-an-agent","name":"/review"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "INVALID_SKILL_PROVIDER");
+
+        let response = app
+            .clone()
+            .oneshot(activate(
+                r#"{"provider":"claude-code","name":"/not-a-skill"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "SKILL_NOT_DISCOVERABLE");
+    }
+
     /// DF-07: activation is delegated to the adapter; a session whose
     /// adapter has no live in-process provider (here: the read-only
     /// adapter) still fails closed with the stable 422 — never a silent
