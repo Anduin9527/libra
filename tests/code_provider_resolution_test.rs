@@ -1,5 +1,6 @@
-//! plan-20260825 PS-06: end-to-end zero/one/many credential detection for
-//! `libra code` without `--provider`.
+//! plan-20260825 PS-06 + PS-03: end-to-end zero/one/many credential
+//! detection for `libra code` without `--provider`, and the persisted
+//! `code.defaultProvider` config slot ahead of that detection.
 //!
 //! **Layer:** L1 — deterministic. Every run gets an isolated HOME and an
 //! isolated `LIBRA_CONFIG_GLOBAL_DB`, and the six auto-selectable provider
@@ -418,6 +419,180 @@ impl OutputWithTimeoutKill for Command {
         let _ = child.wait();
         (out, err)
     }
+}
+
+/// Store `code.defaultProvider` through the real CLI in the given scope.
+fn set_default_provider(repo: &Repo, scope_global: bool, value: &str) {
+    let mut args = vec!["config", "set"];
+    if scope_global {
+        args.push("--global");
+    }
+    args.extend(["code.defaultProvider", value]);
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(&args)
+        .current_dir(&repo.root)
+        .output()
+        .expect("config set code.defaultProvider");
+    assert!(
+        out.status.success(),
+        "config set failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn config_default_key_wins_over_unique_detection_candidate() {
+    // PS-03: the persisted default outranks detection even when detection
+    // would have auto-selected a different unique candidate — and when the
+    // configured provider lacks its key, the run lands on that provider's
+    // own missing-key error, naming only it.
+    let repo = init_repo();
+    set_default_provider(&repo, true, "gemini");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .env("MOONSHOT_API_KEY", "probe-kimi")
+        .output()
+        .expect("run config-over-detection probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "the configured provider's own auth error is expected: {stderr}"
+    );
+    assert!(
+        stderr.contains("GEMINI_API_KEY is not configured for provider 'gemini'"),
+        "the config-selected provider must drive the error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("auto-selected") && !stderr.contains("MOONSHOT_API_KEY"),
+        "detection must not run on a config hit: {stderr}"
+    );
+}
+
+#[test]
+fn config_default_key_local_repo_overrides_global() {
+    // PS-03: `read_cascaded_config_value` semantics — the repo-local key
+    // shadows the global one.
+    let repo = init_repo();
+    set_default_provider(&repo, true, "gemini");
+    set_default_provider(&repo, false, "zhipu");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .output()
+        .expect("run local-over-global probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128), "{stderr}");
+    assert!(
+        stderr.contains("ZHIPU_API_KEY is not configured for provider 'zhipu'"),
+        "the repo-local value must win: {stderr}"
+    );
+    assert!(
+        !stderr.contains("gemini"),
+        "the shadowed global value must not surface: {stderr}"
+    );
+}
+
+#[test]
+fn config_default_key_invalid_value_is_usage_error_without_echo() {
+    // PS-03: an unrecognized stored id is LBR-CLI-002 with the full legal
+    // domain — and the stored value itself (which could be a mistakenly
+    // pasted secret) never appears in the output.
+    let repo = init_repo();
+    set_default_provider(&repo, true, "sk-SENTINEL-not-a-provider");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .output()
+        .expect("run invalid-config probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "invalid value must be a usage error: {stderr}"
+    );
+    assert!(
+        stderr.contains("code.defaultProvider")
+            && stderr.contains("unrecognized provider id")
+            && stderr.contains(
+                "Valid values: anthropic, codex, deepseek, gemini, kimi, ollama, openai, zhipu"
+            ),
+        "a-mode guidance with the sorted domain expected: {stderr}"
+    );
+    assert!(
+        !stderr.contains("SENTINEL"),
+        "the stored value must never be echoed: {stderr}"
+    );
+}
+
+#[test]
+fn config_default_key_is_overridden_by_explicit_provider() {
+    // PS-03: `--provider` outranks the persisted default — the run must
+    // land on the explicit provider's error surface, not the configured
+    // one's.
+    let repo = init_repo();
+    set_default_provider(&repo, true, "zhipu");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args([
+            "code",
+            "--provider",
+            "gemini",
+            "--port",
+            "0",
+            "--mcp-port",
+            "0",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .expect("run explicit-over-config probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128), "{stderr}");
+    assert!(
+        stderr.contains("GEMINI_API_KEY is not configured for provider 'gemini'"),
+        "explicit --provider must win over the config key: {stderr}"
+    );
+    assert!(
+        !stderr.contains("zhipu") && !stderr.contains("ZHIPU_API_KEY"),
+        "the overridden config value must not surface: {stderr}"
+    );
+}
+
+#[test]
+fn config_default_key_pairs_with_model_before_the_guard() {
+    // PS-03: the config slot precedes the `--model` pairing guard — a
+    // persisted default determines the pairing just as a flag would, so
+    // the run proceeds to the provider's own credential check instead of
+    // the 129 pairing rejection.
+    let repo = init_repo();
+    set_default_provider(&repo, true, "gemini");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args([
+            "code",
+            "--model",
+            "arbitrary-model",
+            "--port",
+            "0",
+            "--mcp-port",
+            "0",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .expect("run config-plus-model probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "the pairing guard must not fire on a config hit: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--model without --provider"),
+        "pairing rejection must be bypassed by the config slot: {stderr}"
+    );
+    assert!(
+        stderr.contains("GEMINI_API_KEY is not configured for provider 'gemini'"),
+        "the run must reach the configured provider's credential check: {stderr}"
+    );
 }
 
 #[test]

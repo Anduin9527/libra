@@ -765,6 +765,70 @@ fn resolve_provider_from_sources(
     }
 }
 
+/// PS-03: the persisted default-provider key in the `libra config` SQLite
+/// database (repo-local overrides global). Unrelated to the `[code.*]`
+/// profile sections of `agents.toml` — neither carrier falls back to the
+/// other.
+const DEFAULT_PROVIDER_CONFIG_KEY: &str = "code.defaultProvider";
+
+/// PS-03 slot-4 verdict over the raw `code.defaultProvider` value: absent
+/// falls through (the cascaded reader already treats present-but-empty as
+/// absent), a provider id resolves, anything else is a usage error. The
+/// error never echoes the stored value: a secret pasted into the wrong key
+/// must not round-trip into an error line (GC-PS-01).
+fn config_slot_outcome(raw: Option<&str>) -> CliResult<Option<CodeProvider>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match provider_spec_by_id(raw.trim()) {
+        Some(spec) => Ok(Some(spec.provider)),
+        None => Err(CliError::command_usage(invalid_default_provider_message())),
+    }
+}
+
+/// ADR-PS-03 a-mode message for an unrecognized `code.defaultProvider`
+/// value: conclusion, the full legal id domain, copy-pasteable fix/clear
+/// commands, and how to inspect what is stored — without printing it.
+fn invalid_default_provider_message() -> String {
+    let mut ids: Vec<&str> = PROVIDER_SPECS.iter().map(|spec| spec.id).collect();
+    ids.sort_unstable();
+    [
+        format!("the {DEFAULT_PROVIDER_CONFIG_KEY} config key holds an unrecognized provider id"),
+        String::new(),
+        format!("Valid values: {}", ids.join(", ")),
+        String::new(),
+        "Fix or clear the key:".to_string(),
+        format!("    libra config set --global {DEFAULT_PROVIDER_CONFIG_KEY} <id>"),
+        format!("    libra config unset --global {DEFAULT_PROVIDER_CONFIG_KEY}"),
+        String::new(),
+        "Inspect the stored value:".to_string(),
+        format!("    libra config get {DEFAULT_PROVIDER_CONFIG_KEY}"),
+    ]
+    .join("\n")
+}
+
+/// PS-03 slot-4 read: cascade `code.defaultProvider` from the SESSION
+/// target's repo config (`--repo` / `--cwd` aware, same routing as the
+/// PS-06 detection) down to the global config, then judge the value.
+async fn config_default_provider(working_dir: &std::path::Path) -> CliResult<Option<CodeProvider>> {
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_config_value};
+    let local_db = crate::utils::util::try_get_storage_path(Some(working_dir.to_path_buf()))
+        .ok()
+        .map(|storage| storage.join(crate::utils::util::DATABASE));
+    let local_target = match &local_db {
+        Some(db) => LocalIdentityTarget::ExplicitDb(db),
+        None => LocalIdentityTarget::None,
+    };
+    let raw = read_cascaded_config_value(local_target, DEFAULT_PROVIDER_CONFIG_KEY)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "reading the {DEFAULT_PROVIDER_CONFIG_KEY} config key failed: {error:#}"
+            ))
+        })?;
+    config_slot_outcome(raw.as_deref())
+}
+
 /// One auto-selection candidate from the PS-06 credential detection: the
 /// capability row plus where its key was found. Never carries the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,9 +841,12 @@ pub(crate) struct DetectedCandidate {
     pub(crate) layer: &'static str,
 }
 
-/// Pure PS-06 zero/one/many composition over slots 1-2 plus detection —
-/// the spec oracle for `provider_detection`: `detect` is only invoked when
-/// no earlier source decided (the "explicit means zero probes" contract),
+/// Pure PS-06/PS-03 zero/one/many composition over slots 1-2, the
+/// persisted `code.defaultProvider` slot, and detection — the spec oracle
+/// for `provider_detection` / `provider_config_key`: `detect` is only
+/// invoked when no earlier source decided (the "explicit means zero
+/// probes" contract), the config slot sits between the flag/binding slots
+/// and the `--model` pairing guard exactly as the real entry orders them,
 /// and the outcome goes through the same `three_state_outcome` the real
 /// entry uses. The entry itself short-circuits structurally (see
 /// `resolve_provider_at_entry`), so production no longer calls this.
@@ -787,10 +854,14 @@ pub(crate) struct DetectedCandidate {
 fn resolve_provider_with_detection(
     explicit: Option<CodeProvider>,
     binding_provider_id: Option<&str>,
+    config_value: Option<&str>,
     model_without_provider: bool,
     detect: impl FnOnce() -> CliResult<Vec<DetectedCandidate>>,
 ) -> CliResult<(CodeProvider, Option<DetectedCandidate>)> {
     if let Some(decided) = resolve_provider_from_sources(explicit, binding_provider_id)? {
+        return Ok((decided, None));
+    }
+    if let Some(decided) = config_slot_outcome(config_value)? {
         return Ok((decided, None));
     }
     if model_without_provider {
@@ -873,6 +944,11 @@ fn ambiguous_candidates_message(candidates: &[DetectedCandidate]) -> String {
     for candidate in candidates {
         lines.push(format!("    libra code --provider {}", candidate.id));
     }
+    lines.push(String::new());
+    lines.push("Or persist a default:".to_string());
+    lines.push(format!(
+        "    libra config set --global {DEFAULT_PROVIDER_CONFIG_KEY} <id>"
+    ));
     lines.join("\n")
 }
 
@@ -895,6 +971,16 @@ async fn resolve_provider_at_entry(
         args.provider,
         binding.as_ref().map(|b| b.provider_id.as_str()),
     )? {
+        args.provider = Some(decided);
+        return Ok(());
+    }
+    // Slot 4 (PS-03, ADR-PS-05): the persisted `code.defaultProvider`
+    // config key — session-target repo config first, then global. A valid
+    // hit resolves like an explicit provider (credential detection never
+    // runs), an invalid value is a usage error rather than a silent
+    // fallthrough, and the slot precedes the --model pairing guard because
+    // a persisted default determines the pairing just as a flag would.
+    if let Some(decided) = config_default_provider(working_dir).await? {
         args.provider = Some(decided);
         return Ok(());
     }
@@ -5004,7 +5090,7 @@ mod tests {
         // Explicit selection must not probe at all.
         let probes = AtomicUsize::new(0);
         let (chosen, auto) =
-            resolve_provider_with_detection(Some(CodeProvider::Zhipu), None, false, || {
+            resolve_provider_with_detection(Some(CodeProvider::Zhipu), None, None, false, || {
                 probes.fetch_add(1, Ordering::SeqCst);
                 Ok(vec![])
             })
@@ -5017,7 +5103,8 @@ mod tests {
         );
 
         // --model without any provider source is ambiguous before detection.
-        let err = resolve_provider_with_detection(None, None, true, || Ok(vec![])).unwrap_err();
+        let err =
+            resolve_provider_with_detection(None, None, None, true, || Ok(vec![])).unwrap_err();
         assert!(
             err.to_string().contains("--model without --provider"),
             "{err}"
@@ -5025,7 +5112,8 @@ mod tests {
 
         // Zero candidates: auth error with the checked chain, every
         // configurable key command, and the credential-free block.
-        let err = resolve_provider_with_detection(None, None, false, || Ok(vec![])).unwrap_err();
+        let err =
+            resolve_provider_with_detection(None, None, None, false, || Ok(vec![])).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no provider credentials configured"), "{msg}");
         assert!(msg.contains("Checked in order:"), "{msg}");
@@ -5059,7 +5147,7 @@ mod tests {
             "global vault",
         );
         let (chosen, auto) =
-            resolve_provider_with_detection(None, None, false, || Ok(vec![only])).unwrap();
+            resolve_provider_with_detection(None, None, None, false, || Ok(vec![only])).unwrap();
         assert_eq!(chosen, CodeProvider::Deepseek);
         assert_eq!(auto, Some(only));
 
@@ -5076,8 +5164,8 @@ mod tests {
             "GEMINI_API_KEY",
             "--env-file",
         );
-        let err =
-            resolve_provider_with_detection(None, None, false, || Ok(vec![a, b])).unwrap_err();
+        let err = resolve_provider_with_detection(None, None, None, false, || Ok(vec![a, b]))
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("multiple provider credentials are configured"),
@@ -5098,6 +5186,103 @@ mod tests {
         assert!(
             !msg.contains("secret") && !msg.to_lowercase().contains("value:"),
             "no value material may leak: {msg}"
+        );
+        assert!(
+            msg.contains("    libra config set --global code.defaultProvider <id>"),
+            "the persistent-default alternative must be offered (PS-03): {msg}"
+        );
+    }
+
+    /// plan-20260825 PS-03: the `code.defaultProvider` slot — value
+    /// domain, ladder position (after flags/binding, before the --model
+    /// guard and detection), and the no-echo usage error.
+    #[test]
+    fn provider_config_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{CodeProvider, config_slot_outcome, resolve_provider_with_detection};
+
+        // Every capability-table id is a legal value and maps to its own
+        // provider; surrounding whitespace is tolerated.
+        for spec in super::PROVIDER_SPECS {
+            let padded = format!("  {}  ", spec.id);
+            assert_eq!(
+                config_slot_outcome(Some(&padded)).unwrap(),
+                Some(spec.provider),
+                "id '{}' must resolve",
+                spec.id
+            );
+        }
+        // Absent falls through (empty never reaches here: the cascaded
+        // reader returns None for present-but-empty values).
+        assert_eq!(config_slot_outcome(None).unwrap(), None);
+
+        // An unrecognized value is a usage error whose a-mode message
+        // lists the full sorted domain and copy-pasteable fixes — and
+        // never echoes the stored value (GC-PS-01: it could be a secret
+        // pasted into the wrong key).
+        let err = config_slot_outcome(Some("sk-SENTINEL")).unwrap_err();
+        let msg = err.to_string();
+        let first_line = msg.lines().next().unwrap();
+        assert!(
+            first_line.contains("code.defaultProvider")
+                && first_line.contains("unrecognized provider id"),
+            "conclusion-first a-mode line expected: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "Valid values: anthropic, codex, deepseek, gemini, kimi, ollama, openai, zhipu"
+            ),
+            "the full sorted id domain must be listed: {msg}"
+        );
+        assert!(
+            msg.contains("    libra config set --global code.defaultProvider <id>")
+                && msg.contains("    libra config unset --global code.defaultProvider")
+                && msg.contains("    libra config get code.defaultProvider"),
+            "fix/clear/inspect commands must be copy-pasteable: {msg}"
+        );
+        assert!(
+            !msg.contains("sk-SENTINEL"),
+            "the stored value must never be echoed: {msg}"
+        );
+
+        // Ladder position: a config hit resolves without a single
+        // detection probe, even when --model is present (a persisted
+        // default determines the pairing just as a flag would).
+        let probes = AtomicUsize::new(0);
+        let (chosen, auto) =
+            resolve_provider_with_detection(None, None, Some("deepseek"), true, || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            })
+            .unwrap();
+        assert_eq!((chosen, auto), (CodeProvider::Deepseek, None));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "a config hit must skip credential detection"
+        );
+
+        // Explicit --provider outranks the config slot.
+        let (chosen, _) = resolve_provider_with_detection(
+            Some(CodeProvider::Zhipu),
+            None,
+            Some("deepseek"),
+            false,
+            || Ok(vec![]),
+        )
+        .unwrap();
+        assert_eq!(chosen, CodeProvider::Zhipu);
+
+        // An invalid config value fails the resolution even though
+        // detection would have found candidates — never a silent skip.
+        let err = resolve_provider_with_detection(None, None, Some("nonsense"), false, || {
+            panic!("detection must not run after an invalid config value")
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognized provider id"),
+            "{err}"
         );
     }
 
