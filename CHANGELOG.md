@@ -12,8 +12,9 @@ durable store — the exact `503 WIRE_V2_REQUIRES_DURABLE_SESSION` surfaces to
 the caller instead.
 
 **Upgrade path:** **`v0.21.29` is the last release serving wire v1** — stay on
-it (or any `0.21.24`–`0.21.29` build baked by the DEFER-08 checklist) if you
-cannot consume v2 yet. To migrate, request `?wire=2&cursor=<last acknowledged
+exactly that release if you cannot consume v2 yet (it is the DEP-02-baked
+build: consumers migrated and the server default already v2, with explicit v1
+still served; earlier 0.21.x builds predate parts of that bake). To migrate, request `?wire=2&cursor=<last acknowledged
 cursor>`, persist the cursor, deduplicate side effects by `eventId`, and treat
 `event: resync` / `WIRE_V2_RESYNC_REQUIRED` as one explicit
 `GET /api/code/session` snapshot fetch followed by a reconnect at the

@@ -466,8 +466,8 @@ impl CodeSession {
 
     /// Open the built-in compatibility client's default SSE v2 subscription.
     ///
-    /// Tests that intentionally pin the legacy snapshot contract must call
-    /// [`Self::open_event_stream_v1`] explicitly.
+    /// v2 is the only wire: the legacy v1 snapshot stream (and the harness
+    /// helper that requested it) was removed in 0.22.0 (DF-08).
     /// The returned [`super::EventStream`] reads events on a worker
     /// thread; per-event timeouts are configured by the caller.
     ///

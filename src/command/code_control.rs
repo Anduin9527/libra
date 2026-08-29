@@ -669,7 +669,6 @@ fn event_stream_error_code(body: &str) -> Option<String> {
 
 struct OpenedEventStream {
     response: reqwest::Response,
-    wire_version: u8,
     recovery: Option<Value>,
 }
 
@@ -688,7 +687,6 @@ async fn open_event_stream(
     if response.status() == StatusCode::OK {
         return Ok(OpenedEventStream {
             response,
-            wire_version: BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
             recovery: None,
         });
     }
@@ -709,7 +707,6 @@ async fn open_event_stream(
         }
         return Ok(OpenedEventStream {
             response: restarted,
-            wire_version: BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
             recovery: Some(json!({
                 "code": WIRE_V2_CURSOR_AHEAD,
                 "reason": "the requested cursor belongs to a later or different durable session; the client dropped it and restarted from cursor 0",
@@ -866,7 +863,7 @@ where
                 data,
                 durable_tail,
                 forwarded,
-            } if opened.wire_version == BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION => {
+            } => {
                 consecutive_resyncs = if forwarded == 0 {
                     consecutive_resyncs.saturating_add(1)
                 } else {
@@ -892,14 +889,8 @@ where
                 }
                 opened = OpenedEventStream {
                     response,
-                    wire_version: BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
                     recovery: None,
                 };
-            }
-            EventStreamOutcome::ResyncRequired { .. } => {
-                return Err(CliError::fatal(
-                    "events.subscribe received a v2 resync event on the legacy v1 stream",
-                ));
             }
         }
     }
@@ -1279,7 +1270,6 @@ mod tests {
         let opened = open_event_stream(&Client::new(), &base_url, 17)
             .await
             .expect("v2 event stream");
-        assert_eq!(opened.wire_version, BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION);
         assert_eq!(opened.response.status(), StatusCode::OK);
         assert!(
             opened
