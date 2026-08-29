@@ -84,10 +84,28 @@ impl Client {
         let api_key = resolve_env_for_target("ZHIPU_API_KEY", local_target)
             .await?
             .ok_or_else(|| {
+                // plan-20260825 PS-01 (ADR-PS-03 a-mode): second user-facing
+                // instance of the missing-credential message; the checked
+                // chain here is the resolve_env_for_target order (no
+                // --env-file at this layer).
                 anyhow!(
-                    "ZHIPU_API_KEY is not set in env, repo vault, or global config \
-                     (set the environment variable or run `libra config --global add \
-                     vault.env.ZHIPU_API_KEY <key>`)"
+                    // Line-joined: `\` continuations strip the next line's
+                    // whitespace, which would eat the four-space command
+                    // indentation the a-mode structure mandates.
+                    [
+                        "ZHIPU_API_KEY is not configured",
+                        "",
+                        "Checked in order: process environment, repo-local vault, global vault",
+                        "",
+                        "Configure the key (recommended):",
+                        "    libra config set --global vault.env.ZHIPU_API_KEY <value>",
+                        "    export ZHIPU_API_KEY=<value>",
+                        "",
+                        "Run without credentials:",
+                        "    libra code --provider codex",
+                        "    libra code --provider ollama --model <name>",
+                    ]
+                    .join("\n")
                 )
             })?;
         let base_url = resolve_env_for_target("ZHIPU_BASE_URL", local_target)

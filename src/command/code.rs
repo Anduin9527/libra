@@ -1668,7 +1668,7 @@ fn build_any_completion_model_for_args(
         // fall back to the libra config DB (repo-local + global
         // `vault.env.<name>`) via the sync resolver. Phase 5 from_env →
         // resolve_env call-site cutover: users who configured an API key
-        // once via `libra config --global add vault.env.GEMINI_API_KEY <…>`
+        // once via `libra config set --global vault.env.GEMINI_API_KEY <…>`
         // no longer need to re-export it in every shell.
         //
         // The DB read may fail (e.g. stale global config schema); we treat
@@ -1719,6 +1719,148 @@ fn resolve_provider_api_base(
     }
 }
 
+/// Default model id for a CLI provider (plan-20260825 PS-01: extracted from
+/// the factory closure so the ADR-PS-02 capability-table test can assert the
+/// `needs_explicit_model` column against these exact branches). Ollama errors
+/// when `--model` is omitted (no sensible local default); the rest fall back
+/// to a flagship model constant.
+fn cli_default_model(provider: CodeProvider) -> CliResult<String> {
+    Ok(match provider {
+        CodeProvider::Gemini => GEMINI_2_5_FLASH.to_string(),
+        CodeProvider::Openai => GPT_4O_MINI.to_string(),
+        CodeProvider::Anthropic => CLAUDE_3_5_SONNET.to_string(),
+        CodeProvider::Deepseek => "deepseek-chat".to_string(),
+        CodeProvider::Kimi => KIMI_K2_6.to_string(),
+        CodeProvider::Zhipu => GLM_5.to_string(),
+        CodeProvider::Ollama => {
+            return Err(CliError::command_usage(
+                "--model is required when using --provider ollama \
+                 (e.g. --model llama3.2)",
+            ));
+        }
+        #[cfg(feature = "test-provider")]
+        CodeProvider::Fake => FAKE_DEFAULT_MODEL.to_string(),
+        CodeProvider::Codex => unreachable!("Codex filtered above"),
+    })
+}
+
+/// plan-20260825 ADR-PS-02: the provider capability table is the single
+/// source of truth for the API-key env-var mapping and for user-facing
+/// credential enumeration. PS-01 drives the env lookup and the missing-key
+/// message from it; PS-02/PS-06 will consume `auto_selectable` for
+/// zero/one/many credential auto-selection (candidates = rows with
+/// `key_required && credential configured`; `codex`/`ollama` never
+/// auto-select but must appear in the credential-free block of the
+/// zero-candidate message).
+pub(crate) struct ProviderSpec {
+    pub(crate) provider: CodeProvider,
+    pub(crate) id: &'static str,
+    pub(crate) api_key_env: Option<&'static str>,
+    pub(crate) key_required: bool,
+    pub(crate) needs_explicit_model: bool,
+    pub(crate) auto_selectable: bool,
+}
+
+pub(crate) const PROVIDER_SPECS: &[ProviderSpec] = &[
+    ProviderSpec {
+        provider: CodeProvider::Gemini,
+        id: crate::internal::ai::providers::runtime::provider_id::GEMINI,
+        api_key_env: Some("GEMINI_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Openai,
+        id: crate::internal::ai::providers::runtime::provider_id::OPENAI,
+        api_key_env: Some("OPENAI_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Anthropic,
+        id: crate::internal::ai::providers::runtime::provider_id::ANTHROPIC,
+        api_key_env: Some("ANTHROPIC_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Deepseek,
+        id: crate::internal::ai::providers::runtime::provider_id::DEEPSEEK,
+        api_key_env: Some("DEEPSEEK_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Kimi,
+        id: crate::internal::ai::providers::runtime::provider_id::KIMI,
+        api_key_env: Some("MOONSHOT_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Zhipu,
+        id: crate::internal::ai::providers::runtime::provider_id::ZHIPU,
+        api_key_env: Some("ZHIPU_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Ollama,
+        id: crate::internal::ai::providers::runtime::provider_id::OLLAMA,
+        api_key_env: Some("OLLAMA_API_KEY"),
+        key_required: false,
+        needs_explicit_model: true,
+        auto_selectable: false,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Codex,
+        id: "codex",
+        api_key_env: None,
+        key_required: false,
+        needs_explicit_model: false,
+        auto_selectable: false,
+    },
+];
+
+/// Look up a capability row by canonical provider id. The `fake`
+/// test-provider is deliberately absent (cfg-gated); callers treat a miss
+/// as "no API key env" which preserves the pre-table behavior.
+pub(crate) fn provider_spec_by_id(id: &str) -> Option<&'static ProviderSpec> {
+    PROVIDER_SPECS.iter().find(|spec| spec.id == id)
+}
+
+/// ADR-PS-03 "a-mode" missing-credential message: conclusion first, the
+/// checked lookup chain, a copy-pasteable recommended command block, then
+/// the credential-free alternatives (ADR-PS-02 requires codex/ollama here).
+/// Never prints key material.
+fn missing_api_key_message(env_var: &str, provider_id: &str) -> String {
+    // Built line-by-line: `\` string continuations strip the next line's
+    // leading whitespace, which silently ate the mandatory four-space
+    // command indentation on the first attempt.
+    [
+        format!("{env_var} is not configured for provider '{provider_id}'"),
+        String::new(),
+        "Checked in order: --env-file (default Web launch), process environment, \
+         repo-local vault, global vault"
+            .to_string(),
+        String::new(),
+        "Configure the key (recommended):".to_string(),
+        format!("    libra config set --global vault.env.{env_var} <value>"),
+        format!("    export {env_var}=<value>"),
+        String::new(),
+        "Run without credentials:".to_string(),
+        "    libra code --provider codex".to_string(),
+        "    libra code --provider ollama --model <name>".to_string(),
+    ]
+    .join("\n")
+}
+
 fn build_any_completion_model_for_args_with_lookup(
     args: &CodeArgs,
     env_file: &CodeEnvFile,
@@ -1759,30 +1901,6 @@ fn build_any_completion_model_for_args_with_lookup(
         }
     };
 
-    // 2. Resolve the default model id from the CLI provider. Ollama errors
-    //    if `--model` is omitted (no sensible local default); the rest fall
-    //    back to a flagship model constant. Honored only when the agent
-    //    override does not supply a binding model id below.
-    let cli_default_model = |provider: CodeProvider| -> CliResult<String> {
-        Ok(match provider {
-            CodeProvider::Gemini => GEMINI_2_5_FLASH.to_string(),
-            CodeProvider::Openai => GPT_4O_MINI.to_string(),
-            CodeProvider::Anthropic => CLAUDE_3_5_SONNET.to_string(),
-            CodeProvider::Deepseek => "deepseek-chat".to_string(),
-            CodeProvider::Kimi => KIMI_K2_6.to_string(),
-            CodeProvider::Zhipu => GLM_5.to_string(),
-            CodeProvider::Ollama => {
-                return Err(CliError::command_usage(
-                    "--model is required when using --provider ollama \
-                     (e.g. --model llama3.2)",
-                ));
-            }
-            #[cfg(feature = "test-provider")]
-            CodeProvider::Fake => FAKE_DEFAULT_MODEL.to_string(),
-            CodeProvider::Codex => unreachable!("Codex filtered above"),
-        })
-    };
-
     let mut variant: Option<String> = None;
     // 3. OC-Phase 2 P2.4: apply `--agent <name>` override atomically.
     //    When the profile carries a structured binding, all three of
@@ -1804,18 +1922,12 @@ fn build_any_completion_model_for_args_with_lookup(
     //    agent override flows through to env-var lookup).
     let resolve_env = |key: &str| provider_env_value_with_lookup(env_file, key, &env_lookup);
 
-    let api_key = match provider_id_str.as_str() {
-        provider_id::GEMINI => resolve_env("GEMINI_API_KEY"),
-        provider_id::OPENAI => resolve_env("OPENAI_API_KEY"),
-        provider_id::ANTHROPIC => resolve_env("ANTHROPIC_API_KEY"),
-        provider_id::DEEPSEEK => resolve_env("DEEPSEEK_API_KEY"),
-        provider_id::KIMI => resolve_env("MOONSHOT_API_KEY"),
-        provider_id::ZHIPU => resolve_env("ZHIPU_API_KEY"),
-        provider_id::OLLAMA => resolve_env("OLLAMA_API_KEY"),
-        #[cfg(feature = "test-provider")]
-        provider_id::FAKE => None,
-        _ => None,
-    };
+    // ADR-PS-02: env-var mapping is table-driven; a spec miss (unknown id,
+    // or the cfg-gated `fake` provider) means "no API key env" exactly like
+    // the match arms this replaced.
+    let api_key = provider_spec_by_id(&provider_id_str)
+        .and_then(|spec| spec.api_key_env)
+        .and_then(resolve_env);
 
     let api_base = resolve_provider_api_base(&provider_id_str, args.api_base.clone(), resolve_env);
 
@@ -1876,16 +1988,11 @@ fn build_any_completion_model_for_args_with_lookup(
                      (set --api-base https://ollama.com or OLLAMA_BASE_URL=https://ollama.com)",
                     )
                 } else {
-                    // Name the missing variable AND how to configure it, so
-                    // the user has an actionable next step rather than a bare
-                    // "not set" (C3 criterion: missing-key errors must say
-                    // which env var and how to set it). Mirrors the
-                    // vault-aware resolution chain in
-                    // `build_any_completion_model_for_args`.
-                    CliError::auth(format!(
-                        "{env_var} is not set; export {env_var} or store it with \
-                         `libra config --global add vault.env.{env_var} <value>`"
-                    ))
+                    // plan-20260825 PS-01 (ADR-PS-03 a-mode): conclusion,
+                    // checked chain, copy-pasteable recommended commands,
+                    // credential-free alternatives. Replaces the old hint
+                    // that named a nonexistent config subcommand.
+                    CliError::auth(missing_api_key_message(&env_var, &provider_id_str))
                 }
             }
             ProviderFactoryError::BuildFailed { reason, .. } => CliError::io(reason),
@@ -4494,6 +4601,58 @@ mod tests {
         path::{Path, PathBuf},
         sync::Arc,
     };
+
+    /// plan-20260825 PS-01: the ADR-PS-03 a-mode missing-credential message
+    /// must be copy-paste executable — the recommended command is the real
+    /// `config set --global` shape, the extinct `config --global add` never
+    /// reappears, command lines are four-space indented, and the ADR-PS-02
+    /// credential-free alternatives (codex / ollama with an explicit model)
+    /// are present. No key material beyond the env-var NAME is printed.
+    #[test]
+    fn missing_api_key_message_is_executable() {
+        let msg = super::missing_api_key_message("GEMINI_API_KEY", "gemini");
+        assert!(
+            msg.starts_with("GEMINI_API_KEY is not configured for provider 'gemini'"),
+            "first line must be the conclusion without a command: {msg}"
+        );
+        assert!(
+            msg.contains("Checked in order: --env-file (default Web launch), process environment, repo-local vault, global vault"),
+            "lookup chain missing: {msg}"
+        );
+        assert!(
+            msg.contains("    libra config set --global vault.env.GEMINI_API_KEY <value>"),
+            "recommended command must be the executable config set form: {msg}"
+        );
+        assert!(
+            !msg.contains("config --global add"),
+            "the nonexistent add subcommand must never reappear: {msg}"
+        );
+        assert!(
+            msg.contains("    libra code --provider codex")
+                && msg.contains("    libra code --provider ollama --model <name>"),
+            "credential-free alternatives missing: {msg}"
+        );
+    }
+
+    /// plan-20260825 PS-01 (ADR-PS-02): the capability table's
+    /// `needs_explicit_model` column must agree with `cli_default_model`'s
+    /// error branches — exactly the providers without a default model id
+    /// (today: ollama) may set it. Codex never reaches the factory helper,
+    /// so its row is exempt from the comparison.
+    #[test]
+    fn provider_spec_table_matches_default_model_branches() {
+        for spec in super::PROVIDER_SPECS {
+            if matches!(spec.provider, super::CodeProvider::Codex) {
+                continue;
+            }
+            let default_model_errors = super::cli_default_model(spec.provider).is_err();
+            assert_eq!(
+                default_model_errors, spec.needs_explicit_model,
+                "capability row for '{}' disagrees with cli_default_model",
+                spec.id
+            );
+        }
+    }
 
     use axum::{Json, Router, extract::Request, routing::post};
     use serde_json::{Value, json};
