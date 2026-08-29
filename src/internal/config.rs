@@ -1150,20 +1150,54 @@ pub async fn resolve_env_for_target(
     name: &str,
     local_target: LocalIdentityTarget<'_>,
 ) -> Result<Option<String>> {
+    Ok(locate_env_for_target(name, local_target)
+        .await?
+        .map(|(value, _layer)| value))
+}
+
+/// Which layer of the credential chain produced a value
+/// (plan-20260825 PS-06). Layer names are user-facing (auto-selection
+/// notes and ambiguity listings) and never carry the value itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EnvHitLayer {
+    ProcessEnvironment,
+    RepoLocalVault,
+    GlobalVault,
+}
+
+impl EnvHitLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnvHitLayer::ProcessEnvironment => "process environment",
+            EnvHitLayer::RepoLocalVault => "repo-local vault",
+            EnvHitLayer::GlobalVault => "global vault",
+        }
+    }
+}
+
+/// [`resolve_env_for_target`] with the hit layer attached — the priority
+/// chain is identical (process env → repo-local vault → global vault) and
+/// the resolver delegates here, so the two can never drift.
+pub async fn locate_env_for_target(
+    name: &str,
+    local_target: LocalIdentityTarget<'_>,
+) -> Result<Option<(String, EnvHitLayer)>> {
     // 1. System environment variable — per-process override (12-Factor)
     if let Ok(val) = std::env::var(name) {
-        return Ok(Some(val));
+        return Ok(Some((val, EnvHitLayer::ProcessEnvironment)));
     }
 
     let vault_key = format!("vault.env.{name}");
 
     // 2. Local config (vault.env.*)
     if let Some(value) = local_env_value_for_target(local_target, &vault_key).await? {
-        return Ok(Some(value));
+        return Ok(Some((value, EnvHitLayer::RepoLocalVault)));
     }
 
     // 3. Global config — lowest priority
-    global_env_value(name, &vault_key).await
+    Ok(global_env_value(name, &vault_key)
+        .await?
+        .map(|value| (value, EnvHitLayer::GlobalVault)))
 }
 
 /// Resolve the global config database path.
@@ -2582,6 +2616,39 @@ mod tests {
     use sea_orm::Statement;
 
     use super::*;
+
+    /// plan-20260825 PS-06: `locate_env_for_target` tags the hit layer and
+    /// `resolve_env_for_target` delegates to it, so value and layer can
+    /// never disagree. Uses the process-env layer (deterministic, no DB) and
+    /// an unset name against an isolated global DB for the miss path.
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn locate_env_reports_the_hit_layer_and_resolver_delegates() {
+        let name = "LIBRA_PS06_LOCATE_TEST_KEY";
+        // SAFETY-adjacent: serial(env) — process env is shared state.
+        unsafe { std::env::set_var(name, "layer-probe") };
+        let located = locate_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("locate over process env");
+        assert_eq!(
+            located,
+            Some(("layer-probe".to_string(), EnvHitLayer::ProcessEnvironment))
+        );
+        let resolved = resolve_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("resolver delegates");
+        assert_eq!(resolved.as_deref(), Some("layer-probe"));
+        unsafe { std::env::remove_var(name) };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("isolated-global.db");
+        unsafe { std::env::set_var("LIBRA_CONFIG_GLOBAL_DB", &db) };
+        let missing = locate_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("miss path");
+        assert_eq!(missing, None, "unset name must locate nowhere");
+        unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
+    }
 
     async fn write_schema_version(db_path: &Path, version: i64) {
         let conn = crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))

@@ -738,48 +738,15 @@ pub(crate) fn resolved_provider(args: &CodeArgs) -> CodeProvider {
         .expect("provider must be resolved at execute() entry (ADR-PS-05)")
 }
 
-/// ADR-PS-03 a-mode usage error for "no provider from any source": lists
-/// every provider with its configuration command (enumerated from the
-/// ADR-PS-02 capability table) and the credential-free alternatives.
-fn provider_required_message() -> String {
-    let mut lines = vec![
-        "no AI provider selected".to_string(),
-        String::new(),
-        "Pick a provider explicitly:".to_string(),
-    ];
-    for spec in PROVIDER_SPECS {
-        if spec.key_required {
-            lines.push(format!("    libra code --provider {}", spec.id));
-        }
-    }
-    lines.push(String::new());
-    lines.push("Run without credentials:".to_string());
-    lines.push("    libra code --provider codex".to_string());
-    lines.push("    libra code --provider ollama --model <name>".to_string());
-    lines.push(String::new());
-    lines.push("Store a provider key once (enables the provider above):".to_string());
-    for spec in PROVIDER_SPECS {
-        if let Some(env) = spec.api_key_env
-            && spec.key_required
-        {
-            lines.push(format!(
-                "    libra config set --global vault.env.{env} <value>"
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
-/// Pure ADR-PS-05 priority ladder for this card (slots 1 and 2): an explicit
-/// `--provider` wins; otherwise a mappable `--agent` binding provider id;
-/// both present and disagreeing is a usage conflict; neither is a usage
-/// error carrying the a-mode provider enumeration. Later cards insert
-/// `--resume` metadata (PS-05) and `code.defaultProvider` (PS-03) between
-/// binding and the error.
+/// Pure ADR-PS-05 priority ladder, slots 1 and 2: an explicit `--provider`
+/// wins; otherwise a mappable `--agent` binding provider id; both present
+/// and disagreeing is a usage conflict. `Ok(None)` means "no source yet" —
+/// the caller falls through to the later slots (PS-05 resume metadata,
+/// PS-03 `code.defaultProvider`, then the PS-06 credential detection).
 fn resolve_provider_from_sources(
     explicit: Option<CodeProvider>,
     binding_provider_id: Option<&str>,
-) -> CliResult<CodeProvider> {
+) -> CliResult<Option<CodeProvider>> {
     let binding = binding_provider_id.and_then(|id| {
         PROVIDER_SPECS
             .iter()
@@ -792,23 +759,186 @@ fn resolve_provider_from_sources(
              drop one of them",
             binding_provider_id.unwrap_or_default()
         ))),
-        (Some(flag), _) => Ok(flag),
-        (None, Some(bound)) => Ok(bound),
-        (None, None) => Err(CliError::command_usage(provider_required_message())),
+        (Some(flag), _) => Ok(Some(flag)),
+        (None, Some(bound)) => Ok(Some(bound)),
+        (None, None) => Ok(None),
     }
+}
+
+/// One auto-selection candidate from the PS-06 credential detection: the
+/// capability row plus where its key was found. Never carries the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetectedCandidate {
+    pub(crate) provider: CodeProvider,
+    pub(crate) id: &'static str,
+    pub(crate) api_key_env: &'static str,
+    /// Display name of the hit layer (`--env-file`, or an
+    /// `EnvHitLayer::as_str` value). Never the credential itself.
+    pub(crate) layer: &'static str,
+}
+
+/// Pure PS-06 zero/one/many composition over slots 1-2 plus detection.
+/// `detect` is only invoked when no earlier source decided — the
+/// "explicit means zero probes" contract is load-bearing and pinned by a
+/// unit test. Returns the provider plus the candidate to announce on
+/// stderr when auto-selection happened.
+fn resolve_provider_with_detection(
+    explicit: Option<CodeProvider>,
+    binding_provider_id: Option<&str>,
+    model_without_provider: bool,
+    detect: impl FnOnce() -> CliResult<Vec<DetectedCandidate>>,
+) -> CliResult<(CodeProvider, Option<DetectedCandidate>)> {
+    if let Some(decided) = resolve_provider_from_sources(explicit, binding_provider_id)? {
+        return Ok((decided, None));
+    }
+    if model_without_provider {
+        return Err(CliError::command_usage(
+            "--model without --provider is ambiguous: a model id cannot pick \
+             its provider, and credential detection cannot infer the pairing.\n\
+             \n\
+             Pass the pair explicitly:\n\
+                 libra code --provider <id> --model <name>",
+        ));
+    }
+    let mut candidates = detect()?;
+    candidates.sort_by_key(|c| c.id);
+    match candidates.len() {
+        0 => Err(CliError::auth(credential_zero_state_message())),
+        1 => {
+            let only = candidates[0];
+            Ok((only.provider, Some(only)))
+        }
+        _ => Err(CliError::command_usage(ambiguous_candidates_message(
+            &candidates,
+        ))),
+    }
+}
+
+/// PS-06 zero-candidate outcome (LBR-AUTH-001): the a-mode message names
+/// the checked chain, every configurable provider with its one-line key
+/// command, and the credential-free alternatives.
+fn credential_zero_state_message() -> String {
+    let mut lines = vec![
+        "no provider credentials configured".to_string(),
+        String::new(),
+        "Checked in order: --env-file (default Web launch), process environment, \
+         repo-local vault, global vault"
+            .to_string(),
+        String::new(),
+        "Store a provider key (any one enables that provider):".to_string(),
+    ];
+    for spec in PROVIDER_SPECS {
+        if let Some(env) = spec.api_key_env
+            && spec.key_required
+        {
+            lines.push(format!(
+                "    libra config set --global vault.env.{env} <value>"
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Run without credentials:".to_string());
+    lines.push("    libra code --provider codex".to_string());
+    lines.push("    libra code --provider ollama --model <name>".to_string());
+    lines.join("\n")
+}
+
+/// PS-06 many-candidate outcome (LBR-CLI-002): candidates in provider-id
+/// order, each with its env var and hit layer — never the value.
+fn ambiguous_candidates_message(candidates: &[DetectedCandidate]) -> String {
+    let mut lines = vec![
+        "multiple provider credentials are configured; pick one explicitly".to_string(),
+        String::new(),
+        "Configured candidates:".to_string(),
+    ];
+    for candidate in candidates {
+        lines.push(format!(
+            "    {}  ({} in {})",
+            candidate.id, candidate.api_key_env, candidate.layer
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Run with one of them:".to_string());
+    for candidate in candidates {
+        lines.push(format!("    libra code --provider {}", candidate.id));
+    }
+    lines.join("\n")
 }
 
 /// ADR-PS-05 entry resolution: runs in `execute()` after the working-dir
 /// preflight and before `validate_mode_args`, then writes the result back to
-/// `args.provider`. `--stdio` / `--control stdio` never call this.
-fn resolve_provider_at_entry(args: &mut CodeArgs, working_dir: &std::path::Path) -> CliResult<()> {
+/// `args.provider`. `--stdio` / `--control stdio` never call this. When the
+/// PS-06 credential detection auto-selects the only candidate, the reason
+/// (provider id, env var, hit layer — never the value) goes to stderr;
+/// stdout stays untouched.
+async fn resolve_provider_at_entry(
+    args: &mut CodeArgs,
+    working_dir: &std::path::Path,
+) -> CliResult<()> {
     let binding = resolve_agent_binding_override(args, working_dir)?;
-    let resolved = resolve_provider_from_sources(
+    // The env file participates in detection as its own layer, mirroring the
+    // provider_env_value_with_lookup chain the factory uses later.
+    let env_file = load_code_env_file(args.env_file.as_deref())?;
+    let candidates = detect_provider_candidates(&env_file).await?;
+    let model_without_provider =
+        args.model.is_some() && args.provider.is_none() && binding.is_none();
+    let (resolved, auto) = resolve_provider_with_detection(
         args.provider,
         binding.as_ref().map(|b| b.provider_id.as_str()),
+        model_without_provider,
+        || Ok(candidates),
     )?;
+    if let Some(candidate) = auto {
+        eprintln!(
+            "provider '{}' auto-selected: {} found in {}",
+            candidate.id, candidate.api_key_env, candidate.layer
+        );
+    }
     args.provider = Some(resolved);
     Ok(())
+}
+
+/// PS-06 credential probe over the ADR-PS-02 table: for every
+/// `auto_selectable` row, report whether its key exists and where.
+/// `codex`/`ollama` are excluded by the table itself. The `--env-file`
+/// layer is checked first, then the shared process-env → repo vault →
+/// global vault chain (`locate_env_for_target`).
+async fn detect_provider_candidates(env_file: &CodeEnvFile) -> CliResult<Vec<DetectedCandidate>> {
+    use crate::internal::config::{LocalIdentityTarget, locate_env_for_target};
+    let mut out = Vec::new();
+    for spec in PROVIDER_SPECS {
+        if !spec.auto_selectable {
+            continue;
+        }
+        let Some(env) = spec.api_key_env else {
+            continue;
+        };
+        if env_file.get(env).is_some() {
+            out.push(DetectedCandidate {
+                provider: spec.provider,
+                id: spec.id,
+                api_key_env: env,
+                layer: "--env-file",
+            });
+            continue;
+        }
+        let located = locate_env_for_target(env, LocalIdentityTarget::CurrentRepo)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "credential detection failed while checking {env}: {error:#}"
+                ))
+            })?;
+        if let Some((_value, layer)) = located {
+            out.push(DetectedCandidate {
+                provider: spec.provider,
+                id: spec.id,
+                api_key_env: env,
+                layer: layer.as_str(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// `docs/development/cli-error-contract-design.md`.
@@ -868,7 +998,7 @@ pub async fn execute(mut args: CodeArgs, output: &OutputConfig) -> CliResult<()>
     // the resolved value. `--stdio` keeps `None` — it never builds a
     // completion provider and rejects an explicit `--provider` below.
     if !args.stdio {
-        resolve_provider_at_entry(&mut args, &session_workdir)?;
+        resolve_provider_at_entry(&mut args, &session_workdir).await?;
     }
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
@@ -1855,14 +1985,12 @@ pub(crate) struct ProviderSpec {
     pub(crate) id: &'static str,
     pub(crate) api_key_env: Option<&'static str>,
     pub(crate) key_required: bool,
-    // Consumed by the PS-06 zero/one/many credential resolution; until that
-    // card lands the column exists for table completeness (ADR-PS-02) and
-    // the cli_default_model consistency test.
+    // Exercised by the cli_default_model consistency test; kept as the
+    // ADR-PS-02 table contract for model-requirement enumeration (no
+    // production reader yet — ollama is already excluded from
+    // auto-selection via `auto_selectable`).
     #[allow(dead_code)]
     pub(crate) needs_explicit_model: bool,
-    // Consumed by PS-06 auto-selection (candidates = key_required rows with
-    // a configured credential); dormant until then.
-    #[allow(dead_code)]
     pub(crate) auto_selectable: bool,
 }
 
@@ -4749,9 +4877,8 @@ mod tests {
 
     /// plan-20260825 PS-02 (ADR-PS-05 slots 1-2): explicit `--provider`
     /// wins, a mappable `--agent` binding fills in when the flag is absent,
-    /// a disagreement between the two is a usage conflict, and no source at
-    /// all yields the a-mode usage error enumerating every configurable
-    /// provider (from the ADR-PS-02 table) plus the credential-free pair.
+    /// a disagreement between the two is a usage conflict, and no source
+    /// falls through (`Ok(None)`) to the PS-06 detection slot.
     #[test]
     fn provider_resolution_entry() {
         use super::{CodeProvider, resolve_provider_from_sources};
@@ -4763,36 +4890,146 @@ mod tests {
         );
         assert_eq!(
             resolve_provider_from_sources(Some(CodeProvider::Kimi), Some("kimi")).unwrap(),
-            CodeProvider::Kimi
+            Some(CodeProvider::Kimi)
         );
         assert_eq!(
             resolve_provider_from_sources(Some(CodeProvider::Zhipu), None).unwrap(),
-            CodeProvider::Zhipu,
+            Some(CodeProvider::Zhipu),
             "explicit flag stands alone"
         );
         assert_eq!(
             resolve_provider_from_sources(None, Some("anthropic")).unwrap(),
-            CodeProvider::Anthropic,
+            Some(CodeProvider::Anthropic),
             "binding fills in when the flag is absent"
         );
+        assert_eq!(
+            resolve_provider_from_sources(None, None).unwrap(),
+            None,
+            "no source falls through to detection (PS-06)"
+        );
+    }
 
-        let err = resolve_provider_from_sources(None, None).unwrap_err();
+    fn candidate(
+        provider: CodeProvider,
+        id: &'static str,
+        env: &'static str,
+        layer: &'static str,
+    ) -> super::DetectedCandidate {
+        super::DetectedCandidate {
+            provider,
+            id,
+            api_key_env: env,
+            layer,
+        }
+    }
+
+    /// plan-20260825 PS-06: the zero/one/many outcomes of credential
+    /// detection, the zero-probe contract for explicit selection, the
+    /// `--model`-without-provider guard, and the redaction rule (messages
+    /// carry provider id / env var / layer, never a value).
+    #[test]
+    fn provider_detection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{CodeProvider, resolve_provider_with_detection};
+
+        // Explicit selection must not probe at all.
+        let probes = AtomicUsize::new(0);
+        let (chosen, auto) =
+            resolve_provider_with_detection(Some(CodeProvider::Zhipu), None, false, || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            })
+            .unwrap();
+        assert_eq!((chosen, auto), (CodeProvider::Zhipu, None));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "explicit --provider must short-circuit detection"
+        );
+
+        // --model without any provider source is ambiguous before detection.
+        let err = resolve_provider_with_detection(None, None, true, || Ok(vec![])).unwrap_err();
+        assert!(
+            err.to_string().contains("--model without --provider"),
+            "{err}"
+        );
+
+        // Zero candidates: auth error with the checked chain, every
+        // configurable key command, and the credential-free block.
+        let err = resolve_provider_with_detection(None, None, false, || Ok(vec![])).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("no AI provider selected"), "{msg}");
-        for id in ["gemini", "openai", "anthropic", "deepseek", "kimi", "zhipu"] {
+        assert!(msg.contains("no provider credentials configured"), "{msg}");
+        assert!(msg.contains("Checked in order:"), "{msg}");
+        for env in [
+            "GEMINI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MOONSHOT_API_KEY",
+            "ZHIPU_API_KEY",
+        ] {
             assert!(
-                msg.contains(&format!("    libra code --provider {id}")),
-                "provider '{id}' missing from the enumeration: {msg}"
+                msg.contains(&format!(
+                    "    libra config set --global vault.env.{env} <value>"
+                )),
+                "{env} missing: {msg}"
             );
         }
-        assert!(
-            msg.contains("    libra config set --global vault.env.MOONSHOT_API_KEY <value>"),
-            "per-provider config command missing: {msg}"
-        );
         assert!(
             msg.contains("    libra code --provider codex")
                 && msg.contains("    libra code --provider ollama --model <name>"),
             "credential-free alternatives missing: {msg}"
+        );
+
+        // One candidate: auto-selected, and the announcement payload names
+        // id/env/layer only.
+        let only = candidate(
+            CodeProvider::Deepseek,
+            "deepseek",
+            "DEEPSEEK_API_KEY",
+            "global vault",
+        );
+        let (chosen, auto) =
+            resolve_provider_with_detection(None, None, false, || Ok(vec![only])).unwrap();
+        assert_eq!(chosen, CodeProvider::Deepseek);
+        assert_eq!(auto, Some(only));
+
+        // Many candidates: usage error, id-sorted, layer shown, value never.
+        let a = candidate(
+            CodeProvider::Kimi,
+            "kimi",
+            "MOONSHOT_API_KEY",
+            "process environment",
+        );
+        let b = candidate(
+            CodeProvider::Gemini,
+            "gemini",
+            "GEMINI_API_KEY",
+            "--env-file",
+        );
+        let err =
+            resolve_provider_with_detection(None, None, false, || Ok(vec![a, b])).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiple provider credentials are configured"),
+            "{msg}"
+        );
+        let gemini_at = msg
+            .find("    gemini  (GEMINI_API_KEY in --env-file)")
+            .unwrap();
+        let kimi_at = msg
+            .find("    kimi  (MOONSHOT_API_KEY in process environment)")
+            .unwrap();
+        assert!(gemini_at < kimi_at, "candidates must be id-sorted: {msg}");
+        assert!(
+            msg.contains("    libra code --provider gemini")
+                && msg.contains("    libra code --provider kimi"),
+            "per-candidate commands missing: {msg}"
+        );
+        assert!(
+            !msg.contains("secret") && !msg.to_lowercase().contains("value:"),
+            "no value material may leak: {msg}"
         );
     }
 
