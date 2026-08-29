@@ -1753,11 +1753,19 @@ fn cli_default_model(provider: CodeProvider) -> CliResult<String> {
 /// auto-select but must appear in the credential-free block of the
 /// zero-candidate message).
 pub(crate) struct ProviderSpec {
+    // The dormant columns below are the ADR-PS-02 contract for the follow-up
+    // cards (PS-02 entry resolution consumes `provider`/`key_required`;
+    // PS-06 consumes `needs_explicit_model`/`auto_selectable`); allows are
+    // removed as each consumer lands.
+    #[allow(dead_code)]
     pub(crate) provider: CodeProvider,
     pub(crate) id: &'static str,
     pub(crate) api_key_env: Option<&'static str>,
+    #[allow(dead_code)]
     pub(crate) key_required: bool,
+    #[allow(dead_code)]
     pub(crate) needs_explicit_model: bool,
+    #[allow(dead_code)]
     pub(crate) auto_selectable: bool,
 }
 
@@ -4604,8 +4612,9 @@ mod tests {
 
     /// plan-20260825 PS-01: the ADR-PS-03 a-mode missing-credential message
     /// must be copy-paste executable — the recommended command is the real
-    /// `config set --global` shape, the extinct `config --global add` never
-    /// reappears, command lines are four-space indented, and the ADR-PS-02
+    /// `config set --global` shape, the extinct add-style hint never
+    /// reappears (assembled dynamically below so this file cannot trip the
+    /// zero-hit guard itself), command lines are four-space indented, and the ADR-PS-02
     /// credential-free alternatives (codex / ollama with an explicit model)
     /// are present. No key material beyond the env-var NAME is printed.
     #[test]
@@ -4623,8 +4632,9 @@ mod tests {
             msg.contains("    libra config set --global vault.env.GEMINI_API_KEY <value>"),
             "recommended command must be the executable config set form: {msg}"
         );
+        let extinct = format!("config --global {}", "add");
         assert!(
-            !msg.contains("config --global add"),
+            !msg.contains(&extinct),
             "the nonexistent add subcommand must never reappear: {msg}"
         );
         assert!(

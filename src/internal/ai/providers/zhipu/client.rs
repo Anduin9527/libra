@@ -213,9 +213,34 @@ mod tests {
         let err = Client::from_resolved_env(crate::internal::config::LocalIdentityTarget::None)
             .await
             .expect_err("from_resolved_env must fail without an API key");
+        // plan-20260825 PS-01 (terra R1): pin the ADR-PS-03 a-mode
+        // structure so a regression to the old unexecutable hint, a wrong
+        // lookup chain, lost indentation, or missing credential-free
+        // alternatives turns this test red.
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("ZHIPU_API_KEY"),
-            "error should name the missing key, got: {err}"
+            msg.starts_with("ZHIPU_API_KEY is not configured"),
+            "conclusion line drifted: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "Checked in order: process environment, repo-local vault, global vault"
+            ) && !msg.contains("--env-file"),
+            "chain must reflect resolve_env_for_target (no --env-file layer): {msg}"
+        );
+        assert!(
+            msg.contains("    libra config set --global vault.env.ZHIPU_API_KEY <value>"),
+            "recommended command must be the executable config set form: {msg}"
+        );
+        let extinct = format!("config --global {}", "add");
+        assert!(
+            !msg.contains(&extinct),
+            "the removed subcommand shape must never reappear: {msg}"
+        );
+        assert!(
+            msg.contains("    libra code --provider codex")
+                && msg.contains("    libra code --provider ollama --model <name>"),
+            "credential-free alternatives missing: {msg}"
         );
 
         drop(key_guard);
