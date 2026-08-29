@@ -528,7 +528,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | 已完成 | `libra agent bridge --stdio` 唯一标准入站面；LB-01..LB-07 全部合入，protocol v1 的 20 个 method 自 `v0.21.1` 起全部实现（`v0.21.0` 首发）；不覆盖 MCP/旧工具服务器恢复，TypeScript 侧 `@libra/dsh-bundle` 归兄弟仓 `REL-TS-01` |
 | [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02） | 已排期 | M2 研发历程记忆首个纵向切片（MemoryNote/MemoryEvent、MemoryWriter、FTS5/BM25、`libra memory` 命令面）；实现未开始；不覆盖 MCP 面、向量检索、团队同步与 MEM-03..06 |
 | [`plan-20260822.md`](plan-20260822.md) | A（UP-01） | 已排期 | 客户端与发布 CI 侧（trust table、generation floor、`release.yml`、install 验签）；Backend Workers 侧在 libra-backend 姊妹计划；密钥 ceremony 私钥半边不在本仓库 |
-| [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | 实施中 | 承接 0715 的 DEFER-01/08/10 与 skill activation 残差；按 DF-01..DF-09 处理文档事实源、fix bridge、SSE v2 默认与 v1 删除。DF-08 仍受成功公开 patch release 的 DEP-02 硬前置约束 |
+| [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | 完成（2026-08-30） | 承接 0715 的 DEFER-01/08/10 与 skill activation 残差；DF-01..DF-09 九卡全部 done/complete（文档事实源、fix bridge、SSE v2 默认、skill activation provider 消费、v1 物理删除）；DEP-02 以 v0.21.29 满足，v0.22.0（minor，breaking：仅支持 wire v2）已发布 |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---
