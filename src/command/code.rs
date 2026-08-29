@@ -5351,6 +5351,124 @@ mod tests {
         );
     }
 
+    /// plan-20260825 PS-04 (terra R1): cross-surface pin over a REAL turn.
+    /// Boot the headless runtime, submit one message against the canned
+    /// chat-completions stub, and assert that the banner enum, the UI
+    /// snapshot label, and the usage rows the recorder persisted all carry
+    /// the same effective provider. Run twice:
+    /// - with an `--agent` binding whose provider deliberately disagrees
+    ///   with `args.provider` (possible here because the entry resolution
+    ///   is bypassed) — every face must follow the binding, and
+    /// - without `--agent` — every face must follow `args.provider`.
+    ///
+    /// A regression of ANY face (snapshot, usage, banner) back to a skewed
+    /// source fails one of the two scenarios.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_labels_ui_and_usage_follow_the_effective_provider() {
+        use crate::internal::ai::web::code_ui::CodeUiCommandAdapter as _;
+
+        for with_binding in [true, false] {
+            let (base_url, _captured, server) = start_chat_completions_stub().await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let storage_root = tmp.path().join(".libra");
+            std::fs::create_dir_all(&storage_root).unwrap();
+            let db_path = storage_root.join(crate::utils::util::DATABASE);
+            // Real schema (the same bootstrap `libra init` runs) so the
+            // usage recorder actually persists rows.
+            crate::internal::db::create_database(&db_path.display().to_string())
+                .await
+                .expect("bootstrap storage schema");
+
+            let mut args = base_args();
+            let mut env_file = CodeEnvFile::default();
+            args.api_base = Some(base_url);
+            if with_binding {
+                write_agent_profile(
+                    tmp.path(),
+                    "labeler",
+                    "---\nname: labeler\ndescription: Label probe\ntools: []\n\
+                     model: deepseek/deepseek-chat\n---\nYou label.",
+                );
+                // Deliberate skew: the flag says gemini, the binding says
+                // deepseek — the labels must follow the binding.
+                args.provider = Some(CodeProvider::Gemini);
+                args.agent = Some("labeler".to_string());
+            } else {
+                args.provider = Some(CodeProvider::Deepseek);
+                args.model = Some("deepseek-chat".to_string());
+            }
+            env_file
+                .values
+                .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+
+            let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+            let session_state = SessionState::new(&tmp.path().to_string_lossy());
+            let (runtime, effective_provider) = build_non_codex_headless_runtime(
+                &args,
+                tmp.path(),
+                &env_file,
+                session_store,
+                session_state,
+                false,
+                init_mcp_server(tmp.path()).await,
+            )
+            .await
+            .expect("headless runtime must build")
+            .expect("provider is supported in the headless path");
+
+            assert_eq!(
+                effective_provider,
+                CodeProvider::Deepseek,
+                "banner face (with_binding={with_binding})"
+            );
+            let snapshot = runtime.snapshot().await;
+            assert_eq!(
+                snapshot.provider.provider, "deepseek",
+                "UI snapshot face (with_binding={with_binding})"
+            );
+            assert_eq!(snapshot.provider.model.as_deref(), Some("deepseek-chat"));
+
+            // One real turn: the adapter enqueues, the worker completes
+            // against the stub, and the recorder persists labeled rows.
+            runtime
+                .adapter()
+                .submit_message("hello".to_string())
+                .await
+                .expect("submit message");
+            let recorder = UsageRecorder::new(
+                establish_connection(db_path.to_str().expect("utf8 db path"))
+                    .await
+                    .expect("open usage connection"),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut aggregates = Vec::new();
+            while std::time::Instant::now() < deadline {
+                aggregates = recorder
+                    .query()
+                    .aggregate_by_model()
+                    .await
+                    .expect("aggregate usage rows");
+                if !aggregates.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            assert!(
+                !aggregates.is_empty(),
+                "the turn must record usage rows (with_binding={with_binding})"
+            );
+            for row in &aggregates {
+                assert_eq!(
+                    row.provider, "deepseek",
+                    "usage face must carry the effective provider \
+                     (with_binding={with_binding}): {row:?}"
+                );
+                assert_eq!(row.model, "deepseek-chat", "usage model face: {row:?}");
+            }
+            server.abort();
+        }
+    }
+
     /// plan-20260825 PS-01 (ADR-PS-02): the capability table's
     /// `needs_explicit_model` column must agree with `cli_default_model`'s
     /// error branches — exactly the providers without a default model id
