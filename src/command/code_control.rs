@@ -743,6 +743,22 @@ enum EventStreamOutcome {
     },
 }
 
+/// DF-08: the v1 snapshot wire was deleted in 0.22.0 — an events stream
+/// that emits any legacy envelope event name is a server regression the
+/// automation client must fail on, never forward.
+fn reject_legacy_v1_notification(notification: &Value) -> CliResult<()> {
+    let event = notification["params"]["event"].as_str().unwrap_or_default();
+    if matches!(
+        event,
+        "session_updated" | "status_changed" | "controller_changed"
+    ) {
+        return Err(CliError::fatal(format!(
+            "events.subscribe received removed v1 envelope event '{event}' (SSE wire v1 was deleted in 0.22.0)"
+        )));
+    }
+    Ok(())
+}
+
 fn resync_durable_tail(notification: &Value) -> CliResult<Option<u64>> {
     if notification
         .pointer("/params/event")
@@ -782,6 +798,7 @@ where
             CliError::fatal(format!("failed to read SSE event stream: {error}"))
         })?;
         for notification in parser.push(&chunk) {
+            reject_legacy_v1_notification(&notification)?;
             if let Some(durable_tail) = resync_durable_tail(&notification)? {
                 return Ok(EventStreamOutcome::ResyncRequired {
                     data: notification["params"]["data"].clone(),
@@ -794,6 +811,7 @@ where
         }
     }
     for notification in parser.finish() {
+        reject_legacy_v1_notification(&notification)?;
         if let Some(durable_tail) = resync_durable_tail(&notification)? {
             return Ok(EventStreamOutcome::ResyncRequired {
                 data: notification["params"]["data"].clone(),
@@ -1054,13 +1072,36 @@ mod tests {
     fn sse_parser_emits_json_rpc_notifications() {
         let mut parser = SseParser::default();
 
-        let output = parser
-            .push(b"event: session_updated\ndata: {\"seq\":1,\"type\":\"session_updated\"}\n\n");
+        let output =
+            parser.push(b"event: code_workflow\ndata: {\"cursor\":1,\"kind\":\"status\"}\n\n");
 
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["method"], "events.notification");
-        assert_eq!(output[0]["params"]["event"], "session_updated");
-        assert_eq!(output[0]["params"]["data"]["seq"], 1);
+        assert_eq!(output[0]["params"]["event"], "code_workflow");
+        assert_eq!(output[0]["params"]["data"]["cursor"], 1);
+    }
+
+    /// DF-08: any removed v1 envelope event name on the (v2-only) stream
+    /// must fail the subscription instead of being forwarded.
+    #[test]
+    fn removed_v1_event_names_fail_the_subscription() {
+        for legacy in ["session_updated", "status_changed", "controller_changed"] {
+            let notification = json!({
+                "method": "events.notification",
+                "params": { "event": legacy, "data": {} }
+            });
+            let error = reject_legacy_v1_notification(&notification)
+                .expect_err("legacy event names must be rejected");
+            assert!(
+                error.to_string().contains("deleted in 0.22.0"),
+                "removal guidance expected: {error}"
+            );
+        }
+        let ok = json!({
+            "method": "events.notification",
+            "params": { "event": "code_workflow", "data": {"cursor": 1} }
+        });
+        assert!(reject_legacy_v1_notification(&ok).is_ok());
     }
 
     #[test]

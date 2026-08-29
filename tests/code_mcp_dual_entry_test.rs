@@ -553,10 +553,12 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
 /// pins the reverse direction from the web→MCP case above:
 ///
 ///   1. initialize an MCP client against the runtime's `mcpUrl`;
-///   2. subscribe to web SSE before writing;
-///   3. call MCP `tools/call create_task`;
-///   4. assert the web SSE `session_updated` snapshot contains a
-///      transcript entry for the MCP-created task.
+///   2. call MCP `tools/call create_task`;
+///   3. poll the web `/session` snapshot until it shows a transcript
+///      entry for the MCP-created task (DF-08: out-of-band writes do not
+///      append durable `code_workflow` events, and the v1 SSE snapshot
+///      stream this test used to watch was removed — snapshot fetch is
+///      the v2-era observability contract).
 #[cfg(feature = "test-provider")]
 #[test]
 #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]

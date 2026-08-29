@@ -269,14 +269,14 @@ pub enum Step {
     /// Wave 4 / PR 4 — drain the stream's v2 `code_workflow`
     /// projection deltas (transcript upserts) until either:
     ///
-    ///   * the snapshot contained in the latest event has
-    ///     `status == "idle"` (terminal state), OR
+    ///   * a status projection reported non-idle then idle AND a
+    ///     completed assistant transcript projection was seen, OR
     ///   * `timeoutMs` elapses (whichever comes first).
     ///
     /// Run multi-event assertions on the COLLECTED sequence — e.g.
     /// `assistant_content_monotonic` walks the assistant message
-    /// content across each session_updated and asserts it grows
-    /// monotonically (no truncation, no shrink).
+    /// content across each collected transcript projection and asserts
+    /// it grows monotonically (no truncation, no shrink).
     CollectSessionUpdates {
         name: String,
         stream: String,
@@ -453,8 +453,9 @@ fn default_event_timeout_ms() -> u64 {
     5_000
 }
 
-/// DF-05: compatibility matrices consume durable delta/cursor wire v2 unless
-/// a case explicitly opts into the legacy snapshot wire.
+/// DF-05 defaulted compatibility matrices to the durable delta/cursor wire
+/// v2; DF-08 removed the legacy snapshot wire entirely, so v2 is the only
+/// wire a case may name.
 pub const DEFAULT_SSE_WIRE_VERSION: u8 = 2;
 
 fn default_sse_wire_version() -> u8 {
@@ -1079,12 +1080,11 @@ impl CaseRuntime<'_> {
         // consume the entire test budget without ever reaching
         // the target.
         //
-        // Wave 4 fix: the initial-replay `session_updated` carries
-        // the snapshot at SUBSCRIPTION time (typically idle, empty
-        // transcript). For an assertion like
-        // `event_transcript_contains:<reply>` the first matching
-        // event won't satisfy it — the assistant hasn't streamed
-        // yet. Treat assertion failure as "this isn't the event we
+        // Wave 4 fix (kept for v2): the durable replay's earliest
+        // `code_workflow` frames predate the submitted turn. For an
+        // assertion like `event_transcript_contains:<reply>` the first
+        // matching event won't satisfy it — the assistant hasn't
+        // streamed yet. Treat assertion failure as "this isn't the event we
         // want, keep waiting" and only surface the LAST error on
         // timeout. The rule guarantees we don't silently lose a
         // genuinely failing assertion: if the deadline elapses,
