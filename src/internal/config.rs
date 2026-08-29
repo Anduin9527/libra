@@ -2647,6 +2647,56 @@ mod tests {
             .await
             .expect("miss path");
         assert_eq!(missing, None, "unset name must locate nowhere");
+
+        // Repo-local and global layers, and local-over-global precedence
+        // (PS-06 terra R1: swapping the two labels must turn a test red).
+        let global_conn =
+            crate::internal::db::create_database(db.to_str().expect("utf8 global db path"))
+                .await
+                .expect("create isolated global db");
+        ConfigKv::set_with_conn(
+            &global_conn,
+            &format!("vault.env.{name}"),
+            "from-global",
+            false,
+        )
+        .await
+        .expect("write global vault value");
+        drop(global_conn);
+
+        let located = locate_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("global layer");
+        assert_eq!(
+            located,
+            Some(("from-global".to_string(), EnvHitLayer::GlobalVault)),
+            "global vault hit must carry the GlobalVault label"
+        );
+
+        let local_db = tmp.path().join("isolated-local.db");
+        let local_conn =
+            crate::internal::db::create_database(local_db.to_str().expect("utf8 local db path"))
+                .await
+                .expect("create isolated local db");
+        ConfigKv::set_with_conn(
+            &local_conn,
+            &format!("vault.env.{name}"),
+            "from-local",
+            false,
+        )
+        .await
+        .expect("write local vault value");
+        drop(local_conn);
+
+        let located = locate_env_for_target(name, LocalIdentityTarget::ExplicitDb(&local_db))
+            .await
+            .expect("local layer");
+        assert_eq!(
+            located,
+            Some(("from-local".to_string(), EnvHitLayer::RepoLocalVault)),
+            "repo-local must win over global and carry the RepoLocalVault label"
+        );
+
         unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
     }
 

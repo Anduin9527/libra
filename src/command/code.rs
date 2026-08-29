@@ -777,11 +777,13 @@ pub(crate) struct DetectedCandidate {
     pub(crate) layer: &'static str,
 }
 
-/// Pure PS-06 zero/one/many composition over slots 1-2 plus detection.
-/// `detect` is only invoked when no earlier source decided — the
-/// "explicit means zero probes" contract is load-bearing and pinned by a
-/// unit test. Returns the provider plus the candidate to announce on
-/// stderr when auto-selection happened.
+/// Pure PS-06 zero/one/many composition over slots 1-2 plus detection —
+/// the spec oracle for `provider_detection`: `detect` is only invoked when
+/// no earlier source decided (the "explicit means zero probes" contract),
+/// and the outcome goes through the same `three_state_outcome` the real
+/// entry uses. The entry itself short-circuits structurally (see
+/// `resolve_provider_at_entry`), so production no longer calls this.
+#[cfg(test)]
 fn resolve_provider_with_detection(
     explicit: Option<CodeProvider>,
     binding_provider_id: Option<&str>,
@@ -800,7 +802,16 @@ fn resolve_provider_with_detection(
                  libra code --provider <id> --model <name>",
         ));
     }
-    let mut candidates = detect()?;
+    three_state_outcome(detect()?)
+}
+
+/// Shared PS-06 verdict over a detected candidate set — the single place
+/// where zero/one/many becomes an outcome, used by both the pure
+/// composition above (unit-tested) and the real entry point (which
+/// short-circuits structurally before ever detecting).
+fn three_state_outcome(
+    mut candidates: Vec<DetectedCandidate>,
+) -> CliResult<(CodeProvider, Option<DetectedCandidate>)> {
     candidates.sort_by_key(|c| c.id);
     match candidates.len() {
         0 => Err(CliError::auth(credential_zero_state_message())),
@@ -876,18 +887,31 @@ async fn resolve_provider_at_entry(
     working_dir: &std::path::Path,
 ) -> CliResult<()> {
     let binding = resolve_agent_binding_override(args, working_dir)?;
-    // The env file participates in detection as its own layer, mirroring the
-    // provider_env_value_with_lookup chain the factory uses later.
-    let env_file = load_code_env_file(args.env_file.as_deref())?;
-    let candidates = detect_provider_candidates(&env_file).await?;
-    let model_without_provider =
-        args.model.is_some() && args.provider.is_none() && binding.is_none();
-    let (resolved, auto) = resolve_provider_with_detection(
+    // Slots 1-2 short-circuit BEFORE any env-file read or credential probe:
+    // the explicit-means-zero-probes contract is structural here, not only
+    // unit-tested (PS-06 terra R1).
+    if let Some(decided) = resolve_provider_from_sources(
         args.provider,
         binding.as_ref().map(|b| b.provider_id.as_str()),
-        model_without_provider,
-        || Ok(candidates),
-    )?;
+    )? {
+        args.provider = Some(decided);
+        return Ok(());
+    }
+    // The --model pairing guard also precedes env-file IO and detection.
+    if args.model.is_some() {
+        return Err(CliError::command_usage(
+            "--model without --provider is ambiguous: a model id cannot pick \
+             its provider, and credential detection cannot infer the pairing.\n\
+             \n\
+             Pass the pair explicitly:\n\
+                 libra code --provider <id> --model <name>",
+        ));
+    }
+    // Only now: the env file participates in detection as its own layer,
+    // mirroring the provider_env_value_with_lookup chain the factory uses.
+    let env_file = load_code_env_file(args.env_file.as_deref())?;
+    let candidates = detect_provider_candidates(&env_file).await?;
+    let (resolved, auto) = three_state_outcome(candidates)?;
     if let Some(candidate) = auto {
         eprintln!(
             "provider '{}' auto-selected: {} found in {}",

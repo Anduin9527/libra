@@ -194,3 +194,121 @@ fn one_candidate_auto_selects_announcing_on_stderr_only() {
         let _ = child.kill();
     }
 }
+
+#[test]
+fn model_without_provider_is_rejected_before_env_file_io() {
+    // PS-06 terra R1: the pairing guard must precede env-file reading —
+    // pointing --env-file at a DIRECTORY would IO-error if the file were
+    // read first, so a 129 usage error here proves the ordering.
+    let repo = init_repo();
+    let out = base_command(&repo.home, &repo.global_db)
+        .args([
+            "code",
+            "--model",
+            "arbitrary-model",
+            "--env-file",
+            ".",
+            "--port",
+            "0",
+            "--mcp-port",
+            "0",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .expect("run model-without-provider probe");
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "pairing guard must fire before env-file IO; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--model without --provider"),
+        "pairing message missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("env-file") || !stderr.contains("LBR-IO-001"),
+        "env-file IO must not have been attempted: {stderr}"
+    );
+}
+
+#[test]
+fn explicit_provider_skips_detection_probes() {
+    // PS-06 terra R1: with LIBRA_CONFIG_GLOBAL_DB poisoned (a directory),
+    // any detection probe would fail loudly with "credential detection
+    // failed"; an explicit --provider must therefore never mention it and
+    // instead reach the provider's own missing-key a-mode error.
+    let repo = init_repo();
+    let poisoned = repo.home.join("poisoned-db-dir");
+    std::fs::create_dir_all(&poisoned).expect("poisoned dir");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args([
+            "code",
+            "--provider",
+            "gemini",
+            "--port",
+            "0",
+            "--mcp-port",
+            "0",
+        ])
+        .current_dir(&repo.root)
+        .env("LIBRA_CONFIG_GLOBAL_DB", &poisoned)
+        .output()
+        .expect("run explicit-provider probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("credential detection failed"),
+        "explicit --provider must not run detection probes: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "explicit gemini without a key lands on its own auth error: {stderr}"
+    );
+    assert!(
+        stderr.contains("GEMINI_API_KEY is not configured for provider 'gemini'"),
+        "the provider-specific a-mode error is expected: {stderr}"
+    );
+}
+
+#[test]
+fn many_candidates_report_the_global_vault_layer() {
+    // PS-06 terra R1: the repo/global layer labels are user-facing — cover
+    // the global-vault label end to end by storing one key in the isolated
+    // global DB and one in the process environment.
+    let repo = init_repo();
+    let set = base_command(&repo.home, &repo.global_db)
+        .args([
+            "config",
+            "set",
+            "--global",
+            "vault.env.ZHIPU_API_KEY",
+            "layer-probe-zhipu",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .expect("store global vault key");
+    assert!(
+        set.status.success(),
+        "config set --global failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .env("DEEPSEEK_API_KEY", "probe-deepseek")
+        .output()
+        .expect("run mixed-layer probe");
+    assert_eq!(out.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("    deepseek  (DEEPSEEK_API_KEY in process environment)")
+            && stderr.contains("    zhipu  (ZHIPU_API_KEY in global vault)"),
+        "layer labels must distinguish the sources: {stderr}"
+    );
+    assert!(
+        !stderr.contains("layer-probe-zhipu") && !stderr.contains("probe-deepseek"),
+        "values must never leak: {stderr}"
+    );
+}
