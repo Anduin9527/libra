@@ -6665,7 +6665,9 @@ no_cache_unknown_network = true
                 "expected {expected_env} in missing-key error for {provider:?}, got: {msg}"
             );
             assert!(
-                msg.contains("is not set") || msg.contains("is required"),
+                msg.contains("is not configured")
+                    || msg.contains("is not set")
+                    || msg.contains("is required"),
                 "missing-key error should be readable and actionable for {provider:?}, got: {msg}"
             );
             // C3 criterion: the error must also explain HOW to configure the
