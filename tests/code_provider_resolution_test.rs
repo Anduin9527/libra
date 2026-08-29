@@ -459,3 +459,59 @@ fn empty_string_keys_are_not_configured() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn empty_upper_layer_falls_through_to_lower_layer() {
+    // PS-06 terra R5: an empty upper-layer value must not shadow a usable
+    // key beneath it — the empty process env falls through to the
+    // repo-local vault (and detection and the real boot agree).
+    let repo = init_repo();
+    let st = base_command(&repo.home, &repo.global_db)
+        .args(["config", "set", "vault.env.GEMINI_API_KEY", "vault-probe"])
+        .current_dir(&repo.root)
+        .status()
+        .expect("store repo-local key");
+    assert!(st.success());
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .env("GEMINI_API_KEY", "")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        stderr.contains("provider 'gemini' auto-selected") && stderr.contains("repo-local vault"),
+        "empty process env must fall through to the repo-local vault: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is not configured"),
+        "the boot must agree with detection (no missing-key error): {stderr}"
+    );
+
+    // And the mirrored case: empty --env-file value, non-empty process env —
+    // one coherent launch from the process-environment layer.
+    let env_file = repo.root.join("empty2.env");
+    std::fs::write(&env_file, "GEMINI_API_KEY=\n").expect("write env file");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--env-file"])
+        .arg(&env_file)
+        .args(["--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .env("GEMINI_API_KEY", "proc-probe")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        stderr.contains("provider 'gemini' auto-selected")
+            && stderr.contains("process environment"),
+        "empty env-file value must fall through to the process env: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is not configured"),
+        "boot and detection must use the same source: {stderr}"
+    );
+    assert!(
+        !stderr.contains("vault-probe") && !stderr.contains("proc-probe"),
+        "values must never leak: {stderr}"
+    );
+}

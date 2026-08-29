@@ -1863,8 +1863,12 @@ fn provider_env_value_with_lookup(
     key: &str,
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> Option<String> {
+    // Empty env-file values are a MISS that falls through to the lookup
+    // chain (terra R5) — returning them early would diverge from detection
+    // and from the per-source rule in locate_env_for_target.
     env_file
         .get(key)
+        .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .or_else(|| lookup(key))
 }

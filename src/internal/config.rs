@@ -1097,7 +1097,9 @@ pub async fn resolve_env(name: &str) -> Result<Option<String>> {
 /// Prefer the async [`resolve_env`] when the caller is already inside an
 /// async context — that avoids the per-call thread spawn.
 pub fn resolve_env_sync(name: &str) -> anyhow::Result<Option<String>> {
-    if let Ok(val) = std::env::var(name) {
+    if let Ok(val) = std::env::var(name)
+        && !val.trim().is_empty()
+    {
         return Ok(Some(val));
     }
 
@@ -1133,7 +1135,9 @@ pub fn resolve_env_sync_for_dir(
     name: &str,
     dir: &std::path::Path,
 ) -> anyhow::Result<Option<String>> {
-    if let Ok(val) = std::env::var(name) {
+    if let Ok(val) = std::env::var(name)
+        && !val.trim().is_empty()
+    {
         return Ok(Some(val));
     }
     let local_db = crate::utils::util::try_get_storage_path(Some(dir.to_path_buf()))
@@ -1216,21 +1220,30 @@ pub async fn locate_env_for_target(
     name: &str,
     local_target: LocalIdentityTarget<'_>,
 ) -> Result<Option<(String, EnvHitLayer)>> {
+    // An empty value can never authenticate: every source treats it as a
+    // MISS and falls through to the next layer (plan-20260825 PS-06 terra
+    // R5) — filtering only the final result would hide a usable key in a
+    // lower layer behind an empty upper one.
     // 1. System environment variable — per-process override (12-Factor)
-    if let Ok(val) = std::env::var(name) {
+    if let Ok(val) = std::env::var(name)
+        && !val.trim().is_empty()
+    {
         return Ok(Some((val, EnvHitLayer::ProcessEnvironment)));
     }
 
     let vault_key = format!("vault.env.{name}");
 
     // 2. Local config (vault.env.*)
-    if let Some(value) = local_env_value_for_target(local_target, &vault_key).await? {
+    if let Some(value) = local_env_value_for_target(local_target, &vault_key).await?
+        && !value.trim().is_empty()
+    {
         return Ok(Some((value, EnvHitLayer::RepoLocalVault)));
     }
 
     // 3. Global config — lowest priority
     Ok(global_env_value(name, &vault_key)
         .await?
+        .filter(|value| !value.trim().is_empty())
         .map(|value| (value, EnvHitLayer::GlobalVault)))
 }
 
