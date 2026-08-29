@@ -5736,6 +5736,135 @@ mod tests {
         server.abort();
     }
 
+    /// plan-20260824 DF-07 (terra R4): admission + `commandId` idempotent
+    /// retry through the real headless runtime. The durable identity is
+    /// the raw text (the activation block rides execution-only provider
+    /// context), so resending the exact `{text, commandId}` after the
+    /// composed turn completed must acknowledge idempotently — never a
+    /// payload conflict, never a second provider execution.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skill_activation_admission_command_retry_is_idempotent() {
+        let (base_url, captured, server) = start_chat_completions_stub().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        crate::internal::db::create_database(
+            &storage_root
+                .join(crate::utils::util::DATABASE)
+                .display()
+                .to_string(),
+        )
+        .await
+        .expect("bootstrap storage schema");
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        args.model = Some("deepseek-chat".to_string());
+        args.api_base = Some(base_url);
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+        let (runtime, _effective) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &env_file,
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("headless runtime must build")
+        .expect("deepseek is supported in the headless path");
+
+        runtime
+            .adapter()
+            .activate_skill("claude-code", "/review")
+            .await
+            .expect("activate /review");
+        runtime
+            .adapter()
+            .submit_message_with_command_id("please review x".to_string(), Some("c1".to_string()))
+            .await
+            .expect("submit c1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let first_count = loop {
+            let bodies = captured.lock().await;
+            let matching = bodies
+                .iter()
+                .filter(|body| body.to_string().contains("please review x"))
+                .count();
+            if matching > 0
+                && bodies
+                    .iter()
+                    .any(|body| body.to_string().contains("[skill activation]"))
+            {
+                break bodies.len();
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the composed c1 turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+
+        // Resend the exact same {text, commandId} until the turn settles.
+        // The invariant under test: the durable comparison happens on the
+        // RAW text, so a retry is answered by the command-status contract
+        // (Ok while pending/succeeded, COMMAND_ALREADY_TERMINAL once the
+        // canned-stub turn lands failed) — NEVER a payload conflict, which
+        // is what leaking the composed input into the identity produced.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match runtime
+                .adapter()
+                .submit_message_with_command_id(
+                    "please review x".to_string(),
+                    Some("c1".to_string()),
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        !message.to_lowercase().contains("payload"),
+                        "the raw-identity retry must never be a payload conflict: {message}"
+                    );
+                    if message.contains("COMMAND_ALREADY_TERMINAL") {
+                        // Terminal answer from the durable status contract —
+                        // exactly the raw-identity match this test pins.
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "retry never acknowledged: {message}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let bodies = captured.lock().await;
+        let review_requests = bodies
+            .iter()
+            .filter(|body| body.to_string().contains("please review x"))
+            .count();
+        let first_review_requests = bodies[..first_count]
+            .iter()
+            .filter(|body| body.to_string().contains("please review x"))
+            .count();
+        assert_eq!(
+            review_requests, first_review_requests,
+            "retries must not re-execute the provider turn"
+        );
+        server.abort();
+    }
+
     /// plan-20260824 DF-07 (terra R2): a durable-persistence failure after
     /// admission (the provider is guaranteed not to start) must NOT spend
     /// the pending activation — the next successful plain turn still

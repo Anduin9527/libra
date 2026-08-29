@@ -4939,15 +4939,15 @@ mod cex_00_5 {
     }
 }
 
-/// plan-20260824 DF-07 (terra R2): direct durable-command coverage. With
-/// activations composed at the direct submit seam, every durable command
-/// keeps its own `(commandId, rawText) → composed payload` retry entry:
-/// a later composed command (`cmd-2`) must not evict `cmd-1`'s payload, a
-/// `cmd-1` retry must never degrade to the raw text (which would trip the
-/// worker's payload comparison), and a terminal idempotent retry resolves
-/// as success — the provider never re-executes the turn.
+/// plan-20260824 DF-07 (terra R2/R4): direct durable-command coverage on
+/// the raw-identity contract. The activation block rides
+/// `TurnRequest::provider_context` (merged only at the executor handoff),
+/// so the durable hash is always the raw text: a command submitted BEFORE
+/// an activation stays idempotent when retried AFTER it (the R4 repro), a
+/// composed command's own retry is equally idempotent, and neither retry
+/// re-executes or loses the pending activation.
 #[tokio::test(flavor = "multi_thread")]
-async fn skill_activation_direct_durable_retry_reuses_composed_payload() {
+async fn skill_activation_direct_durable_retry_is_idempotent_on_raw_identity() {
     use std::sync::Arc;
 
     use libra::internal::ai::{
@@ -5029,13 +5029,33 @@ async fn skill_activation_direct_durable_retry_reuses_composed_payload() {
         Some(RuntimeCommandDurability::new(store)),
     );
 
-    // cmd-1 with activation A.
-    adapter
-        .activate_skill("claude-code", "/review")
-        .await
-        .expect("activate /review");
-    adapter
-        .submit_message_with_command_id("first message".to_string(), Some("cmd-1".to_string()))
+    let submit_with_retry_on_busy = |text: &'static str, command: &'static str| {
+        let adapter = adapter.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match adapter
+                    .submit_message_with_command_id(text.to_string(), Some(command.to_string()))
+                    .await
+                {
+                    Ok(()) => break Ok(()),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if message.contains("already active")
+                            && std::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        break Err(error);
+                    }
+                }
+            }
+        }
+    };
+
+    // cmd-1 BEFORE any activation: the executor sees the raw text.
+    submit_with_retry_on_busy("plain message", "cmd-1")
         .await
         .expect("submit cmd-1");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -5043,73 +5063,51 @@ async fn skill_activation_direct_durable_retry_reuses_composed_payload() {
         assert!(std::time::Instant::now() < deadline, "cmd-1 must execute");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let first_payload = inputs.lock().await[0].clone();
-    assert!(
-        first_payload.contains("[skill activation]") && first_payload.contains("'/review'"),
-        "cmd-1 must carry activation A: {first_payload}"
+    assert_eq!(inputs.lock().await[0], "plain message");
+
+    // Activate, then retry cmd-1 with the SAME raw text (the R4 repro):
+    // raw identity matches the durable record, so the retry acknowledges
+    // idempotently — no payload conflict, no re-execution.
+    adapter
+        .activate_skill("claude-code", "/review")
+        .await
+        .expect("activate /review");
+    submit_with_retry_on_busy("plain message", "cmd-1")
+        .await
+        .expect("cmd-1 retry after activation must stay idempotent");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        inputs.lock().await.len(),
+        1,
+        "the idempotent retry must not re-execute"
     );
 
-    // cmd-2 with activation B (retried past the active-turn window).
-    adapter
-        .activate_skill("claude-code", "/simplify")
+    // The activation survived the acknowledged retry and rides the next
+    // fresh plain turn as execution-only context appended to the raw text.
+    submit_with_retry_on_busy("next task", "cmd-2")
         .await
-        .expect("activate /simplify");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        match adapter
-            .submit_message_with_command_id("second message".to_string(), Some("cmd-2".to_string()))
-            .await
-        {
-            Ok(()) => break,
-            Err(_) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("cmd-2 never admitted: {error}"),
-        }
-    }
+        .expect("submit cmd-2");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while inputs.lock().await.len() < 2 {
         assert!(std::time::Instant::now() < deadline, "cmd-2 must execute");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let second_payload = inputs.lock().await[1].clone();
+    let composed = inputs.lock().await[1].clone();
     assert!(
-        second_payload.contains("'/simplify'") && !second_payload.contains("'/review'"),
-        "cmd-2 must carry only activation B: {second_payload}"
+        composed.starts_with("next task") && composed.contains("'/review'"),
+        "the provider input is raw text plus the activation block: {composed}"
     );
 
-    // cmd-1 terminal retry: must resolve Ok, must never send the raw text,
-    // and must not re-execute with a different payload.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let retry = loop {
-        match adapter
-            .submit_message_with_command_id("first message".to_string(), Some("cmd-1".to_string()))
-            .await
-        {
-            Ok(()) => break Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                if message.contains("already active") && std::time::Instant::now() < deadline {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
-                }
-                break Err(error);
-            }
-        }
-    };
-    retry.expect("a terminal idempotent cmd-1 retry must acknowledge as success");
-    // Give a (wrong) re-execution a moment to surface, then assert payloads.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let all = inputs.lock().await.clone();
-    for extra in all.iter().skip(2) {
-        assert_eq!(
-            extra, &first_payload,
-            "a cmd-1 re-execution may only ever see cmd-1's composed payload"
-        );
-    }
-    assert!(
-        all.iter().skip(2).all(|extra| extra != "first message"),
-        "the raw text must never reach the provider on retry: {all:?}"
+    // A composed command's own retry is idempotent on the same raw
+    // identity — again no conflict and no re-execution.
+    submit_with_retry_on_busy("next task", "cmd-2")
+        .await
+        .expect("composed cmd-2 retry must stay idempotent");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        inputs.lock().await.len(),
+        2,
+        "the composed command retry must not re-execute"
     );
     worker.abort();
 }

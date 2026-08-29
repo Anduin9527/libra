@@ -632,7 +632,7 @@ impl WebCodeUiAdmission {
     /// recovery is safe: the outer slot only holds a binding pointer.
     async fn restore_composed_skills(
         &self,
-        composed: Option<super::agent_runtime_adapter::ComposedProviderInput>,
+        composed: Option<super::agent_runtime_adapter::ComposedSkillContext>,
     ) {
         let Some(composed) = composed else { return };
         let bound = self
@@ -989,27 +989,26 @@ impl WebCodeUiAdmission {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             match bound {
-                Some(pending) => Some(pending.lock().await.compose(
-                    &text,
-                    browser_command_id_supplied.then_some(runtime_turn_id.as_str()),
-                )),
+                Some(pending) => pending.lock().await.compose_context(&text),
                 None => None,
             }
         } else {
             None
         };
-        let provider_input = composed_skills
-            .as_ref()
-            .map(|composed| composed.input.clone())
-            .unwrap_or_else(|| text.clone());
-        let submission = runtime
-            .submit(TurnRequest::new(
-                self.runtime_session_id.clone(),
-                runtime_turn_id.clone(),
-                provider_input,
-                true,
-            ))
-            .await;
+        // The raw text is the turn's durable identity (the worker hashes
+        // it); the activation block rides as execution-only provider
+        // context, so identical `(commandId, raw text)` retries stay
+        // idempotent no matter what context either attempt carried.
+        let mut turn_request = TurnRequest::new(
+            self.runtime_session_id.clone(),
+            runtime_turn_id.clone(),
+            text.clone(),
+            true,
+        );
+        if let Some(composed) = composed_skills.as_ref() {
+            turn_request = turn_request.with_provider_context(composed.context.clone());
+        }
+        let submission = runtime.submit(turn_request).await;
         if let Err(error) = submission {
             self.restore_composed_skills(composed_skills.take()).await;
             *slot = None;

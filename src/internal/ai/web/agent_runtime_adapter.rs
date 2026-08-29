@@ -81,81 +81,40 @@ pub struct AgentRuntimeCodeUiAdapter {
     pending_skills: Arc<Mutex<PendingSkillContext>>,
 }
 
-/// DF-07: session-scoped pending skill activations plus the most recent
-/// composed turn, kept so a durable `commandId` retry recomposes the exact
-/// same provider payload instead of tripping payload-conflict guards.
-///
-/// Consumption happens only at the definitive provider-turn seam (right
-/// before `runtime.submit`, after every admission/routing guard), so
-/// revision notes, control messages, and rejected submissions never spend
-/// or leak an activation. The composed context rides ONLY the
-/// provider-facing turn input — durable intents, transcripts, and retry
-/// identity all keep the raw user text.
+/// DF-07: session-scoped pending skill activations. Consumption happens
+/// only at the definitive provider-turn seam (right before
+/// `runtime.submit`, after every admission/routing guard); the composed
+/// block travels as [`TurnRequest::provider_context`] — execution-only —
+/// so raw text remains the sole durable/retry identity everywhere (terra
+/// R4: no payload cache is needed for idempotency, and a retry with the
+/// same raw text is idempotent no matter what context either attempt
+/// carried). Failed pre-provider exits restore the consumed set.
 #[derive(Default)]
 pub(crate) struct PendingSkillContext {
     /// `(provider, name)` in activation order, deduplicated.
     active: Vec<(String, String)>,
-    /// Bounded `(commandId, rawText) → composed input` store so EVERY
-    /// durable command's retry recomposes its own payload (a single slot
-    /// would let a later command evict an earlier one — terra R2).
-    composed_retries: std::collections::VecDeque<ComposedSkillTurn>,
 }
 
-/// Bound for [`PendingSkillContext::composed_retries`] — matches the
-/// admission layer's admitted-command-input retention scale.
-const COMPOSED_RETRY_LIMIT: usize = 64;
-
-struct ComposedSkillTurn {
-    command_id: String,
-    raw_text: String,
-    input: String,
-}
-
-/// One provider-turn composition: the input to submit plus what to give
-/// back via [`PendingSkillContext::restore`] when the submission fails.
-pub(crate) struct ComposedProviderInput {
-    pub(crate) input: String,
+/// One provider-turn context composition: the execution-only context block
+/// plus what [`PendingSkillContext::restore`] gives back when the
+/// submission fails before the provider runs.
+pub(crate) struct ComposedSkillContext {
+    pub(crate) context: String,
     consumed: Vec<(String, String)>,
-    /// The exact `(commandId, rawText)` retry entry this composition
-    /// minted, if any — restore removes only this tuple, never the same
-    /// command's other payloads (terra R3).
-    retry_key: Option<(String, String)>,
 }
 
 impl PendingSkillContext {
-    /// Compose the provider-facing input for an admitted plain turn.
-    /// Slash/empty text passes through untouched (callers already route
-    /// those away from this seam; this is defense in depth). A repeated
-    /// `command_id` + raw text reuses the previously composed input
-    /// verbatim so durable retries stay payload-stable.
-    pub(crate) fn compose(
-        &mut self,
-        text: &str,
-        command_id: Option<&str>,
-    ) -> ComposedProviderInput {
-        if let Some(command_id) = command_id
-            && let Some(prior) = self
-                .composed_retries
-                .iter()
-                .find(|entry| entry.command_id == command_id && entry.raw_text == text)
-        {
-            return ComposedProviderInput {
-                input: prior.input.clone(),
-                consumed: Vec::new(),
-                retry_key: None,
-            };
-        }
+    /// Compose the execution-only activation context for an admitted plain
+    /// turn, consuming the active set. Returns `None` — and consumes
+    /// nothing — when there is nothing pending or the text is slash/empty
+    /// (callers already route those away from this seam; this is defense
+    /// in depth).
+    pub(crate) fn compose_context(&mut self, text: &str) -> Option<ComposedSkillContext> {
         let trimmed = text.trim();
         if self.active.is_empty() || trimmed.is_empty() || trimmed.starts_with('/') {
-            return ComposedProviderInput {
-                input: text.to_string(),
-                consumed: Vec::new(),
-                retry_key: None,
-            };
+            return None;
         }
         let mut lines = vec![
-            text.to_string(),
-            String::new(),
             "[skill activation] The operator activated these provider skills for this \
              session; consume them on this turn when relevant. Tool permissions are \
              unchanged by activation:"
@@ -164,34 +123,16 @@ impl PendingSkillContext {
         for (provider, name) in &self.active {
             lines.push(format!("- '{name}' ({provider})"));
         }
-        let input = lines.join("\n");
         let consumed = std::mem::take(&mut self.active);
-        let retry_key = command_id.map(|command_id| {
-            self.composed_retries.push_back(ComposedSkillTurn {
-                command_id: command_id.to_string(),
-                raw_text: text.to_string(),
-                input: input.clone(),
-            });
-            while self.composed_retries.len() > COMPOSED_RETRY_LIMIT {
-                self.composed_retries.pop_front();
-            }
-            (command_id.to_string(), text.to_string())
-        });
-        ComposedProviderInput {
-            input,
+        Some(ComposedSkillContext {
+            context: lines.join("\n"),
             consumed,
-            retry_key,
-        }
+        })
     }
 
     /// Give a failed submission's consumed activations back (in front, so
-    /// activation order is preserved) and drop a retry key minted for the
-    /// failed attempt.
-    pub(crate) fn restore(&mut self, outcome: ComposedProviderInput) {
-        if let Some((command_id, raw_text)) = outcome.retry_key.as_ref() {
-            self.composed_retries
-                .retain(|entry| !(entry.command_id == *command_id && entry.raw_text == *raw_text));
-        }
+    /// activation order is preserved).
+    pub(crate) fn restore(&mut self, outcome: ComposedSkillContext) {
         if !outcome.consumed.is_empty() {
             let mut restored = outcome.consumed;
             restored.extend(std::mem::take(&mut self.active));
@@ -446,7 +387,6 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
         if text.trim().is_empty() {
             return Err(anyhow!("Empty messages are not accepted by libra code"));
         }
-        let command_id_for_skills = command_id.clone();
         let turn_id = self.turn_id(command_id)?;
         {
             let mut active_turn = self.active_turn.lock().await;
@@ -487,24 +427,23 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
             }
         };
         // DF-07: definitive provider-turn seam for the direct path — every
-        // guard passed and the slot is reserved, so composing (and thereby
-        // consuming) here means a rejected submission can restore.
-        let composed = self
-            .pending_skills
-            .lock()
-            .await
-            .compose(&text, command_id_for_skills.as_deref());
-        if let Err(error) = self
-            .runtime
-            .submit(TurnRequest::new(
-                self.runtime_session_id.clone(),
-                turn_id.clone(),
-                composed.input.clone(),
-                true,
-            ))
-            .await
-        {
-            self.pending_skills.lock().await.restore(composed);
+        // guard passed and the slot is reserved. The raw text is the turn's
+        // durable identity; the activation block rides as execution-only
+        // provider context, and a rejected submission restores it.
+        let composed = self.pending_skills.lock().await.compose_context(&text);
+        let mut turn_request = TurnRequest::new(
+            self.runtime_session_id.clone(),
+            turn_id.clone(),
+            text.clone(),
+            true,
+        );
+        if let Some(composed) = composed.as_ref() {
+            turn_request = turn_request.with_provider_context(composed.context.clone());
+        }
+        if let Err(error) = self.runtime.submit(turn_request).await {
+            if let Some(composed) = composed {
+                self.pending_skills.lock().await.restore(composed);
+            }
             self.rollback_active_turn(&turn_id).await;
             // A terminal idempotent retry of a succeeded command is an
             // acknowledgement, not a failure (terra R2); the consumed
@@ -667,9 +606,11 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
 mod tests {
     use super::PendingSkillContext;
 
-    /// DF-07: plain turns compose+consume at the submit seam, slash/empty
-    /// text passes through (defense in depth — routing already keeps those
-    /// away), and duplicates hold one slot.
+    /// DF-07: plain turns compose+consume the context block at the submit
+    /// seam, slash/empty text passes through (defense in depth — routing
+    /// already keeps those away), and duplicates hold one slot. The block
+    /// never contains the user text: it rides `TurnRequest::provider_context`
+    /// while the raw text stays the durable identity.
     #[test]
     fn pending_skill_context_composes_only_plain_text() {
         let mut ctx = PendingSkillContext::default();
@@ -677,37 +618,39 @@ mod tests {
         assert_eq!(ctx.record("claude-code", "/review"), 1, "dedup");
         assert_eq!(ctx.record("codex", "/plan"), 2);
 
-        assert_eq!(ctx.compose("/help", None).input, "/help");
-        assert_eq!(ctx.compose("   ", None).input, "   ");
+        assert!(ctx.compose_context("/help").is_none());
+        assert!(ctx.compose_context("   ").is_none());
         assert_eq!(ctx.active.len(), 2, "still pending after control text");
 
-        let composed = ctx.compose("review my diff", None);
-        assert!(composed.input.starts_with("review my diff"));
+        let composed = ctx
+            .compose_context("review my diff")
+            .expect("plain text composes");
         assert!(
-            composed.input.contains("[skill activation]")
-                && composed.input.contains("- '/review' (claude-code)")
-                && composed.input.contains("- '/plan' (codex)"),
-            "activation context must ride the plain turn: {}",
-            composed.input
+            composed.context.contains("[skill activation]")
+                && composed.context.contains("- '/review' (claude-code)")
+                && composed.context.contains("- '/plan' (codex)"),
+            "activation block must list the consumed set: {}",
+            composed.context
+        );
+        assert!(
+            !composed.context.contains("review my diff"),
+            "the block is context-only; raw text stays the identity"
         );
         assert!(ctx.active.is_empty(), "consumed at the seam");
-        assert_eq!(
-            ctx.compose("next message", None).input,
-            "next message",
+        assert!(
+            ctx.compose_context("next message").is_none(),
             "a later turn must not re-inject"
         );
     }
 
-    /// DF-07 (terra R1): a failed submission restores the consumed set (in
-    /// order) and drops a retry key minted for the failed attempt, so the
-    /// next successful plain turn still carries the activation.
+    /// DF-07 (terra R1/R3): a failed submission restores the consumed set
+    /// in order, and the next successful plain turn still carries it.
     #[test]
     fn pending_skill_context_restores_on_failed_submission() {
         let mut ctx = PendingSkillContext::default();
         ctx.record("claude-code", "/review");
         ctx.record("codex", "/plan");
-        let composed = ctx.compose("do it", Some("cmd-1"));
-        assert!(composed.input.contains("[skill activation]"));
+        let composed = ctx.compose_context("do it").expect("composes");
         assert!(ctx.active.is_empty());
 
         ctx.restore(composed);
@@ -719,99 +662,10 @@ mod tests {
             ],
             "restore must reinstate the consumed set in order"
         );
+        let retried = ctx.compose_context("do it").expect("recomposes");
         assert!(
-            ctx.composed_retries.is_empty(),
-            "the failed attempt's retry entry must be dropped"
-        );
-        let retried = ctx.compose("do it", Some("cmd-1"));
-        assert!(
-            retried.input.contains("[skill activation]"),
-            "the next successful attempt still carries the activation"
-        );
-    }
-
-    /// DF-07 (terra R2): the retry store is a bounded map — EVERY durable
-    /// command keeps its own `(commandId, rawText) → payload` entry, so a
-    /// later composed command cannot evict an earlier one's retry payload.
-    #[test]
-    fn pending_skill_context_recomposes_for_command_id_retries() {
-        let mut ctx = PendingSkillContext::default();
-        ctx.record("claude-code", "/review");
-        let first = ctx.compose("first message", Some("cmd-1"));
-        assert!(first.input.contains("'/review'"));
-
-        // A second composed command lands its own entry…
-        ctx.record("codex", "/plan");
-        let second = ctx.compose("second message", Some("cmd-2"));
-        assert!(second.input.contains("'/plan'") && !second.input.contains("'/review'"));
-
-        // …and the earlier command's retry still reuses ITS payload.
-        let retry_first = ctx.compose("first message", Some("cmd-1"));
-        assert_eq!(
-            first.input, retry_first.input,
-            "cmd-1 retry must survive cmd-2"
-        );
-        assert!(retry_first.consumed.is_empty(), "a reuse consumes nothing");
-        let retry_second = ctx.compose("second message", Some("cmd-2"));
-        assert_eq!(second.input, retry_second.input);
-
-        // Different text under a known id is a fresh (passthrough) compose.
-        assert_eq!(ctx.compose("other", Some("cmd-3")).input, "other");
-    }
-
-    /// DF-07 (terra R3): a failed attempt under an already-used commandId
-    /// with DIFFERENT text must only remove ITS OWN `(commandId, rawText)`
-    /// entry — the original request's retry payload survives and keeps
-    /// reusing the original composition.
-    #[test]
-    fn pending_skill_context_restore_keeps_other_payloads_of_the_same_command() {
-        let mut ctx = PendingSkillContext::default();
-        ctx.record("claude-code", "/review");
-        let original = ctx.compose("text A", Some("cmd-1"));
-        assert!(original.input.contains("'/review'"));
-
-        // Same command id, different raw text (a payload-conflict attempt
-        // in flight): it mints its own entry consuming activation B…
-        ctx.record("codex", "/review");
-        let conflicting = ctx.compose("text B", Some("cmd-1"));
-        assert!(conflicting.input.contains("(codex)"));
-
-        // …and its failure cleanup must not touch (cmd-1, "text A").
-        ctx.restore(conflicting);
-        assert_eq!(
-            ctx.active,
-            vec![("codex".to_string(), "/review".to_string())],
-            "only the failed attempt's consumed set comes back"
-        );
-        let retry = ctx.compose("text A", Some("cmd-1"));
-        assert_eq!(
-            retry.input, original.input,
-            "the original request's retry payload must survive the cleanup"
-        );
-        assert!(retry.consumed.is_empty());
-    }
-
-    /// DF-07 (terra R2): the retry store is bounded — the oldest entry
-    /// falls out past the cap and only that entry loses reuse.
-    #[test]
-    fn pending_skill_context_retry_store_is_bounded() {
-        let mut ctx = PendingSkillContext::default();
-        for index in 0..=super::COMPOSED_RETRY_LIMIT {
-            ctx.record("claude-code", "/review");
-            let _ = ctx.compose(&format!("message {index}"), Some(&format!("cmd-{index}")));
-        }
-        assert_eq!(ctx.composed_retries.len(), super::COMPOSED_RETRY_LIMIT);
-        assert!(
-            !ctx.composed_retries
-                .iter()
-                .any(|entry| entry.command_id == "cmd-0"),
-            "the oldest entry must be evicted"
-        );
-        assert!(
-            ctx.composed_retries
-                .iter()
-                .any(|entry| entry.command_id == format!("cmd-{}", super::COMPOSED_RETRY_LIMIT)),
-            "the newest entry must be retained"
+            retried.context.contains("'/review'") && retried.context.contains("'/plan'"),
+            "the next successful attempt still carries the activations"
         );
     }
 }
