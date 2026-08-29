@@ -579,11 +579,11 @@ mod tests {
 
     #[test]
     fn parses_single_event_block() {
-        let body = "event: status_changed\ndata: {\"status\":\"thinking\"}\n\n";
+        let body = "event: code_workflow\ndata: {\"cursor\":1,\"kind\":\"status\"}\n\n";
         let events = events_only(drive(body));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event, "status_changed");
-        assert_eq!(events[0].data, "{\"status\":\"thinking\"}");
+        assert_eq!(events[0].event, "code_workflow");
+        assert_eq!(events[0].data, "{\"cursor\":1,\"kind\":\"status\"}");
     }
 
     #[test]

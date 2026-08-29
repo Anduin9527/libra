@@ -2126,94 +2126,25 @@ fn transcript_projection_entry(payload: &Value) -> Option<&Value> {
 
 fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) -> Result<()> {
     match assertion {
-        "event_data_has_transcript_array" => {
-            // Initial replay must include the snapshot's transcript
-            // array so a fresh subscriber renders the room state.
-            let transcript = payload
-                .pointer("/data/transcript")
-                .and_then(Value::as_array);
-            if transcript.is_none() {
-                bail!("payload missing /data/transcript array");
-            }
-        }
-        "event_data_has_controller" => {
-            let controller = payload.pointer("/data/controller");
-            if !controller.is_some_and(Value::is_object) {
-                bail!("payload missing /data/controller object");
-            }
-        }
         "event_data_status_thinking" => {
-            let status = payload
-                .pointer("/data/status")
+            // v2-only (DF-08): the status must come from the durable
+            // status projection delta — a v1 `/data/status` payload
+            // smuggled inside a `code_workflow` frame must fail.
+            let status = projection_payload(payload, "status")
                 .and_then(Value::as_str)
-                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
                 .unwrap_or("");
             if status != "thinking" {
-                bail!("expected /data/status == 'thinking', got '{status}'");
-            }
-        }
-        "event_data_status_idle" => {
-            let status = payload
-                .pointer("/data/status")
-                .and_then(Value::as_str)
-                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
-                .unwrap_or("");
-            if status != "idle" {
-                bail!("expected /data/status == 'idle', got '{status}'");
-            }
-        }
-        "event_data_status_executing_tool" => {
-            let status = payload
-                .pointer("/data/status")
-                .and_then(Value::as_str)
-                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
-                .unwrap_or("");
-            if status != "executing_tool" {
-                bail!("expected /data/status == 'executing_tool', got '{status}'");
-            }
-        }
-        "event_data_controller_kind_automation" => {
-            let kind = payload
-                .pointer("/data/controller/kind")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    projection_payload(payload, "controller")?
-                        .get("kind")
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("");
-            if kind != "automation" {
-                bail!("expected /data/controller.kind == 'automation', got '{kind}'");
-            }
-        }
-        "event_data_controller_kind_none" => {
-            // W5-02: see `controller_kind_none`.
-            let kind = payload
-                .pointer("/data/controller/kind")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    projection_payload(payload, "controller")?
-                        .get("kind")
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("");
-            if kind != "none" {
-                bail!("expected /data/controller.kind 'none', got '{kind}'");
+                bail!("expected status projection payload 'thinking', got '{status}'");
             }
         }
         other if other.starts_with("event_transcript_contains:") => {
             let needle = other.trim_start_matches("event_transcript_contains:");
-            let haystack = if let Some(transcript) = payload
-                .pointer("/data/transcript")
-                .and_then(Value::as_array)
-            {
-                serde_json::to_string(transcript).unwrap_or_default()
-            } else if let Some(entry) = transcript_projection_entry(payload) {
+            // v2-only (DF-08): only the transcript_upsert projection
+            // counts — a v1 `/data/transcript` payload must fail.
+            let haystack = if let Some(entry) = transcript_projection_entry(payload) {
                 serde_json::to_string(entry).unwrap_or_default()
             } else {
-                return Err(anyhow!(
-                    "payload missing a v1 transcript or v2 transcript_upsert projection"
-                ));
+                return Err(anyhow!("payload missing a v2 transcript_upsert projection"));
             };
             if !haystack.contains(needle) {
                 bail!("transcript did not contain '{needle}'; serialised transcript:\n{haystack}");
@@ -2246,26 +2177,10 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
             // streaming pipeline.
             let mut prev: Option<String> = None;
             for (idx, payload) in collected.iter().enumerate() {
-                let assistant_content = payload
-                    .pointer("/data/transcript")
-                    .and_then(Value::as_array)
-                    .and_then(|transcript| {
-                        transcript.iter().rev().find_map(|entry| {
-                            (entry.pointer("/kind").and_then(Value::as_str)
-                                == Some("assistant_message"))
-                            .then(|| {
-                                entry
-                                    .pointer("/content")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .flatten()
-                        })
-                    })
-                    .or_else(|| {
-                        let entry = transcript_projection_entry(payload)?;
-                        (entry.pointer("/kind").and_then(Value::as_str)
-                            == Some("assistant_message"))
+                // v2-only (DF-08): read the transcript_upsert projection.
+                let assistant_content = (|| {
+                    let entry = transcript_projection_entry(payload)?;
+                    (entry.pointer("/kind").and_then(Value::as_str) == Some("assistant_message"))
                         .then(|| {
                             entry
                                 .pointer("/content")
@@ -2273,7 +2188,7 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
                                 .map(str::to_string)
                         })
                         .flatten()
-                    });
+                })();
                 let Some(current) = assistant_content else {
                     // Snapshots before the first assistant chunk
                     // legitimately have no assistant message yet.
@@ -2303,16 +2218,12 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
                 anyhow!("event_transcript_contains assertion needs at least one collected event")
             })?;
             let needle = other.trim_start_matches("event_transcript_contains:");
-            let haystack = if let Some(transcript) =
-                last.pointer("/data/transcript").and_then(Value::as_array)
-            {
-                serde_json::to_string(transcript).unwrap_or_default()
-            } else if let Some(entry) = transcript_projection_entry(last) {
+            // v2-only (DF-08): the final collected payload must carry a
+            // transcript_upsert projection.
+            let haystack = if let Some(entry) = transcript_projection_entry(last) {
                 serde_json::to_string(entry).unwrap_or_default()
             } else {
-                return Err(anyhow!(
-                    "payload missing a v1 transcript or v2 transcript_upsert projection"
-                ));
+                return Err(anyhow!("payload missing a v2 transcript_upsert projection"));
             };
             if !haystack.contains(needle) {
                 bail!("transcript did not contain '{needle}'; serialised transcript:\n{haystack}");
@@ -2723,7 +2634,48 @@ fn evaluate_command_output_assertion(assertion: &str, output: &Output) -> Result
 
 #[cfg(test)]
 mod df08_tests {
+    use serde_json::Value;
+
     use super::{SseEvent, reject_legacy_v1_event};
+
+    /// DF-08 regression: a v1 snapshot payload smuggled inside a
+    /// `code_workflow` frame must FAIL the v2 assertions — the `/data/…`
+    /// compatibility arms are gone, only projection deltas count.
+    #[test]
+    fn v1_payload_in_code_workflow_clothing_fails_v2_assertions() {
+        let event = SseEvent {
+            event: "code_workflow".to_string(),
+            data: String::new(),
+        };
+        let smuggled: Value = serde_json::json!({
+            "cursor": 1,
+            "kind": "status",
+            "data": {
+                "status": "thinking",
+                "transcript": [{ "kind": "assistant_message", "content": "hi" }]
+            }
+        });
+        assert!(
+            super::evaluate_event_assertion("event_data_status_thinking", &event, &smuggled)
+                .is_err(),
+            "a /data/status payload must not satisfy the status assertion"
+        );
+        assert!(
+            super::evaluate_event_assertion("event_transcript_contains:hi", &event, &smuggled)
+                .is_err(),
+            "a /data/transcript payload must not satisfy the transcript assertion"
+        );
+
+        let genuine: Value = serde_json::json!({
+            "cursor": 2,
+            "kind": "code_ui_projection_delta:status",
+            "payload": { "payload": "thinking" }
+        });
+        assert!(
+            super::evaluate_event_assertion("event_data_status_thinking", &event, &genuine).is_ok(),
+            "the real v2 status projection must still pass"
+        );
+    }
 
     /// DF-08 regression: a v2 stream that emits any removed v1 envelope
     /// event name must fail the case loudly instead of being skipped.
