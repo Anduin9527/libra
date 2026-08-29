@@ -61,9 +61,9 @@ use reqwest::blocking::{Client, Response};
 pub const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 
 /// Capacity of the worker→consumer channel. 64 is sized so a normal
-/// SSE matrix run (one snapshot per submit, plus controller_changed
-/// /status_changed bursts that never exceed a handful) drains
-/// synchronously without any backpressure. If a future high-fan-out
+/// SSE matrix run (a handful of v2 `code_workflow` projection deltas
+/// per submitted turn) drains synchronously without any backpressure.
+/// If a future high-fan-out
 /// case ever fills this, `send_or_drop` exits the worker loop and
 /// `next_event` surfaces the stored last-error (see
 /// [`EventStream::last_error`]) so the test fails loud rather than

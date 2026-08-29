@@ -241,8 +241,8 @@ pub enum Step {
     },
     /// Read the very next event off `stream` and assert it has the
     /// requested `event:` field plus all expected assertions. Use
-    /// this when the next event is deterministic (e.g. SSE initial
-    /// replay always emits `session_updated` first).
+    /// this when the next event is deterministic (e.g. a v2 durable
+    /// replay emits `code_workflow` frames from the cursor).
     ExpectEvent {
         name: String,
         stream: String,
@@ -266,8 +266,8 @@ pub enum Step {
         timeout_ms: u64,
         expect: AssertionsExpect,
     },
-    /// Wave 4 / PR 4 — drain every `session_updated` event off
-    /// `stream` until either:
+    /// Wave 4 / PR 4 — drain the stream's v2 `code_workflow`
+    /// projection deltas (transcript upserts) until either:
     ///
     ///   * the snapshot contained in the latest event has
     ///     `status == "idle"` (terminal state), OR

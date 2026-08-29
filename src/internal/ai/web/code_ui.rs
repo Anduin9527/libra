@@ -2076,21 +2076,6 @@ pub fn browser_controller_token_from_headers(headers: &axum::http::HeaderMap) ->
         .filter(|value| !value.is_empty())
 }
 
-pub fn snapshot_from_event(event: &CodeUiEventEnvelope) -> anyhow::Result<CodeUiSessionSnapshot> {
-    Ok(event.data.clone())
-}
-
-pub fn ensure_session_updated_event(
-    snapshot: &CodeUiSessionSnapshot,
-) -> anyhow::Result<CodeUiEventEnvelope> {
-    Ok(CodeUiEventEnvelope {
-        seq: 0,
-        event_type: CodeUiEventType::SessionUpdated,
-        at: Utc::now(),
-        data: snapshot.clone(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     /// DF-08: `CodeUiEventEnvelope` is no longer an HTTP SSE wire — it
