@@ -66,26 +66,6 @@ impl WorktreeRootCapability {
         self.relative(path)
     }
 
-    /// Compatibility adapter for the status command's existing absolute path
-    /// callers. The helper converts the absolute path to a validated relative
-    /// path before invoking beneath traversal; the root itself is represented
-    /// by an empty path for root metadata/listing operations.
-    pub(crate) fn relative_from_absolute(&self, path: &Path) -> io::Result<PathBuf> {
-        if !path.is_absolute() {
-            return self.relative(path);
-        }
-        let relative = path.strip_prefix(&self.root).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "worktree request path is outside its sealed root",
-            )
-        })?;
-        if relative.as_os_str().is_empty() {
-            return Ok(PathBuf::new());
-        }
-        self.relative_or_root(relative)
-    }
-
     /// Resolve a validated relative path for diagnostics or APIs that need a
     /// pathname. Actual reads must still use `utils::beneath` with the sealed
     /// root descriptor to close symlink-swap/TOCTOU races.
@@ -807,23 +787,6 @@ pub(crate) fn write_raw_frame(writer: &mut impl Write, payload: &[u8]) -> io::Re
     writer.flush()
 }
 
-pub(crate) fn read_raw_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > FRAME_CAP {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "status io worker binary frame length invalid",
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut payload)?;
-    }
-    Ok(payload)
-}
-
 pub(crate) fn parse_event_frames(mut data: &[u8]) -> Option<Vec<IoEvent>> {
     let mut events = Vec::new();
     while !data.is_empty() {
@@ -922,11 +885,6 @@ mod tests {
                 "path must be rejected: {invalid:?}"
             );
         }
-        assert!(
-            capability
-                .relative_from_absolute(Path::new("/tmp/escape"))
-                .is_err()
-        );
     }
 
     #[cfg(windows)]

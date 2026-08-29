@@ -25,14 +25,14 @@ pub(crate) const MAX_INFLIGHT: usize = 8;
 pub(crate) const MAX_PENDING: usize = 64;
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-pub(crate) type InProcessHandler = fn(IoRequest, &mut Vec<u8>) -> io::Result<bool>;
+type InProcessHandler = fn(IoRequest, &mut Vec<u8>) -> io::Result<bool>;
 
 #[derive(Clone, Copy)]
-pub(crate) struct WorkerConfig {
-    pub(crate) worker_arg: &'static str,
-    pub(crate) cap_env: &'static str,
-    pub(crate) ppid_env: &'static str,
-    pub(crate) in_process_handler: InProcessHandler,
+struct WorkerConfig {
+    worker_arg: &'static str,
+    cap_env: &'static str,
+    ppid_env: &'static str,
+    in_process_handler: InProcessHandler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,16 @@ enum JobOutcome {
 }
 
 impl WorktreeIo {
-    pub(crate) fn new(config: WorkerConfig) -> Self {
+    pub(crate) fn default() -> Self {
+        Self::new(WorkerConfig {
+            worker_arg: super::handler::WORKER_ARG,
+            cap_env: super::handler::CAP_ENV,
+            ppid_env: super::handler::PPID_ENV,
+            in_process_handler: super::handler::handle_request_to_buffer,
+        })
+    }
+
+    fn new(config: WorkerConfig) -> Self {
         Self::new_with_limits(config, IoLimits::default(), true)
     }
 
