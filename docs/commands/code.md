@@ -291,7 +291,7 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 | Explicit v1 | `?wire=1` or `?wire=v1` |
 | Explicit v2 | `?wire=2` or `?wire=v2` |
 | Accept hint | `Accept: text/event-stream;libra-wire=2` (query `wire=` wins if both are set) |
-| Default (unspecified) | The server remains **v1** for clients that omit `wire` / `libra-wire`. The built-in SPA (W3-09) and `libra code --control stdio` automation client explicitly request `?wire=2`. |
+| Default (unspecified) | The server defaults to **v2** for clients that omit `wire` / `libra-wire` (DF-06; `v0.21.27` was the last release defaulting to v1). Explicit `?wire=1` still selects the full-snapshot stream. The built-in SPA (W3-09) and `libra code --control stdio` automation client explicitly request `?wire=2`. |
 | Illegal values | fail-closed `400 INVALID_WIRE_VERSION` |
 
 **SSE v1** (server default when unspecified): `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and

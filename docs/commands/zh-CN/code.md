@@ -270,7 +270,7 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | 显式 v1 | `?wire=1` 或 `?wire=v1` |
 | 显式 v2 | `?wire=2` 或 `?wire=v2` |
 | Accept 提示 | `Accept: text/event-stream;libra-wire=2`（若同时给出 query `wire=`，以 query 为准） |
-| 未指定默认 | 省略 `wire` / `libra-wire` 时，服务端仍默认为 **v1**。内置 SPA（W3-09）和 `libra code --control stdio` automation 客户端会显式请求 `?wire=2`。 |
+| 未指定默认 | 省略 `wire` / `libra-wire` 时，服务端默认为 **v2**（DF-06；`v0.21.27` 是最后一个默认 v1 的版本）。显式 `?wire=1` 仍为全量 snapshot stream。内置 SPA（W3-09）和 `libra code --control stdio` automation 客户端会显式请求 `?wire=2`。 |
 | 非法值 | fail-closed `400 INVALID_WIRE_VERSION` |
 
 **SSE v1**（未指定版本时的服务端默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。

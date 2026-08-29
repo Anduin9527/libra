@@ -39,8 +39,10 @@ pub const CODE_UI_TRANSPORT_BROADCAST_CAPACITY: usize = MAX_CODE_UI_TRANSPORT_BA
 /// Wire code for recoverable transport-capacity exits (bootstrap or lag).
 pub const WIRE_V2_RESYNC_REQUIRED: &str = "WIRE_V2_RESYNC_REQUIRED";
 
-/// Default SSE wire when the client omits a version (until W3-09 flips default).
-pub const DEFAULT_CODE_UI_SSE_WIRE_VERSION: CodeUiSseWireVersion = CodeUiSseWireVersion::V1;
+/// Default SSE wire when the client omits a version. Flipped to v2 by
+/// plan-20260824 DF-06 (v0.21.27 was the last release defaulting to v1);
+/// explicit `wire=1` still selects the full-snapshot stream until DF-08.
+pub const DEFAULT_CODE_UI_SSE_WIRE_VERSION: CodeUiSseWireVersion = CodeUiSseWireVersion::V2;
 
 /// Negotiated Code UI SSE wire version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,12 +491,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_wire_defaults_to_v1_when_unspecified() {
+    fn parse_wire_defaults_to_v2_when_unspecified() {
+        // DF-06: the omitted-wire default is v2; an Accept header without
+        // a `libra-wire` parameter must not change that.
         let query = CodeEventsQuery::default();
         let headers = HeaderMap::new();
         assert_eq!(
             parse_code_events_wire_version(&query, &headers).unwrap(),
-            CodeUiSseWireVersion::V1
+            CodeUiSseWireVersion::V2
+        );
+        let mut accept = HeaderMap::new();
+        accept.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert_eq!(
+            parse_code_events_wire_version(&query, &accept).unwrap(),
+            CodeUiSseWireVersion::V2
         );
     }
 
@@ -562,11 +575,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::ACCEPT,
-            HeaderValue::from_static("text/event-streaming;libra-wire=2"),
+            // libra-wire=1 on a lookalike media type: were the lookalike
+            // honored, the result would be V1 — falling back to the (v2)
+            // default proves it was ignored.
+            HeaderValue::from_static("text/event-streaming;libra-wire=1"),
         );
         assert_eq!(
             parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
-            CodeUiSseWireVersion::V1
+            DEFAULT_CODE_UI_SSE_WIRE_VERSION
         );
     }
 

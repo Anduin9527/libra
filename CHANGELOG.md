@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.21.28] — 2026-08-29
+
+### Changed: the server-side SSE default wire is now v2 (plan-20260824 DF-06)
+
+`GET /api/code/events` without `wire=` / `Accept: text/event-stream;libra-wire=N`
+now negotiates the **v2 delta/cursor stream**. **`v0.21.27` was the last release
+whose omitted-wire default was v1.** Explicit `?wire=1` / `v1` still returns the
+full-snapshot stream (unchanged), and illegal values still fail closed with
+`INVALID_WIRE_VERSION`. Clients that relied on the omitted-wire v1 default must
+either pin `?wire=1` (supported until the DEFER-08 removal checklist completes)
+or consume v2 (`wire=2&cursor=<last>`; see `docs/commands/code.md`).
+
 ## [0.21.1] — 2026-08-24
 
 ### Added: the bridge's remaining VCS methods (plan-20260818 LB-04/LB-05, closes DEFER-LB-07)

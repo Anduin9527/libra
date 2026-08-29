@@ -1371,8 +1371,18 @@ fn sse_wire_version_negotiation() {
     );
     assert_eq!(
         parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
-        CodeUiSseWireVersion::V1,
-        "DF-05 must not change the server's omitted-wire default"
+        CodeUiSseWireVersion::V2,
+        "DF-06: the server's omitted-wire default is v2"
+    );
+    let mut accept_without_wire = HeaderMap::new();
+    accept_without_wire.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    assert_eq!(
+        parse_code_events_wire_version(&CodeEventsQuery::default(), &accept_without_wire).unwrap(),
+        CodeUiSseWireVersion::V2,
+        "DF-06: an Accept header without libra-wire keeps the v2 default"
     );
     for (raw, expected) in [
         ("1", CodeUiSseWireVersion::V1),
