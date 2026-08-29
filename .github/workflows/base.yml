@@ -397,7 +397,16 @@ jobs:
           # features and env stay on the command line / step env verbatim.
           # ADR-NP-02 rollback (previous command, verbatim):
           #   cargo test --features test-provider \
-          #     --test code_ui_scenarios ... --test code_ui_perf_smoke_test \
+          #     --test code_ui_scenarios \
+          #     --test harness_self_test \
+          #     --test code_codex_default_web_test \
+          #     --test ai_code_ui_headless_test \
+          #     --test code_codex_runtime_test \
+          #     --test code_ui_remote_lease_matrix \
+          #     --test code_ui_remote_sse_matrix \
+          #     --test code_ui_remote_state_matrix \
+          #     --test code_mcp_dual_entry_test \
+          #     --test code_ui_perf_smoke_test \
           #     -- --test-threads=1
           cargo nextest run --features test-provider --profile test-provider --no-fail-fast \
             --test code_ui_scenarios \
