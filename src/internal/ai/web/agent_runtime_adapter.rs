@@ -95,8 +95,15 @@ pub struct AgentRuntimeCodeUiAdapter {
 pub(crate) struct PendingSkillContext {
     /// `(provider, name)` in activation order, deduplicated.
     active: Vec<(String, String)>,
-    last_composed: Option<ComposedSkillTurn>,
+    /// Bounded `(commandId, rawText) → composed input` store so EVERY
+    /// durable command's retry recomposes its own payload (a single slot
+    /// would let a later command evict an earlier one — terra R2).
+    composed_retries: std::collections::VecDeque<ComposedSkillTurn>,
 }
+
+/// Bound for [`PendingSkillContext::composed_retries`] — matches the
+/// admission layer's admitted-command-input retention scale.
+const COMPOSED_RETRY_LIMIT: usize = 64;
 
 struct ComposedSkillTurn {
     command_id: String,
@@ -109,7 +116,8 @@ struct ComposedSkillTurn {
 pub(crate) struct ComposedProviderInput {
     pub(crate) input: String,
     consumed: Vec<(String, String)>,
-    recorded_retry_key: bool,
+    /// The `commandId` whose retry entry this composition minted, if any.
+    retry_key: Option<String>,
 }
 
 impl PendingSkillContext {
@@ -123,14 +131,16 @@ impl PendingSkillContext {
         text: &str,
         command_id: Option<&str>,
     ) -> ComposedProviderInput {
-        if let (Some(command_id), Some(last)) = (command_id, self.last_composed.as_ref())
-            && last.command_id == command_id
-            && last.raw_text == text
+        if let Some(command_id) = command_id
+            && let Some(prior) = self
+                .composed_retries
+                .iter()
+                .find(|entry| entry.command_id == command_id && entry.raw_text == text)
         {
             return ComposedProviderInput {
-                input: last.input.clone(),
+                input: prior.input.clone(),
                 consumed: Vec::new(),
-                recorded_retry_key: false,
+                retry_key: None,
             };
         }
         let trimmed = text.trim();
@@ -138,7 +148,7 @@ impl PendingSkillContext {
             return ComposedProviderInput {
                 input: text.to_string(),
                 consumed: Vec::new(),
-                recorded_retry_key: false,
+                retry_key: None,
             };
         }
         let mut lines = vec![
@@ -154,20 +164,21 @@ impl PendingSkillContext {
         }
         let input = lines.join("\n");
         let consumed = std::mem::take(&mut self.active);
-        let recorded_retry_key = if let Some(command_id) = command_id {
-            self.last_composed = Some(ComposedSkillTurn {
+        let retry_key = command_id.map(|command_id| {
+            self.composed_retries.push_back(ComposedSkillTurn {
                 command_id: command_id.to_string(),
                 raw_text: text.to_string(),
                 input: input.clone(),
             });
-            true
-        } else {
-            false
-        };
+            while self.composed_retries.len() > COMPOSED_RETRY_LIMIT {
+                self.composed_retries.pop_front();
+            }
+            command_id.to_string()
+        });
         ComposedProviderInput {
             input,
             consumed,
-            recorded_retry_key,
+            retry_key,
         }
     }
 
@@ -175,8 +186,9 @@ impl PendingSkillContext {
     /// activation order is preserved) and drop a retry key minted for the
     /// failed attempt.
     pub(crate) fn restore(&mut self, outcome: ComposedProviderInput) {
-        if outcome.recorded_retry_key {
-            self.last_composed = None;
+        if let Some(retry_key) = outcome.retry_key.as_deref() {
+            self.composed_retries
+                .retain(|entry| entry.command_id != retry_key);
         }
         if !outcome.consumed.is_empty() {
             let mut restored = outcome.consumed;
@@ -199,10 +211,13 @@ impl super::web_admission::WebCodeUiAdmission {
     /// DF-07: bind the adapter's pending-skill state so the admission path
     /// composes the provider input at its own submit seam.
     pub(crate) fn bind_pending_skills(&self, pending: Arc<Mutex<PendingSkillContext>>) {
+        // Poison recovery is safe: the slot only holds a binding pointer, so
+        // adopting the inner value can never observe a torn state. Never
+        // panic on a production path (GC-11).
         *self
             .pending_skills
             .lock()
-            .expect("pending-skill binding lock poisoned") = Some(pending);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
     }
 }
 
@@ -482,6 +497,12 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
         {
             self.pending_skills.lock().await.restore(composed);
             self.rollback_active_turn(&turn_id).await;
+            // A terminal idempotent retry of a succeeded command is an
+            // acknowledgement, not a failure (terra R2); the consumed
+            // activations were already restored above.
+            if let RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. } = &error {
+                return Ok(());
+            }
             return Err(Self::map_runtime_error(error));
         }
         self.spawn_release_watcher(stream, turn_id);
@@ -690,8 +711,8 @@ mod tests {
             "restore must reinstate the consumed set in order"
         );
         assert!(
-            ctx.last_composed.is_none(),
-            "the failed attempt's retry key must be dropped"
+            ctx.composed_retries.is_empty(),
+            "the failed attempt's retry entry must be dropped"
         );
         let retried = ctx.compose("do it", Some("cmd-1"));
         assert!(
@@ -700,17 +721,56 @@ mod tests {
         );
     }
 
-    /// DF-07: a durable `commandId` retry with the same raw text reuses the
-    /// composed payload verbatim even though the set was already consumed.
+    /// DF-07 (terra R2): the retry store is a bounded map — EVERY durable
+    /// command keeps its own `(commandId, rawText) → payload` entry, so a
+    /// later composed command cannot evict an earlier one's retry payload.
     #[test]
     fn pending_skill_context_recomposes_for_command_id_retries() {
         let mut ctx = PendingSkillContext::default();
         ctx.record("claude-code", "/review");
-        let first = ctx.compose("do it", Some("cmd-1"));
-        assert!(first.input.contains("[skill activation]"));
-        let retry = ctx.compose("do it", Some("cmd-1"));
-        assert_eq!(first.input, retry.input, "retry must reuse the payload");
-        assert!(retry.consumed.is_empty(), "a reuse consumes nothing");
-        assert_eq!(ctx.compose("other", Some("cmd-2")).input, "other");
+        let first = ctx.compose("first message", Some("cmd-1"));
+        assert!(first.input.contains("'/review'"));
+
+        // A second composed command lands its own entry…
+        ctx.record("codex", "/plan");
+        let second = ctx.compose("second message", Some("cmd-2"));
+        assert!(second.input.contains("'/plan'") && !second.input.contains("'/review'"));
+
+        // …and the earlier command's retry still reuses ITS payload.
+        let retry_first = ctx.compose("first message", Some("cmd-1"));
+        assert_eq!(
+            first.input, retry_first.input,
+            "cmd-1 retry must survive cmd-2"
+        );
+        assert!(retry_first.consumed.is_empty(), "a reuse consumes nothing");
+        let retry_second = ctx.compose("second message", Some("cmd-2"));
+        assert_eq!(second.input, retry_second.input);
+
+        // Different text under a known id is a fresh (passthrough) compose.
+        assert_eq!(ctx.compose("other", Some("cmd-3")).input, "other");
+    }
+
+    /// DF-07 (terra R2): the retry store is bounded — the oldest entry
+    /// falls out past the cap and only that entry loses reuse.
+    #[test]
+    fn pending_skill_context_retry_store_is_bounded() {
+        let mut ctx = PendingSkillContext::default();
+        for index in 0..=super::COMPOSED_RETRY_LIMIT {
+            ctx.record("claude-code", "/review");
+            let _ = ctx.compose(&format!("message {index}"), Some(&format!("cmd-{index}")));
+        }
+        assert_eq!(ctx.composed_retries.len(), super::COMPOSED_RETRY_LIMIT);
+        assert!(
+            !ctx.composed_retries
+                .iter()
+                .any(|entry| entry.command_id == "cmd-0"),
+            "the oldest entry must be evicted"
+        );
+        assert!(
+            ctx.composed_retries
+                .iter()
+                .any(|entry| entry.command_id == format!("cmd-{}", super::COMPOSED_RETRY_LIMIT)),
+            "the newest entry must be retained"
+        );
     }
 }

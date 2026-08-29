@@ -4938,3 +4938,178 @@ mod cex_00_5 {
         assert_eq!(snap.snapshot_kind(), cloned.snapshot_kind());
     }
 }
+
+/// plan-20260824 DF-07 (terra R2): direct durable-command coverage. With
+/// activations composed at the direct submit seam, every durable command
+/// keeps its own `(commandId, rawText) → composed payload` retry entry:
+/// a later composed command (`cmd-2`) must not evict `cmd-1`'s payload, a
+/// `cmd-1` retry must never degrade to the raw text (which would trip the
+/// worker's payload comparison), and a terminal idempotent retry resolves
+/// as success — the provider never re-executes the turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_activation_direct_durable_retry_reuses_composed_payload() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExecutionControlService,
+            InMemoryAuditSink, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            RuntimeExecutionContext, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
+            SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        },
+        session::SessionJsonlStore,
+        web::{
+            AgentRuntimeCodeUiAdapter,
+            code_ui::{
+                CodeUiCapabilities, CodeUiCommandAdapter, CodeUiProviderInfo, CodeUiSession,
+                initial_snapshot,
+            },
+        },
+    };
+    use tokio::sync::Mutex;
+
+    struct RecordingExecutor {
+        inputs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl RuntimeTurnExecutor for RecordingExecutor {
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.inputs.lock().await.push(request.input);
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "done".to_string(),
+            })
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(RecordingExecutor {
+        inputs: inputs.clone(),
+    });
+    let tool_boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "df07-direct-durable".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let store = SessionJsonlStore::new(temp.path().join("session"));
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(executor, tool_boundary).with_durability(
+            RuntimeCommandDurability::new(store.clone()),
+            "df07-repo",
+            "df07-principal",
+        ),
+    );
+
+    let session = CodeUiSession::new(initial_snapshot(
+        temp.path().to_string_lossy(),
+        CodeUiProviderInfo {
+            provider: "test".to_string(),
+            model: Some("test-model".to_string()),
+            mode: None,
+            managed: false,
+        },
+        CodeUiCapabilities::default(),
+    ));
+    let adapter = AgentRuntimeCodeUiAdapter::new(
+        session,
+        CodeUiCapabilities::default(),
+        handle.clone(),
+        "session",
+        Arc::new(ExecutionControlService::new("session", None, None).expect("execution control")),
+        None,
+        Some(RuntimeCommandDurability::new(store)),
+    );
+
+    // cmd-1 with activation A.
+    adapter
+        .activate_skill("claude-code", "/review")
+        .await
+        .expect("activate /review");
+    adapter
+        .submit_message_with_command_id("first message".to_string(), Some("cmd-1".to_string()))
+        .await
+        .expect("submit cmd-1");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while inputs.lock().await.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "cmd-1 must execute");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let first_payload = inputs.lock().await[0].clone();
+    assert!(
+        first_payload.contains("[skill activation]") && first_payload.contains("'/review'"),
+        "cmd-1 must carry activation A: {first_payload}"
+    );
+
+    // cmd-2 with activation B (retried past the active-turn window).
+    adapter
+        .activate_skill("claude-code", "/simplify")
+        .await
+        .expect("activate /simplify");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match adapter
+            .submit_message_with_command_id("second message".to_string(), Some("cmd-2".to_string()))
+            .await
+        {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("cmd-2 never admitted: {error}"),
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while inputs.lock().await.len() < 2 {
+        assert!(std::time::Instant::now() < deadline, "cmd-2 must execute");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let second_payload = inputs.lock().await[1].clone();
+    assert!(
+        second_payload.contains("'/simplify'") && !second_payload.contains("'/review'"),
+        "cmd-2 must carry only activation B: {second_payload}"
+    );
+
+    // cmd-1 terminal retry: must resolve Ok, must never send the raw text,
+    // and must not re-execute with a different payload.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let retry = loop {
+        match adapter
+            .submit_message_with_command_id("first message".to_string(), Some("cmd-1".to_string()))
+            .await
+        {
+            Ok(()) => break Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("already active") && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                break Err(error);
+            }
+        }
+    };
+    retry.expect("a terminal idempotent cmd-1 retry must acknowledge as success");
+    // Give a (wrong) re-execution a moment to surface, then assert payloads.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let all = inputs.lock().await.clone();
+    for extra in all.iter().skip(2) {
+        assert_eq!(
+            extra, &first_payload,
+            "a cmd-1 re-execution may only ever see cmd-1's composed payload"
+        );
+    }
+    assert!(
+        all.iter().skip(2).all(|extra| extra != "first message"),
+        "the raw text must never reach the provider on retry: {all:?}"
+    );
+    worker.abort();
+}

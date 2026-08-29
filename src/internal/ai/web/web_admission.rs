@@ -626,6 +626,25 @@ impl WebCodeUiAdmission {
         Ok(true)
     }
 
+    /// DF-07: give consumed skill activations back on any exit where the
+    /// provider is guaranteed not to run the composed turn (submit failure,
+    /// pre-start cancellation, durable-persistence failure). Poison
+    /// recovery is safe: the outer slot only holds a binding pointer.
+    async fn restore_composed_skills(
+        &self,
+        composed: Option<super::agent_runtime_adapter::ComposedProviderInput>,
+    ) {
+        let Some(composed) = composed else { return };
+        let bound = self
+            .pending_skills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(pending) = bound {
+            pending.lock().await.restore(composed);
+        }
+    }
+
     pub(crate) async fn submit_message_with_command_id(
         &self,
         runtime: &AgentRuntimeHandle,
@@ -962,11 +981,12 @@ impl WebCodeUiAdmission {
         // submission restores the consumed activations. Only the
         // provider-facing input is composed; the durable intent, the
         // transcript user entry, and `in_flight.input` keep the raw text.
-        let composed_skills = if mode == WebTurnMode::PlanPhase0 && claiming_revision.is_none() {
+        let mut composed_skills = if mode == WebTurnMode::PlanPhase0 && claiming_revision.is_none()
+        {
             let bound = self
                 .pending_skills
                 .lock()
-                .expect("pending-skill binding lock poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             match bound {
                 Some(pending) => Some(pending.lock().await.compose(
@@ -991,16 +1011,7 @@ impl WebCodeUiAdmission {
             ))
             .await;
         if let Err(error) = submission {
-            if let Some(composed) = composed_skills {
-                let bound = self
-                    .pending_skills
-                    .lock()
-                    .expect("pending-skill binding lock poisoned")
-                    .clone();
-                if let Some(pending) = bound {
-                    pending.lock().await.restore(composed);
-                }
-            }
+            self.restore_composed_skills(composed_skills.take()).await;
             *slot = None;
             if let Some((pending, claim)) = claiming_revision.as_ref() {
                 match self.persistence.as_ref().map(|persistence| {
@@ -1158,6 +1169,10 @@ impl WebCodeUiAdmission {
                 drop(slot);
                 self.cancel_gated_runtime_turn(runtime, &runtime_turn_id, completion_for_rollback)
                     .await?;
+                // DF-07 (terra R2): the provider never started — give the
+                // consumed activations back so the next plain turn still
+                // carries them.
+                self.restore_composed_skills(composed_skills.take()).await;
                 self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                     .await?;
                 return Err(anyhow!(
@@ -1181,6 +1196,9 @@ impl WebCodeUiAdmission {
                 &runtime_turn_id,
             )
             .await?;
+            // DF-07 (terra R2): cancelled before the executor start gate
+            // opened — the composed turn never reaches the provider.
+            self.restore_composed_skills(composed_skills.take()).await;
             self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                 .await?;
             return Ok(());
@@ -1210,6 +1228,9 @@ impl WebCodeUiAdmission {
                 &runtime_turn_id,
             )
             .await?;
+            // DF-07 (terra R2): cancellation won before the start gate —
+            // the provider never runs this composed turn.
+            self.restore_composed_skills(composed_skills.take()).await;
             self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                 .await?;
             return Ok(());

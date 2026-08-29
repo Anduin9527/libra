@@ -5736,6 +5736,130 @@ mod tests {
         server.abort();
     }
 
+    /// plan-20260824 DF-07 (terra R2): a durable-persistence failure after
+    /// admission (the provider is guaranteed not to start) must NOT spend
+    /// the pending activation — the next successful plain turn still
+    /// delivers it to the provider. Failure is injected by making the
+    /// session's events log read-only across the failing submit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skill_activation_survives_persistence_failure_before_provider_start() {
+        let (base_url, captured, server) = start_chat_completions_stub().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        crate::internal::db::create_database(
+            &storage_root
+                .join(crate::utils::util::DATABASE)
+                .display()
+                .to_string(),
+        )
+        .await
+        .expect("bootstrap storage schema");
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        args.model = Some("deepseek-chat".to_string());
+        args.api_base = Some(base_url);
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+        let session_id = session_state.id.clone();
+        let (runtime, _effective) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &env_file,
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("headless runtime must build")
+        .expect("deepseek is supported in the headless path");
+
+        runtime
+            .adapter()
+            .activate_skill("claude-code", "/review")
+            .await
+            .expect("activate /review");
+
+        // Inject: the session events log becomes read-only, so the durable
+        // user-message write fails after worker admission but before the
+        // executor start gate opens.
+        let events_path = storage_root
+            .join("sessions")
+            .join(&session_id)
+            .join("events.jsonl");
+        assert!(events_path.exists(), "events log must exist after boot");
+        let mut readonly = std::fs::metadata(&events_path).unwrap().permissions();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&events_path, readonly).unwrap();
+
+        let failed = runtime
+            .adapter()
+            .submit_message("first try".to_string())
+            .await;
+        let error = failed.expect_err("the persistence failure must fail the submit");
+        // The read-only log surfaces at the earliest durable write on the
+        // admission path (worker intent persistence, or the later
+        // user-message record — both are pre-provider-start exits that
+        // share the same restore semantics).
+        assert!(
+            error.to_string().contains("no turn was started"),
+            "unexpected failure shape: {error}"
+        );
+
+        let mut writable = std::fs::metadata(&events_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        std::fs::set_permissions(&events_path, writable).unwrap();
+
+        // The activation must have been restored: the next successful plain
+        // turn's provider request still carries it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match runtime
+                .adapter()
+                .submit_message("after recovery".to_string())
+                .await
+            {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("recovery submit never admitted: {error}"),
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let bodies = captured.lock().await;
+            let recovered: Vec<String> = bodies
+                .iter()
+                .map(|body| body.to_string())
+                .filter(|body| body.contains("after recovery"))
+                .collect();
+            if !recovered.is_empty() {
+                assert!(
+                    recovered
+                        .iter()
+                        .any(|body| body.contains("[skill activation]") && body.contains("/review")),
+                    "the restored activation must ride the recovered turn: {recovered:?}"
+                );
+                break;
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recovered turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        server.abort();
+    }
+
     /// plan-20260825 PS-05 (terra R1): the provenance write is best-effort
     /// — with the session's `<id>.json` save path blocked (a directory
     /// squats on it), the headless runtime must still boot and label
