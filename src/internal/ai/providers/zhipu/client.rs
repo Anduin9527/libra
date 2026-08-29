@@ -223,9 +223,8 @@ mod tests {
             "conclusion line drifted: {msg}"
         );
         assert!(
-            msg.contains(
-                "Checked in order: process environment, repo-local vault, global vault"
-            ) && !msg.contains("--env-file"),
+            msg.contains("Checked in order: process environment, repo-local vault, global vault")
+                && !msg.contains("--env-file"),
             "chain must reflect resolve_env_for_target (no --env-file layer): {msg}"
         );
         assert!(

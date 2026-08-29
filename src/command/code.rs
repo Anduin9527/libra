@@ -2000,7 +2000,7 @@ fn build_any_completion_model_for_args_with_lookup(
                     // checked chain, copy-pasteable recommended commands,
                     // credential-free alternatives. Replaces the old hint
                     // that named a nonexistent config subcommand.
-                    CliError::auth(missing_api_key_message(&env_var, &provider_id_str))
+                    CliError::auth(missing_api_key_message(env_var, &provider_id_str))
                 }
             }
             ProviderFactoryError::BuildFailed { reason, .. } => CliError::io(reason),
