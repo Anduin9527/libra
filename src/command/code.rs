@@ -516,10 +516,12 @@ pub struct CodeArgs {
     #[arg(long = "control-url", value_name = "URL")]
     pub control_url: Option<String>,
 
-    /// AI provider backend. No default: plan-20260825 PS-02 (ADR-PS-05)
-    /// resolves the effective provider at the `execute()` entry
-    /// (`--provider` → `--agent` binding → usage error) and writes it back
-    /// here, so `None` after parsing means "not explicitly chosen".
+    /// AI provider backend. No default: the effective provider is resolved
+    /// at startup — `--provider` → `--agent` binding → the persisted
+    /// `code.defaultProvider` config key → credential detection (a config
+    /// hit skips detection; zero configured keys exit 128, several exit
+    /// 129) — and written back here, so `None` after parsing means "not
+    /// explicitly chosen" (plan-20260825 ADR-PS-05).
     #[arg(long, value_enum)]
     pub provider: Option<CodeProvider>,
 

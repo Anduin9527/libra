@@ -37,7 +37,7 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 | Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | 每进程本地自动化 token 路径。在 `write` 模式下，Unix/macOS 文件必须是权限 `0600` 的普通文件。与 `--control stdio` 一起使用时可覆盖 worktree 默认 token 路径（与 `--control-info-file` 独立）；权限过宽 fail-closed（`CONTROL_TOKEN_PERMS`）。 |
 | Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | 非 secret 本地 endpoint discovery 元数据路径。launch 模式在 Unix/macOS 上以原子写 + `0600` 落盘。该文件永不包含 token 材料。与 `--control stdio` 一起使用时仅为 `baseUrl` 的 **读取** discovery 路径（显式 `--control-url` 可覆盖）。自定义 info 路径**不会**改写默认 token 位置——若 token 不在 worktree `code/` 目录下，请同时传 `--control-token-file`。 |
 | Control URL | | `--control-url <URL>` |（discovery） | 已有 Code UI control endpoint 的 base URL（例如 `http://127.0.0.1:3000`）。仅与 `--control stdio` 合法。省略时从 `--control-info-file` discovery。必须是字面 loopback IP。 |
-| Provider | | `--provider` | *（无默认——启动时解析）* | AI provider 后端（见下方 Provider Backends）。缺省时由 `--agent` 绑定或凭据探测解析；零个已配置 key 以 128 退出、多个以 129 退出。 |
+| Provider | | `--provider` | *（无默认——启动时解析）* | AI provider 后端（见下方 Provider Backends）。缺省时依次由 `--agent` 绑定、持久化配置键 `code.defaultProvider`、再到凭据探测解析（配置键命中跳过探测）；零个已配置 key 以 128 退出、多个以 129 退出。 |
 | Model | | `--model` | provider 默认值 | Provider 专用 model ID。 |
 | Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
 | Temperature | | `--temperature` | provider 默认值 | 生成采样 temperature。 |
