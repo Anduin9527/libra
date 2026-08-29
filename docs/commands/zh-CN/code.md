@@ -457,8 +457,8 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 ## 常用命令
 
 ```bash
-# 启动 Web Code UI 会话（恰有一个已配置凭据时自动选用该 provider；
-# 否则请显式传 --provider）
+# 启动 Web Code UI 会话（provider 在启动时解析：--provider 旗标、
+# --agent 绑定、持久化配置键 code.defaultProvider、再到唯一凭据自动选用）
 libra code
 
 # 使用 Anthropic Claude 启动
@@ -569,7 +569,7 @@ Web Code UI 是主要的（也是唯一的交互式）协作入口。遗留 TUI 
 
 ### 为什么支持多个 AI provider？
 
-不同 provider 擅长不同任务，并具有不同成本/延迟画像。没有默认 provider：生效 provider 在启动时解析（显式旗标、`--agent` 绑定或唯一凭据自动选用）。Anthropic Claude 擅长谨慎 reasoning 和代码审查。本地 Ollama 支持完全离线开发。通过抽象在 `CompletionClient` trait 后面，添加新 provider 只需要实现该 trait，无需触碰 session、tool 或 Web UI 层。
+不同 provider 擅长不同任务，并具有不同成本/延迟画像。没有内置默认 provider：生效 provider 在启动时解析（显式旗标、`--agent` 绑定、持久化配置键 `code.defaultProvider`，或唯一凭据自动选用）。Anthropic Claude 擅长谨慎 reasoning 和代码审查。本地 Ollama 支持完全离线开发。通过抽象在 `CompletionClient` trait 后面，添加新 provider 只需要实现该 trait，无需触碰 session、tool 或 Web UI 层。
 
 ### 为什么集成 MCP？
 

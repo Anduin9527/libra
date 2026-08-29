@@ -545,8 +545,9 @@ The `web_search` tool requires the session network policy to allow outbound acce
 ## Common Commands
 
 ```bash
-# Start a Web Code UI session (auto-selects the provider when exactly one
-# credential is configured; otherwise pass --provider explicitly)
+# Start a Web Code UI session (provider resolved at startup:
+# --provider flag, --agent binding, the persisted code.defaultProvider
+# config key, then single-credential auto-selection)
 libra code
 
 # Start with Anthropic Claude
@@ -657,7 +658,7 @@ The Web Code UI is the primary (and only interactive) collaborative surface. The
 
 ### Why multiple AI provider support?
 
-Different providers excel at different tasks and have different cost/latency profiles. There is no default provider: the effective provider is resolved at startup (explicit flag, `--agent` binding, or single-credential auto-selection). Anthropic Claude excels at careful reasoning and code review. Local Ollama support enables fully offline development. By abstracting behind a `CompletionClient` trait, adding a new provider requires only implementing the trait without touching the session, tool, or web UI layers.
+Different providers excel at different tasks and have different cost/latency profiles. There is no baked-in default provider: the effective provider is resolved at startup (explicit flag, `--agent` binding, the persisted `code.defaultProvider` config key, or single-credential auto-selection). Anthropic Claude excels at careful reasoning and code review. Local Ollama support enables fully offline development. By abstracting behind a `CompletionClient` trait, adding a new provider requires only implementing the trait without touching the session, tool, or web UI layers.
 
 ### Why MCP integration?
 
