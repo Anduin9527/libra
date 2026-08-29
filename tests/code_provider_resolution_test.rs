@@ -437,6 +437,214 @@ fn agent_binding_labels_follow_the_effective_provider() {
     );
 }
 
+/// Seed a resumable session directly through the library store (the same
+/// store the CLI reads), returning the thread id to pass to `--resume`.
+/// `provider`/`model` seed the PS-05 provenance metadata when given.
+fn seed_resumable_session(repo: &Repo, provider: Option<&str>, model: Option<&str>) -> String {
+    use libra::internal::ai::session::{SessionState, SessionStore};
+    // The CLI's working dir comes from getcwd, which resolves symlinks
+    // (macOS /var → /private/var), so the recorded working_dir must be the
+    // canonical form for load_for_thread_id to match.
+    let cli_dir = repo.root.canonicalize().expect("canonical repo root");
+    let store = SessionStore::from_storage_path(&repo.root.join(".libra"));
+    let mut session = SessionState::new(&cli_dir.to_string_lossy());
+    if let Some(provider) = provider {
+        session
+            .metadata
+            .insert("provider".to_string(), serde_json::json!(provider));
+    }
+    if let Some(model) = model {
+        session
+            .metadata
+            .insert("model".to_string(), serde_json::json!(model));
+    }
+    store.save(&session).expect("save seeded session");
+    session.id
+}
+
+#[test]
+fn resume_inherits_provider_over_config_and_detection() {
+    // PS-05: the recorded provider outranks BOTH the persisted config
+    // default and a unique detection candidate — and a recorded provider
+    // missing its key errors on ITS OWN key instead of silently switching
+    // models (the manual VER scenario, automated).
+    let repo = init_repo();
+    let thread_id = seed_resumable_session(&repo, Some("zhipu"), Some("glm-recorded"));
+    set_default_provider(&repo, true, "gemini");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--resume"])
+        .arg(&thread_id)
+        .args(["--port", "0", "--mcp-port", "0"])
+        .current_dir(repo.root.canonicalize().expect("canonical root"))
+        .env("GEMINI_API_KEY", "probe-gemini")
+        .output()
+        .expect("run resume-inheritance probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "the inherited provider's own auth error is expected: {stderr}"
+    );
+    assert!(
+        stderr.contains("ZHIPU_API_KEY is not configured for provider 'zhipu'"),
+        "the recorded provider must drive the run: {stderr}"
+    );
+    assert!(
+        !stderr.contains("auto-selected"),
+        "neither detection nor the config default may fire on a resume hit: {stderr}"
+    );
+}
+
+#[test]
+fn resume_inherits_provider_missing_metadata_falls_through() {
+    // PS-05: a pre-PS-05 session without recorded provenance keeps
+    // resolving through the remaining chain (here: single-candidate
+    // detection) — never fatal.
+    let repo = init_repo();
+    let thread_id = seed_resumable_session(&repo, None, None);
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--resume"])
+        .arg(&thread_id)
+        .args(["--port", "0", "--mcp-port", "0"])
+        .current_dir(repo.root.canonicalize().expect("canonical root"))
+        .env("GEMINI_API_KEY", "probe-gemini")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        stderr.contains("provider 'gemini' auto-selected"),
+        "metadata-less resume must fall through to detection: {stderr}"
+    );
+    assert!(
+        !stderr.contains("provider_resume_mismatch") && !stderr.contains("was recorded with"),
+        "no mismatch warning without a record: {stderr}"
+    );
+
+    // The boot must have stamped the previously-recordless session with
+    // the provider that actually drove it (insert-if-absent).
+    use libra::internal::ai::session::SessionStore;
+    let store = SessionStore::from_storage_path(&repo.root.join(".libra"));
+    let session = store.load(&thread_id).expect("reload resumed session");
+    assert_eq!(
+        session.recorded_provider_id(),
+        Some("gemini"),
+        "boot must record the effective provider on the session"
+    );
+    assert!(
+        session.recorded_model_id().is_some(),
+        "boot must record the paired model id"
+    );
+}
+
+#[test]
+fn resume_inherits_provider_provenance_recorded_on_new_session() {
+    // PS-05 AC1: a brand-new session records its effective provider and
+    // model ids in the session metadata at first boot — ids only, no
+    // credential material anywhere in the session file.
+    let repo = init_repo();
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .env("GEMINI_API_KEY", "probe-gemini")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    use libra::internal::ai::session::SessionStore;
+    let store = SessionStore::from_storage_path(&repo.root.join(".libra"));
+    let session = store
+        .load_latest()
+        .expect("list sessions")
+        .unwrap_or_else(|| panic!("the boot must have created a session; stderr: {stderr}"));
+    assert_eq!(session.recorded_provider_id(), Some("gemini"));
+    assert!(session.recorded_model_id().is_some());
+    let raw = serde_json::to_string(&session.metadata).expect("serialize metadata");
+    assert!(
+        !raw.contains("probe-gemini"),
+        "session metadata must never contain credential material: {raw}"
+    );
+}
+
+#[test]
+fn resume_inherits_provider_mismatch_warns_and_continues() {
+    // PS-05: an explicit provider that disagrees with the record warns on
+    // stderr (ids only) and continues; under --machine the warning is a
+    // structured event, not prose.
+    let repo = init_repo();
+    let thread_id = seed_resumable_session(&repo, Some("zhipu"), Some("glm-recorded"));
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--resume"])
+        .arg(&thread_id)
+        .args(["--provider", "gemini", "--port", "0", "--mcp-port", "0"])
+        .current_dir(repo.root.canonicalize().expect("canonical root"))
+        .env("GEMINI_API_KEY", "probe-gemini")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        stderr.contains("was recorded with provider")
+            && stderr.contains("'zhipu'")
+            && stderr.contains("'gemini'"),
+        "the mismatch warning must name both ids: {stderr}"
+    );
+    assert!(
+        !stderr.contains("probe-gemini"),
+        "no key material may appear (GC-PS-01): {stderr}"
+    );
+    assert!(
+        stderr.contains("http://") || String::from_utf8_lossy(&out.0).contains("http://"),
+        "the run must continue past the warning: {stderr}"
+    );
+
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["--machine", "code", "--resume"])
+        .arg(&thread_id)
+        .args(["--provider", "gemini", "--port", "0", "--mcp-port", "0"])
+        .current_dir(repo.root.canonicalize().expect("canonical root"))
+        .env("GEMINI_API_KEY", "probe-gemini")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    let event_line = stderr
+        .lines()
+        .find(|line| line.contains("provider_resume_mismatch"))
+        .unwrap_or_else(|| panic!("structured mismatch event missing: {stderr}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(event_line).expect("event line must be valid JSON");
+    assert_eq!(parsed["recorded"], "zhipu");
+    assert_eq!(parsed["using"], "gemini");
+    assert!(
+        !stderr.contains("was recorded with provider"),
+        "prose form must not appear under --machine: {stderr}"
+    );
+}
+
+#[test]
+fn resume_inherits_provider_and_model_for_model_requiring_provider() {
+    // PS-05 model inheritance: ollama has no default model, so a bare
+    // `--provider ollama` launch would be a usage error — a resumed
+    // thread recorded as ollama/llama-recorded must boot past that guard
+    // by inheriting the model together with the provider.
+    let repo = init_repo();
+    let thread_id = seed_resumable_session(&repo, Some("ollama"), Some("llama-recorded"));
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--resume"])
+        .arg(&thread_id)
+        .args(["--port", "0", "--mcp-port", "0"])
+        .current_dir(repo.root.canonicalize().expect("canonical root"))
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stdout = String::from_utf8_lossy(&out.0);
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        stdout.contains("Provider: Ollama"),
+        "the recorded provider must drive the boot; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Model is required") && !stderr.contains("--model"),
+        "the recorded model must satisfy ollama's explicit-model requirement: {stderr}"
+    );
+}
+
 /// Spawn helper: run to first-seconds boot then kill, returning
 /// (stdout, stderr) bytes — for launches that would otherwise run forever.
 trait OutputWithTimeoutKill {

@@ -37,7 +37,7 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 | Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | 每进程本地自动化 token 路径。在 `write` 模式下，Unix/macOS 文件必须是权限 `0600` 的普通文件。与 `--control stdio` 一起使用时可覆盖 worktree 默认 token 路径（与 `--control-info-file` 独立）；权限过宽 fail-closed（`CONTROL_TOKEN_PERMS`）。 |
 | Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | 非 secret 本地 endpoint discovery 元数据路径。launch 模式在 Unix/macOS 上以原子写 + `0600` 落盘。该文件永不包含 token 材料。与 `--control stdio` 一起使用时仅为 `baseUrl` 的 **读取** discovery 路径（显式 `--control-url` 可覆盖）。自定义 info 路径**不会**改写默认 token 位置——若 token 不在 worktree `code/` 目录下，请同时传 `--control-token-file`。 |
 | Control URL | | `--control-url <URL>` |（discovery） | 已有 Code UI control endpoint 的 base URL（例如 `http://127.0.0.1:3000`）。仅与 `--control stdio` 合法。省略时从 `--control-info-file` discovery。必须是字面 loopback IP。 |
-| Provider | | `--provider` | *（无默认——启动时解析）* | AI provider 后端（见下方 Provider Backends）。缺省时依次由 `--agent` 绑定、持久化配置键 `code.defaultProvider`、再到凭据探测解析（配置键命中跳过探测）；零个已配置 key 以 128 退出、多个以 129 退出。 |
+| Provider | | `--provider` | *（无默认——启动时解析）* | AI provider 后端（见下方 Provider Backends）。缺省时依次由 `--agent` 绑定、被恢复线程记录的 provider（携 `--resume` 时）、持久化配置键 `code.defaultProvider`、再到凭据探测解析（resume 或配置键命中跳过探测）；零个已配置 key 以 128 退出、多个以 129 退出。 |
 | Model | | `--model` | provider 默认值 | Provider 专用 model ID。 |
 | Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。绑定生效时，启动 banner、UI 快照与 usage 记录一律以该生效 provider 打标。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
 | Temperature | | `--temperature` | provider 默认值 | 生成采样 temperature。 |
@@ -49,7 +49,7 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 | Kimi thinking | | `--kimi-thinking <enabled\|disabled>` | model 默认值 | 使用 `--provider kimi` 时发送 Kimi 的 `thinking` 对象。 |
 | Kimi stream | | `--kimi-stream <true\|false>` | `true`（Kimi） | 使用 `--provider kimi` 时发送 Kimi 的 `stream` boolean；默认流式。对非 Kimi provider 拒绝。 |
 | Context | | `--context` | 无 | 运行上下文：`dev`（别名 `development`）、`review`（别名 `code-review`）、`research`（别名 `explore`）。 |
-| Resume | | `--resume <THREAD_ID>` | 无 | 按 thread ID 恢复规范 Libra 线程。 |
+| Resume | | `--resume <THREAD_ID>` | 无 | 按 thread ID 恢复规范 Libra 线程。未显式指定 provider 时继承线程记录的 provider/model；显式指定与记录不符时向 stderr 告警并继续。 |
 | Approval policy | | `--approval-policy` | `on-request` | 工具审批策略（见下方 Approval Policies）。 |
 | Approval TTL | | `--approval-ttl <SECS>` | `300` | 已授予的审批在再次提示前对匹配命令保持可复用的秒数。覆盖 `.libra/config.toml` 中的项目配置 `[approval] ttl_seconds`；与会提示的策略相关。 |
 | Network access | | `--network-access <allow\|deny>` | `deny` | shell/gate 默认网络策略。仅接受默认的 `deny`：`--network-access allow` 在所有模式下均被拒绝，直到 Plan network-policy gate 接管每次执行的 sandbox 网络（请在 Plan review 中批准网络）。 |
@@ -79,9 +79,11 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 
 DeepSeek 请求可以通过 `--deepseek-thinking enabled --deepseek-reasoning-effort high --deepseek-stream true` 选择加入 provider 专用字段；这些标志会对非 DeepSeek provider 拒绝。
 Kimi 请求默认使用所选 model 的 thinking 行为；对于需要更低延迟或官方 Web 搜索兼容性的 K2.6/K2.5 run，使用 `--kimi-thinking disabled`。当 provider 返回 Kimi `reasoning_content` 时，Libra 会在 tool-call turns 中保留它。
-`--provider` 没有默认值：生效 provider 在启动时一次性解析——显式 `--provider` 优先，其次 `--agent` 绑定的 provider（两者不一致为 usage 错误），再次持久化配置键 `code.defaultProvider`（repo-local 覆盖 global）；三者皆无时 `libra code` 回落到对六个可配置 provider 的凭据探测（codex 与 ollama 永不被自动选中）：零个已配置 key 以 128（`LBR-AUTH-001`）退出，给出查找链、逐行 key 配置命令与免凭据备选（`--provider codex`、`--provider ollama --model <name>`）；恰一个已配置 key 自动选用该 provider，并向 stderr 打印一行理由（provider id、变量名、命中层——绝不含值）；两个及以上以 129（`LBR-CLI-002`）退出并按 id 字典序列出候选及其命中层。`--model` 在标志、绑定与 `code.defaultProvider` 均未给出 provider 时，在进入探测前即被拒绝（配对不可推断）。候选判定口径：key 在 `--env-file`（仅默认 Web 启动）、进程环境、repo-local vault 或 global vault 任一层持有**非空（trim 后）值**才构成候选；空/全空白值在该层视为 miss 并继续向下一层下探。`--stdio` 与 `--control stdio` 不进行 provider 解析；`--stdio` 下显式传 `--provider` 会被拒绝。
+`--provider` 没有默认值：生效 provider 在启动时一次性解析——显式 `--provider` 优先，其次 `--agent` 绑定的 provider（两者不一致为 usage 错误），再次（携 `--resume <thread_id>` 时）被恢复线程记录的 provider，再次持久化配置键 `code.defaultProvider`（repo-local 覆盖 global）；四者皆无时 `libra code` 回落到对六个可配置 provider 的凭据探测（codex 与 ollama 永不被自动选中）：零个已配置 key 以 128（`LBR-AUTH-001`）退出，给出查找链、逐行 key 配置命令与免凭据备选（`--provider codex`、`--provider ollama --model <name>`）；恰一个已配置 key 自动选用该 provider，并向 stderr 打印一行理由（provider id、变量名、命中层——绝不含值）；两个及以上以 129（`LBR-CLI-002`）退出并按 id 字典序列出候选及其命中层。`--model` 在标志、绑定、被恢复线程记录与 `code.defaultProvider` 均未给出 provider 时，在进入探测前即被拒绝（配对不可推断）。候选判定口径：key 在 `--env-file`（仅默认 Web 启动）、进程环境、repo-local vault 或 global vault 任一层持有**非空（trim 后）值**才构成候选；空/全空白值在该层视为 miss 并继续向下一层下探。`--stdio` 与 `--control stdio` 不进行 provider 解析；`--stdio` 下显式传 `--provider` 会被拒绝。
 
 若不想每次手打 `--provider`，可持久化默认值：`libra config set --global code.defaultProvider <id>`（合法取值：`anthropic`、`codex`、`deepseek`、`gemini`、`kimi`、`ollama`、`openai`、`zhipu`；repo-local 的 `libra config set code.defaultProvider <id>` 覆盖 global 值）。该键只存放于 `libra config` 的 SQLite 数据库——与 `agents.toml` 的 `[code.*]` profile 段无关，两个载体互不读取、互不回退。配置命中时完全跳过凭据探测，并像显式标志一样与 `--model` 配对；若该 provider 缺凭据，则以该 provider 自身的缺 key 报错退出（128）。未设置或空值下探到凭据探测；无法识别的 id 以 129（`LBR-CLI-002`）退出并列出合法取值——不回显已存储的值。
+
+被恢复的线程记得自己的出身：会话在首次启动时把生效 provider 与 model 的 id 写入 session metadata（只有 id——绝不含凭据）；`--resume <thread_id>` 且未显式指定 provider 时继承该记录的 provider——`--model` 缺省时同时继承记录的 model——优先于 `code.defaultProvider` 与凭据探测，避免把历史消息静默喂给另一个模型。显式 `--provider`（或 `--agent` 绑定）与记录不符时向 stderr 打印列出两个 id 的告警并继续执行（`--machine` 下为结构化 `provider_resume_mismatch` 事件而非散文）。早于该记录机制创建的会话按剩余优先级链正常解析。
 
 常规运行时，将 provider keys 存在 `vault.env.<NAME>` 中（例如 `libra config set --global vault.env.GEMINI_API_KEY <value>`——与缺凭据报错推荐的命令一致）；Libra 按以下顺序解析凭据：`--env-file` 值（仅默认 Web 启动可用）→ 进程环境 → repo-local Vault → global Vault。对需要显式 dotenv 覆盖的 live tests，使用 `--env-file .env.test`。在默认 Web 启动下，非 Codex provider 支持 `--env-file`、`--context`、`--approval-policy`、`--approval-ttl`（env-file 值仍优先于进程环境/Vault）。Managed Web `--provider codex` 仍拒绝 `--env-file`、`--approval-ttl` 与 `--resume`（未接入 Codex app-server 路径）；裸 `libra code --provider codex --resume <thread_id>` 同样以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除）；MCP `--stdio` 继续拒绝这些 Web-only flag。
 
@@ -458,7 +460,8 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 
 ```bash
 # 启动 Web Code UI 会话（provider 在启动时解析：--provider 旗标、
-# --agent 绑定、持久化配置键 code.defaultProvider、再到唯一凭据自动选用）
+# --agent 绑定、被恢复线程的记录（携 --resume 时）、持久化配置键
+# code.defaultProvider、再到唯一凭据自动选用）
 libra code
 
 # 使用 Anthropic Claude 启动
@@ -569,7 +572,7 @@ Web Code UI 是主要的（也是唯一的交互式）协作入口。遗留 TUI 
 
 ### 为什么支持多个 AI provider？
 
-不同 provider 擅长不同任务，并具有不同成本/延迟画像。没有内置默认 provider：生效 provider 在启动时解析（显式旗标、`--agent` 绑定、持久化配置键 `code.defaultProvider`，或唯一凭据自动选用）。Anthropic Claude 擅长谨慎 reasoning 和代码审查。本地 Ollama 支持完全离线开发。通过抽象在 `CompletionClient` trait 后面，添加新 provider 只需要实现该 trait，无需触碰 session、tool 或 Web UI 层。
+不同 provider 擅长不同任务，并具有不同成本/延迟画像。没有内置默认 provider：生效 provider 在启动时解析（显式旗标、`--agent` 绑定、被恢复线程记录的 provider、持久化配置键 `code.defaultProvider`，或唯一凭据自动选用）。Anthropic Claude 擅长谨慎 reasoning 和代码审查。本地 Ollama 支持完全离线开发。通过抽象在 `CompletionClient` trait 后面，添加新 provider 只需要实现该 trait，无需触碰 session、tool 或 Web UI 层。
 
 ### 为什么集成 MCP？
 

@@ -381,7 +381,7 @@ libra config list --gpg-keys
 
 ## `code.defaultProvider` 键
 
-`libra code` 在启动时一次性解析生效 provider；`code.defaultProvider` 是该阶梯中的持久化槽位（显式 `--provider` → `--agent` 绑定 → **`code.defaultProvider`** → 凭据探测）：
+`libra code` 在启动时一次性解析生效 provider；`code.defaultProvider` 是该阶梯中的持久化槽位（显式 `--provider` → `--agent` 绑定 → 被恢复线程记录的 provider（`--resume`）→ **`code.defaultProvider`** → 凭据探测）：
 
 ```bash
 libra config set --global code.defaultProvider deepseek   # global 默认

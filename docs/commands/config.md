@@ -383,7 +383,7 @@ Supported `--usage` values are `signing` and `encrypt`.
 
 ## The `code.defaultProvider` Key
 
-`libra code` resolves its effective provider once at startup; `code.defaultProvider` is the persisted slot in that ladder (explicit `--provider` → `--agent` binding → **`code.defaultProvider`** → credential detection):
+`libra code` resolves its effective provider once at startup; `code.defaultProvider` is the persisted slot in that ladder (explicit `--provider` → `--agent` binding → resumed thread's recorded provider (`--resume`) → **`code.defaultProvider`** → credential detection):
 
 ```bash
 libra config set --global code.defaultProvider deepseek   # global default

@@ -517,11 +517,12 @@ pub struct CodeArgs {
     pub control_url: Option<String>,
 
     /// AI provider backend. No default: the effective provider is resolved
-    /// at startup — `--provider` → `--agent` binding → the persisted
-    /// `code.defaultProvider` config key → credential detection (a config
-    /// hit skips detection; zero configured keys exit 128, several exit
-    /// 129) — and written back here, so `None` after parsing means "not
-    /// explicitly chosen" (plan-20260825 ADR-PS-05).
+    /// at startup — `--provider` → `--agent` binding → the resumed
+    /// thread's recorded provider (with `--resume`) → the persisted
+    /// `code.defaultProvider` config key → credential detection (a resume
+    /// or config hit skips detection; zero configured keys exit 128,
+    /// several exit 129) — and written back here, so `None` after parsing
+    /// means "not explicitly chosen" (plan-20260825 ADR-PS-05).
     #[arg(long, value_enum)]
     pub provider: Option<CodeProvider>,
 
@@ -831,6 +832,104 @@ async fn config_default_provider(working_dir: &std::path::Path) -> CliResult<Opt
     config_slot_outcome(raw.as_deref())
 }
 
+/// PS-05: load the session targeted by `--resume <thread_id>` for
+/// provenance reads at entry-resolution time. Every miss — not resuming,
+/// an empty id, no storage root, or no matching session — returns `None`
+/// so the caller falls through; the real resume path later surfaces its
+/// own errors for genuinely broken ids.
+fn resume_session_snapshot(args: &CodeArgs, working_dir: &std::path::Path) -> Option<SessionState> {
+    let thread_id = args.resume.as_deref()?.trim();
+    if thread_id.is_empty() {
+        return None;
+    }
+    let storage_root = resolve_storage_root(working_dir)?;
+    let store = SessionStore::from_storage_path(&storage_root);
+    store
+        .load_for_thread_id(thread_id, &working_dir.to_string_lossy())
+        .ok()
+        .flatten()
+}
+
+/// PS-05 slot-3 read: the recorded provider (and model) provenance of the
+/// thread being resumed. `None` when there is nothing usable — including a
+/// recorded id outside the capability table, which is logged and ignored
+/// rather than fatal (AC: metadata-less sessions keep resolving through
+/// the remaining ADR-PS-05 chain).
+fn resume_recorded_provenance(
+    args: &CodeArgs,
+    working_dir: &std::path::Path,
+) -> Option<(CodeProvider, Option<String>)> {
+    let session = resume_session_snapshot(args, working_dir)?;
+    let recorded = session.recorded_provider_id()?;
+    let Some(spec) = provider_spec_by_id(recorded) else {
+        tracing::warn!(
+            recorded,
+            "resumed session records an unknown provider id; ignoring the provenance"
+        );
+        return None;
+    };
+    Some((
+        spec.provider,
+        session.recorded_model_id().map(str::to_string),
+    ))
+}
+
+/// PS-05: an explicit provider selection (flag or `--agent` binding) that
+/// disagrees with the resumed thread's recorded provider gets a stderr
+/// warning — the thread's history was produced under another provider —
+/// and the run continues. Ids only (GC-PS-01); machine surfaces get a
+/// structured event instead of prose (ADR-PS-03 rule five).
+fn warn_on_resume_provider_mismatch(
+    args: &CodeArgs,
+    working_dir: &std::path::Path,
+    decided: CodeProvider,
+    output: &OutputConfig,
+) {
+    if args.resume.is_none() {
+        return;
+    }
+    let Some((recorded, _)) = resume_recorded_provenance(args, working_dir) else {
+        return;
+    };
+    if recorded == decided {
+        return;
+    }
+    let id_for = |provider: CodeProvider| {
+        PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.provider == provider)
+            .map(|spec| spec.id.to_string())
+            .unwrap_or_else(|| format!("{provider:?}").to_lowercase())
+    };
+    let recorded_id = id_for(recorded);
+    let using_id = id_for(decided);
+    let thread_id = args.resume.as_deref().unwrap_or_default();
+    if output.is_json() {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "provider_resume_mismatch",
+                "thread_id": thread_id,
+                "recorded": recorded_id,
+                "using": using_id,
+            })
+        );
+    } else {
+        let lines = [
+            format!(
+                "warning: thread '{thread_id}' was recorded with provider \
+                 '{recorded_id}', but '{using_id}' was explicitly selected; \
+                 continuing with '{using_id}'"
+            ),
+            String::new(),
+            format!("The thread's history was produced under '{recorded_id}'."),
+            "To keep the recorded pairing, drop the explicit selection:".to_string(),
+            format!("    libra code --resume {thread_id}"),
+        ];
+        eprintln!("{}", lines.join("\n"));
+    }
+}
+
 /// One auto-selection candidate from the PS-06 credential detection: the
 /// capability row plus where its key was found. Never carries the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -973,7 +1072,25 @@ async fn resolve_provider_at_entry(
         args.provider,
         binding.as_ref().map(|b| b.provider_id.as_str()),
     )? {
+        // PS-05: an explicit selection that disagrees with the resumed
+        // thread's recorded provider warns and proceeds — never fatal.
+        warn_on_resume_provider_mismatch(args, working_dir, decided, output);
         args.provider = Some(decided);
+        return Ok(());
+    }
+    // Slot 3 (PS-05, ADR-PS-05): a resumed thread inherits its recorded
+    // provider — and, when `--model` is absent, its recorded model — from
+    // the session metadata, ahead of the persisted config default, the
+    // --model pairing guard, and detection. A session without the record
+    // (pre-PS-05 threads) or an unresolvable thread id simply falls
+    // through to the remaining slots — never fatal here; the real resume
+    // path surfaces its own errors later.
+    if let Some((recorded_provider, recorded_model)) = resume_recorded_provenance(args, working_dir)
+    {
+        args.provider = Some(recorded_provider);
+        if args.model.is_none() {
+            args.model = recorded_model;
+        }
         return Ok(());
     }
     // Slot 4 (PS-03, ADR-PS-05): the persisted `code.defaultProvider`
@@ -3233,6 +3350,20 @@ where
     // actually dispatched on, not from `args.provider` — so an `--agent`
     // binding override can never mislabel the session.
     let provider_name = effective_provider_id;
+    // PS-05: record the session's provider/model provenance under the
+    // writer lease, insert-if-absent — an existing record is the thread's
+    // history and a later override must not rewrite it. Ids only, never
+    // credentials (GC-PS-01).
+    let mut session_state = session_state;
+    if session_state.record_provider_provenance(&provider_name, &model_name) {
+        session_store.save(&session_state).map_err(|error| {
+            CliError::io(format!(
+                "failed to persist provider provenance for Code session '{}': {error}",
+                session_state.id
+            ))
+        })?;
+    }
+    let session_state = session_state;
     let provider = CodeUiProviderInfo {
         provider: provider_name.clone(),
         model: Some(model_name.clone()),
