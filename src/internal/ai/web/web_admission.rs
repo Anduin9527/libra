@@ -1167,12 +1167,12 @@ impl WebCodeUiAdmission {
                 // gate and release it after cancellation. Do not retain the
                 // admission lock while waiting for that completion.
                 drop(slot);
+                // DF-07 (terra R2/R3): the provider never starts past this
+                // point — restore FIRST, before any fallible cleanup, so an
+                // error path cannot skip it.
+                self.restore_composed_skills(composed_skills.take()).await;
                 self.cancel_gated_runtime_turn(runtime, &runtime_turn_id, completion_for_rollback)
                     .await?;
-                // DF-07 (terra R2): the provider never started — give the
-                // consumed activations back so the next plain turn still
-                // carries them.
-                self.restore_composed_skills(composed_skills.take()).await;
                 self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                     .await?;
                 return Err(anyhow!(
@@ -1189,6 +1189,10 @@ impl WebCodeUiAdmission {
             // projection and must not publish a fresh Thinking turn.
             pre_start_state.store(PRE_START_CANCELLED, Ordering::Release);
             drop(slot);
+            // DF-07 (terra R2/R3): cancelled before the executor start gate
+            // opened — restore FIRST so a failed terminal persist cannot
+            // skip it.
+            self.restore_composed_skills(composed_skills.take()).await;
             self.settle_cancelled_before_start(
                 session,
                 user_entry,
@@ -1196,9 +1200,6 @@ impl WebCodeUiAdmission {
                 &runtime_turn_id,
             )
             .await?;
-            // DF-07 (terra R2): cancelled before the executor start gate
-            // opened — the composed turn never reaches the provider.
-            self.restore_composed_skills(composed_skills.take()).await;
             self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                 .await?;
             return Ok(());
@@ -1221,6 +1222,9 @@ impl WebCodeUiAdmission {
             // Do not open the tool gate; replace the just-published streaming
             // entry with the one terminal no-tool result.
             drop(slot);
+            // DF-07 (terra R2/R3): cancellation won before the start gate —
+            // restore FIRST so a failed terminal persist cannot skip it.
+            self.restore_composed_skills(composed_skills.take()).await;
             self.settle_cancelled_before_start(
                 session,
                 user_entry,
@@ -1228,9 +1232,6 @@ impl WebCodeUiAdmission {
                 &runtime_turn_id,
             )
             .await?;
-            // DF-07 (terra R2): cancellation won before the start gate —
-            // the provider never runs this composed turn.
-            self.restore_composed_skills(composed_skills.take()).await;
             self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
                 .await?;
             return Ok(());

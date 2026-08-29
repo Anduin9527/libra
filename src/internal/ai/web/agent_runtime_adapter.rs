@@ -116,8 +116,10 @@ struct ComposedSkillTurn {
 pub(crate) struct ComposedProviderInput {
     pub(crate) input: String,
     consumed: Vec<(String, String)>,
-    /// The `commandId` whose retry entry this composition minted, if any.
-    retry_key: Option<String>,
+    /// The exact `(commandId, rawText)` retry entry this composition
+    /// minted, if any — restore removes only this tuple, never the same
+    /// command's other payloads (terra R3).
+    retry_key: Option<(String, String)>,
 }
 
 impl PendingSkillContext {
@@ -173,7 +175,7 @@ impl PendingSkillContext {
             while self.composed_retries.len() > COMPOSED_RETRY_LIMIT {
                 self.composed_retries.pop_front();
             }
-            command_id.to_string()
+            (command_id.to_string(), text.to_string())
         });
         ComposedProviderInput {
             input,
@@ -186,9 +188,9 @@ impl PendingSkillContext {
     /// activation order is preserved) and drop a retry key minted for the
     /// failed attempt.
     pub(crate) fn restore(&mut self, outcome: ComposedProviderInput) {
-        if let Some(retry_key) = outcome.retry_key.as_deref() {
+        if let Some((command_id, raw_text)) = outcome.retry_key.as_ref() {
             self.composed_retries
-                .retain(|entry| entry.command_id != retry_key);
+                .retain(|entry| !(entry.command_id == *command_id && entry.raw_text == *raw_text));
         }
         if !outcome.consumed.is_empty() {
             let mut restored = outcome.consumed;
@@ -383,6 +385,13 @@ impl AgentRuntimeCodeUiAdapter {
     /// Validate an A0-07 activation before a provider consumes it.
     pub fn skill_activate(&self, activation: &CodeSkillActivation) -> Result<()> {
         self.execution_control.skill_activate(activation)
+    }
+
+    /// Test-provider-only view of the still-pending activations, so race
+    /// regressions can assert restore semantics without a provider turn.
+    #[cfg(feature = "test-provider")]
+    pub async fn pending_skill_activations_for_test(&self) -> Vec<(String, String)> {
+        self.pending_skills.lock().await.active.clone()
     }
 }
 
@@ -748,6 +757,38 @@ mod tests {
 
         // Different text under a known id is a fresh (passthrough) compose.
         assert_eq!(ctx.compose("other", Some("cmd-3")).input, "other");
+    }
+
+    /// DF-07 (terra R3): a failed attempt under an already-used commandId
+    /// with DIFFERENT text must only remove ITS OWN `(commandId, rawText)`
+    /// entry — the original request's retry payload survives and keeps
+    /// reusing the original composition.
+    #[test]
+    fn pending_skill_context_restore_keeps_other_payloads_of_the_same_command() {
+        let mut ctx = PendingSkillContext::default();
+        ctx.record("claude-code", "/review");
+        let original = ctx.compose("text A", Some("cmd-1"));
+        assert!(original.input.contains("'/review'"));
+
+        // Same command id, different raw text (a payload-conflict attempt
+        // in flight): it mints its own entry consuming activation B…
+        ctx.record("codex", "/review");
+        let conflicting = ctx.compose("text B", Some("cmd-1"));
+        assert!(conflicting.input.contains("(codex)"));
+
+        // …and its failure cleanup must not touch (cmd-1, "text A").
+        ctx.restore(conflicting);
+        assert_eq!(
+            ctx.active,
+            vec![("codex".to_string(), "/review".to_string())],
+            "only the failed attempt's consumed set comes back"
+        );
+        let retry = ctx.compose("text A", Some("cmd-1"));
+        assert_eq!(
+            retry.input, original.input,
+            "the original request's retry payload must survive the cleanup"
+        );
+        assert!(retry.consumed.is_empty());
     }
 
     /// DF-07 (terra R2): the retry store is bounded — the oldest entry
