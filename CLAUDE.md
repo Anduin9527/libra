@@ -46,6 +46,9 @@ cargo +nightly fmt --all
 # Lint — all warnings must be resolved before committing (all features on)
 cargo clippy --all-targets --all-features -- -D warnings
 
+# Dependencies compile at opt-level 2 in dev profile (TA-05: kills the 5-17s
+# opt-0 RSA keygen in every `libra init --vault`); first build after checkout
+# recompiles deps once (+10-20 min), behavior unchanged.
 # Quick compile check (skip the Next.js web build for speed)
 LIBRA_SKIP_WEB_BUILD=1 cargo check
 LIBRA_SKIP_WEB_BUILD=1 cargo build
