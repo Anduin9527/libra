@@ -219,11 +219,11 @@ fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<Beneat
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return Ok(BeneathRootIdentity {
+        Ok(BeneathRootIdentity {
             path: root_path.to_path_buf(),
             dev: metadata.dev(),
             ino: metadata.ino(),
-        });
+        })
     }
     #[cfg(windows)]
     {
@@ -234,11 +234,11 @@ fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<Beneat
         let index = metadata
             .file_index()
             .ok_or_else(|| io::Error::other("cannot identify pinned worktree root handle"))?;
-        return Ok(BeneathRootIdentity {
+        Ok(BeneathRootIdentity {
             path: root_path.to_path_buf(),
             volume,
             index,
-        });
+        })
     }
     #[cfg(not(any(unix, windows)))]
     Ok(BeneathRootIdentity {
