@@ -106,7 +106,7 @@ The stdio client speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and maps 
 | JSON-RPC method | HTTP equivalent |
 |-----------------|-----------------|
 | `session.get` | `GET /api/code/session` |
-| `events.subscribe` | `GET /api/code/events?wire=2&cursor=<last>`; accepts optional params `{ "cursor": <last acknowledged v2 cursor> }` and acknowledges `{ subscribed, requestedWire, requestedCursor }` before forwarding events. `requestedWire` is the requested version, not a negotiated-version guarantee. Omitting params is the cursor-0 initial bootstrap. On `WIRE_V2_RESYNC_REQUIRED`, the client fetches `/session`, emits one enriched `resync` notification whose data includes `snapshot`, then reconnects at the server-provided `durableTail`. Exact `409 WIRE_V2_CURSOR_AHEAD` means the cursor belongs to a later/different session; the client emits the same snapshot recovery with code `WIRE_V2_CURSOR_AHEAD`, drops that cursor, and restarts v2 from 0. If the server instead returns exact `503 WIRE_V2_REQUIRES_DURABLE_SESSION`, the client retries once with `?wire=1` and forwards legacy snapshot notifications. |
+| `events.subscribe` | `GET /api/code/events?wire=2&cursor=<last>`; accepts optional params `{ "cursor": <last acknowledged v2 cursor> }` and acknowledges `{ subscribed, requestedWire, requestedCursor }` before forwarding events. `requestedWire` is the requested version, not a negotiated-version guarantee. Omitting params is the cursor-0 initial bootstrap. On `WIRE_V2_RESYNC_REQUIRED`, the client fetches `/session`, emits one enriched `resync` notification whose data includes `snapshot`, then reconnects at the server-provided `durableTail`. Exact `409 WIRE_V2_CURSOR_AHEAD` means the cursor belongs to a later/different session; the client emits the same snapshot recovery with code `WIRE_V2_CURSOR_AHEAD`, drops that cursor, and restarts v2 from 0. An exact `503 WIRE_V2_REQUIRES_DURABLE_SESSION` is terminal: the legacy `?wire=1` fallback was removed in 0.22.0 together with the server-side v1 wire — the error (with removal guidance) surfaces to the caller. |
 | `diagnostics.get` | `GET /api/code/diagnostics` |
 | `controller.attach` | `POST /api/code/controller/attach` |
 | `controller.detach` | `POST /api/code/controller/detach` |
@@ -288,15 +288,13 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 
 | Selection | Mechanism |
 |---|---|
-| Explicit v1 | `?wire=1` or `?wire=v1` |
+| Explicit v1 | **Removed in 0.22.0** — `?wire=1` / `?wire=v1` return `400 INVALID_WIRE_VERSION` with removal guidance (`v0.21.29` was the last release serving wire v1) |
 | Explicit v2 | `?wire=2` or `?wire=v2` |
 | Accept hint | `Accept: text/event-stream;libra-wire=2` (query `wire=` wins if both are set) |
-| Default (unspecified) | The server defaults to **v2** for clients that omit `wire` / `libra-wire` (DF-06; `v0.21.27` was the last release defaulting to v1). Explicit `?wire=1` still selects the full-snapshot stream. The built-in SPA (W3-09) and `libra code --control stdio` automation client explicitly request `?wire=2`. |
+| Default (unspecified) | The server defaults to **v2** for clients that omit `wire` / `libra-wire` (DF-06; `v0.21.27` was the last release defaulting to v1). The built-in SPA (W3-09) and `libra code --control stdio` automation client explicitly request `?wire=2`. |
 | Illegal values | fail-closed `400 INVALID_WIRE_VERSION` |
 
-**SSE v1** (explicit `wire=1` full-snapshot stream): `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and
-`data`. Event `type` is `session_updated`, `status_changed`, or
-`controller_changed`; `session_updated` carries a full `CodeUiSessionSnapshot`.
+**SSE v1** (removed): the full-snapshot `CodeUiEventEnvelope` stream (`seq`/`type`/`at`/`data` records with `session_updated` / `status_changed` / `controller_changed` events) was physically removed in 0.22.0 after the DEFER-08 bake completed. Clients that still need it must stay on `v0.21.29`; the snapshot bootstrap on v2 is one `GET /api/code/session` fetch.
 
 **SSE wire v2**: `code_workflow` events with camelCase `cursor` (durable W1-06
 workflow sequence), `eventId`, `kind`, `at`, and minimal `payload`. Reconnect with
@@ -439,10 +437,10 @@ replay therefore cannot reopen that gate.
 
 ### SSE v1 compatibility window (DEFER-08)
 
-v1 snapshot SSE remains supported through at least one successful public patch
-release after wire v2 becomes the default and the built-in frontend/automation
-clients have migrated. Physical removal of v1 is **not** part of plan-20260715;
-see DEFER-08 / ADR-CODE-08. Removal preconditions (checklist; all required):
+**Completed — v1 was physically removed in 0.22.0** (plan-20260824 DF-08,
+ADR-DF-03). The checklist below is the historical record of the bake this
+removal required; `v0.21.29` was the last release serving wire v1, and
+clients that cannot consume v2 must stay on it.
 
 1. [x] Built-in frontend migrated to v2 (W3-09 evidence): the SPA
    opens `GET /api/code/events?wire=2` from `sse-resilience` (`wrapClientForSseResilience`),
@@ -454,11 +452,18 @@ see DEFER-08 / ADR-CODE-08. Removal preconditions (checklist; all required):
    `events.subscribe`, lets callers resume from an acknowledged cursor, and
    handles `WIRE_V2_RESYNC_REQUIRED` / `WIRE_V2_CURSOR_AHEAD` with explicit
    snapshot reconciliation and bounded reconnect behavior.
-3. [x] Compat / matrix tests consume v2 by default (DF-05 evidence):
-   `code_ui_remote_sse_matrix` defaults `openEvents` to wire v2, while the
-   initial-snapshot and controller-change compatibility cases explicitly use v1.
-4. Release notes name the last v1-supporting version and the upgrade path.
-5. At least one successful public patch release after (1)–(4) while v1 still works.
+3. [x] Compat / matrix tests consume v2 by default (DF-05 evidence; the two
+   explicit-v1 compatibility cases were deleted with the wire in DF-08 — a
+   fixture-shape guard now rejects any v1 `openEvents` step).
+4. [x] Release notes name the last v1-supporting version and the upgrade path
+   (DF-08 evidence: the 0.22.0 CHANGELOG entry names `v0.21.29` and the v2
+   consumption path).
+5. [x] At least one successful public patch release after (1)–(4) while v1
+   still works (DEP-02 evidence: `v0.21.29` — released after the DF-06 default
+   switch with default wire=v2 and explicit v1 still served; annotated tag on
+   origin. `gh release view` is unavailable against this repository's
+   non-GitHub remote, so the tag + release pipeline is the recorded evidence,
+   the same convention as DF-03..DF-07).
 
 
 `GET /api/code/threads` returns `{ items, nextOffset? }`. Each item has `id`, optional `title`, `archived`, optional `currentIntentId`, optional `workingDir`, `createdAt`, and `updatedAt`. `workingDir` is omitted until ThreadProjection persists a per-thread cwd (do not invent the server cwd for linked-worktree threads). `limit` defaults to 50 and clamps to 200; malformed `limit` or `offset` returns `INVALID_QUERY_PARAM`.
@@ -476,7 +481,7 @@ Code UI API errors use `{ error: { code, message } }`:
 | `INVALID_BROWSER_BOOTSTRAP` | 403 | `X-Libra-Browser-Bootstrap` does not match this Libra Code session. |
 | `RATE_LIMITED` | 429 | Per-session write budget exhausted; retry after the rate-limit window (see `Retry-After` / wait for window recovery). |
 | `REDACTION_FAILED` | 500 | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the response omits unredacted payload; restart `libra code` or retry after fixing redactor configuration. |
-| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` wire negotiation received an illegal `wire` / `libra-wire` value (only `1`/`v1` and `2`/`v2` are accepted). |
+| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` wire negotiation received an illegal `wire` / `libra-wire` value (only `2`/`v2` is accepted; `1`/`v1` was removed in 0.22.0 and the error names the last serving release). |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 requires a SessionStore-backed workflow hub (mounted today for default Web headless persistence; managed Codex Web does not yet expose one). |
 | `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (an ahead cursor would permanently skip live events). |
 | `WIRE_V2_RESYNC_REQUIRED` | SSE `resync` then close | Transport backlog exceeded (1,024 events / 8 MiB); fetch snapshot and reconnect with `cursor=<durableTail>`. |

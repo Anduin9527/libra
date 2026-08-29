@@ -1384,19 +1384,27 @@ fn sse_wire_version_negotiation() {
         CodeUiSseWireVersion::V2,
         "DF-06: an Accept header without libra-wire keeps the v2 default"
     );
-    for (raw, expected) in [
-        ("1", CodeUiSseWireVersion::V1),
-        ("v1", CodeUiSseWireVersion::V1),
-        ("2", CodeUiSseWireVersion::V2),
-        ("v2", CodeUiSseWireVersion::V2),
-    ] {
+    for raw in ["2", "v2"] {
         let query = CodeEventsQuery {
             wire: Some(raw.into()),
             cursor: None,
         };
         assert_eq!(
             parse_code_events_wire_version(&query, &headers).unwrap(),
-            expected
+            CodeUiSseWireVersion::V2
+        );
+    }
+    // DF-08: wire v1 was removed — explicit v1 fails closed with removal
+    // guidance instead of negotiating the deleted snapshot stream.
+    for raw in ["1", "v1"] {
+        let query = CodeEventsQuery {
+            wire: Some(raw.into()),
+            cursor: None,
+        };
+        let error = parse_code_events_wire_version(&query, &headers).unwrap_err();
+        assert!(
+            error.contains("removed in 0.22.0"),
+            "removal guidance expected: {error}"
         );
     }
     assert!(
@@ -1419,7 +1427,9 @@ fn sse_wire_version_negotiation() {
         parse_code_events_wire_version(&CodeEventsQuery::default(), &accept).unwrap(),
         CodeUiSseWireVersion::V2
     );
-    assert_eq!(
+    // Query precedence over Accept still holds: the removed v1 in the
+    // query fails even though the Accept hint names the valid v2.
+    assert!(
         parse_code_events_wire_version(
             &CodeEventsQuery {
                 wire: Some("1".into()),
@@ -1427,8 +1437,7 @@ fn sse_wire_version_negotiation() {
             },
             &accept
         )
-        .unwrap(),
-        CodeUiSseWireVersion::V1,
+        .is_err(),
         "query wire must win over Accept"
     );
 }

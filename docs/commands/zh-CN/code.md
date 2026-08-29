@@ -106,7 +106,7 @@ Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方�
 | JSON-RPC 方法 | HTTP 等价接口 |
 |-----------------|-----------------|
 | `session.get` | `GET /api/code/session` |
-| `events.subscribe` | 请求 `GET /api/code/events?wire=2&cursor=<last>`；接受可选参数 `{ "cursor": <最后确认的 v2 cursor> }`，先确认 `{ subscribed, requestedWire, requestedCursor }`，再转发事件。`requestedWire` 仅表示请求版本，不保证协商后的实际版本。省略参数为 cursor-0 首次 bootstrap。收到 `WIRE_V2_RESYNC_REQUIRED` 时，客户端拉取 `/session`，发出一条 data 含 `snapshot` 的增强 `resync` 通知，再从服务端给出的 `durableTail` 重连。精确的 `409 WIRE_V2_CURSOR_AHEAD` 表示 cursor 属于更晚/不同的 session；客户端会以该 code 发出同类 snapshot 恢复通知，丢弃旧 cursor，并从 0 重启 v2。若服务端返回精确的 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`，客户端会以 `?wire=1` 重试一次并转发遗留 snapshot 通知。 |
+| `events.subscribe` | 请求 `GET /api/code/events?wire=2&cursor=<last>`；接受可选参数 `{ "cursor": <最后确认的 v2 cursor> }`，先确认 `{ subscribed, requestedWire, requestedCursor }`，再转发事件。`requestedWire` 仅表示请求版本，不保证协商后的实际版本。省略参数为 cursor-0 首次 bootstrap。收到 `WIRE_V2_RESYNC_REQUIRED` 时，客户端拉取 `/session`，发出一条 data 含 `snapshot` 的增强 `resync` 通知，再从服务端给出的 `durableTail` 重连。精确的 `409 WIRE_V2_CURSOR_AHEAD` 表示 cursor 属于更晚/不同的 session；客户端会以该 code 发出同类 snapshot 恢复通知，丢弃旧 cursor，并从 0 重启 v2。精确的 `503 WIRE_V2_REQUIRES_DURABLE_SESSION` 现为终态：遗留的 `?wire=1` 回退已随服务端 v1 wire 在 0.22.0 删除——错误（含删除指引）直接上抛给调用方。 |
 | `diagnostics.get` | `GET /api/code/diagnostics` |
 | `controller.attach` | `POST /api/code/controller/attach` |
 | `controller.detach` | `POST /api/code/controller/detach` |
@@ -267,13 +267,13 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 
 | 选择 | 机制 |
 |---|---|
-| 显式 v1 | `?wire=1` 或 `?wire=v1` |
+| 显式 v1 | **已在 0.22.0 删除**——`?wire=1` / `?wire=v1` 返回 `400 INVALID_WIRE_VERSION` 并附删除指引（`v0.21.29` 是最后一个提供 wire v1 的版本） |
 | 显式 v2 | `?wire=2` 或 `?wire=v2` |
 | Accept 提示 | `Accept: text/event-stream;libra-wire=2`（若同时给出 query `wire=`，以 query 为准） |
-| 未指定默认 | 省略 `wire` / `libra-wire` 时，服务端默认为 **v2**（DF-06；`v0.21.27` 是最后一个默认 v1 的版本）。显式 `?wire=1` 仍为全量 snapshot stream。内置 SPA（W3-09）和 `libra code --control stdio` automation 客户端会显式请求 `?wire=2`。 |
+| 未指定默认 | 省略 `wire` / `libra-wire` 时，服务端默认为 **v2**（DF-06；`v0.21.27` 是最后一个默认 v1 的版本）。内置 SPA（W3-09）和 `libra code --control stdio` automation 客户端会显式请求 `?wire=2`。 |
 | 非法值 | fail-closed `400 INVALID_WIRE_VERSION` |
 
-**SSE v1**（显式 `wire=1` 的全量 snapshot stream）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
+**SSE v1**（已删除）：全量 snapshot 的 `CodeUiEventEnvelope` 流（`seq`/`type`/`at`/`data` 记录，事件 `session_updated` / `status_changed` / `controller_changed`）在 DEFER-08 烘焙完成后于 0.22.0 物理删除。仍需 v1 的客户端请停留在 `v0.21.29`；v2 下的 snapshot bootstrap 是一次 `GET /api/code/session`。
 
 **SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`）。Code UI **projection** 热窗口是同数值、独立命名的预算（`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`），两者不可相加。单事件 fold 只访问 suffix，不回放整段 session 历史（W3-14；10k events 下 release p95 ≤ 5 ms）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的默认 Web headless（非 Codex `HeadlessCodeRuntime`）；managed `--provider codex` Web 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
 
@@ -368,7 +368,7 @@ replay 因而不会重新打开该 gate。
 
 ### SSE v1 兼容窗口（DEFER-08）
 
-在 wire v2 成为默认、且内置前端/automation 客户端完成迁移之后，v1 snapshot SSE 仍至少保留一个成功的公开 patch release。v1 的物理移除**不属于** plan-20260715；见 DEFER-08 / ADR-CODE-08。移除前置条件清单（须全部满足）：
+**已完成——v1 已在 0.22.0 物理删除**（plan-20260824 DF-08，ADR-DF-03）。下方清单是本次删除所需烘焙的历史记录；`v0.21.29` 是最后一个提供 wire v1 的版本，无法消费 v2 的客户端请停留在该版本。
 
 1. [x] 内置前端已迁移到 v2（W3-09 证据）：SPA 经 `sse-resilience` 的
    `wrapClientForSseResilience` 打开 `GET /api/code/events?wire=2`，用 wire cursor
@@ -378,11 +378,14 @@ replay 因而不会重新打开该 gate。
    `libra code --control stdio` 的 `events.subscribe` 会追加
    `?wire=2&cursor=<last>`，允许调用方从已确认 cursor 续接，并用显式 snapshot
    对账和有界重连处理 `WIRE_V2_RESYNC_REQUIRED` / `WIRE_V2_CURSOR_AHEAD`。
-3. [x] Compat / matrix 测试默认消费 v2（DF-05 证据）：
-   `code_ui_remote_sse_matrix` 的 `openEvents` 默认为 wire v2；初始 snapshot
-   与 controller-change 兼容用例显式使用 v1。
-4. Release notes 写明最后支持 v1 的版本与升级路径。
-5. 在 (1)–(4) 之后、v1 仍可用时，至少有一次成功的公开 patch release。
+3. [x] Compat / matrix 测试默认消费 v2（DF-05 证据；两个显式 v1 兼容用例已随
+   wire 在 DF-08 删除——夹具形态守卫现在拒绝任何 v1 `openEvents` 步骤）。
+4. [x] Release notes 写明最后支持 v1 的版本与升级路径（DF-08 证据：0.22.0 的
+   CHANGELOG 条目写明 `v0.21.29` 与 v2 消费路径）。
+5. [x] 在 (1)–(4) 之后、v1 仍可用时，至少有一次成功的公开 patch release
+   （DEP-02 证据：`v0.21.29`——在 DF-06 默认切换之后发布，默认 wire=v2 且显式
+   v1 仍可用；annotated tag 已在 origin。本仓库远端非 GitHub，`gh release view`
+   不可用，故以 tag + 发布流水线为记录证据，与 DF-03..DF-07 同口径）。
 
 
 `GET /api/code/threads` 返回 `{ items, nextOffset? }`。每个 item 有 `id`、可选 `title`、`archived`、可选 `currentIntentId`、可选 `workingDir`、`createdAt` 和 `updatedAt`。在 ThreadProjection 持久化 per-thread cwd 之前省略 `workingDir`（不要用 server cwd 冒充 linked-worktree thread）。`limit` 默认 50 并 clamp 到 200；格式错误的 `limit` 或 `offset` 返回 `INVALID_QUERY_PARAM`。
@@ -400,7 +403,7 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `INVALID_BROWSER_BOOTSTRAP` | 403 | `X-Libra-Browser-Bootstrap` 与本 Libra Code 会话不匹配。 |
 | `RATE_LIMITED` | 429 | 当前 session 写配额耗尽；等待速率窗口恢复后重试（见 `Retry-After`）。 |
 | `REDACTION_FAILED` | 500 | Session / diagnostics / SSE 投影无法应用 secret redactor（规则为空或序列化失败）。Fail-closed：响应不包含未脱敏 payload；重启 `libra code` 或修复 redactor 配置后重试。 |
-| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` 的 `wire` / `libra-wire` 取值非法（仅接受 `1`/`v1` 与 `2`/`v2`）。 |
+| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` 的 `wire` / `libra-wire` 取值非法（仅接受 `2`/`v2`；`1`/`v1` 已在 0.22.0 删除，错误信息会指明最后提供 v1 的版本）。 |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 需要 SessionStore-backed workflow hub（当前挂在默认 Web headless persistence；managed Codex Web 尚未暴露）。 |
 | `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` 超过 durable workflow 尾部；丢弃 cursor 并 resync（超前 cursor 会导致后续 live 事件永久跳过）。 |
 | `WIRE_V2_RESYNC_REQUIRED` | SSE `resync` 后断流 | Transport backlog 超限（1,024 条 / 8 MiB）；拉取 snapshot 并以 `cursor=<durableTail>` 重连。 |

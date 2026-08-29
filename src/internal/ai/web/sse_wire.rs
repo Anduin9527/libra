@@ -41,20 +41,21 @@ pub const WIRE_V2_RESYNC_REQUIRED: &str = "WIRE_V2_RESYNC_REQUIRED";
 
 /// Default SSE wire when the client omits a version. Flipped to v2 by
 /// plan-20260824 DF-06 (v0.21.27 was the last release defaulting to v1);
-/// explicit `wire=1` still selects the full-snapshot stream until DF-08.
+/// the v1 snapshot stream itself was removed by DF-08 in 0.22.0
+/// (v0.21.29 was the last release still serving explicit `wire=1`).
 pub const DEFAULT_CODE_UI_SSE_WIRE_VERSION: CodeUiSseWireVersion = CodeUiSseWireVersion::V2;
 
-/// Negotiated Code UI SSE wire version.
+/// Negotiated Code UI SSE wire version. v2 delta/cursor is the only wire:
+/// v1 was physically removed in 0.22.0 (plan-20260824 DF-08, ADR-DF-03 —
+/// the DEFER-08 bake checklist completed with v0.21.29).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeUiSseWireVersion {
-    V1,
     V2,
 }
 
 impl CodeUiSseWireVersion {
     pub fn as_u8(self) -> u8 {
         match self {
-            Self::V1 => 1,
             Self::V2 => 2,
         }
     }
@@ -89,10 +90,14 @@ pub fn parse_code_events_wire_version(
 
 fn parse_wire_token(raw: &str) -> Result<CodeUiSseWireVersion, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "v1" => Ok(CodeUiSseWireVersion::V1),
         "2" | "v2" => Ok(CodeUiSseWireVersion::V2),
+        "1" | "v1" => Err(
+            "SSE wire v1 was removed in 0.22.0; only 2/v2 is supported (v0.21.29 was the \
+             last release serving wire v1 — stay on it if you cannot consume v2 yet)"
+                .to_string(),
+        ),
         other => Err(format!(
-            "query parameter `wire` must be 1/v1 or 2/v2 (got '{other}')"
+            "query parameter `wire` must be 2/v2 (got '{other}'; wire v1 was removed in 0.22.0)"
         )),
     }
 }
@@ -512,21 +517,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_wire_accepts_explicit_v1_and_v2() {
+    fn parse_wire_accepts_explicit_v2_and_rejects_removed_v1() {
         let headers = HeaderMap::new();
-        for (raw, expected) in [
-            ("1", CodeUiSseWireVersion::V1),
-            ("v1", CodeUiSseWireVersion::V1),
-            ("2", CodeUiSseWireVersion::V2),
-            ("V2", CodeUiSseWireVersion::V2),
-        ] {
+        for raw in ["2", "v2", "V2"] {
             let query = CodeEventsQuery {
                 wire: Some(raw.to_string()),
                 cursor: None,
             };
             assert_eq!(
                 parse_code_events_wire_version(&query, &headers).unwrap(),
-                expected
+                CodeUiSseWireVersion::V2
+            );
+        }
+        // DF-08: explicit v1 is a stable fail-closed error naming the
+        // removal and the last serving release.
+        for raw in ["1", "v1"] {
+            let query = CodeEventsQuery {
+                wire: Some(raw.to_string()),
+                cursor: None,
+            };
+            let error = parse_code_events_wire_version(&query, &headers).unwrap_err();
+            assert!(
+                error.contains("removed in 0.22.0") && error.contains("v0.21.29"),
+                "removal guidance expected: {error}"
             );
         }
     }
@@ -542,8 +555,24 @@ mod tests {
 
     #[test]
     fn query_wire_wins_over_accept_header() {
+        // Precedence still holds with a single wire: an ILLEGAL Accept hint
+        // must be ignored when the query names v2, and the removed v1 in
+        // the query must fail even when the Accept hint is valid.
         let mut headers = HeaderMap::new();
         headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream;libra-wire=9"),
+        );
+        let query = CodeEventsQuery {
+            wire: Some("2".into()),
+            cursor: None,
+        };
+        assert_eq!(
+            parse_code_events_wire_version(&query, &headers).unwrap(),
+            CodeUiSseWireVersion::V2
+        );
+        let mut valid_accept = HeaderMap::new();
+        valid_accept.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream;libra-wire=2"),
         );
@@ -551,9 +580,9 @@ mod tests {
             wire: Some("1".into()),
             cursor: None,
         };
-        assert_eq!(
-            parse_code_events_wire_version(&query, &headers).unwrap(),
-            CodeUiSseWireVersion::V1
+        assert!(
+            parse_code_events_wire_version(&query, &valid_accept).is_err(),
+            "removed v1 in the query must fail even with a valid Accept hint"
         );
     }
 
@@ -576,8 +605,8 @@ mod tests {
         headers.insert(
             header::ACCEPT,
             // libra-wire=1 on a lookalike media type: were the lookalike
-            // honored, the result would be V1 — falling back to the (v2)
-            // default proves it was ignored.
+            // honored, the removed v1 would be a hard error — falling back
+            // to the (v2) default proves it was ignored.
             HeaderValue::from_static("text/event-streaming;libra-wire=1"),
         );
         assert_eq!(

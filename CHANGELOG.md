@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.22.0] — 2026-08-30
+
+### Removed (breaking): the SSE wire v1 snapshot stream (plan-20260824 DF-08, ADR-DF-03)
+
+`GET /api/code/events` now serves only the **v2 delta/cursor wire**. Explicit
+`?wire=1` / `?wire=v1` (or `Accept: text/event-stream;libra-wire=1`) returns
+`400 INVALID_WIRE_VERSION` with removal guidance, and the `libra code
+--control stdio` client no longer falls back to v1 when a session has no
+durable store — the exact `503 WIRE_V2_REQUIRES_DURABLE_SESSION` surfaces to
+the caller instead.
+
+**Upgrade path:** **`v0.21.29` is the last release serving wire v1** — stay on
+it (or any `0.21.24`–`0.21.29` build baked by the DEFER-08 checklist) if you
+cannot consume v2 yet. To migrate, request `?wire=2&cursor=<last acknowledged
+cursor>`, persist the cursor, deduplicate side effects by `eventId`, and treat
+`event: resync` / `WIRE_V2_RESYNC_REQUIRED` as one explicit
+`GET /api/code/session` snapshot fetch followed by a reconnect at the
+server-provided `durableTail` (see `docs/commands/code.md`). The removal
+followed the completed DEFER-08 bake: consumers migrated (DF-05), server
+default flipped in `v0.21.28` (DF-06, last default-v1 release `v0.21.27`), and
+one further public patch release (`v0.21.29`) shipped with v1 still working.
+
 ## [0.21.28] — 2026-08-29
 
 ### Changed: the server-side SSE default wire is now v2 (plan-20260824 DF-06)

@@ -11,7 +11,7 @@ pub mod sse_wire;
 pub mod web_admission;
 pub mod write_guards;
 
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 pub use agent_runtime_adapter::AgentRuntimeCodeUiAdapter;
 use anyhow::Context;
@@ -40,7 +40,7 @@ use self::{
         CodeUiGoalCancelRequest, CodeUiGoalStartRequest, CodeUiInteractionResponse,
         CodeUiMessageRequest, CodeUiRuntimeHandle, CodeUiSessionResumeRequest, CodeUiSessionStatus,
         CodeUiSkillActivateRequest, CodeUiTaskDispatchRequest,
-        browser_controller_token_from_headers, ensure_session_updated_event,
+        browser_controller_token_from_headers,
     },
     write_guards::{
         SessionWriteRateLimiter, ensure_trusted_browser_origin, trusted_loopback_origins,
@@ -1116,38 +1116,9 @@ async fn code_events_handler(
     })?;
 
     match wire {
-        sse_wire::CodeUiSseWireVersion::V1 => {
-            let runtime = code_ui_runtime(&state)?;
-            let redactor = state.secret_redactor.clone();
-            let current_snapshot = runtime.snapshot().await;
-            let initial_event = ensure_session_updated_event(&current_snapshot)?;
-            let receiver = runtime.subscribe();
-
-            let initial_redactor = redactor.clone();
-            let initial_stream = stream::once(async move {
-                Ok::<Event, Infallible>(code_ui_event_to_sse(
-                    initial_event,
-                    initial_redactor.as_ref(),
-                ))
-            });
-            let updates = BroadcastStream::new(receiver).filter_map(move |message| {
-                let runtime = runtime.clone();
-                let redactor = redactor.clone();
-                async move {
-                    code_ui_broadcast_event_or_recovery(&runtime, message)
-                        .await
-                        .map(|event| {
-                            Ok::<Event, Infallible>(code_ui_event_to_sse(event, redactor.as_ref()))
-                        })
-                }
-            });
-            Ok(Sse::new(initial_stream.chain(updates))
-                .keep_alive(KeepAlive::new())
-                .into_response())
-        }
         sse_wire::CodeUiSseWireVersion::V2 => {
-            // `cursor` is v2-only; ignore it on v1 so legacy clients with stray
-            // query params keep working.
+            // v2 is the only wire since DF-08 removed the v1 snapshot
+            // stream (0.22.0); `wire=1` already failed closed above.
             let cursor =
                 sse_wire::parse_code_events_cursor(&query).map_err(|message| WebApiError {
                     status: StatusCode::BAD_REQUEST,
@@ -1405,18 +1376,6 @@ fn code_ui_wire_v2_resync_sse(reason: &str, last_cursor: u64, durable_tail: u64)
                 sse_wire::WIRE_V2_RESYNC_REQUIRED
             ))
         })
-}
-
-async fn code_ui_broadcast_event_or_recovery(
-    runtime: &Arc<CodeUiRuntimeHandle>,
-    message: Result<code_ui::CodeUiEventEnvelope, BroadcastStreamRecvError>,
-) -> Option<code_ui::CodeUiEventEnvelope> {
-    match message {
-        Ok(event) => Some(event),
-        Err(BroadcastStreamRecvError::Lagged(_)) => {
-            ensure_session_updated_event(&runtime.snapshot().await).ok()
-        }
-    }
 }
 
 async fn code_diagnostics_handler(
@@ -2319,30 +2278,6 @@ async fn enforce_code_write_identity_gates(
         ensure_browser_origin_for_write(state, headers)?;
     }
     ensure_session_write_rate_limit(state, runtime).await
-}
-
-fn code_ui_event_to_sse(event: code_ui::CodeUiEventEnvelope, redactor: &SecretRedactor) -> Event {
-    // W3-12: never emit an unredacted snapshot on the SSE wire. If
-    // redaction/serialization fails, drop payload data (fail closed).
-    match project_json_for_wire(&event, redactor) {
-        Ok(projected) => Event::default()
-            .event(event.event_type.as_str())
-            .json_data(projected)
-            .unwrap_or_else(|_| code_ui_redaction_failed_sse(event.event_type)),
-        Err(_) => code_ui_redaction_failed_sse(event.event_type),
-    }
-}
-
-fn code_ui_redaction_failed_sse(event_type: code_ui::CodeUiEventType) -> Event {
-    Event::default()
-        .event(event_type.as_str())
-        .json_data(serde_json::json!({
-            "error": {
-                "code": "REDACTION_FAILED",
-                "message": "session event omitted because secret redaction failed"
-            }
-        }))
-        .unwrap_or_else(|_| Event::default().event(event_type.as_str()))
 }
 
 fn ensure_loopback_api_request(remote_addr: SocketAddr) -> Result<(), WebApiError> {
@@ -3673,25 +3608,6 @@ mod tests {
         assert!(!html.contains("<script"), "remote notice must be zero JS");
     }
 
-    #[tokio::test]
-    async fn sse_lag_recovers_with_full_session_snapshot_event() {
-        let runtime = test_code_ui_runtime().await;
-
-        let event =
-            code_ui_broadcast_event_or_recovery(&runtime, Err(BroadcastStreamRecvError::Lagged(3)))
-                .await
-                .expect("lagged receiver should produce recovery event");
-
-        assert_eq!(
-            event.event_type,
-            crate::internal::ai::web::code_ui::CodeUiEventType::SessionUpdated
-        );
-        assert_eq!(event.seq, 0);
-        let snapshot = crate::internal::ai::web::code_ui::snapshot_from_event(&event)
-            .expect("recovery event should contain full snapshot");
-        assert_eq!(snapshot.provider.provider, "test");
-    }
-
     /// Wave 3 / PR 3 §5.6 — control-audit `client_id` field
     /// redaction. The plan calls out "client_id 80 字符上限、控制
     /// 字符替换" — `sanitized_audit_client_id` enforces both, plus
@@ -4452,17 +4368,26 @@ mod tests {
         let illegal_value: serde_json::Value = serde_json::from_slice(&illegal_body).unwrap();
         assert_eq!(illegal_value["error"]["code"], "INVALID_WIRE_VERSION");
 
-        // v1 must ignore stray/non-numeric cursor query params (v2-only field).
-        let v1_stray_cursor = Request::builder()
+        // DF-08: explicit v1 is a stable 400 naming the removal — the
+        // snapshot stream is physically gone.
+        let removed_v1 = Request::builder()
             .method(Method::GET)
-            .uri("/events?wire=1&cursor=not-a-number")
+            .uri("/events?wire=1")
             .body(Body::empty())
             .unwrap();
-        let v1_response = app.clone().oneshot(v1_stray_cursor).await.unwrap();
-        assert_eq!(
-            v1_response.status(),
-            StatusCode::OK,
-            "v1 must ignore invalid cursor query values"
+        let removed_response = app.clone().oneshot(removed_v1).await.unwrap();
+        assert_eq!(removed_response.status(), StatusCode::BAD_REQUEST);
+        let removed_body = to_bytes(removed_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let removed_value: serde_json::Value = serde_json::from_slice(&removed_body).unwrap();
+        assert_eq!(removed_value["error"]["code"], "INVALID_WIRE_VERSION");
+        assert!(
+            removed_value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("removed in 0.22.0"),
+            "removal guidance expected: {removed_value}"
         );
 
         let no_hub = code_router()

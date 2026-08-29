@@ -24,7 +24,6 @@ use crate::utils::error::{CliError, CliResult};
 /// Keep this independent from the server's omitted-wire compatibility default:
 /// DF-05 migrates consumers to v2 while DF-06 owns the server default switch.
 pub const BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION: u8 = 2;
-const LEGACY_CODE_EVENTS_SSE_WIRE_VERSION: u8 = 1;
 const WIRE_V2_REQUIRES_DURABLE_SESSION: &str = "WIRE_V2_REQUIRES_DURABLE_SESSION";
 const WIRE_V2_RESYNC_REQUIRED: &str = "WIRE_V2_RESYNC_REQUIRED";
 const WIRE_V2_CURSOR_AHEAD: &str = "WIRE_V2_CURSOR_AHEAD";
@@ -720,23 +719,21 @@ async fn open_event_stream(
             })),
         });
     }
-    let requires_legacy_fallback = status == StatusCode::SERVICE_UNAVAILABLE
-        && code.as_deref() == Some(WIRE_V2_REQUIRES_DURABLE_SESSION);
-    if !requires_legacy_fallback {
-        return Err(event_stream_error(status, &body));
+    // DF-08: the v1 snapshot fallback was removed together with the
+    // server-side v1 wire (0.22.0). A session without a durable hub now
+    // surfaces its stable 503 directly — there is no other wire to try.
+    if status == StatusCode::SERVICE_UNAVAILABLE
+        && code.as_deref() == Some(WIRE_V2_REQUIRES_DURABLE_SESSION)
+    {
+        return Err(event_stream_error(
+            status,
+            &format!(
+                "{body}\n(events.subscribe requires a durable v2 session; the legacy v1 \
+                 fallback was removed in 0.22.0 — v0.21.29 is the last release with wire v1)"
+            ),
+        ));
     }
-
-    let fallback =
-        request_event_stream(client, base_url, LEGACY_CODE_EVENTS_SSE_WIRE_VERSION, None).await?;
-    if fallback.status() == StatusCode::OK {
-        return Ok(OpenedEventStream {
-            response: fallback,
-            wire_version: LEGACY_CODE_EVENTS_SSE_WIRE_VERSION,
-            recovery: None,
-        });
-    }
-    let (fallback_status, fallback_body) = event_stream_error_body(fallback).await;
-    Err(event_stream_error(fallback_status, &fallback_body))
+    Err(event_stream_error(status, &body))
 }
 
 #[derive(Debug)]
@@ -1109,7 +1106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_stream_retries_v1_when_v2_requires_a_durable_session() {
+    async fn event_stream_surfaces_durable_session_requirement_without_v1_fallback() {
         #[derive(Default)]
         struct MockState {
             wires: Mutex<Vec<String>>,
@@ -1159,27 +1156,30 @@ mod tests {
         });
 
         let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
-        let opened = open_event_stream(&Client::new(), &base_url, 41)
-            .await
-            .expect("v1 fallback stream");
-        assert_eq!(opened.wire_version, LEGACY_CODE_EVENTS_SSE_WIRE_VERSION);
-        assert_eq!(opened.response.status(), StatusCode::OK);
+        // DF-08: the v1 fallback is gone — the durable-session requirement
+        // surfaces directly, with removal guidance, after exactly ONE
+        // (v2) request.
+        let message = match open_event_stream(&Client::new(), &base_url, 41).await {
+            Ok(_) => panic!("no durable session must be a terminal error now"),
+            Err(error) => error.to_string(),
+        };
         assert!(
-            opened
-                .response
-                .text()
-                .await
-                .expect("SSE body")
-                .contains("session_updated")
+            message.contains("WIRE_V2_REQUIRES_DURABLE_SESSION")
+                && message.contains("removed in 0.22.0"),
+            "durable-session error with removal guidance expected: {message}"
         );
-        assert_eq!(*state.wires.lock().await, ["2:41", "1:-"]);
+        assert_eq!(
+            *state.wires.lock().await,
+            ["2:41"],
+            "the client must not retry with the removed wire v1"
+        );
 
         let _ = shutdown_tx.send(());
         let _ = server.await;
     }
 
     #[tokio::test]
-    async fn event_stream_v1_fallback_forwards_legacy_notifications() {
+    async fn event_stream_durable_session_requirement_reaches_the_handler_caller() {
         async fn events(Query(query): Query<HashMap<String, String>>) -> Response {
             if query.get("wire").map(String::as_str) == Some("2") {
                 return (
@@ -1216,16 +1216,22 @@ mod tests {
 
         let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
         let mut notifications = Vec::new();
-        stream_events_with_handler(&Client::new(), &base_url, 9, |notification| {
+        let error = stream_events_with_handler(&Client::new(), &base_url, 9, |notification| {
             notifications.push(notification.clone());
             Ok(())
         })
         .await
-        .expect("v1 fallback notification forwarding");
-
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0]["params"]["event"], "session_updated");
-        assert_eq!(notifications[0]["params"]["data"]["seq"], 1);
+        .expect_err("DF-08: no v1 fallback — the 503 must reach the caller");
+        assert!(
+            error
+                .to_string()
+                .contains("WIRE_V2_REQUIRES_DURABLE_SESSION"),
+            "stable code expected: {error}"
+        );
+        assert!(
+            notifications.is_empty(),
+            "no legacy notifications may be forwarded"
+        );
 
         let _ = shutdown_tx.send(());
         let _ = server.await;
