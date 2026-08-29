@@ -862,9 +862,12 @@ fn resume_recorded_provenance(
     let session = resume_session_snapshot(args, working_dir)?;
     let recorded = session.recorded_provider_id()?;
     let Some(spec) = provider_spec_by_id(recorded) else {
+        // The stored value is unvalidated data (it could even be a
+        // mistakenly pasted secret): log only the fixed category and the
+        // session identity — never the value itself (GC-PS-01).
         tracing::warn!(
-            recorded,
-            "resumed session records an unknown provider id; ignoring the provenance"
+            session_id = %session.id,
+            "resumed session records an unrecognized provider id; ignoring the provenance"
         );
         return None;
     };
@@ -3353,15 +3356,18 @@ where
     // PS-05: record the session's provider/model provenance under the
     // writer lease, insert-if-absent — an existing record is the thread's
     // history and a later override must not rewrite it. Ids only, never
-    // credentials (GC-PS-01).
+    // credentials (GC-PS-01). The write is best-effort: a failure is
+    // logged and the session boots without a durable record (the next
+    // boot retries) — provenance must never block the session itself.
     let mut session_state = session_state;
-    if session_state.record_provider_provenance(&provider_name, &model_name) {
-        session_store.save(&session_state).map_err(|error| {
-            CliError::io(format!(
-                "failed to persist provider provenance for Code session '{}': {error}",
-                session_state.id
-            ))
-        })?;
+    if session_state.record_provider_provenance(&provider_name, &model_name)
+        && let Err(error) = session_store.save(&session_state)
+    {
+        tracing::warn!(
+            session_id = %session_state.id,
+            %error,
+            "failed to persist provider provenance; continuing without it"
+        );
     }
     let session_state = session_state;
     let provider = CodeUiProviderInfo {
@@ -5596,6 +5602,56 @@ mod tests {
             }
             server.abort();
         }
+    }
+
+    /// plan-20260825 PS-05 (terra R1): the provenance write is best-effort
+    /// — with the session's `<id>.json` save path blocked (a directory
+    /// squats on it), the headless runtime must still boot and label
+    /// correctly instead of aborting the session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provenance_write_failure_does_not_block_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        let sessions_dir = storage_root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Ollama);
+        args.model = Some("llama3.2".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let mut session_state = SessionState::new(&tmp.path().to_string_lossy());
+        // Make the provenance `save` fail without touching the lease or
+        // the event log: give the session a thread id and squat a
+        // DIRECTORY on its thread-index entry, so `save`'s
+        // `record_thread_session_index` read errors ("is a directory").
+        // Only UUID thread ids are indexed on disk, so inject one.
+        let injected_thread = "11111111-1111-4111-8111-111111111111";
+        session_state
+            .metadata
+            .insert("thread_id".to_string(), serde_json::json!(injected_thread));
+        std::fs::create_dir_all(sessions_dir.join(".thread_index").join(injected_thread)).unwrap();
+        // Self-check: the injection really breaks `save` (otherwise this
+        // test would pass vacuously).
+        assert!(
+            session_store.save(&session_state).is_err(),
+            "the thread-index squat must make SessionStore::save fail"
+        );
+
+        let (runtime, effective_provider) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &CodeEnvFile::default(),
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("a failed provenance write must not abort the boot")
+        .expect("Ollama is a supported headless provider");
+        assert_eq!(effective_provider, CodeProvider::Ollama);
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.provider.provider, "ollama");
     }
 
     /// plan-20260825 PS-01 (ADR-PS-02): the capability table's

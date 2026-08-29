@@ -619,6 +619,35 @@ fn resume_inherits_provider_mismatch_warns_and_continues() {
 }
 
 #[test]
+fn resume_inherits_provider_corrupt_record_never_leaks_and_falls_through() {
+    // PS-05 terra R1: a corrupt recorded provider id (which could be a
+    // mistakenly pasted secret) must neither surface anywhere in the
+    // output — including tracing at LIBRA_LOG=warn — nor break the run:
+    // the resolution falls through to detection.
+    let repo = init_repo();
+    let thread_id = seed_resumable_session(&repo, Some("sk-SENTINEL-corrupt-record"), None);
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--resume"])
+        .arg(&thread_id)
+        .args(["--port", "0", "--mcp-port", "0"])
+        .current_dir(repo.root.canonicalize().expect("canonical root"))
+        .env("GEMINI_API_KEY", "probe-gemini")
+        .env("LIBRA_LOG", "warn")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stdout = String::from_utf8_lossy(&out.0);
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        !stdout.contains("SENTINEL") && !stderr.contains("SENTINEL"),
+        "the corrupt recorded value must never be echoed (GC-PS-01);\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("provider 'gemini' auto-selected"),
+        "a corrupt record must fall through to detection: {stderr}"
+    );
+}
+
+#[test]
 fn resume_inherits_provider_and_model_for_model_requiring_provider() {
     // PS-05 model inheritance: ollama has no default model, so a bare
     // `--provider ollama` launch would be a usage error — a resumed
