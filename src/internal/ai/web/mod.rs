@@ -4337,7 +4337,7 @@ mod tests {
             .uri("/events?wire=2")
             .body(Body::empty())
             .unwrap();
-        let missing_response = no_hub.oneshot(missing).await.unwrap();
+        let missing_response = no_hub.clone().oneshot(missing).await.unwrap();
         assert_eq!(missing_response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let missing_body = to_bytes(missing_response.into_body(), usize::MAX)
             .await
@@ -4347,6 +4347,77 @@ mod tests {
             missing_value["error"]["code"],
             "WIRE_V2_REQUIRES_DURABLE_SESSION"
         );
+
+        // DF-06: the omitted-wire default is v2, so without a durable hub
+        // the omission now fails closed exactly like explicit v2.
+        let missing_default = Request::builder()
+            .method(Method::GET)
+            .uri("/events")
+            .body(Body::empty())
+            .unwrap();
+        let missing_default_response = no_hub.oneshot(missing_default).await.unwrap();
+        assert_eq!(
+            missing_default_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "omitted wire must route to v2 (and its durable-hub requirement)"
+        );
+        let missing_default_body = to_bytes(missing_default_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_default_value: serde_json::Value =
+            serde_json::from_slice(&missing_default_body).unwrap();
+        assert_eq!(
+            missing_default_value["error"]["code"],
+            "WIRE_V2_REQUIRES_DURABLE_SESSION"
+        );
+
+        // DF-06: with a hub, both a bare `/events` and an Accept header
+        // without `libra-wire` stream v2 `code_workflow` frames.
+        async fn sse_prefix(response: axum::response::Response) -> String {
+            use futures_util::StreamExt;
+            let mut stream = response.into_body().into_data_stream();
+            let mut collected = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                match timeout(Duration::from_millis(200), stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        collected.extend_from_slice(&chunk);
+                        if String::from_utf8_lossy(&collected).contains("event: code_workflow") {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(error))) => panic!("SSE body error: {error}"),
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            String::from_utf8(collected).expect("utf8 SSE body")
+        }
+        for omitted in [
+            Request::builder()
+                .method(Method::GET)
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/events")
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(omitted).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = sse_prefix(response).await;
+            assert!(
+                body.contains("event: code_workflow"),
+                "omitted wire must stream the v2 delta envelope (DF-06): {body}"
+            );
+            assert!(
+                !body.contains("session_updated"),
+                "omitted wire must not fall back to the v1 snapshot stream: {body}"
+            );
+        }
 
         let request = Request::builder()
             .method(Method::GET)

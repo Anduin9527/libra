@@ -273,7 +273,7 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | 未指定默认 | 省略 `wire` / `libra-wire` 时，服务端默认为 **v2**（DF-06；`v0.21.27` 是最后一个默认 v1 的版本）。显式 `?wire=1` 仍为全量 snapshot stream。内置 SPA（W3-09）和 `libra code --control stdio` automation 客户端会显式请求 `?wire=2`。 |
 | 非法值 | fail-closed `400 INVALID_WIRE_VERSION` |
 
-**SSE v1**（未指定版本时的服务端默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
+**SSE v1**（显式 `wire=1` 的全量 snapshot stream）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
 
 **SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`）。Code UI **projection** 热窗口是同数值、独立命名的预算（`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`），两者不可相加。单事件 fold 只访问 suffix，不回放整段 session 历史（W3-14；10k events 下 release p95 ≤ 5 ms）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的默认 Web headless（非 Codex `HeadlessCodeRuntime`）；managed `--provider codex` Web 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
 
