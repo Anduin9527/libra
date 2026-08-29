@@ -443,16 +443,15 @@ pub(crate) fn hash_file_blob_beneath(
         let target = crate::utils::beneath::read_symlink_beneath(root, relative)?;
         return Ok(git_internal::internal::object::blob::Blob::from_content_bytes(target).id);
     }
-    if !stat.is_file {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "worktree blob path is not a regular file or symlink",
-        ));
-    }
 
-    // Open once through the pinned root and hash the descriptor. Neither the
-    // content nor its LFS attributes are rediscovered through a pathname
-    // after this point, so a rename/symlink swap cannot redirect the read.
+    // Open once through the pinned root and hash the descriptor. This open is
+    // intentionally also attempted for non-symlink nodes that are not regular
+    // files: a FIFO or a FUSE-backed node may block here, and the helper
+    // process deadline must be able to reclaim that syscall. `open_file_beneath`
+    // still rejects non-regular descriptors after its pinned, no-follow open.
+    // Neither the content nor its LFS attributes are rediscovered through a
+    // pathname after this point, so a rename/symlink swap cannot redirect the
+    // read.
     let file = crate::utils::beneath::open_file_beneath(root, relative)?;
     let length = file.metadata()?.len();
     if crate::utils::attributes::is_lfs_tracked_beneath(root_path, root, relative)? {
