@@ -116,10 +116,10 @@ fn registry_diff(
         }
     }
     for (k, v) in expected {
-        if let Some((lane, _)) = reg.get(k) {
-            if lane != v {
-                out.push(format!("{k}: registry says {lane}, classifier says {v}"));
-            }
+        if let Some((lane, _)) = reg.get(k)
+            && lane != v
+        {
+            out.push(format!("{k}: registry says {lane}, classifier says {v}"));
         }
     }
     out
@@ -257,11 +257,11 @@ fn site_rows_point_at_real_attribute_sites() {
             let mut from = 0;
             while let Some(pos) = text[from..].find(&needle) {
                 let at = from + pos;
-                if let Some(open) = text[at..].find('{') {
-                    if serial_attrs_in_braces(&text, at + open) >= ordinal {
-                        resolved = true;
-                        break;
-                    }
+                if let Some(open) = text[at..].find('{')
+                    && serial_attrs_in_braces(&text, at + open) >= ordinal
+                {
+                    resolved = true;
+                    break;
                 }
                 from = at + needle.len();
             }
