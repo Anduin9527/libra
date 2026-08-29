@@ -5365,8 +5365,6 @@ mod tests {
     /// source fails one of the two scenarios.
     #[tokio::test(flavor = "multi_thread")]
     async fn provider_labels_ui_and_usage_follow_the_effective_provider() {
-        use crate::internal::ai::web::code_ui::CodeUiCommandAdapter as _;
-
         for with_binding in [true, false] {
             let (base_url, _captured, server) = start_chat_completions_stub().await;
             let tmp = tempfile::TempDir::new().unwrap();
