@@ -1035,6 +1035,7 @@ impl CaseRuntime<'_> {
         let received = event_stream
             .next_event(timeout)?
             .ok_or_else(|| anyhow!("timed out waiting for SSE event '{event}' on '{stream}'"))?;
+        reject_legacy_v1_event(&received)?;
         if received.event != event {
             bail!(
                 "expected SSE event '{event}' on '{stream}', got '{}': {}",
@@ -1110,6 +1111,7 @@ impl CaseRuntime<'_> {
                 None => continue,
             };
             reject_v2_control_event(&event)?;
+            reject_legacy_v1_event(&event)?;
             if event.event != target_event {
                 continue;
             }
@@ -1150,12 +1152,10 @@ impl CaseRuntime<'_> {
             )
         })?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        // The initial replay can be idle before a submitted turn starts,
-        // so only treat idle as terminal after a non-idle status. Wire v1
-        // publishes the final transcript snapshot before its terminal idle
-        // event. Wire v2 projection deltas are independently persisted and
-        // can arrive in the opposite order, so v2 must also observe the
-        // completed assistant projection before collection finishes.
+        // v2 (the only wire since DF-08 removed v1): projection deltas are
+        // independently persisted and can arrive in either order, so
+        // collection finishes only after a non-idle status, an idle status,
+        // AND a completed assistant transcript projection were all seen.
         let mut collected: Vec<Value> = Vec::new();
         let mut saw_non_idle = false;
         let mut saw_idle = false;
@@ -1170,10 +1170,8 @@ impl CaseRuntime<'_> {
                 None => break,
             };
             reject_v2_control_event(&event)?;
-            if event.event != "session_updated"
-                && event.event != "status_changed"
-                && event.event != "code_workflow"
-            {
+            reject_legacy_v1_event(&event)?;
+            if event.event != "code_workflow" {
                 continue;
             }
             let payload = parse_event_data(&event).with_context(|| {
@@ -1183,16 +1181,8 @@ impl CaseRuntime<'_> {
                 )
             })?;
             validate_v2_event_shape(&event, &payload)?;
-            let status = payload
-                .pointer("/data/status")
-                .and_then(Value::as_str)
-                .or_else(|| projection_payload(&payload, "status").and_then(Value::as_str));
+            let status = projection_payload(&payload, "status").and_then(Value::as_str);
             let is_idle = status.is_some_and(|status| status == "idle");
-            // Track the turn lifecycle from BOTH event streams.
-            // status_changed: thinking flips the gate; the
-            // matching status_changed: idle (which fires after
-            // every transcript mutation has already produced its
-            // session_updated) closes the collection.
             if status.is_some_and(|status| status != "idle") {
                 saw_non_idle = true;
             }
@@ -1211,13 +1201,10 @@ impl CaseRuntime<'_> {
             }) {
                 saw_completed_assistant = true;
             }
-            let is_v1_snapshot = event.event == "session_updated";
-            if is_v1_snapshot || transcript_projection.is_some() {
+            if transcript_projection.is_some() {
                 collected.push(payload);
             }
-            if saw_non_idle
-                && ((is_v1_snapshot && is_idle) || (saw_idle && saw_completed_assistant))
-            {
+            if saw_non_idle && saw_idle && saw_completed_assistant {
                 break;
             }
         }
@@ -2076,14 +2063,31 @@ fn snapshot_tool_call_has_status(snapshot: &Value, id: &str, status: &str) -> bo
         .unwrap_or(false)
 }
 
-/// Parse an SSE event's `data:` field as JSON. The `/api/code/events`
-/// handler always serialises a `CodeUiEventEnvelope` via
-/// `Event::json_data`, so a deserialisation failure here means the
-/// runtime emitted a malformed envelope — surface as an error rather
-/// than silently empty.
+/// Parse an SSE event's `data:` field as JSON. Since DF-08 the
+/// `/api/code/events` handler serialises only v2 `code_workflow`
+/// envelopes (`{ cursor, eventId, kind, at, payload }`), so a
+/// deserialisation failure here means the runtime emitted a malformed
+/// envelope — surface as an error rather than silently empty.
 fn parse_event_data(event: &SseEvent) -> Result<Value> {
     serde_json::from_str(&event.data)
         .with_context(|| format!("failed to parse SSE data as JSON: {}", event.data))
+}
+
+/// DF-08: the v1 snapshot wire is gone — a v2 stream that emits any of the
+/// legacy envelope event names is a server regression, never something a
+/// case may silently skip past.
+fn reject_legacy_v1_event(event: &SseEvent) -> Result<()> {
+    if matches!(
+        event.event.as_str(),
+        "session_updated" | "status_changed" | "controller_changed"
+    ) {
+        bail!(
+            "wire v2 stream emitted removed v1 envelope event '{}' (SSE wire v1 was deleted in 0.22.0): {}",
+            event.event,
+            event.data
+        );
+    }
+    Ok(())
 }
 
 fn reject_v2_control_event(event: &SseEvent) -> Result<()> {
@@ -2224,8 +2228,9 @@ fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) 
 }
 
 /// Evaluate an assertion across a sequence of collected SSE
-/// payloads. Used by `Step::CollectSessionUpdates`. Each payload
-/// is the full envelope (`{ seq, type, at, data: snapshot }`).
+/// payloads. Used by `Step::CollectSessionUpdates`. Since DF-08 each
+/// payload is a v2 `code_workflow` envelope carrying a
+/// `transcript_upsert` projection delta.
 ///
 /// New cross-event assertions live here; per-event assertions
 /// stay on `evaluate_event_assertion`. Suffix assertions of the
@@ -2714,4 +2719,32 @@ fn evaluate_command_output_assertion(assertion: &str, output: &Output) -> Result
         return Ok(());
     }
     bail!("unsupported command output assertion '{assertion}'")
+}
+
+#[cfg(test)]
+mod df08_tests {
+    use super::{SseEvent, reject_legacy_v1_event};
+
+    /// DF-08 regression: a v2 stream that emits any removed v1 envelope
+    /// event name must fail the case loudly instead of being skipped.
+    #[test]
+    fn legacy_v1_event_names_fail_the_stream() {
+        for legacy in ["session_updated", "status_changed", "controller_changed"] {
+            let event = SseEvent {
+                event: legacy.to_string(),
+                data: "{}".to_string(),
+            };
+            let error = reject_legacy_v1_event(&event)
+                .expect_err("legacy v1 envelope events must be rejected");
+            assert!(
+                error.to_string().contains("deleted in 0.22.0"),
+                "removal guidance expected: {error}"
+            );
+        }
+        let ok = SseEvent {
+            event: "code_workflow".to_string(),
+            data: "{}".to_string(),
+        };
+        assert!(reject_legacy_v1_event(&ok).is_ok());
+    }
 }

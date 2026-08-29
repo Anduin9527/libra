@@ -22,13 +22,13 @@ use libra::internal::ai::{
         code_ui::{
             CodeUiAckResponse, CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities,
             CodeUiControllerAttachRequest, CodeUiControllerAttachResponse, CodeUiControllerKind,
-            CodeUiControllerState, CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind,
-            CodeUiInteractionOption, CodeUiInteractionRequest, CodeUiInteractionResponse,
-            CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot,
-            CodeUiPlanStep, CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest,
-            CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiSkillActivateRequest,
-            CodeUiTaskSnapshot, CodeUiThreadGraph, CodeUiThreadGraphNode, CodeUiToolCallSnapshot,
-            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, code_ui_error_codes,
+            CodeUiControllerState, CodeUiInteractionKind, CodeUiInteractionOption,
+            CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
+            CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
+            CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest, CodeUiSessionSnapshot,
+            CodeUiSessionStatus, CodeUiSkillActivateRequest, CodeUiTaskSnapshot, CodeUiThreadGraph,
+            CodeUiThreadGraphNode, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
+            CodeUiTranscriptEntryKind, code_ui_error_codes,
         },
         sse_wire::CodeUiWireV2Event,
     },
@@ -293,44 +293,6 @@ fn snapshot_round_trips_through_camel_case_wire_shape() {
     assert_eq!(
         round_tripped.patchsets[0].changes[0].change_type,
         "modified"
-    );
-}
-
-/// SSE envelopes must use the same closed event-name set the browser's
-/// `CodeUiEventType` union subscribes to, and the payload must remain a typed
-/// full snapshot instead of arbitrary JSON.
-#[test]
-fn event_envelope_round_trips_typed_event_and_snapshot_payload() {
-    let snapshot = fully_populated_snapshot();
-    let event = CodeUiEventEnvelope {
-        seq: 42,
-        event_type: CodeUiEventType::ControllerChanged,
-        at: fixed_ts(),
-        data: snapshot,
-    };
-
-    let serialized = serde_json::to_value(&event).expect("event envelope must serialize");
-    assert_eq!(
-        serialized["type"],
-        Value::String("controller_changed".into())
-    );
-    assert_eq!(
-        serialized["data"]["sessionId"],
-        Value::String("session-1".into())
-    );
-    assert_eq!(
-        serialized["data"]["interactions"][0]["kind"],
-        Value::String("post_plan_choice".into())
-    );
-
-    let round_tripped: CodeUiEventEnvelope =
-        serde_json::from_value(serialized).expect("event envelope must deserialize");
-    assert_eq!(round_tripped.event_type, CodeUiEventType::ControllerChanged);
-    assert_eq!(round_tripped.data.session_id, "session-1");
-    assert_eq!(round_tripped.data.interactions.len(), 1);
-    assert_eq!(
-        round_tripped.data.interactions[0].status,
-        CodeUiInteractionStatus::Pending
     );
 }
 

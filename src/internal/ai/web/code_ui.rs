@@ -539,8 +539,10 @@ pub struct CodeUiSession {
 
 impl CodeUiSession {
     pub fn new(snapshot: CodeUiSessionSnapshot) -> Arc<Self> {
-        // v1 snapshot fan-out is independent of the W3-08 v2 transport budget
-        // (full `CodeUiSessionSnapshot` payloads have no 8 MiB ring policy).
+        // Internal runtime wake broadcast (full `CodeUiSessionSnapshot`
+        // envelopes for in-process subscribers such as task executors) —
+        // NOT the removed v1 HTTP stream, and independent of the W3-08 v2
+        // transport budget (no 8 MiB ring policy applies here).
         let (tx, _) = broadcast::channel(256);
         Arc::new(Self {
             snapshot: RwLock::new(snapshot),
@@ -2091,6 +2093,38 @@ pub fn ensure_session_updated_event(
 
 #[cfg(test)]
 mod tests {
+    /// DF-08: `CodeUiEventEnvelope` is no longer an HTTP SSE wire — it
+    /// survives as the INTERNAL runtime wake broadcast (task executors and
+    /// other in-process subscribers). Pin its serde shape here so internal
+    /// consumers keep decoding it after the v1 wire removal.
+    #[test]
+    fn internal_broadcast_envelope_round_trips() {
+        let snapshot = initial_snapshot(
+            "/tmp/df08-internal",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        );
+        let session_id = snapshot.session_id.clone();
+        let event = CodeUiEventEnvelope {
+            seq: 42,
+            event_type: CodeUiEventType::ControllerChanged,
+            at: chrono::Utc::now(),
+            data: snapshot,
+        };
+        let serialized = serde_json::to_value(&event).expect("envelope serializes");
+        assert_eq!(serialized["type"], "controller_changed");
+        assert_eq!(serialized["data"]["sessionId"], session_id.as_str());
+        let round_tripped: CodeUiEventEnvelope =
+            serde_json::from_value(serialized).expect("envelope deserializes");
+        assert_eq!(round_tripped.event_type, CodeUiEventType::ControllerChanged);
+        assert_eq!(round_tripped.data.session_id, session_id);
+    }
+
     use tokio::sync::Mutex;
 
     use super::*;
