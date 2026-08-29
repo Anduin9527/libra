@@ -79,6 +79,8 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 
 DeepSeek 请求可以通过 `--deepseek-thinking enabled --deepseek-reasoning-effort high --deepseek-stream true` 选择加入 provider 专用字段；这些标志会对非 DeepSeek provider 拒绝。
 Kimi 请求默认使用所选 model 的 thinking 行为；对于需要更低延迟或官方 Web 搜索兼容性的 K2.6/K2.5 run，使用 `--kimi-thinking disabled`。当 provider 返回 Kimi `reasoning_content` 时，Libra 会在 tool-call turns 中保留它。
+`--provider` 没有默认值：生效 provider 在启动时一次性解析——显式 `--provider` 优先，其次 `--agent` 绑定的 provider（两者不一致为 usage 错误）；两者皆无时 `libra code` 以 usage 错误退出，并逐行列出全部 provider、对应的一行 key 配置命令与免凭据备选（`--provider codex`、`--provider ollama --model <name>`）。`--stdio` 与 `--control stdio` 不进行 provider 解析；`--stdio` 下显式传 `--provider` 会被拒绝。
+
 常规运行时，将 provider keys 存在 `vault.env.<NAME>` 中（例如 `libra config set --global vault.env.GEMINI_API_KEY <value>`——与缺凭据报错推荐的命令一致）；Libra 按以下顺序解析凭据：`--env-file` 值（仅默认 Web 启动可用）→ 进程环境 → repo-local Vault → global Vault。对需要显式 dotenv 覆盖的 live tests，使用 `--env-file .env.test`。在默认 Web 启动下，非 Codex provider 支持 `--env-file`、`--context`、`--approval-policy`、`--approval-ttl`（env-file 值仍优先于进程环境/Vault）。Managed Web `--provider codex` 仍拒绝 `--env-file`、`--approval-ttl` 与 `--resume`（未接入 Codex app-server 路径）；裸 `libra code --provider codex --resume <thread_id>` 同样以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除）；MCP `--stdio` 继续拒绝这些 Web-only flag。
 
 Ollama 请求默认流式读取 `/api/chat` 响应，并向 debug logs 添加每请求 `request_id`。它们也默认使用 `think:false`，避免具备 reasoning 能力的本地模型在 tool calls 前花数分钟生成隐藏 reasoning。单次运行使用 `--ollama-thinking high`，或将 `OLLAMA_THINK=true`、`low`、`medium`、`high` 或 `auto` 设为环境默认值。`auto` 会省略 `think` 字段并让 Ollama 决定。当远程/云 Ollama endpoint 接受简单 tools 但对 Libra 完整 tool schema payload 返回 503 时，使用 `--ollama-compact-tools` 或 `OLLAMA_COMPACT_TOOLS=true`。

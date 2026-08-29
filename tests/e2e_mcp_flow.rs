@@ -200,7 +200,16 @@ async fn test_e2e_mcp_flow() {
     // The default Web Code UI launch is headless, so the test can run without a
     // terminal. The MCP server is started by the current Web launch.
     let mut child = Command::new(&libra_bin)
-        .args(["code", "--mcp-port", "0", "--port", "0"])
+        // PS-02 (ADR-PS-01): bare `libra code` no longer defaults to gemini.
+        .args([
+            "code",
+            "--provider",
+            "gemini",
+            "--mcp-port",
+            "0",
+            "--port",
+            "0",
+        ])
         .current_dir(repo_path)
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_home)
@@ -490,7 +499,16 @@ async fn test_web_only_sigterm_releases_ports() {
     assert!(status.success(), "libra init failed");
 
     let child = Command::new(&libra_bin)
-        .args(["code", "--mcp-port", "0", "--port", "0"])
+        // PS-02 (ADR-PS-01): bare `libra code` no longer defaults to gemini.
+        .args([
+            "code",
+            "--provider",
+            "gemini",
+            "--mcp-port",
+            "0",
+            "--port",
+            "0",
+        ])
         .current_dir(repo_path)
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_home)

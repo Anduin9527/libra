@@ -516,9 +516,12 @@ pub struct CodeArgs {
     #[arg(long = "control-url", value_name = "URL")]
     pub control_url: Option<String>,
 
-    /// AI provider backend
-    #[arg(long, value_enum, default_value_t = CodeProvider::Gemini)]
-    pub provider: CodeProvider,
+    /// AI provider backend. No default: plan-20260825 PS-02 (ADR-PS-05)
+    /// resolves the effective provider at the `execute()` entry
+    /// (`--provider` → `--agent` binding → usage error) and writes it back
+    /// here, so `None` after parsing means "not explicitly chosen".
+    #[arg(long, value_enum)]
+    pub provider: Option<CodeProvider>,
 
     /// Model id (provider-specific)
     #[arg(long)]
@@ -679,7 +682,7 @@ pub struct CodeArgs {
 /// notice that the review gate has been disabled.
 pub(crate) fn effective_plan_mode(args: &CodeArgs) -> bool {
     args.plan_mode
-        .unwrap_or(matches!(args.provider, CodeProvider::Codex))
+        .unwrap_or(matches!(args.provider, Some(CodeProvider::Codex)))
 }
 
 // ---------------------------------------------------------------------------
@@ -722,8 +725,90 @@ fn warn_deprecated_mcp_stdio() {
 /// Returns [`CliError`] for invalid mode combinations, provider credential
 /// failures, network bind failures, Codex app-server startup failures, or
 /// terminal/session initialization failures. Error classification follows
+/// Post-resolution accessor: every consumer past the ADR-PS-05 entry
+/// resolution reads the written-back provider through this. Reaching it with
+/// `None` is a programmer error (a consumer ran before resolution or on the
+/// `--stdio`/`--control stdio` paths that never resolve).
+pub(crate) fn resolved_provider(args: &CodeArgs) -> CodeProvider {
+    args.provider
+        .expect("provider must be resolved at execute() entry (ADR-PS-05)")
+}
+
+/// ADR-PS-03 a-mode usage error for "no provider from any source": lists
+/// every provider with its configuration command (enumerated from the
+/// ADR-PS-02 capability table) and the credential-free alternatives.
+fn provider_required_message() -> String {
+    let mut lines = vec![
+        "no AI provider selected".to_string(),
+        String::new(),
+        "Pick a provider explicitly:".to_string(),
+    ];
+    for spec in PROVIDER_SPECS {
+        if spec.key_required {
+            lines.push(format!("    libra code --provider {}", spec.id));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Run without credentials:".to_string());
+    lines.push("    libra code --provider codex".to_string());
+    lines.push("    libra code --provider ollama --model <name>".to_string());
+    lines.push(String::new());
+    lines.push("Store a provider key once (enables the provider above):".to_string());
+    for spec in PROVIDER_SPECS {
+        if let Some(env) = spec.api_key_env
+            && spec.key_required
+        {
+            lines.push(format!(
+                "    libra config set --global vault.env.{env} <value>"
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Pure ADR-PS-05 priority ladder for this card (slots 1 and 2): an explicit
+/// `--provider` wins; otherwise a mappable `--agent` binding provider id;
+/// both present and disagreeing is a usage conflict; neither is a usage
+/// error carrying the a-mode provider enumeration. Later cards insert
+/// `--resume` metadata (PS-05) and `code.defaultProvider` (PS-03) between
+/// binding and the error.
+fn resolve_provider_from_sources(
+    explicit: Option<CodeProvider>,
+    binding_provider_id: Option<&str>,
+) -> CliResult<CodeProvider> {
+    let binding = binding_provider_id.and_then(|id| {
+        PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.id == id)
+            .map(|spec| spec.provider)
+    });
+    match (explicit, binding) {
+        (Some(flag), Some(bound)) if flag != bound => Err(CliError::command_usage(format!(
+            "--provider {flag:?} conflicts with the --agent binding's provider '{}'; \
+             drop one of them",
+            binding_provider_id.unwrap_or_default()
+        ))),
+        (Some(flag), _) => Ok(flag),
+        (None, Some(bound)) => Ok(bound),
+        (None, None) => Err(CliError::command_usage(provider_required_message())),
+    }
+}
+
+/// ADR-PS-05 entry resolution: runs in `execute()` after the working-dir
+/// preflight and before `validate_mode_args`, then writes the result back to
+/// `args.provider`. `--stdio` / `--control stdio` never call this.
+fn resolve_provider_at_entry(args: &mut CodeArgs, working_dir: &std::path::Path) -> CliResult<()> {
+    let binding = resolve_agent_binding_override(args, working_dir)?;
+    let resolved = resolve_provider_from_sources(
+        args.provider,
+        binding.as_ref().map(|b| b.provider_id.as_str()),
+    )?;
+    args.provider = Some(resolved);
+    Ok(())
+}
+
 /// `docs/development/cli-error-contract-design.md`.
-pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute(mut args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
     // Client-only control shim (W4-02) + control-info discovery (W4-10): no
     // worktree gate, no Web/MCP boot, no auto-start / port scan.
     if args.control == ControlMode::Stdio {
@@ -773,6 +858,14 @@ pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
     // and fail-close when that target is unregistered or unreadable.
     let session_workdir = resolve_code_preflight_working_dir(&args)?;
     crate::command::require_registered_worktree_scope("libra code", &session_workdir)?;
+    // plan-20260825 PS-02 (ADR-PS-05): resolve the effective provider once at
+    // the entry and write it back; every later consumer (plan-mode default,
+    // web runtime dispatch, banner, factory, usage labels, flag gates) reads
+    // the resolved value. `--stdio` keeps `None` — it never builds a
+    // completion provider and rejects an explicit `--provider` below.
+    if !args.stdio {
+        resolve_provider_at_entry(&mut args, &session_workdir)?;
+    }
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
         execute_stdio(&args).await
@@ -1203,79 +1296,80 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     let mcp_server = init_mcp_server(&working_dir).await;
 
     let mut managed_codex_server = ManagedCodexBootstrapGuard::new(None);
-    let code_ui_runtime =
-        if web_only_runtime_kind(args.provider) == WebOnlyRuntimeKind::ManagedCodexAppServer {
-            let server =
-                start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
-            if let Err(error) = check_process_terminate(&process_terminate) {
-                let shutdown_error =
-                    shutdown_code_lifecycle(None, None, None, None, Some(server), None)
-                        .await
-                        .err();
-                if let Some(shutdown_error) = shutdown_error {
-                    return Err(error.with_detail("shutdown", shutdown_error.to_string()));
-                }
-                return Err(error);
+    let code_ui_runtime = if web_only_runtime_kind(resolved_provider(args))
+        == WebOnlyRuntimeKind::ManagedCodexAppServer
+    {
+        let server =
+            start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
+        if let Err(error) = check_process_terminate(&process_terminate) {
+            let shutdown_error =
+                shutdown_code_lifecycle(None, None, None, None, Some(server), None)
+                    .await
+                    .err();
+            if let Some(shutdown_error) = shutdown_error {
+                return Err(error.with_detail("shutdown", shutdown_error.to_string()));
             }
-            println!("Starting Libra Code Web UI with Codex provider");
-            println!("Working directory: {}", working_dir.display());
-            println!("Codex WebSocket: {}", server.ws_url);
-            println!("Codex app-server: auto-started");
-            println!("{}", browser_control_banner_line(browser_control));
-            let ws_url = server.ws_url.clone();
-            managed_codex_server = ManagedCodexBootstrapGuard::new(Some(server));
+            return Err(error);
+        }
+        println!("Starting Libra Code Web UI with Codex provider");
+        println!("Working directory: {}", working_dir.display());
+        println!("Codex WebSocket: {}", server.ws_url);
+        println!("Codex app-server: auto-started");
+        println!("{}", browser_control_banner_line(browser_control));
+        let ws_url = server.ws_url.clone();
+        managed_codex_server = ManagedCodexBootstrapGuard::new(Some(server));
 
-            start_codex_code_ui_runtime(
-                args,
-                &working_dir,
-                &ws_url,
-                mcp_server.clone(),
-                browser_control == BrowserControlMode::Loopback,
-                CodeUiInitialController::Unclaimed,
-            )
-            .await?
-        } else {
-            // §C.4.1: refuse rather than mint a phantom `<working_dir>/.libra`.
-            let storage_root = require_storage_root(&working_dir)?;
-            let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
-            session_store
-                .rebuild_thread_session_index()
-                .map_err(|error| {
-                    CliError::io(format!(
-                        "failed to rebuild the Code thread→session index under '{}': {error}",
-                        storage_root.display()
-                    ))
-                })?;
-            let session_state =
-                load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
-            // All accepted non-Codex web-only providers now route through the
-            // headless runtime (C2 relaxed the web-only provider gate).
-            // Construction errors propagate via `?`; the read-only placeholder
-            // below is only the `Ok(None)` (not-wired) fallback — reached when
-            // the builder declines a provider (today only `Codex`, which is
-            // routed away before this branch), so it is defensive fail-closed
-            // code rather than a live path.
-            match build_non_codex_headless_runtime(
-                args,
-                &working_dir,
-                &env_file,
-                session_store,
-                session_state,
-                browser_control == BrowserControlMode::Loopback,
-                mcp_server.clone(),
-            )
-            .await?
-            {
-                Some(runtime) => {
-                    println!("Starting Libra Code Web UI in headless mode");
-                    println!("Working directory: {}", working_dir.display());
-                    println!("Provider: {:?}", args.provider);
-                    println!("{}", browser_control_banner_line(browser_control));
-                    runtime
-                }
-                None => build_placeholder_web_code_ui_runtime(args, &working_dir).await,
+        start_codex_code_ui_runtime(
+            args,
+            &working_dir,
+            &ws_url,
+            mcp_server.clone(),
+            browser_control == BrowserControlMode::Loopback,
+            CodeUiInitialController::Unclaimed,
+        )
+        .await?
+    } else {
+        // §C.4.1: refuse rather than mint a phantom `<working_dir>/.libra`.
+        let storage_root = require_storage_root(&working_dir)?;
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        session_store
+            .rebuild_thread_session_index()
+            .map_err(|error| {
+                CliError::io(format!(
+                    "failed to rebuild the Code thread→session index under '{}': {error}",
+                    storage_root.display()
+                ))
+            })?;
+        let session_state =
+            load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
+        // All accepted non-Codex web-only providers now route through the
+        // headless runtime (C2 relaxed the web-only provider gate).
+        // Construction errors propagate via `?`; the read-only placeholder
+        // below is only the `Ok(None)` (not-wired) fallback — reached when
+        // the builder declines a provider (today only `Codex`, which is
+        // routed away before this branch), so it is defensive fail-closed
+        // code rather than a live path.
+        match build_non_codex_headless_runtime(
+            args,
+            &working_dir,
+            &env_file,
+            session_store,
+            session_state,
+            browser_control == BrowserControlMode::Loopback,
+            mcp_server.clone(),
+        )
+        .await?
+        {
+            Some(runtime) => {
+                println!("Starting Libra Code Web UI in headless mode");
+                println!("Working directory: {}", working_dir.display());
+                println!("Provider: {:?}", resolved_provider(args));
+                println!("{}", browser_control_banner_line(browser_control));
+                runtime
             }
-        };
+            None => build_placeholder_web_code_ui_runtime(args, &working_dir).await,
+        }
+    };
     mcp_server.set_code_ui_session(code_ui_runtime.adapter().session());
 
     if let Err(error) = check_process_terminate(&process_terminate) {
@@ -1753,18 +1847,17 @@ fn cli_default_model(provider: CodeProvider) -> CliResult<String> {
 /// auto-select but must appear in the credential-free block of the
 /// zero-candidate message).
 pub(crate) struct ProviderSpec {
-    // The dormant columns below are the ADR-PS-02 contract for the follow-up
-    // cards (PS-02 entry resolution consumes `provider`/`key_required`;
-    // PS-06 consumes `needs_explicit_model`/`auto_selectable`); allows are
-    // removed as each consumer lands.
-    #[allow(dead_code)]
     pub(crate) provider: CodeProvider,
     pub(crate) id: &'static str,
     pub(crate) api_key_env: Option<&'static str>,
-    #[allow(dead_code)]
     pub(crate) key_required: bool,
+    // Consumed by the PS-06 zero/one/many credential resolution; until that
+    // card lands the column exists for table completeness (ADR-PS-02) and
+    // the cli_default_model consistency test.
     #[allow(dead_code)]
     pub(crate) needs_explicit_model: bool,
+    // Consumed by PS-06 auto-selection (candidates = key_required rows with
+    // a configured credential); dormant until then.
     #[allow(dead_code)]
     pub(crate) auto_selectable: bool,
 }
@@ -1888,7 +1981,7 @@ fn build_any_completion_model_for_args_with_lookup(
 
     // 1. Map `--provider` to the canonical provider id string (the factory's
     //    dispatch key). Codex bypasses this helper entirely.
-    let mut provider_id_str = match args.provider {
+    let mut provider_id_str = match resolved_provider(args) {
         CodeProvider::Gemini => provider_id::GEMINI.to_string(),
         CodeProvider::Openai => provider_id::OPENAI.to_string(),
         CodeProvider::Anthropic => provider_id::ANTHROPIC.to_string(),
@@ -1922,7 +2015,7 @@ fn build_any_completion_model_for_args_with_lookup(
     } else {
         match args.model.clone() {
             Some(m) => m,
-            None => cli_default_model(args.provider)?,
+            None => cli_default_model(resolved_provider(args))?,
         }
     };
 
@@ -2056,7 +2149,7 @@ fn resolve_agent_binding_override(
 }
 
 fn completion_thinking_for_args(args: &CodeArgs) -> Option<CompletionThinking> {
-    completion_thinking_for_provider(args.provider, args)
+    completion_thinking_for_provider(resolved_provider(args), args)
 }
 
 /// Provider-explicit variant of [`completion_thinking_for_args`] used by the
@@ -2074,7 +2167,7 @@ fn completion_thinking_for_provider(
 }
 
 fn completion_reasoning_effort_for_args(args: &CodeArgs) -> Option<CompletionReasoningEffort> {
-    completion_reasoning_effort_for_provider(args.provider, args)
+    completion_reasoning_effort_for_provider(resolved_provider(args), args)
 }
 
 /// Provider-explicit variant of [`completion_reasoning_effort_for_args`].
@@ -2091,7 +2184,7 @@ fn completion_reasoning_effort_for_provider(
 }
 
 fn completion_stream_for_args(args: &CodeArgs) -> Option<bool> {
-    completion_stream_for_provider(args.provider, args)
+    completion_stream_for_provider(resolved_provider(args), args)
 }
 
 /// Provider-explicit variant of [`completion_stream_for_args`].
@@ -2844,7 +2937,7 @@ where
         exec_approval_tx,
         exec_approval_rx,
     } = approval_channels;
-    let provider_name = format!("{:?}", args.provider).to_lowercase();
+    let provider_name = format!("{:?}", resolved_provider(args)).to_lowercase();
     let provider = CodeUiProviderInfo {
         provider: provider_name.clone(),
         model: Some(model_name.clone()),
@@ -2936,9 +3029,15 @@ where
     } else {
         None
     };
-    let preamble = system_preamble(working_dir, args.context, args.provider, Some(&model_name))
-        .map_err(CliError::failure)?;
-    let preserve_reasoning_content = preserve_reasoning_content_for_provider(args.provider);
+    let preamble = system_preamble(
+        working_dir,
+        args.context,
+        resolved_provider(args),
+        Some(&model_name),
+    )
+    .map_err(CliError::failure)?;
+    let preserve_reasoning_content =
+        preserve_reasoning_content_for_provider(resolved_provider(args));
     let temperature = args.temperature;
     let thinking = completion_thinking_for_args(args);
     let reasoning_effort = completion_reasoning_effort_for_args(args);
@@ -3073,7 +3172,7 @@ async fn build_non_codex_headless_runtime(
     let (exec_approval_tx, exec_approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<ExecApprovalRequest>();
 
-    match args.provider {
+    match resolved_provider(args) {
         CodeProvider::Gemini
         | CodeProvider::Openai
         | CodeProvider::Anthropic
@@ -3152,10 +3251,10 @@ async fn build_placeholder_web_code_ui_runtime(
     let mut snapshot = initial_snapshot(
         working_dir.to_string_lossy().to_string(),
         CodeUiProviderInfo {
-            provider: format!("{:?}", args.provider).to_lowercase(),
+            provider: format!("{:?}", resolved_provider(args)).to_lowercase(),
             model: args.model.clone(),
             mode: Some("web".to_string()),
-            managed: matches!(args.provider, CodeProvider::Codex),
+            managed: matches!(args.provider, Some(CodeProvider::Codex)),
         },
         capabilities.clone(),
     );
@@ -4308,7 +4407,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // Web resume has not landed (W4-01 residual), so bare
         // `--provider codex --resume` must fail closed with a migration hint
         // instead of silently starting a fresh, unresumed Web session.
-        if args.provider == CodeProvider::Codex && args.resume.is_some() {
+        if args.provider == Some(CodeProvider::Codex) && args.resume.is_some() {
             return Err(
                 "--resume is not supported with --provider=codex: the legacy TUI resume driver was removed in the W5 breaking release and managed Codex Web resume has not landed yet; start a new session with `libra code --provider codex` (omit --resume), or resume the thread with a non-Codex provider"
                     .to_string(),
@@ -4317,13 +4416,13 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // Managed Codex web owns its own credential/approval surface; these
         // Legacy/headless flags are accepted for non-Codex web but must not be
         // silently ignored under Codex.
-        if args.provider == CodeProvider::Codex && args.env_file.is_some() {
+        if args.provider == Some(CodeProvider::Codex) && args.env_file.is_some() {
             return Err(
                 "--env-file is not supported with the Web Code UI and --provider=codex; remove --env-file or use a non-Codex headless provider"
                     .to_string(),
             );
         }
-        if args.provider == CodeProvider::Codex && args.approval_ttl.is_some() {
+        if args.provider == Some(CodeProvider::Codex) && args.approval_ttl.is_some() {
             return Err(
                 "--approval-ttl is not supported with the Web Code UI and --provider=codex; remove --approval-ttl or use a non-Codex headless provider"
                     .to_string(),
@@ -4394,7 +4493,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         ensure_loopback_control_host_for_validation(&args.host)?;
     }
 
-    if args.provider != CodeProvider::Codex {
+    if args.provider != Some(CodeProvider::Codex) {
         if args.codex_port.is_some() {
             return Err("--codex-port is only supported with --provider=codex".to_string());
         }
@@ -4406,7 +4505,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         }
     }
 
-    if args.provider == CodeProvider::Codex && args.api_base.is_some() {
+    if args.provider == Some(CodeProvider::Codex) && args.api_base.is_some() {
         return Err("--api-base is not supported with --provider=codex".to_string());
     }
     if let Some(base_url) = args.api_base.as_deref() {
@@ -4437,43 +4536,43 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         ));
     }
 
-    if args.provider != CodeProvider::Ollama && args.ollama_thinking.is_some() {
+    if args.provider != Some(CodeProvider::Ollama) && args.ollama_thinking.is_some() {
         return Err(
             "--ollama-thinking/--thinking is only supported with --provider=ollama".to_string(),
         );
     }
 
-    if args.provider != CodeProvider::Ollama && args.ollama_compact_tools {
+    if args.provider != Some(CodeProvider::Ollama) && args.ollama_compact_tools {
         return Err("--ollama-compact-tools is only supported with --provider=ollama".to_string());
     }
 
-    if args.provider != CodeProvider::Deepseek && args.deepseek_thinking.is_some() {
+    if args.provider != Some(CodeProvider::Deepseek) && args.deepseek_thinking.is_some() {
         return Err("--deepseek-thinking is only supported with --provider=deepseek".to_string());
     }
 
-    if args.provider != CodeProvider::Deepseek && args.deepseek_reasoning_effort.is_some() {
+    if args.provider != Some(CodeProvider::Deepseek) && args.deepseek_reasoning_effort.is_some() {
         return Err(
             "--deepseek-reasoning-effort is only supported with --provider=deepseek".to_string(),
         );
     }
 
-    if args.provider != CodeProvider::Deepseek && args.deepseek_stream.is_some() {
+    if args.provider != Some(CodeProvider::Deepseek) && args.deepseek_stream.is_some() {
         return Err(
             "--deepseek-stream/--stream is only supported with --provider=deepseek".to_string(),
         );
     }
 
-    if args.provider != CodeProvider::Kimi && args.kimi_thinking.is_some() {
+    if args.provider != Some(CodeProvider::Kimi) && args.kimi_thinking.is_some() {
         return Err("--kimi-thinking is only supported with --provider=kimi".to_string());
     }
 
-    if args.provider != CodeProvider::Kimi && args.kimi_stream.is_some() {
+    if args.provider != Some(CodeProvider::Kimi) && args.kimi_stream.is_some() {
         return Err("--kimi-stream is only supported with --provider=kimi".to_string());
     }
 
     #[cfg(feature = "test-provider")]
     {
-        if args.provider == CodeProvider::Fake {
+        if args.provider == Some(CodeProvider::Fake) {
             if std::env::var_os("LIBRA_ENABLE_TEST_PROVIDER").is_none() {
                 return Err(
                     "--provider=fake is test-only; set LIBRA_ENABLE_TEST_PROVIDER=1 to use it"
@@ -4558,7 +4657,7 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_launch: bool) -> Result
     // rejection in `validate_mode_args` (invoked after this helper), so
     // mismatched flags and `--api-base` under Codex are still rejected there.
     if !web_launch {
-        reject_mode_flag(args.provider != CodeProvider::Gemini, "--provider", mode)?;
+        reject_mode_flag(args.provider.is_some(), "--provider", mode)?;
         reject_mode_flag(args.model.is_some(), "--model", mode)?;
         reject_mode_flag(args.temperature.is_some(), "--temperature", mode)?;
         reject_mode_flag(args.api_base.is_some(), "--api-base", mode)?;
@@ -4636,6 +4735,55 @@ mod tests {
         assert!(
             !msg.contains(&extinct),
             "the nonexistent add subcommand must never reappear: {msg}"
+        );
+        assert!(
+            msg.contains("    libra code --provider codex")
+                && msg.contains("    libra code --provider ollama --model <name>"),
+            "credential-free alternatives missing: {msg}"
+        );
+    }
+
+    /// plan-20260825 PS-02 (ADR-PS-05 slots 1-2): explicit `--provider`
+    /// wins, a mappable `--agent` binding fills in when the flag is absent,
+    /// a disagreement between the two is a usage conflict, and no source at
+    /// all yields the a-mode usage error enumerating every configurable
+    /// provider (from the ADR-PS-02 table) plus the credential-free pair.
+    #[test]
+    fn provider_resolution_entry() {
+        use super::{CodeProvider, resolve_provider_from_sources};
+
+        assert_eq!(
+            resolve_provider_from_sources(Some(CodeProvider::Kimi), Some("gemini")).ok(),
+            None,
+            "flag vs binding disagreement must be a usage conflict"
+        );
+        assert_eq!(
+            resolve_provider_from_sources(Some(CodeProvider::Kimi), Some("kimi")).unwrap(),
+            CodeProvider::Kimi
+        );
+        assert_eq!(
+            resolve_provider_from_sources(Some(CodeProvider::Zhipu), None).unwrap(),
+            CodeProvider::Zhipu,
+            "explicit flag stands alone"
+        );
+        assert_eq!(
+            resolve_provider_from_sources(None, Some("anthropic")).unwrap(),
+            CodeProvider::Anthropic,
+            "binding fills in when the flag is absent"
+        );
+
+        let err = resolve_provider_from_sources(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no AI provider selected"), "{msg}");
+        for id in ["gemini", "openai", "anthropic", "deepseek", "kimi", "zhipu"] {
+            assert!(
+                msg.contains(&format!("    libra code --provider {id}")),
+                "provider '{id}' missing from the enumeration: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("    libra config set --global vault.env.MOONSHOT_API_KEY <value>"),
+            "per-provider config command missing: {msg}"
         );
         assert!(
             msg.contains("    libra code --provider codex")
@@ -4747,7 +4895,9 @@ mod tests {
             control_token_file: None,
             control_info_file: None,
             control_url: None,
-            provider: CodeProvider::Gemini,
+            // None mirrors a bare parse: PS-02 removed the clap default,
+            // and stdio-family tests must not trip the explicitness gate.
+            provider: None,
             model: None,
             temperature: None,
             ollama_thinking: None,
@@ -4896,7 +5046,7 @@ mod tests {
     #[test]
     fn accepts_resume_in_non_codex_web_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.resume = Some("thread-id".to_string());
         assert!(
             validate_mode_args(&args, &OutputConfig::default()).is_ok(),
@@ -4931,7 +5081,7 @@ mod tests {
     #[test]
     fn rejects_env_file_and_approval_ttl_for_managed_codex_web() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.env_file = Some(PathBuf::from(".env.test"));
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -4940,7 +5090,7 @@ mod tests {
         );
 
         let mut ttl_args = base_args();
-        ttl_args.provider = CodeProvider::Codex;
+        ttl_args.provider = Some(CodeProvider::Codex);
         ttl_args.approval_ttl = Some(42);
         let err = validate_mode_args(&ttl_args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -4982,7 +5132,7 @@ mod tests {
             .expect("persist headless session");
 
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.resume = Some("headless-thread".to_string());
         let restored =
             load_or_create_headless_web_session_state(&args, &working_dir, &session_store)
@@ -5204,7 +5354,7 @@ mod tests {
         ];
         for provider in providers {
             let mut args = base_args();
-            args.provider = provider;
+            args.provider = Some(provider);
             assert!(
                 validate_mode_args(&args, &OutputConfig::default()).is_ok(),
                 "web-only must accept --provider {provider:?}"
@@ -5217,7 +5367,7 @@ mod tests {
     #[test]
     fn accepts_model_api_base_and_temperature_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.model = Some("llama3".to_string());
         args.api_base = Some("http://127.0.0.1:11434/v1".to_string());
         args.temperature = Some(0.2);
@@ -5229,7 +5379,7 @@ mod tests {
     #[test]
     fn accepts_matching_provider_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5240,7 +5390,7 @@ mod tests {
     #[test]
     fn accepts_matching_deepseek_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Deepseek;
+        args.provider = Some(CodeProvider::Deepseek);
         args.deepseek_thinking = Some(DeepSeekThinkingArg::Enabled);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5248,7 +5398,7 @@ mod tests {
     #[test]
     fn accepts_matching_kimi_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Kimi;
+        args.provider = Some(CodeProvider::Kimi);
         args.kimi_thinking = Some(KimiThinkingArg::Enabled);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5260,7 +5410,7 @@ mod tests {
     fn rejects_out_of_range_temperature() {
         for bad in [2.5_f64, -0.1, f64::NAN, 3.0] {
             let mut args = base_args();
-            args.provider = CodeProvider::Ollama;
+            args.provider = Some(CodeProvider::Ollama);
             args.temperature = Some(bad);
             let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
             assert!(
@@ -5271,7 +5421,7 @@ mod tests {
         // Boundary values are accepted.
         for good in [0.0_f64, 2.0, 1.0] {
             let mut args = base_args();
-            args.provider = CodeProvider::Ollama;
+            args.provider = Some(CodeProvider::Ollama);
             args.temperature = Some(good);
             assert!(
                 validate_mode_args(&args, &OutputConfig::default()).is_ok(),
@@ -5286,7 +5436,7 @@ mod tests {
     #[test]
     fn rejects_mismatched_provider_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Deepseek;
+        args.provider = Some(CodeProvider::Deepseek);
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -5299,7 +5449,7 @@ mod tests {
     #[test]
     fn rejects_api_base_under_codex_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.api_base = Some("http://127.0.0.1:8080".to_string());
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -5342,7 +5492,7 @@ mod tests {
         // provider != gemini
         let mut args = base_args();
         args.stdio = true;
-        args.provider = CodeProvider::Openai;
+        args.provider = Some(CodeProvider::Openai);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
             err.contains("--provider") && err.contains("--stdio"),
@@ -5494,7 +5644,7 @@ mod tests {
 
         for case in cases {
             let mut args = base_args();
-            args.provider = case.provider;
+            args.provider = Some(case.provider);
             args.browser_control = case.explicit;
             args.host = case.host.to_string();
 
@@ -5587,7 +5737,7 @@ mod tests {
         args.control = ControlMode::Stdio;
         args.control_url = Some("http://127.0.0.1:3000".to_string());
         args.control_token_file = Some(PathBuf::from("token"));
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
             err.contains("--provider") && err.contains("--control stdio"),
@@ -5837,7 +5987,7 @@ no_cache_unknown_network = true
     #[test]
     fn effective_plan_mode_defaults_to_true_for_codex() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         assert!(effective_plan_mode(&args));
     }
 
@@ -5854,7 +6004,7 @@ no_cache_unknown_network = true
         ];
         for provider in providers {
             let mut args = base_args();
-            args.provider = provider;
+            args.provider = Some(provider);
             assert!(
                 !effective_plan_mode(&args),
                 "expected plan_mode=false default for provider {provider:?}"
@@ -5865,14 +6015,14 @@ no_cache_unknown_network = true
     #[test]
     fn effective_plan_mode_respects_explicit_user_value() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.plan_mode = Some(false);
         assert!(
             !effective_plan_mode(&args),
             "explicit --plan-mode=false must override the codex default"
         );
 
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.plan_mode = Some(true);
         assert!(
             effective_plan_mode(&args),
@@ -5885,7 +6035,7 @@ no_cache_unknown_network = true
     #[test]
     fn rejects_explicit_plan_mode_true_for_non_codex_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.plan_mode = Some(true);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(err.contains("--plan-mode"));
@@ -5894,7 +6044,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_explicit_plan_mode_false_for_non_codex_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.plan_mode = Some(false);
         validate_mode_args(&args, &OutputConfig::default()).unwrap();
     }
@@ -5928,7 +6078,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_anthropic_provider_in_default_web_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Anthropic;
+        args.provider = Some(CodeProvider::Anthropic);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
 
@@ -5942,7 +6092,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_ollama_thinking_for_ollama_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5957,7 +6107,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_ollama_compact_tools_for_ollama_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.ollama_compact_tools = true;
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5979,7 +6129,7 @@ no_cache_unknown_network = true
         ])
         .unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Deepseek);
+        assert_eq!(args.provider, Some(CodeProvider::Deepseek));
         assert_eq!(args.deepseek_thinking, Some(DeepSeekThinkingArg::Enabled));
         assert_eq!(
             args.deepseek_reasoning_effort,
@@ -6046,7 +6196,7 @@ no_cache_unknown_network = true
         ])
         .unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Kimi);
+        assert_eq!(args.provider, Some(CodeProvider::Kimi));
         assert_eq!(args.kimi_thinking, Some(KimiThinkingArg::Disabled));
         assert_eq!(
             completion_thinking_for_args(&args),
@@ -6059,7 +6209,7 @@ no_cache_unknown_network = true
     fn defaults_kimi_stream_for_kimi_provider() {
         let args = CodeArgs::try_parse_from(["libra", "--provider", "kimi"]).unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Kimi);
+        assert_eq!(args.provider, Some(CodeProvider::Kimi));
         assert_eq!(args.kimi_stream, None);
         assert_eq!(completion_stream_for_args(&args), Some(true));
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -6071,7 +6221,7 @@ no_cache_unknown_network = true
             CodeArgs::try_parse_from(["libra", "--provider", "kimi", "--kimi-stream", "false"])
                 .unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Kimi);
+        assert_eq!(args.provider, Some(CodeProvider::Kimi));
         assert_eq!(args.kimi_stream, Some(false));
         assert_eq!(completion_stream_for_args(&args), Some(false));
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -6127,7 +6277,7 @@ no_cache_unknown_network = true
         std::fs::write(&cwd_file, "not a directory").unwrap();
 
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.cwd = Some(cwd_file.clone());
 
         let err = resolve_code_preflight_working_dir(&args).unwrap_err();
@@ -6649,7 +6799,7 @@ no_cache_unknown_network = true
 
         for (provider, model, api_base, expected_env) in cases {
             let mut args = base_args();
-            args.provider = *provider;
+            args.provider = Some(*provider);
             args.model = model.map(str::to_string);
             args.api_base = api_base.map(str::to_string);
             let err = build_any_completion_model_for_args_with_lookup(
@@ -6688,7 +6838,7 @@ no_cache_unknown_network = true
         let (base_url, captured, server) = start_chat_completions_stub().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Deepseek;
+        args.provider = Some(CodeProvider::Deepseek);
         args.model = Some("deepseek-chat".to_string());
         args.api_base = Some(base_url);
         let mut env_file = CodeEnvFile::default();
@@ -6724,7 +6874,7 @@ no_cache_unknown_network = true
     async fn headless_ollama_reuses_provider_factory_bootstrap() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.model = Some("llama3.2".to_string());
         let session_store = Arc::new(SessionStore::from_storage_path(&tmp.path().join(".libra")));
         let session_state = SessionState::new(&tmp.path().to_string_lossy());
@@ -6752,7 +6902,7 @@ no_cache_unknown_network = true
     async fn headless_provider_boot_uses_the_shared_env_file_lookup() {
         let tmp = tempfile::TempDir::new().expect("temporary workspace");
         let mut args = base_args();
-        args.provider = CodeProvider::Openai;
+        args.provider = Some(CodeProvider::Openai);
         args.model = Some("gpt-test".to_string());
         let mut env_file = CodeEnvFile::default();
         env_file
@@ -6784,7 +6934,7 @@ no_cache_unknown_network = true
     async fn headless_non_ollama_provider_reuses_provider_factory_bootstrap() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Fake;
+        args.provider = Some(CodeProvider::Fake);
         let fixture_path = tmp.path().join("fake-fixture.json");
         args.fake_fixture = Some({
             std::fs::write(
@@ -6862,7 +7012,7 @@ no_cache_unknown_network = true
     async fn build_non_codex_headless_runtime_excludes_codex_provider() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         let session_store = Arc::new(SessionStore::from_storage_path(&tmp.path().join(".libra")));
         let session_state = SessionState::new(&tmp.path().to_string_lossy());
 
@@ -6904,7 +7054,7 @@ no_cache_unknown_network = true
              body",
         );
         let mut args = base_args();
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.model = Some("gemini-2.0-flash".to_string()); // would-be hybrid
         args.agent = Some("planner".to_string());
         let env_file = CodeEnvFile::default();
@@ -6947,7 +7097,7 @@ no_cache_unknown_network = true
         ];
         for (provider, expected_model, expected_provider_id) in cases {
             let mut args = base_args();
-            args.provider = *provider;
+            args.provider = Some(*provider);
             args.model = None;
             let (_model, model_name, provider_id) =
                 build_any_completion_model_for_args_with_lookup(
@@ -6970,7 +7120,7 @@ no_cache_unknown_network = true
         // Ollama has no sensible local default — omitting `--model` must be a
         // usage error, not a silent fallback.
         let mut ollama = base_args();
-        ollama.provider = CodeProvider::Ollama;
+        ollama.provider = Some(CodeProvider::Ollama);
         ollama.model = None;
         let err = build_any_completion_model_for_args_with_lookup(
             &ollama,
@@ -6995,7 +7145,7 @@ no_cache_unknown_network = true
         let (base_url, captured, server) = start_chat_completions_stub().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Openai;
+        args.provider = Some(CodeProvider::Openai);
         args.model = Some("gpt-4o-mini".to_string());
         // No CLI --api-base; the base URL must come from the env-file.
         args.api_base = None;
