@@ -1,7 +1,8 @@
 //! Code UI SSE wire version negotiation and v2 delta/cursor envelopes (W3-06).
 //!
 //! Transport backlog / resync / slow-consumer backpressure live here (W3-08).
-//! v1 remains the full-snapshot [`super::code_ui::CodeUiEventEnvelope`] stream.
+//! The v1 full-snapshot [`super::code_ui::CodeUiEventEnvelope`] stream was
+//! physically removed in 0.22.0 (plan-20260824 DF-08); v2 is the only wire.
 //! v2 emits minimal payloads keyed by the durable W1-06
 //! [`CodeWorkflowEvent`] sequence — never a second live sequencer.
 

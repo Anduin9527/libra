@@ -221,20 +221,23 @@ fn mcp_result_text(value: &Value) -> String {
 
 #[cfg(feature = "test-provider")]
 fn event_payload_transcript_contains(payload: &Value, needle: &str) -> bool {
-    payload
-        .pointer("/data/transcript")
-        .and_then(Value::as_array)
-        .is_some_and(|transcript| {
-            transcript.iter().any(|entry| {
-                let matches = |key: &str| {
-                    entry
-                        .get(key)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value.contains(needle))
-                };
-                matches("content") || matches("title")
-            })
-        })
+    // DF-08: the v1 full-snapshot envelope is gone — match the v2
+    // `code_workflow` transcript_upsert projection payload instead.
+    let is_transcript_upsert = payload.get("kind").and_then(Value::as_str)
+        == Some("code_ui_projection_delta:transcript_upsert");
+    if !is_transcript_upsert {
+        return false;
+    }
+    let Some(entry) = payload.pointer("/payload/payload") else {
+        return false;
+    };
+    let matches = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains(needle))
+    };
+    matches("content") || matches("title")
 }
 
 #[cfg(feature = "test-provider")]
@@ -251,7 +254,7 @@ fn wait_for_sse_transcript(
             continue;
         };
         last_event = format!("event={} data={}", event.event, event.data);
-        if event.event != "session_updated" {
+        if event.event != "code_workflow" {
             continue;
         }
         let payload: Value = serde_json::from_str(&event.data)
@@ -515,10 +518,9 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
         .context("build MCP consistency client")?;
     let mcp_session_id = mcp_initialize(&client, &mcp_url)?;
 
-    // This assertion inspects the legacy full-session transcript envelope;
-    // DF-05 keeps it as an explicit v1 compatibility case while the SSE
-    // matrix owns default-v2 projection/cursor coverage.
-    let mut events = session.open_event_stream_v1()?;
+    // DF-08 removed the v1 wire: this dual-entry assertion now observes the
+    // v2 `code_workflow` transcript_upsert projection on the default wire.
+    let mut events = session.open_event_stream()?;
     session.attach_automation("code-mcp-web-message-consistency")?;
 
     let marker = "mcp-dual-web-observe-marker";
@@ -572,10 +574,11 @@ fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
         .build()
         .context("build MCP consistency client")?;
     let mcp_session_id = mcp_initialize(&client, &mcp_url)?;
-    // This reverse-direction assertion also needs the legacy full snapshot;
-    // keep the v1 request explicit so it cannot mask the harness v2 default.
-    let mut events = session.open_event_stream_v1()?;
-
+    // DF-08: the v1 snapshot envelope this assertion used to watch was
+    // removed, and an MCP task write does not append a durable
+    // `code_workflow` transcript event — the v2-era observability contract
+    // for out-of-band writes is the session snapshot (the same
+    // snapshot-fetch doctrine v2 resync uses). Poll it instead.
     let marker = "mcp-originated-create-task-marker";
     let title = format!("MCP task {marker}");
     let value = mcp_call_tool(
@@ -596,7 +599,32 @@ fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
         "MCP create_task should return the created task id; got:\n{result_text}",
     );
 
-    let _payload = wait_for_sse_transcript(&mut events, marker, Duration::from_secs(10))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = session.snapshot()?;
+        let seen = snapshot
+            .pointer("/transcript")
+            .and_then(Value::as_array)
+            .is_some_and(|transcript| {
+                transcript.iter().any(|entry| {
+                    ["content", "title"].iter().any(|key| {
+                        entry
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value.contains(marker))
+                    })
+                })
+            });
+        if seen {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for the web session snapshot to show the MCP-created task: {snapshot}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     Ok(())
 }
 
