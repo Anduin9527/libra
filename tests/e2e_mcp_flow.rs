@@ -183,7 +183,12 @@ async fn test_e2e_mcp_flow() {
     assert!(status.success(), "cargo build failed");
 
     let project_root = std::env::current_dir().expect("Failed to get current dir");
-    let libra_bin = project_root.join("target/debug/libra");
+    // Honor CARGO_TARGET_DIR like the sigterm case below — a hardcoded
+    // target/ path ENOENTs under an isolated target dir (PS-02 terra R1).
+    let libra_bin = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| project_root.join("target"))
+        .join("debug/libra");
 
     // Init repo
     let status = Command::new(&libra_bin)

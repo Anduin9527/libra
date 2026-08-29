@@ -730,6 +730,10 @@ fn warn_deprecated_mcp_stdio() {
 /// `None` is a programmer error (a consumer ran before resolution or on the
 /// `--stdio`/`--control stdio` paths that never resolve).
 pub(crate) fn resolved_provider(args: &CodeArgs) -> CodeProvider {
+    // INVARIANT: every caller sits on the default-Web path, downstream of
+    // the resolve_provider_at_entry() write-back in execute(); the
+    // `--stdio`/`--control stdio` paths that keep `None` never reach these
+    // consumers (they reject or ignore provider flags in validate_mode_args).
     args.provider
         .expect("provider must be resolved at execute() entry (ADR-PS-05)")
 }
