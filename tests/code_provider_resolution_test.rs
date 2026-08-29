@@ -419,3 +419,43 @@ impl OutputWithTimeoutKill for Command {
         (out, err)
     }
 }
+
+#[test]
+fn empty_string_keys_are_not_configured() {
+    // PS-06 terra R4: an empty value can never authenticate, so it must
+    // count as unconfigured at every layer — process env and --env-file
+    // both fall through to the zero-candidate auth guidance.
+    let repo = init_repo();
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .env("GEMINI_API_KEY", "")
+        .output()
+        .expect("run empty-process-env probe");
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "empty process-env key must be zero candidates; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no provider credentials configured"),
+        "zero-state guidance expected"
+    );
+
+    let env_file = repo.root.join("empty.env");
+    std::fs::write(&env_file, "ZHIPU_API_KEY=\n").expect("write env file");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["code", "--env-file"])
+        .arg(&env_file)
+        .args(["--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .output()
+        .expect("run empty-env-file probe");
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "empty env-file key must be zero candidates; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

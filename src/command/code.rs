@@ -962,7 +962,10 @@ async fn detect_provider_candidates(
         let Some(env) = spec.api_key_env else {
             continue;
         };
-        if env_file.get(env).is_some() {
+        // An empty value is "not configured" at every layer (terra R4): it
+        // can never authenticate, so it must not win auto-selection nor
+        // shadow the zero-candidate guidance.
+        if env_file.get(env).is_some_and(|v| !v.trim().is_empty()) {
             out.push(DetectedCandidate {
                 provider: spec.provider,
                 id: spec.id,
@@ -982,7 +985,9 @@ async fn detect_provider_candidates(
                     "credential detection failed while checking {env}: {error:#}"
                 ))
             })?;
-        if let Some((_value, layer)) = located {
+        if let Some((value, layer)) = located
+            && !value.trim().is_empty()
+        {
             out.push(DetectedCandidate {
                 provider: spec.provider,
                 id: spec.id,
@@ -2215,7 +2220,11 @@ fn build_any_completion_model_for_args_with_lookup(
     // the match arms this replaced.
     let api_key = provider_spec_by_id(&provider_id_str)
         .and_then(|spec| spec.api_key_env)
-        .and_then(resolve_env);
+        .and_then(resolve_env)
+        // Empty keys are "not configured" (terra R4): fall into the
+        // provider's missing-key a-mode error instead of authenticating
+        // with an empty string.
+        .filter(|value| !value.trim().is_empty());
 
     let api_base = resolve_provider_api_base(&provider_id_str, args.api_base.clone(), resolve_env);
 
