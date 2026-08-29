@@ -65,7 +65,8 @@ impl CodeUiSseWireVersion {
 /// Query parameters for `GET /api/code/events`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CodeEventsQuery {
-    /// Wire version: `1`/`v1` or `2`/`v2`. Omitted → [`DEFAULT_CODE_UI_SSE_WIRE_VERSION`].
+    /// Wire version: only `2`/`v2` is accepted (`1`/`v1` was removed in
+    /// 0.22.0 and is rejected). Omitted → [`DEFAULT_CODE_UI_SSE_WIRE_VERSION`].
     pub wire: Option<String>,
     /// v2 only: last-seen durable workflow sequence; replay emits events with
     /// `sequence > cursor`.
