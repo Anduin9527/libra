@@ -42,7 +42,7 @@ pub(crate) use crate::internal::worktree_io::{
     },
     session::{
         begin as begin_status_io_root_session, relative_path as request_worktree_relative,
-        root_bytes as request_root_bytes,
+        root_bytes as request_root_bytes, session_nonce as request_worktree_session,
     },
 };
 
@@ -264,6 +264,7 @@ pub(crate) fn deadline_file_blob_hash(
                 path: relative,
                 root,
                 hash_kind: current_hash_kind(),
+                root_session: request_worktree_session(),
             },
             path_to_bytes(path),
             crate::command::status_probe::io_op_timeout(),
@@ -635,6 +636,7 @@ mod tests {
             path: super::path_to_bytes(Path::new("tracked.bin")),
             root: super::path_to_bytes(repo_b.path()),
             hash_kind: "sha1".to_string(),
+            root_session: 0,
         };
         let mut buf = Vec::new();
         super::handle_request(request, &mut buf).expect("handle_request");

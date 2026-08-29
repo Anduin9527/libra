@@ -208,7 +208,10 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
             write_frame(stdout, &IoEvent::DoneReadDir { listing })?;
         }
         IoRequest::FileBlobHash {
-            path, hash_kind, ..
+            path,
+            hash_kind,
+            root_session,
+            ..
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let path = bytes_to_path(&path);
@@ -217,14 +220,23 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
             };
             let relative = capability.relative(&path)?;
             let root_fd = crate::utils::beneath::open_root(capability.root())?;
-            let result =
-                match hash_file_blob_beneath(capability.root(), &root_fd, &relative, &hash_kind) {
-                    Ok(hash) => WireResult::Ok(hash.to_string()),
-                    Err(error) => WireResult::Err {
-                        kind: kind_to_u8(error.kind()),
-                        raw_os: error.raw_os_error(),
-                    },
-                };
+            let hash = match root_session {
+                0 => hash_file_blob_beneath(capability.root(), &root_fd, &relative, &hash_kind),
+                session => hash_file_blob_beneath_with_session(
+                    capability.root(),
+                    &root_fd,
+                    &relative,
+                    &hash_kind,
+                    Some(session),
+                ),
+            };
+            let result = match hash {
+                Ok(hash) => WireResult::Ok(hash.to_string()),
+                Err(error) => WireResult::Err {
+                    kind: kind_to_u8(error.kind()),
+                    raw_os: error.raw_os_error(),
+                },
+            };
             write_frame(stdout, &IoEvent::DoneHash { hex: result })?;
         }
         IoRequest::ReadObjectBlob {
@@ -437,6 +449,16 @@ pub(crate) fn hash_file_blob_beneath(
     relative: &Path,
     hash_kind: &str,
 ) -> io::Result<git_internal::hash::ObjectHash> {
+    hash_file_blob_beneath_with_session(root_path, root, relative, hash_kind, None)
+}
+
+fn hash_file_blob_beneath_with_session(
+    root_path: &Path,
+    root: &std::fs::File,
+    relative: &Path,
+    hash_kind: &str,
+    root_session: Option<u64>,
+) -> io::Result<git_internal::hash::ObjectHash> {
     apply_hash_kind(hash_kind);
     let stat = crate::utils::beneath::lstat_beneath(root, relative)?;
     if stat.is_symlink {
@@ -454,7 +476,12 @@ pub(crate) fn hash_file_blob_beneath(
     // read.
     let file = crate::utils::beneath::open_file_beneath(root, relative)?;
     let length = file.metadata()?.len();
-    if crate::utils::attributes::is_lfs_tracked_beneath(root_path, root, relative)? {
+    if crate::utils::attributes::is_lfs_tracked_beneath_session(
+        root_path,
+        root,
+        relative,
+        root_session,
+    )? {
         let (oid, total) = hash_lfs_file_handle(&file, length)?;
         if total != length || file.metadata()?.len() != length {
             return Err(io::Error::new(

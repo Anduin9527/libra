@@ -407,6 +407,10 @@ pub(crate) enum IoRequest {
         /// An absolute, sealed worktree root.
         root: Vec<u8>,
         hash_kind: String,
+        /// Parent invocation nonce. A non-zero value bounds helper-side
+        /// attribute-source negative caching to one status invocation.
+        #[serde(default)]
+        root_session: u64,
     },
     ReadObjectBlob {
         oid: String,
