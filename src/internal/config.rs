@@ -1124,6 +1124,40 @@ pub fn resolve_env_sync(name: &str) -> anyhow::Result<Option<String>> {
 /// actionable error otherwise. Provider clients use this for the
 /// API-key class of variables where missing means the provider cannot
 /// initialise.
+/// [`resolve_env_sync`] with an explicit repository directory for the
+/// repo-local layer (plan-20260825 PS-06 terra R2): the session target's
+/// vault (`--repo` / `--cwd`) participates instead of whatever repository
+/// the process cwd happens to be inside. Falls back to the global/process
+/// layers when the directory holds no repository.
+pub fn resolve_env_sync_for_dir(
+    name: &str,
+    dir: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    if let Ok(val) = std::env::var(name) {
+        return Ok(Some(val));
+    }
+    let local_db = crate::utils::util::try_get_storage_path(Some(dir.to_path_buf()))
+        .ok()
+        .map(|storage| storage.join(crate::utils::util::DATABASE));
+    let owned = name.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Option<String>> {
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|err| anyhow::anyhow!("failed to create tokio runtime: {err}"))?;
+            let target = match &local_db {
+                Some(db) => LocalIdentityTarget::ExplicitDb(db),
+                None => LocalIdentityTarget::None,
+            };
+            runtime.block_on(resolve_env_for_target(&owned, target))
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv().map_err(|_| {
+        anyhow::anyhow!("resolve_env_sync_for_dir worker for '{name}' exited unexpectedly")
+    })?
+}
+
 pub fn resolve_required_env_sync(name: &str) -> anyhow::Result<String> {
     match resolve_env_sync(name)? {
         Some(value) => Ok(value),

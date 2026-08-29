@@ -885,6 +885,7 @@ fn ambiguous_candidates_message(candidates: &[DetectedCandidate]) -> String {
 async fn resolve_provider_at_entry(
     args: &mut CodeArgs,
     working_dir: &std::path::Path,
+    output: &OutputConfig,
 ) -> CliResult<()> {
     let binding = resolve_agent_binding_override(args, working_dir)?;
     // Slots 1-2 short-circuit BEFORE any env-file read or credential probe:
@@ -910,13 +911,27 @@ async fn resolve_provider_at_entry(
     // Only now: the env file participates in detection as its own layer,
     // mirroring the provider_env_value_with_lookup chain the factory uses.
     let env_file = load_code_env_file(args.env_file.as_deref())?;
-    let candidates = detect_provider_candidates(&env_file).await?;
+    let candidates = detect_provider_candidates(&env_file, working_dir).await?;
     let (resolved, auto) = three_state_outcome(candidates)?;
     if let Some(candidate) = auto {
-        eprintln!(
-            "provider '{}' auto-selected: {} found in {}",
-            candidate.id, candidate.api_key_env, candidate.layer
-        );
+        if output.is_json() {
+            // ADR-PS-03 ⑤: machine surfaces get a structured event, never
+            // decorative prose. stderr keeps stdout's contract clean.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "provider_auto_selected",
+                    "provider": candidate.id,
+                    "api_key_env": candidate.api_key_env,
+                    "layer": candidate.layer,
+                })
+            );
+        } else {
+            eprintln!(
+                "provider '{}' auto-selected: {} found in {}",
+                candidate.id, candidate.api_key_env, candidate.layer
+            );
+        }
     }
     args.provider = Some(resolved);
     Ok(())
@@ -927,8 +942,18 @@ async fn resolve_provider_at_entry(
 /// `codex`/`ollama` are excluded by the table itself. The `--env-file`
 /// layer is checked first, then the shared process-env → repo vault →
 /// global vault chain (`locate_env_for_target`).
-async fn detect_provider_candidates(env_file: &CodeEnvFile) -> CliResult<Vec<DetectedCandidate>> {
+async fn detect_provider_candidates(
+    env_file: &CodeEnvFile,
+    working_dir: &std::path::Path,
+) -> CliResult<Vec<DetectedCandidate>> {
     use crate::internal::config::{LocalIdentityTarget, locate_env_for_target};
+    // The repo-local layer must be the SESSION target's vault (`--repo` /
+    // `--cwd` aware), not whatever repository the process cwd happens to be
+    // in (PS-06 terra R2: A-with-gemini running `--repo B` must not select
+    // A's provider for B's session).
+    let local_db = crate::utils::util::try_get_storage_path(Some(working_dir.to_path_buf()))
+        .ok()
+        .map(|storage| storage.join(crate::utils::util::DATABASE));
     let mut out = Vec::new();
     for spec in PROVIDER_SPECS {
         if !spec.auto_selectable {
@@ -946,7 +971,11 @@ async fn detect_provider_candidates(env_file: &CodeEnvFile) -> CliResult<Vec<Det
             });
             continue;
         }
-        let located = locate_env_for_target(env, LocalIdentityTarget::CurrentRepo)
+        let local_target = match &local_db {
+            Some(db) => LocalIdentityTarget::ExplicitDb(db),
+            None => LocalIdentityTarget::None,
+        };
+        let located = locate_env_for_target(env, local_target)
             .await
             .map_err(|error| {
                 CliError::fatal(format!(
@@ -1022,7 +1051,7 @@ pub async fn execute(mut args: CodeArgs, output: &OutputConfig) -> CliResult<()>
     // the resolved value. `--stdio` keeps `None` — it never builds a
     // completion provider and rejects an explicit `--provider` below.
     if !args.stdio {
-        resolve_provider_at_entry(&mut args, &session_workdir).await?;
+        resolve_provider_at_entry(&mut args, &session_workdir, output).await?;
     }
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
@@ -1928,8 +1957,10 @@ fn build_any_completion_model_for_args(
         // path falls through to its existing "API key not set" error,
         // matching the v0.17.534 fallback semantics. Hard schema-mismatch
         // chains are still surfaced via `tracing::warn!` inside
-        // `resolve_env_for_target`.
-        match crate::internal::config::resolve_env_sync(key) {
+        // `resolve_env_for_target`. The repo-local layer targets the
+        // SESSION working dir (`--repo`/`--cwd` aware) so the factory and
+        // the PS-06 detection read the same vault (terra R2).
+        match crate::internal::config::resolve_env_sync_for_dir(key, working_dir) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(

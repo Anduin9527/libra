@@ -312,3 +312,110 @@ fn many_candidates_report_the_global_vault_layer() {
         "values must never leak: {stderr}"
     );
 }
+
+#[test]
+fn session_target_repo_vault_drives_detection_not_caller_cwd() {
+    // PS-06 terra R2: running `libra code --repo B` from repository A must
+    // detect against B's repo-local vault. A configures gemini locally,
+    // B configures deepseek locally; the session targets B, so deepseek
+    // must be the auto-selected candidate with the repo-local layer label.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(home.join(".config")).expect("home");
+    let global_db = temp.path().join("global.db");
+    let repo_a = temp.path().join("a");
+    let repo_b = temp.path().join("b");
+    for repo in [&repo_a, &repo_b] {
+        std::fs::create_dir_all(repo).expect("repo dir");
+        let st = base_command(&home, &global_db)
+            .arg("init")
+            .current_dir(repo)
+            .status()
+            .expect("init");
+        assert!(st.success());
+    }
+    for (repo, key) in [
+        (&repo_a, "vault.env.GEMINI_API_KEY"),
+        (&repo_b, "vault.env.DEEPSEEK_API_KEY"),
+    ] {
+        let st = base_command(&home, &global_db)
+            .args(["config", "set", key, "local-probe"])
+            .current_dir(repo)
+            .status()
+            .expect("config set local");
+        assert!(st.success(), "local config set failed in {repo:?}");
+    }
+
+    let out = base_command(&home, &global_db)
+        .args(["code", "--repo"])
+        .arg(&repo_b)
+        .args(["--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo_a)
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        stderr.contains("provider 'deepseek' auto-selected")
+            && stderr.contains("DEEPSEEK_API_KEY")
+            && stderr.contains("repo-local vault"),
+        "session target B's vault must drive detection: {stderr}"
+    );
+    assert!(
+        !stderr.contains("gemini' auto-selected"),
+        "caller repo A's vault must not leak into the session: {stderr}"
+    );
+}
+
+#[test]
+fn machine_mode_announces_auto_selection_as_structured_event() {
+    // PS-06 terra R2 (ADR-PS-03 ⑤): machine surfaces must not get prose.
+    let repo = init_repo();
+    let out = base_command(&repo.home, &repo.global_db)
+        .args(["--machine", "code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(&repo.root)
+        .env("GEMINI_API_KEY", "probe-gemini")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stderr = String::from_utf8_lossy(&out.1);
+    let event_line = stderr
+        .lines()
+        .find(|l| l.contains("provider_auto_selected"))
+        .unwrap_or_else(|| panic!("structured event missing: {stderr}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(event_line).expect("event line must be valid JSON");
+    assert_eq!(parsed["provider"], "gemini");
+    assert_eq!(parsed["api_key_env"], "GEMINI_API_KEY");
+    assert_eq!(parsed["layer"], "process environment");
+    assert!(
+        !stderr.contains("auto-selected:"),
+        "prose form must not appear under --machine: {stderr}"
+    );
+}
+
+/// Spawn helper: run to first-seconds boot then kill, returning
+/// (stdout, stderr) bytes — for launches that would otherwise run forever.
+trait OutputWithTimeoutKill {
+    fn output_with_timeout_kill(&mut self) -> (Vec<u8>, Vec<u8>);
+}
+impl OutputWithTimeoutKill for Command {
+    fn output_with_timeout_kill(&mut self) -> (Vec<u8>, Vec<u8>) {
+        use std::io::Read;
+        let mut child = self
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        std::thread::sleep(Duration::from_secs(8));
+        let _ = child.kill();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Some(mut s) = child.stdout.take() {
+            let _ = s.read_to_end(&mut out);
+        }
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_end(&mut err);
+        }
+        let _ = child.wait();
+        (out, err)
+    }
+}
