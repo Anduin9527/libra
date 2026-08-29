@@ -153,7 +153,7 @@ The browser server-side endpoints are tagged in the `code_router()` audit matrix
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`. `Automation` leases also require `X-Libra-Control-Token`.
 - `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`; user-initiated sub-agent dispatch requires an active controller write lease (browser or automation). Automation leases additionally require `X-Libra-Control-Token`.
 - `POST /api/code/goal/start`, `POST /api/code/goal/cancel` — loopback + `X-Code-Controller-Token`; goal mutation requires the active controller lease.
-- `POST /api/code/skills/activate`, `POST /api/code/session/resume` — loopback + `X-Code-Controller-Token` on the write router (256 KiB body limit); both require an active controller write lease. Automation leases additionally require `X-Libra-Control-Token`. Resume refuses busy and indeterminate snapshots, and currently fail-closes with `SESSION_RESUME_REQUIRES_RESTART` after proving the target thread is loadable (in-process AgentRuntime swap is not available yet). Skill activate fail-closes with `SKILL_ACTIVATION_UNSUPPORTED` after discoverability validation until a provider-consumed activation path exists.
+- `POST /api/code/skills/activate`, `POST /api/code/session/resume` — loopback + `X-Code-Controller-Token` on the write router (256 KiB body limit); both require an active controller write lease. Automation leases additionally require `X-Libra-Control-Token`. Resume refuses busy and indeterminate snapshots, and currently fail-closes with `SESSION_RESUME_REQUIRES_RESTART` after proving the target thread is loadable (in-process AgentRuntime swap is not available yet). Skill activate hands a validated activation to the live in-process provider (DF-07); sessions without one (read-only, managed Codex) fail closed with `SKILL_ACTIVATION_UNSUPPORTED`.
 
 Browser write requests share the same 256 KiB body limit and audit-sink wiring as automation control. The browser persists the lease only in memory; reloading the page drops the lease and the next write reattaches.
 
@@ -463,7 +463,7 @@ see DEFER-08 / ADR-CODE-08. Removal preconditions (checklist; all required):
 
 `GET /api/code/threads` returns `{ items, nextOffset? }`. Each item has `id`, optional `title`, `archived`, optional `currentIntentId`, optional `workingDir`, `createdAt`, and `updatedAt`. `workingDir` is omitted until ThreadProjection persists a per-thread cwd (do not invent the server cwd for linked-worktree threads). `limit` defaults to 50 and clamps to 200; malformed `limit` or `offset` returns `INVALID_QUERY_PARAM`.
 
-`GET /api/code/skills?provider=<slug>&skill=<name>` returns curated A0-07 `{ items: [{ name, provider }] }`. An unknown `provider` slug returns `INVALID_SKILL_PROVIDER` (same contract as activate); omit `provider` to list all curated providers. `POST /api/code/skills/activate` accepts `{ provider, name }`; after discoverability validation it currently returns `SKILL_ACTIVATION_UNSUPPORTED` until an in-process provider activation path exists.
+`GET /api/code/skills?provider=<slug>&skill=<name>` returns curated A0-07 `{ items: [{ name, provider }] }`. An unknown `provider` slug returns `INVALID_SKILL_PROVIDER` (same contract as activate); omit `provider` to list all curated providers. `POST /api/code/skills/activate` accepts `{ provider, name }`; after discoverability validation the activation is queued for the live in-process provider and acknowledged with `{ accepted, provider, name, pending, consumedOn: "next-plain-turn" }` — the next plain (non-slash, non-empty) turn's provider input carries the activation context (appended after the user text; tool permissions are never widened, and duplicate activations keep one pending slot). Slash/control turns leave activations pending. Unknown `provider` / undiscoverable `name` keep their stable 400 codes; sessions without a live in-process provider (read-only view, managed Codex Web) fail closed with `SKILL_ACTIVATION_UNSUPPORTED`.
 
 Code UI API errors use `{ error: { code, message } }`:
 
@@ -510,7 +510,7 @@ Code UI API errors use `{ error: { code, message } }`:
 | `THREAD_GRAPH_UNAVAILABLE` | 500 | Indexed thread graph could not be loaded (database, projection, or overlay failure). |
 | `INVALID_SKILL_PROVIDER` | 400 | The requested skill provider is not an A0-07 agent slug. |
 | `SKILL_NOT_DISCOVERABLE` | 400 | The requested skill is not curated for that provider. |
-| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | Skill is discoverable, but in-process activation is not available yet. |
+| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | Skill is discoverable, but this session has no live in-process provider to consume the activation (read-only view, managed Codex Web). |
 | `SESSION_RESUME_BUSY` | 409 | A thinking or tool-running session cannot be replaced. |
 | `SESSION_RESUME_NOT_FOUND` | 404 | No matching session exists under this working directory. |
 | `SESSION_RESUME_REQUIRES_RESTART` | 422 | Target thread is loadable, but in-process AgentRuntime swap is not available; restart with `libra code --resume <threadId>`. |

@@ -5604,6 +5604,138 @@ mod tests {
         }
     }
 
+    /// plan-20260824 DF-07: an activated, discoverable A0-07 skill must be
+    /// consumed by the next plain turn — the provider request that turn
+    /// sends carries the activation context — and must NOT leak into any
+    /// later turn (consumed exactly once). Driven through the real headless
+    /// runtime against the canned chat-completions stub.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skill_activation_context_reaches_the_provider_request() {
+        let (base_url, captured, server) = start_chat_completions_stub().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        crate::internal::db::create_database(
+            &storage_root
+                .join(crate::utils::util::DATABASE)
+                .display()
+                .to_string(),
+        )
+        .await
+        .expect("bootstrap storage schema");
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        args.model = Some("deepseek-chat".to_string());
+        args.api_base = Some(base_url);
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+        let (runtime, _effective) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &env_file,
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("headless runtime must build")
+        .expect("deepseek is supported in the headless path");
+
+        let ack = runtime
+            .adapter()
+            .activate_skill("claude-code", "/review")
+            .await
+            .expect("discoverable skill must activate on the live adapter");
+        assert_eq!(
+            (ack.provider.as_str(), ack.name.as_str()),
+            ("claude-code", "/review")
+        );
+        assert_eq!(ack.pending, 1);
+
+        runtime
+            .adapter()
+            .submit_message("please review my change".to_string())
+            .await
+            .expect("submit first turn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let first_turn_len = loop {
+            let bodies = captured.lock().await;
+            if !bodies.is_empty()
+                && bodies
+                    .iter()
+                    .any(|body| body.to_string().contains("please review my change"))
+            {
+                break bodies.len();
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        {
+            let bodies = captured.lock().await;
+            let serialized: Vec<String> = bodies.iter().map(|b| b.to_string()).collect();
+            assert!(
+                serialized
+                    .iter()
+                    .any(|body| body.contains("[skill activation]")
+                        && body.contains("/review")
+                        && body.contains("claude-code")),
+                "the activation context must reach the provider request: {serialized:?}"
+            );
+        }
+
+        // Second plain turn: retry past SESSION_BUSY until the worker frees,
+        // then its provider request must NOT carry the consumed activation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match runtime
+                .adapter()
+                .submit_message("second message".to_string())
+                .await
+            {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(error) => panic!("second turn never admitted: {error}"),
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let bodies = captured.lock().await;
+            let second: Vec<String> = bodies[first_turn_len..]
+                .iter()
+                .map(|b| b.to_string())
+                .filter(|body| body.contains("second message"))
+                .collect();
+            if !second.is_empty() {
+                assert!(
+                    second
+                        .iter()
+                        .all(|body| !body.contains("[skill activation]")),
+                    "a consumed activation must not re-inject on later turns: {second:?}"
+                );
+                break;
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        server.abort();
+    }
+
     /// plan-20260825 PS-05 (terra R1): the provenance write is best-effort
     /// — with the session's `<id>.json` save path blocked (a directory
     /// squats on it), the headless runtime must still boot and label

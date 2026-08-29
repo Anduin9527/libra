@@ -76,6 +76,77 @@ pub struct AgentRuntimeCodeUiAdapter {
     lifecycle_shutdown: Arc<Mutex<Option<Weak<dyn CodeUiLifecycleShutdown>>>>,
     /// In-memory session/TTL approval cache to drop on lease takeover (W4-13).
     approval_store: Arc<Mutex<Option<Arc<Mutex<ApprovalStore>>>>>,
+    /// DF-07: A0-07 skill activations pending consumption by the next plain
+    /// turn (session-scoped, ids only — never skill contents/credentials).
+    pending_skills: Arc<Mutex<PendingSkillContext>>,
+}
+
+/// DF-07: session-scoped pending skill activations plus the most recent
+/// composed turn, kept so a durable `commandId` retry recomposes the exact
+/// same payload instead of tripping payload-conflict guards.
+#[derive(Default)]
+struct PendingSkillContext {
+    /// `(provider, name)` in activation order, deduplicated.
+    active: Vec<(String, String)>,
+    last_composed: Option<ComposedSkillTurn>,
+}
+
+struct ComposedSkillTurn {
+    command_id: String,
+    raw_text: String,
+    input: String,
+}
+
+impl PendingSkillContext {
+    /// Resolve the runtime input for a submitted message. Plain non-empty,
+    /// non-slash messages consume the active set (appended after the user
+    /// text, so slash routing and intent-revision parsing never see it);
+    /// control/slash/empty messages pass through untouched and keep the
+    /// activations pending. A repeated `command_id` + raw text reuses the
+    /// previously composed input verbatim (idempotent retries and durable
+    /// replay comparisons stay stable).
+    fn resolve_input(&mut self, text: &str, command_id: Option<&str>) -> String {
+        if let (Some(command_id), Some(last)) = (command_id, self.last_composed.as_ref())
+            && last.command_id == command_id
+            && last.raw_text == text
+        {
+            return last.input.clone();
+        }
+        let trimmed = text.trim();
+        if self.active.is_empty() || trimmed.is_empty() || trimmed.starts_with('/') {
+            return text.to_string();
+        }
+        let mut lines = vec![
+            text.to_string(),
+            String::new(),
+            "[skill activation] The operator activated these provider skills for this \
+             session; consume them on this turn when relevant. Tool permissions are \
+             unchanged by activation:"
+                .to_string(),
+        ];
+        for (provider, name) in &self.active {
+            lines.push(format!("- '{name}' ({provider})"));
+        }
+        let input = lines.join("\n");
+        self.active.clear();
+        if let Some(command_id) = command_id {
+            self.last_composed = Some(ComposedSkillTurn {
+                command_id: command_id.to_string(),
+                raw_text: text.to_string(),
+                input: input.clone(),
+            });
+        }
+        input
+    }
+
+    /// Record one validated activation; duplicates keep their original slot.
+    /// Returns the pending count.
+    fn record(&mut self, provider: &str, name: &str) -> usize {
+        if !self.active.iter().any(|(p, n)| p == provider && n == name) {
+            self.active.push((provider.to_string(), name.to_string()));
+        }
+        self.active.len()
+    }
 }
 
 impl AgentRuntimeCodeUiAdapter {
@@ -125,6 +196,7 @@ impl AgentRuntimeCodeUiAdapter {
             web_admission,
             lifecycle_shutdown: Arc::new(Mutex::new(None)),
             approval_store: Arc::new(Mutex::new(None)),
+            pending_skills: Arc::new(Mutex::new(PendingSkillContext::default())),
         })
     }
 
@@ -251,6 +323,27 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
         self.capabilities.clone()
     }
 
+    /// DF-07: validate against the A0-07 curated registry (unknown provider
+    /// or undiscoverable name fail closed there) and queue the activation
+    /// for the next plain turn. No new registry, no widened tools.
+    async fn activate_skill(
+        &self,
+        provider: &str,
+        name: &str,
+    ) -> Result<super::code_ui::CodeUiSkillActivationAck> {
+        self.execution_control
+            .skill_activate(&CodeSkillActivation {
+                provider: provider.to_string(),
+                name: name.to_string(),
+            })?;
+        let pending = self.pending_skills.lock().await.record(provider, name);
+        Ok(super::code_ui::CodeUiSkillActivationAck {
+            provider: provider.to_string(),
+            name: name.to_string(),
+            pending,
+        })
+    }
+
     async fn submit_message(&self, text: String) -> Result<()> {
         self.submit_message_with_command_id(text, None).await
     }
@@ -260,6 +353,13 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
         text: String,
         command_id: Option<String>,
     ) -> Result<()> {
+        // DF-07: resolve pending skill activations into the turn input first
+        // so both admission branches see one consistent payload identity.
+        let text = self
+            .pending_skills
+            .lock()
+            .await
+            .resolve_input(&text, command_id.as_deref());
         if let Some(admission) = self.web_admission.as_ref() {
             return admission
                 .submit_message_with_command_id(&self.runtime, &self.session, text, command_id)
@@ -466,5 +566,56 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
             self.session.clear_pending_tool_interactions().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingSkillContext;
+
+    /// DF-07: plain turns consume the active set (appended after the user
+    /// text), slash/empty turns pass through and keep it pending, and
+    /// duplicates hold one slot.
+    #[test]
+    fn pending_skill_context_consumes_only_plain_turns() {
+        let mut ctx = PendingSkillContext::default();
+        assert_eq!(ctx.record("claude-code", "/review"), 1);
+        assert_eq!(ctx.record("claude-code", "/review"), 1, "dedup");
+        assert_eq!(ctx.record("codex", "/plan"), 2);
+
+        // Slash and empty submissions never consume.
+        assert_eq!(ctx.resolve_input("/help", None), "/help");
+        assert_eq!(ctx.resolve_input("   ", None), "   ");
+        assert_eq!(ctx.active.len(), 2, "still pending after control turns");
+
+        let composed = ctx.resolve_input("review my diff", None);
+        assert!(composed.starts_with("review my diff"), "{composed}");
+        assert!(
+            composed.contains("[skill activation]")
+                && composed.contains("- '/review' (claude-code)")
+                && composed.contains("- '/plan' (codex)"),
+            "activation context must ride the plain turn: {composed}"
+        );
+        assert!(ctx.active.is_empty(), "consumed on the plain turn");
+        assert_eq!(
+            ctx.resolve_input("next message", None),
+            "next message",
+            "a later turn must not re-inject"
+        );
+    }
+
+    /// DF-07: a durable `commandId` retry with the same raw text must get
+    /// the identical composed input even though the active set was already
+    /// consumed — otherwise payload-conflict guards would reject the retry.
+    #[test]
+    fn pending_skill_context_recomposes_for_command_id_retries() {
+        let mut ctx = PendingSkillContext::default();
+        ctx.record("claude-code", "/review");
+        let first = ctx.resolve_input("do it", Some("cmd-1"));
+        assert!(first.contains("[skill activation]"));
+        let retry = ctx.resolve_input("do it", Some("cmd-1"));
+        assert_eq!(first, retry, "retry must reuse the composed payload");
+        // A different command with no pending activations passes through.
+        assert_eq!(ctx.resolve_input("other", Some("cmd-2")), "other");
     }
 }

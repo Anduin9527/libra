@@ -876,6 +876,19 @@ pub trait CodeUiReadModel: Send + Sync {
     }
 }
 
+/// Acknowledgment for an accepted in-process skill activation (DF-07).
+/// Carries ids only — never skill file contents or credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiSkillActivationAck {
+    /// A0-07 agent CLI slug (e.g. `claude-code`).
+    pub provider: String,
+    /// Skill invocation name (e.g. `/review`).
+    pub name: String,
+    /// Activations now pending consumption on the next plain turn.
+    pub pending: usize,
+}
+
 #[async_trait]
 pub trait CodeUiCommandAdapter: Send + Sync {
     fn capabilities(&self) -> CodeUiCapabilities;
@@ -899,6 +912,21 @@ pub trait CodeUiCommandAdapter: Send + Sync {
             ));
         }
         self.submit_message(text).await
+    }
+
+    /// DF-07: hand a validated A0-07 skill activation to the in-process
+    /// provider so a later plain turn can consume it (tool permissions are
+    /// never widened by activation). Adapters without a live in-process
+    /// provider keep this stable fail-closed default — the HTTP layer maps
+    /// it to `SKILL_ACTIVATION_UNSUPPORTED`.
+    async fn activate_skill(
+        &self,
+        _provider: &str,
+        _name: &str,
+    ) -> anyhow::Result<CodeUiSkillActivationAck> {
+        Err(anyhow!(
+            "this Code session has no in-process provider to consume skill activations"
+        ))
     }
 
     async fn respond_interaction(

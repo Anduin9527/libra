@@ -1653,19 +1653,28 @@ async fn code_skill_activate_handler(
             retry_after_secs: None,
         });
         }
-        // Discoverability is confirmed, but there is still no in-process
-        // activation path that persists a selection or notifies the live
-        // provider. Fail closed instead of returning accepted:true with no
-        // observable effect — providers emit SkillEvent when they consume a
-        // skill on a later turn.
-        Err(WebApiError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "SKILL_ACTIVATION_UNSUPPORTED".to_string(),
-            message: format!(
-                "skill '{name}' is discoverable for '{provider}', but in-process skill activation is not available yet; the provider emits SkillEvent when it consumes the skill on a later turn"
-            ),
-            retry_after_secs: None,
-        })
+        // DF-07: hand the validated activation to the in-process provider —
+        // the adapter queues it and the next plain turn's provider input
+        // carries the activation context (tool permissions unchanged).
+        // Adapters without a live in-process provider (read-only, managed
+        // Codex) keep the stable fail-closed default and map to 422.
+        match runtime.adapter().activate_skill(provider, name).await {
+            Ok(ack) => Ok(serde_json::json!({
+                "accepted": true,
+                "provider": ack.provider,
+                "name": ack.name,
+                "pending": ack.pending,
+                "consumedOn": "next-plain-turn",
+            })),
+            Err(error) => Err(WebApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "SKILL_ACTIVATION_UNSUPPORTED".to_string(),
+                message: format!(
+                    "skill '{name}' is discoverable for '{provider}', but this session cannot activate it in-process: {error}"
+                ),
+                retry_after_secs: None,
+            }),
+        }
     }
     .await;
     append_control_audit(
@@ -4014,8 +4023,14 @@ mod tests {
         assert_eq!(value["error"]["code"], "INVALID_SKILL_PROVIDER");
     }
 
+    /// DF-07: activation is delegated to the adapter; a session whose
+    /// adapter has no live in-process provider (here: the read-only
+    /// adapter) still fails closed with the stable 422 — never a silent
+    /// `accepted:true` without an observable effect. The live-provider
+    /// consumption path is pinned by
+    /// `command::code::tests::skill_activation_context_reaches_the_provider_request`.
     #[tokio::test]
-    async fn code_skill_activate_rejects_discoverable_skill_without_activation_effect() {
+    async fn code_skill_activate_without_inprocess_provider_still_fails_closed() {
         use axum::extract::connect_info::MockConnectInfo;
 
         let session = CodeUiSession::new(initial_snapshot(
