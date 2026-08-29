@@ -2734,6 +2734,54 @@ mod tests {
         unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
     }
 
+    /// plan-20260825 PS-06 terra R3: the factory's sync lookup must read the
+    /// vault of the DIRECTORY it is given, not the process cwd — two sibling
+    /// repositories with different keys prove the routing at the exact
+    /// function the factory calls.
+    #[test]
+    #[serial_test::serial(env)]
+    fn resolve_env_sync_for_dir_reads_the_target_repos_vault() {
+        let name = "LIBRA_PS06_AB_FACTORY_KEY";
+        unsafe { std::env::remove_var(name) };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "LIBRA_CONFIG_GLOBAL_DB",
+                tmp.path().join("isolated-global.db"),
+            )
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        for (repo, value) in [("a", "from-repo-a"), ("b", "from-repo-b")] {
+            let storage = tmp.path().join(repo).join(".libra");
+            std::fs::create_dir_all(&storage).expect("storage dir");
+            let db = storage.join(crate::utils::util::DATABASE);
+            let conn = runtime
+                .block_on(crate::internal::db::create_database(
+                    db.to_str().expect("utf8"),
+                ))
+                .expect("create repo db");
+            runtime
+                .block_on(ConfigKv::set_with_conn(
+                    &conn,
+                    &format!("vault.env.{name}"),
+                    value,
+                    false,
+                ))
+                .expect("write repo vault value");
+        }
+        drop(runtime);
+
+        let from_a = resolve_env_sync_for_dir(name, &tmp.path().join("a")).expect("resolve A");
+        assert_eq!(from_a.as_deref(), Some("from-repo-a"));
+        let from_b = resolve_env_sync_for_dir(name, &tmp.path().join("b")).expect("resolve B");
+        assert_eq!(
+            from_b.as_deref(),
+            Some("from-repo-b"),
+            "the factory chain must follow the given directory, not the cwd"
+        );
+        unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
+    }
+
     async fn write_schema_version(db_path: &Path, version: i64) {
         let conn = crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
             .await
