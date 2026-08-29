@@ -1640,10 +1640,12 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
         )
         .await?
         {
-            Some(runtime) => {
+            Some((runtime, effective_provider)) => {
                 println!("Starting Libra Code Web UI in headless mode");
                 println!("Working directory: {}", working_dir.display());
-                println!("Provider: {:?}", resolved_provider(args));
+                // PS-04: same line format, but the value is the provider
+                // the factory actually dispatched on.
+                println!("Provider: {effective_provider:?}");
                 println!("{}", browser_control_banner_line(browser_control));
                 runtime
             }
@@ -3174,6 +3176,7 @@ async fn build_headless_web_code_ui_runtime<M>(
     session_bootstrap: HeadlessWebSessionBootstrap,
     model: M,
     model_name: String,
+    effective_provider_id: String,
     approval_channels: HeadlessApprovalChannels,
     browser_write_enabled: bool,
     mcp_server: Arc<LibraMcpServer>,
@@ -3225,7 +3228,11 @@ where
         exec_approval_tx,
         exec_approval_rx,
     } = approval_channels;
-    let provider_name = format!("{:?}", resolved_provider(args)).to_lowercase();
+    // PS-04: every observable label (UI snapshot, usage records, subagent
+    // runtime, system preamble) derives from the provider id the factory
+    // actually dispatched on, not from `args.provider` — so an `--agent`
+    // binding override can never mislabel the session.
+    let provider_name = effective_provider_id;
     let provider = CodeUiProviderInfo {
         provider: provider_name.clone(),
         model: Some(model_name.clone()),
@@ -3320,7 +3327,7 @@ where
     let preamble = system_preamble(
         working_dir,
         args.context,
-        resolved_provider(args),
+        effective_code_provider(args, &provider_name),
         Some(&model_name),
     )
     .map_err(CliError::failure)?;
@@ -3456,7 +3463,7 @@ async fn build_non_codex_headless_runtime(
     session_state: SessionState,
     browser_write_enabled: bool,
     mcp_server: Arc<LibraMcpServer>,
-) -> CliResult<Option<Arc<CodeUiRuntimeHandle>>> {
+) -> CliResult<Option<(Arc<CodeUiRuntimeHandle>, CodeProvider)>> {
     let (exec_approval_tx, exec_approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<ExecApprovalRequest>();
 
@@ -3468,9 +3475,13 @@ async fn build_non_codex_headless_runtime(
         | CodeProvider::Kimi
         | CodeProvider::Zhipu
         | CodeProvider::Ollama => {
-            let (model, model_name, _) =
+            // PS-04: the factory's returned provider id is the effective
+            // dispatch key (an `--agent` binding may override the CLI
+            // slots); it drives every label from here on.
+            let (model, model_name, effective_provider_id) =
                 build_any_completion_model_for_args(args, env_file, working_dir)?;
-            Ok(Some(
+            let effective_provider = effective_code_provider(args, &effective_provider_id);
+            Ok(Some((
                 build_headless_web_code_ui_runtime(
                     args,
                     working_dir,
@@ -3480,6 +3491,7 @@ async fn build_non_codex_headless_runtime(
                     },
                     model,
                     model_name,
+                    effective_provider_id,
                     HeadlessApprovalChannels {
                         exec_approval_tx,
                         exec_approval_rx,
@@ -3488,16 +3500,18 @@ async fn build_non_codex_headless_runtime(
                     mcp_server,
                 )
                 .await?,
-            ))
+                effective_provider,
+            )))
         }
         // Codex is handled by `start_codex_code_ui_runtime` in `execute_web_only`;
         // it must never enter this dispatcher.
         CodeProvider::Codex => Ok(None),
         #[cfg(feature = "test-provider")]
         CodeProvider::Fake => {
-            let (model, model_name, _) =
+            let (model, model_name, effective_provider_id) =
                 build_any_completion_model_for_args(args, env_file, working_dir)?;
-            Ok(Some(
+            let effective_provider = effective_code_provider(args, &effective_provider_id);
+            Ok(Some((
                 build_headless_web_code_ui_runtime(
                     args,
                     working_dir,
@@ -3507,6 +3521,7 @@ async fn build_non_codex_headless_runtime(
                     },
                     model,
                     model_name,
+                    effective_provider_id,
                     HeadlessApprovalChannels {
                         exec_approval_tx,
                         exec_approval_rx,
@@ -3515,9 +3530,21 @@ async fn build_non_codex_headless_runtime(
                     mcp_server,
                 )
                 .await?,
-            ))
+                effective_provider,
+            )))
         }
     }
+}
+
+/// PS-04: map the factory's effective provider id back to the enum for
+/// enum-typed label consumers (startup banner, system preamble). The
+/// cfg-gated `fake` row is deliberately absent from the capability table,
+/// so an unknown id falls back to the entry-resolved value — which the
+/// ADR-PS-05 entry resolution already aligned with any `--agent` binding.
+fn effective_code_provider(args: &CodeArgs, effective_provider_id: &str) -> CodeProvider {
+    provider_spec_by_id(effective_provider_id)
+        .map(|spec| spec.provider)
+        .unwrap_or_else(|| resolved_provider(args))
 }
 
 async fn build_placeholder_web_code_ui_runtime(
@@ -5285,6 +5312,42 @@ mod tests {
         assert!(
             err.to_string().contains("unrecognized provider id"),
             "{err}"
+        );
+    }
+
+    /// plan-20260825 PS-04: observable labels follow the factory's
+    /// effective provider id — for every capability-table row the id maps
+    /// back to its own enum regardless of what `args.provider` says, and
+    /// only an id outside the table (the cfg-gated `fake`) falls back to
+    /// the entry-resolved value.
+    #[test]
+    fn provider_labels() {
+        use super::effective_code_provider;
+
+        // The flag deliberately disagrees with the id under test: the id
+        // must win, proving labels cannot be skewed by `args.provider`.
+        for spec in super::PROVIDER_SPECS {
+            let mut args = base_args();
+            args.provider = Some(if matches!(spec.provider, CodeProvider::Zhipu) {
+                CodeProvider::Gemini
+            } else {
+                CodeProvider::Zhipu
+            });
+            assert_eq!(
+                effective_code_provider(&args, spec.id),
+                spec.provider,
+                "label for id '{}' must follow the factory id",
+                spec.id
+            );
+        }
+
+        // Unknown id (not in the table): fall back to the entry-resolved
+        // provider — the only case where `args.provider` drives the label.
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        assert_eq!(
+            effective_code_provider(&args, "not-a-provider-id"),
+            CodeProvider::Deepseek
         );
     }
 
@@ -7387,6 +7450,8 @@ no_cache_unknown_network = true
         .await
         .expect("headless Ollama should build through ProviderFactory")
         .expect("Ollama is the supported non-Codex headless provider");
+        let (runtime, effective_provider) = runtime;
+        assert_eq!(effective_provider, CodeProvider::Ollama);
         let snapshot = runtime.snapshot().await;
 
         assert_eq!(snapshot.provider.provider, "ollama");
@@ -7419,6 +7484,8 @@ no_cache_unknown_network = true
         .await
         .expect("headless OpenAI should use the shared provider factory")
         .expect("OpenAI is a supported non-Codex headless provider");
+        let (runtime, effective_provider) = runtime;
+        assert_eq!(effective_provider, CodeProvider::Openai);
         let snapshot = runtime.snapshot().await;
 
         assert_eq!(snapshot.provider.provider, "openai");
@@ -7455,6 +7522,8 @@ no_cache_unknown_network = true
         .await
         .expect("headless Fake should build through ProviderFactory")
         .expect("Fake provider is now supported in headless provider factory path");
+        let (runtime, effective_provider) = runtime;
+        assert_eq!(effective_provider, CodeProvider::Fake);
         let snapshot = runtime.snapshot().await;
 
         assert_eq!(snapshot.provider.provider, "fake");

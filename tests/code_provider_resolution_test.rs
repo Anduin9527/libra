@@ -393,6 +393,50 @@ fn machine_mode_announces_auto_selection_as_structured_event() {
     );
 }
 
+#[test]
+fn agent_binding_labels_follow_the_effective_provider() {
+    // PS-04: with an `--agent` profile whose structured binding selects
+    // zhipu, the startup banner must label the session with the binding's
+    // provider (and detection stays silent — the binding decided, so no
+    // auto-selection note may appear).
+    let repo = init_repo();
+    let agents_dir = repo.root.join(".libra").join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("agents dir");
+    std::fs::write(
+        agents_dir.join("labeler.md"),
+        "---\nname: labeler\ndescription: Label probe\ntools: []\nmodel: zhipu/glm-4.7-probe\n---\nYou label.",
+    )
+    .expect("write agent profile");
+    let out = base_command(&repo.home, &repo.global_db)
+        .args([
+            "code",
+            "--agent",
+            "labeler",
+            "--port",
+            "0",
+            "--mcp-port",
+            "0",
+        ])
+        .current_dir(&repo.root)
+        .env("ZHIPU_API_KEY", "probe-zhipu")
+        .stdin(Stdio::null())
+        .output_with_timeout_kill();
+    let stdout = String::from_utf8_lossy(&out.0);
+    let stderr = String::from_utf8_lossy(&out.1);
+    assert!(
+        stdout.contains("Provider: Zhipu"),
+        "banner must carry the binding's provider; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("auto-selected"),
+        "the binding decided — detection must stay silent: {stderr}"
+    );
+    assert!(
+        !stdout.contains("probe-zhipu") && !stderr.contains("probe-zhipu"),
+        "key values must never leak (GC-PS-01)"
+    );
+}
+
 /// Spawn helper: run to first-seconds boot then kill, returning
 /// (stdout, stderr) bytes — for launches that would otherwise run forever.
 trait OutputWithTimeoutKill {

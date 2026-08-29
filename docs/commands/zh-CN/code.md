@@ -39,7 +39,7 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 | Control URL | | `--control-url <URL>` |（discovery） | 已有 Code UI control endpoint 的 base URL（例如 `http://127.0.0.1:3000`）。仅与 `--control stdio` 合法。省略时从 `--control-info-file` discovery。必须是字面 loopback IP。 |
 | Provider | | `--provider` | *（无默认——启动时解析）* | AI provider 后端（见下方 Provider Backends）。缺省时依次由 `--agent` 绑定、持久化配置键 `code.defaultProvider`、再到凭据探测解析（配置键命中跳过探测）；零个已配置 key 以 128 退出、多个以 129 退出。 |
 | Model | | `--model` | provider 默认值 | Provider 专用 model ID。 |
-| Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
+| Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。绑定生效时，启动 banner、UI 快照与 usage 记录一律以该生效 provider 打标。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
 | Temperature | | `--temperature` | provider 默认值 | 生成采样 temperature。 |
 | Ollama thinking | | `--ollama-thinking` / `--thinking` | `OLLAMA_THINK`，然后 `off` | Ollama thinking 模式：`auto`、`off`、`on`、`low`、`medium` 或 `high`。 |
 | Ollama compact tools | | `--ollama-compact-tools` | `OLLAMA_COMPACT_TOOLS`，然后 off | 为拒绝复杂 JSON schemas 的远程/云 Ollama endpoint 发送紧凑 tool schemas。 |
