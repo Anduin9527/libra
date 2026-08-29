@@ -12149,6 +12149,13 @@ async fn shutdown_during_durable_admission_restores_pending_skill_activation() {
             .is_empty(),
         "the composition seam must have consumed the activation"
     );
+    // terra R5 interleave: re-activate the same skill while the consumed
+    // turn is still in flight — after the failed turn restores, the
+    // pending set must hold exactly ONE slot for it.
+    adapter
+        .activate_skill("claude-code", "/review")
+        .await
+        .expect("re-activation while in flight");
 
     let shutdown_runtime = Arc::clone(&runtime);
     let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
@@ -12175,7 +12182,7 @@ async fn shutdown_during_durable_admission_restores_pending_skill_activation() {
     assert_eq!(
         adapter.pending_skill_activations_for_test().await,
         vec![("claude-code".to_string(), "/review".to_string())],
-        "the activation must be restored even though the terminal persist failed"
+        "restored exactly once despite the failed terminal persist and the in-flight re-activation (terra R5)"
     );
 }
 

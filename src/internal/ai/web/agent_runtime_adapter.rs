@@ -131,13 +131,21 @@ impl PendingSkillContext {
     }
 
     /// Give a failed submission's consumed activations back (in front, so
-    /// activation order is preserved).
+    /// activation order is preserved). Deduplicated against anything
+    /// re-activated while the failed turn was in flight — the pending set
+    /// holds at most one slot per `(provider, name)` (terra R5).
     pub(crate) fn restore(&mut self, outcome: ComposedSkillContext) {
-        if !outcome.consumed.is_empty() {
-            let mut restored = outcome.consumed;
-            restored.extend(std::mem::take(&mut self.active));
-            self.active = restored;
+        if outcome.consumed.is_empty() {
+            return;
         }
+        let mut restored = outcome.consumed;
+        for entry in std::mem::take(&mut self.active) {
+            if !restored.contains(&entry) {
+                restored.push(entry);
+            }
+        }
+        restored.dedup();
+        self.active = restored;
     }
 
     /// Record one validated activation; duplicates keep their original slot.
@@ -666,6 +674,39 @@ mod tests {
         assert!(
             retried.context.contains("'/review'") && retried.context.contains("'/plan'"),
             "the next successful attempt still carries the activations"
+        );
+    }
+
+    /// DF-07 (terra R5): a skill re-activated while its consumed turn was
+    /// still in flight must hold ONE pending slot after the failed turn
+    /// restores — never a duplicate context line.
+    #[test]
+    fn pending_skill_context_restore_dedupes_against_reactivation() {
+        let mut ctx = PendingSkillContext::default();
+        ctx.record("claude-code", "/review");
+        let composed = ctx.compose_context("do it").expect("composes");
+        // Re-activate the same skill while the turn is in flight…
+        assert_eq!(ctx.record("claude-code", "/review"), 1);
+        ctx.record("codex", "/review");
+        // …then the turn fails before the provider starts.
+        ctx.restore(composed);
+        assert_eq!(
+            ctx.active,
+            vec![
+                ("claude-code".to_string(), "/review".to_string()),
+                ("codex".to_string(), "/review".to_string())
+            ],
+            "restore must keep one ordered slot per (provider, name)"
+        );
+        let recomposed = ctx.compose_context("retry").expect("recomposes");
+        assert_eq!(
+            recomposed
+                .context
+                .matches("- '/review' (claude-code)")
+                .count(),
+            1,
+            "no duplicate context lines: {}",
+            recomposed.context
         );
     }
 }
