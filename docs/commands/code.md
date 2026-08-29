@@ -37,7 +37,7 @@ The live version graph is in Web Code UI; `libra graph --json` remains the agent
 | Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | Path for the per-process local automation token. In `write` mode, Unix/macOS files must be regular files with `0600` permissions. With `--control stdio`, overrides the worktree default token path (still independent of `--control-info-file`); overly permissive modes fail closed (`CONTROL_TOKEN_PERMS`). |
 | Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | Path for non-secret local endpoint discovery metadata. Written atomically at `0600` on Unix/macOS in launch modes. Never contains token material. With `--control stdio`, this is the **read** discovery path for `baseUrl` only (explicit `--control-url` overrides). Custom info paths do **not** relocate the default token — pass `--control-token-file` when the token is not under the worktree `code/` directory. |
 | Control URL | | `--control-url <URL>` | (discovered) | Base URL of an existing Code UI control endpoint (e.g. `http://127.0.0.1:3000`). Only valid with `--control stdio`. When omitted, discovered from `--control-info-file`. Must be a literal loopback IP. |
-| Provider | | `--provider` | `gemini` | AI provider backend (see Provider Backends below). |
+| Provider | | `--provider` | *(none — resolved at startup)* | AI provider backend (see Provider Backends below). Without it, the provider is resolved from the `--agent` binding or credential detection; zero configured keys exit 128, several exit 129. |
 | Model | | `--model` | provider default | Provider-specific model ID. |
 | Agent profile | | `--agent <NAME>` | none | Select an agent profile by name. When the profile carries a structured `model: provider/model[@variant]` binding, that binding wins atomically -- provider, model ID, and variant all come from the profile, and a separately supplied `--model` is ignored to avoid hybrid pairs; profiles without a structured binding fall back to the CLI defaults. Profiles resolve through the three-tier hierarchy (project `.libra/agents/`, user `~/.config/libra/agents/`, embedded). Unknown or non-primary-eligible profiles are rejected. |
 | Temperature | | `--temperature` | provider default | Sampling temperature for generation. |
@@ -543,7 +543,8 @@ The `web_search` tool requires the session network policy to allow outbound acce
 ## Common Commands
 
 ```bash
-# Start a Web Code UI session with default Gemini provider
+# Start a Web Code UI session (auto-selects the provider when exactly one
+# credential is configured; otherwise pass --provider explicitly)
 libra code
 
 # Start with Anthropic Claude
@@ -654,7 +655,7 @@ The Web Code UI is the primary (and only interactive) collaborative surface. The
 
 ### Why multiple AI provider support?
 
-Different providers excel at different tasks and have different cost/latency profiles. Gemini is the default for its generous free tier and fast response times. Anthropic Claude excels at careful reasoning and code review. Local Ollama support enables fully offline development. By abstracting behind a `CompletionClient` trait, adding a new provider requires only implementing the trait without touching the session, tool, or web UI layers.
+Different providers excel at different tasks and have different cost/latency profiles. There is no default provider: the effective provider is resolved at startup (explicit flag, `--agent` binding, or single-credential auto-selection). Anthropic Claude excels at careful reasoning and code review. Local Ollama support enables fully offline development. By abstracting behind a `CompletionClient` trait, adding a new provider requires only implementing the trait without touching the session, tool, or web UI layers.
 
 ### Why MCP integration?
 
