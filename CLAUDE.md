@@ -46,12 +46,27 @@ cargo +nightly fmt --all
 # Lint — all warnings must be resolved before committing (all features on)
 cargo clippy --all-targets --all-features -- -D warnings
 
+# Dependencies compile at opt-level 2 in dev profile (TA-05: kills the 5-17s
+# opt-0 RSA keygen in every `libra init --vault`); first build after checkout
+# recompiles deps once (+10-20 min), behavior unchanged.
 # Quick compile check (skip the Next.js web build for speed)
 LIBRA_SKIP_WEB_BUILD=1 cargo check
 LIBRA_SKIP_WEB_BUILD=1 cargo build
 
 # Run full test suite (L1 only by default; L2/L3 auto-skip when env vars are unset)
 cargo test --all
+
+# Faster full suite via cargo-nextest (one process per test; external-resource
+# mutual exclusion comes from the generated .config/nextest.toml — regenerate
+# with `sh tests/NEXTEST_GROUPS.sh` after touching tests/SERIAL_REGISTRY.tsv).
+# The authoritative acceptance gate remains `cargo test --all` (plan-20260827
+# ADR-NP-04); nextest is the additional fast execution face. Pinned install:
+cargo install cargo-nextest --version 0.9.143 --locked   # verify: cargo nextest --version
+cargo nextest run --all
+
+# Local test evidence/driver artifacts (junit archives, batch logs) should go
+# to a persistent scratch dir surviving reboots — set LIBRA_TEST_SCRATCH_DIR
+# to a directory on durable media (system /tmp is wiped on reboot).
 
 # Run specific tests
 cargo test command::init_test
@@ -85,7 +100,7 @@ All PRs must pass these jobs on the `[self-hosted]` runner pool:
 2. **compat-clippy** — `cargo clippy --all-targets --all-features -- -D warnings` (with `LIBRA_SKIP_WEB_BUILD=1`)
 3. **compat-web-check** — `pnpm --dir web lint` + `pnpm --dir web build` so `web/out/` cannot drift from `WebAssets`
 4. **compat-redundancy** — directory-shape check on `third-party/rust/crates`
-5. **compat-offline-core** — `cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact` + `cargo test --all` + a second pass with `--features test-provider` for the Code UI automation matrices (`code_ui_scenarios`, `harness_self_test`, `code_codex_default_web_test`, `ai_code_ui_headless_test`, `code_codex_runtime_test`, `code_ui_remote_lease_matrix`, `code_ui_remote_sse_matrix`, `code_ui_remote_state_matrix`, `code_mcp_dual_entry_test`, `code_ui_perf_smoke_test`) under `--test-threads=1`
+5. **compat-offline-core** — `cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact` + pinned `cargo nextest run --all --no-fail-fast --retries 2` (one process per test; external-resource mutual exclusion from the generated `.config/nextest.toml`; the former `compat-offline-command` shard job is merged in) + `cargo test --doc` + a `--features test-provider` nextest pass (`--profile test-provider`, ten Code UI automation targets — `code_ui_scenarios`, `harness_self_test`, `code_codex_default_web_test`, `ai_code_ui_headless_test`, `code_codex_runtime_test`, `code_ui_remote_lease_matrix`, `code_ui_remote_sse_matrix`, `code_ui_remote_state_matrix`, `code_mcp_dual_entry_test`, `code_ui_perf_smoke_test`; the profile carries the section's single-threaded semantic) + the `otlp`/`keyring`/`test-upgrade` feature sections verbatim on `cargo test`
 6. **compat-network-remotes** — `cargo test --features test-network --test network_remotes_test`
 
 Additional workflows: `codeql.yml` (security analysis), `model-generation-nightly.yml` (nightly model-generation matrix), `release.yml` (release pipeline).

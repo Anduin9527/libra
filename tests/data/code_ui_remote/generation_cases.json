@@ -91,7 +91,6 @@
           "name": "open stream",
           "op": "openEvents",
           "stream": "events",
-          "wire": 1,
           "timeoutMs": 5000
         },
         {
@@ -108,7 +107,7 @@
           "name": "observe tool or session update",
           "op": "collectEventsUntil",
           "stream": "events",
-          "event": "session_updated",
+          "event": "code_workflow",
           "timeoutMs": 10000,
           "expect": {
             "assertions": [

@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.21.27"
+version = "0.22.0"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -588,3 +588,11 @@ path = "tests/compat/serial_registry.rs"
 [[test]]
 name = "commit_change_id_header_spike"
 path = "tests/commit_change_id_header_spike.rs"
+
+# plan-20260825 TA-05 (ADR-TA-03): dependencies only at O2 — the dev-profile
+# RSA keygen in `libra init --vault` costs 5-17s at opt-0 (num-bigint-dig is
+# 20-30x slower unoptimized). Workspace crates stay at opt-0 for incremental
+# builds; proc-macros/build scripts are unaffected (no build-override) and
+# debug_assertions are independent of opt-level, so behavior is unchanged.
+[profile.dev.package."*"]
+opt-level = 2

@@ -24,8 +24,8 @@ cursor-0 bootstrap，cursor 仅在同一 session 内有效。v2 resync 会拉取
 session snapshot，再从服务端提供的 durable tail 重连；这表示存在 workflow-event
 gap，消费者必须对账 snapshot state，并按 event ID 去重副作用。Ahead cursor 会在
 同类 snapshot 恢复后被丢弃，v2 从 0 重启。若服务端没有 durable session store 并返回
-`WIRE_V2_REQUIRES_DURABLE_SESSION`，客户端会显式以 v1 重试一次；为兼容旧客户端，
-服务端的未指定版本默认值仍是 v1。
+`WIRE_V2_REQUIRES_DURABLE_SESSION`，该错误即为终态：遗留的 v1 回退已随服务端
+v1 wire 在 0.22.0 删除（服务端未指定版本的默认值自 DF-06 起即为 v2）。
 请勿把 `--control stdio` 与
 弃用的 MCP-only `libra code --stdio` 传输混同（tools/resources；独立的
 `libra mcp --stdio` 计划在 W5 之后，DEFER-02）。

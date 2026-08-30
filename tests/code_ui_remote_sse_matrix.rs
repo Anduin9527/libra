@@ -44,7 +44,9 @@ fn run_sse_case(case_name: &str) -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-fn sse_matrix_defaults_to_v2_and_keeps_explicit_v1_compatibility() -> Result<()> {
+fn sse_matrix_consumes_only_wire_v2() -> Result<()> {
+    // DF-08: wire v1 was removed in 0.22.0 — the fixture must not carry a
+    // single v1 case any more, and every openEvents step names v2.
     let file_path = harness::matrix::data_path(CASE_FILE_PATH);
     let file: CaseFile = load_case_file(&file_path)?;
     assert_eq!(DEFAULT_SSE_WIRE_VERSION, 2);
@@ -59,17 +61,21 @@ fn sse_matrix_defaults_to_v2_and_keeps_explicit_v1_compatibility() -> Result<()>
             .iter()
             .any(|step| matches!(step, Step::OpenEvents { wire: 2, .. }))
     );
-
-    let v1_case = find_case(
-        &file,
-        "sse_initial_connect_replays_session_updated_with_full_snapshot",
-    )?;
-    assert!(
-        v1_case
-            .steps
-            .iter()
-            .any(|step| matches!(step, Step::OpenEvents { wire: 1, .. }))
-    );
+    for case in &file.cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        for step in case["steps"].as_array().into_iter().flatten() {
+            if step["op"] == "openEvents"
+                && let Some(wire) = step.get("wire")
+            {
+                // An omitted wire defaults to v2 in the harness; an
+                // explicit value may only name v2.
+                assert_eq!(
+                    wire, 2,
+                    "case '{name}' must not consume the removed wire v1"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -93,16 +99,11 @@ macro_rules! sse_case {
 // `Step::SubmitAndWaitIdle`) plus the multi-event
 // `assistant_content_monotonic` assertion, which lets every case
 // in `sse_cases.json` run end-to-end.
-#[cfg(feature = "test-provider")]
-sse_case!(sse_initial_connect_replays_session_updated_with_full_snapshot);
-
 // Wave 4 — remaining six P0/P1 cases.
 #[cfg(feature = "test-provider")]
 sse_case!(sse_emits_status_changed_when_submit_starts_thinking);
 #[cfg(feature = "test-provider")]
 sse_case!(sse_emits_code_workflow_after_assistant_completion);
-#[cfg(feature = "test-provider")]
-sse_case!(sse_emits_controller_changed_on_attach_and_detach);
 #[cfg(feature = "test-provider")]
 sse_case!(sse_two_concurrent_subscribers_receive_code_workflow);
 #[cfg(feature = "test-provider")]

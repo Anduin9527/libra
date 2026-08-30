@@ -1850,12 +1850,28 @@ fn nextest_groups_toml_matches_generator_and_registry() {
          run: sh tests/NEXTEST_GROUPS.sh"
     );
 
-    let external_key = |lane: &str| {
+    // External = any named key outside the in-process closed set
+    // {cwd, env, hash_kind} (the classifier's process model). A newly named
+    // key is external by default, so ADR-NP-01's "new external lanes join
+    // automatically" holds mechanically (fail-safe: over-serialize at worst).
+    fn external_lane(lane: &str) -> bool {
         lane.strip_prefix("lane:").is_some_and(|keys| {
             keys.split('+')
-                .any(|k| k == "cloud_live" || k == "workspace_failpoints")
+                .any(|k| !matches!(k, "cwd" | "env" | "hash_kind"))
         })
-    };
+    }
+    assert!(external_lane("lane:cloud_live"));
+    assert!(external_lane(
+        "lane:cloud_live+cwd+env+hash_kind+workspace_failpoints"
+    ));
+    assert!(
+        external_lane("lane:some_future_service+cwd"),
+        "a newly named key must be external by default"
+    );
+    assert!(!external_lane("lane:cwd+env+hash_kind"));
+    assert!(!external_lane("lane:cwd"));
+    assert!(!external_lane("global"));
+    let external_key = external_lane;
     let mut expected_fns = Vec::new();
     let mut expected_bins = Vec::new();
     for (key, (lane, _)) in registry() {
