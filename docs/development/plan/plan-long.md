@@ -539,7 +539,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260821.md`](plan-20260821.md) | A（UP-01） | 已排期 | 客户端与发布 CI 侧（trust table、generation floor、`release.yml`、install 验签）；Backend Workers 侧在 libra-backend 姊妹计划；密钥 ceremony 私钥半边不在本仓库（更正：上版误标为 plan-20260822） |
 | [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03） | 已排期 | Operation Log v2 + Working Copy 快照 + 稳定 Change ID 实施计划（OL-01..OL-12、CH-*；v2 替换 v1 operation、`RepoViewV2`/`WorkspaceSnapshotV2`、`change_identity` 表族、`libra op` 机器接口、Web Operation/Change 图）；另有 `[OL-00]` sidecar Change ID spike；实现未开始 |
 | [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | 完成（2026-08-30） | 承接 0715 的 DEFER-01/08/10 与 skill activation 残差；DF-01..DF-09 九卡全部 done/complete（文档事实源、fix bridge、SSE v2 默认、skill activation provider 消费、v1 物理删除）；DEP-02 以 v0.21.29 满足，v0.22.0（minor，breaking：SSE 仅支持 wire v2）已发布 |
-| [`plan-20260825.md`](plan-20260825.md) | B（Code provider / RT-01 后续） | 完成（2026-08-29） | `libra code` provider 解析与凭据文案收口全部落地（凭据探测三态、`code.defaultProvider`、生效 provider 标签单源、会话 provenance 与 `--resume` 继承）；TA-03/06/07 由 plan-20260827 承接完成；发布回填待窗口 |
+| [`plan-20260825.md`](plan-20260825.md) | B（Code provider / RT-01 后续） | 完成（2026-08-29） | `libra code` provider 解析与凭据文案收口全部落地（凭据探测三态、`code.defaultProvider`、生效 provider 标签单源、会话 provenance 与 `--resume` 继承）；TA-03/06/07 由 plan-20260827 承接完成；发布面按用户 2026-08-30 豁免裁决闭合（代码已随 v0.21.28..v0.22.0 实际发布） |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---
