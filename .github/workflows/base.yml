@@ -243,6 +243,15 @@ jobs:
           command -v rg
           rg --version
 
+      - name: Preserve Rust toolchain cache paths
+        shell: bash
+        run: |
+          # The test steps below use an isolated HOME for Libra's config, but
+          # rustup and Cargo must continue to use the runner's installed
+          # toolchains and registry cache.
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+
       - name: Check compatibility matrix drift
         run: cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact
 
@@ -384,6 +393,15 @@ jobs:
         run: |
           corepack enable
           corepack prepare pnpm@11.10.0 --activate
+
+      - name: Preserve Rust toolchain cache paths
+        shell: bash
+        run: |
+          # The test step below uses an isolated HOME for Libra's config, but
+          # rustup and Cargo must continue to use the runner's installed
+          # toolchains and registry cache.
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
 
       # Network-only test layer (`test-network` feature gate). Tests requiring outbound
       # network but no secrets are surfaced through this job; tests requiring real
