@@ -27,8 +27,9 @@ session snapshot and reconnects at the server-provided durable tail; this marks
 a workflow-event gap, so consumers must reconcile snapshot state and deduplicate
 side effects by event ID. An ahead cursor is dropped after the same snapshot
 recovery and v2 restarts from zero. If the server has no durable session store and returns
-`WIRE_V2_REQUIRES_DURABLE_SESSION`, the client retries once with explicit v1;
-the server's omitted-wire default remains v1 for compatibility. Do not confuse
+`WIRE_V2_REQUIRES_DURABLE_SESSION`, that error is terminal: the legacy v1
+fallback was removed in 0.22.0 together with the server-side v1 wire (the
+server's omitted-wire default has been v2 since DF-06). Do not confuse
 `--control stdio` with the deprecated MCP-only
 `libra code --stdio` transport (tools/resources; a dedicated
 `libra mcp --stdio` is planned after W5, DEFER-02).

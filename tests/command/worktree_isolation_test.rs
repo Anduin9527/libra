@@ -4953,7 +4953,7 @@ fn remove_gcs_private_head_rows() {
 /// prune of a missing path) purges them. The add-time strict sweep still
 /// guarantees a fresh re-add never inherits stale rows.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
     let repo = repo_with_feature();
     let main = repo.path();
@@ -5304,7 +5304,7 @@ fn registry_mutators_serialize_on_worktrees_lock() {
 /// worktree at the same path: its sparse view starts disabled/empty and
 /// its layer registry starts empty.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 fn worktree_add_sweeps_stale_scope_rows() {
     let repo = repo_with_feature();
     let main = repo.path();
@@ -5373,7 +5373,7 @@ fn worktree_add_sweeps_stale_scope_rows() {
 /// repository, so the still-materialized overlay files must stay
 /// un-stageable (never-enters-commit).
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 fn worktree_remove_purges_layer_scope_rows() {
     let repo = repo_with_feature();
     let main = repo.path();

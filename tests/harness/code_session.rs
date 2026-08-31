@@ -466,8 +466,8 @@ impl CodeSession {
 
     /// Open the built-in compatibility client's default SSE v2 subscription.
     ///
-    /// Tests that intentionally pin the legacy snapshot contract must call
-    /// [`Self::open_event_stream_v1`] explicitly.
+    /// v2 is the only wire: the legacy v1 snapshot stream (and the harness
+    /// helper that requested it) was removed in 0.22.0 (DF-08).
     /// The returned [`super::EventStream`] reads events on a worker
     /// thread; per-event timeouts are configured by the caller.
     ///
@@ -479,24 +479,17 @@ impl CodeSession {
         self.open_event_stream_with_wire(2, None)
     }
 
-    /// Explicit legacy snapshot-wire compatibility subscription.
-    pub fn open_event_stream_v1(&self) -> Result<super::EventStream> {
-        self.open_event_stream_with_wire(1, None)
-    }
-
     /// Open a versioned SSE subscription, optionally resuming after a durable
-    /// v2 cursor. Matrix case files use this seam so omitted `wire` defaults to
-    /// v2 while the one compatibility case can name v1 explicitly.
+    /// v2 cursor. v2 is the only wire since DF-08 removed the v1 snapshot
+    /// stream; matrix case files use this seam with omitted `wire`
+    /// defaulting to v2.
     pub fn open_event_stream_with_wire(
         &self,
         wire: u8,
         cursor: Option<u64>,
     ) -> Result<super::EventStream> {
-        if wire != 1 && wire != 2 {
-            bail!("test SSE wire must be 1 or 2 (got {wire})");
-        }
-        if wire == 1 && cursor.is_some() {
-            bail!("test SSE cursor is only valid with wire 2");
+        if wire != 2 {
+            bail!("test SSE wire must be 2 (wire v1 was removed in 0.22.0; got {wire})");
         }
         // Use a dedicated client with no overall timeout so the SSE
         // long-poll isn't cut off by the harness's default 5 s

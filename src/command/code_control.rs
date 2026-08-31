@@ -24,7 +24,6 @@ use crate::utils::error::{CliError, CliResult};
 /// Keep this independent from the server's omitted-wire compatibility default:
 /// DF-05 migrates consumers to v2 while DF-06 owns the server default switch.
 pub const BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION: u8 = 2;
-const LEGACY_CODE_EVENTS_SSE_WIRE_VERSION: u8 = 1;
 const WIRE_V2_REQUIRES_DURABLE_SESSION: &str = "WIRE_V2_REQUIRES_DURABLE_SESSION";
 const WIRE_V2_RESYNC_REQUIRED: &str = "WIRE_V2_RESYNC_REQUIRED";
 const WIRE_V2_CURSOR_AHEAD: &str = "WIRE_V2_CURSOR_AHEAD";
@@ -670,7 +669,6 @@ fn event_stream_error_code(body: &str) -> Option<String> {
 
 struct OpenedEventStream {
     response: reqwest::Response,
-    wire_version: u8,
     recovery: Option<Value>,
 }
 
@@ -689,7 +687,6 @@ async fn open_event_stream(
     if response.status() == StatusCode::OK {
         return Ok(OpenedEventStream {
             response,
-            wire_version: BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
             recovery: None,
         });
     }
@@ -710,7 +707,6 @@ async fn open_event_stream(
         }
         return Ok(OpenedEventStream {
             response: restarted,
-            wire_version: BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
             recovery: Some(json!({
                 "code": WIRE_V2_CURSOR_AHEAD,
                 "reason": "the requested cursor belongs to a later or different durable session; the client dropped it and restarted from cursor 0",
@@ -720,23 +716,21 @@ async fn open_event_stream(
             })),
         });
     }
-    let requires_legacy_fallback = status == StatusCode::SERVICE_UNAVAILABLE
-        && code.as_deref() == Some(WIRE_V2_REQUIRES_DURABLE_SESSION);
-    if !requires_legacy_fallback {
-        return Err(event_stream_error(status, &body));
+    // DF-08: the v1 snapshot fallback was removed together with the
+    // server-side v1 wire (0.22.0). A session without a durable hub now
+    // surfaces its stable 503 directly — there is no other wire to try.
+    if status == StatusCode::SERVICE_UNAVAILABLE
+        && code.as_deref() == Some(WIRE_V2_REQUIRES_DURABLE_SESSION)
+    {
+        return Err(event_stream_error(
+            status,
+            &format!(
+                "{body}\n(events.subscribe requires a durable v2 session; the legacy v1 \
+                 fallback was removed in 0.22.0 — v0.21.29 is the last release with wire v1)"
+            ),
+        ));
     }
-
-    let fallback =
-        request_event_stream(client, base_url, LEGACY_CODE_EVENTS_SSE_WIRE_VERSION, None).await?;
-    if fallback.status() == StatusCode::OK {
-        return Ok(OpenedEventStream {
-            response: fallback,
-            wire_version: LEGACY_CODE_EVENTS_SSE_WIRE_VERSION,
-            recovery: None,
-        });
-    }
-    let (fallback_status, fallback_body) = event_stream_error_body(fallback).await;
-    Err(event_stream_error(fallback_status, &fallback_body))
+    Err(event_stream_error(status, &body))
 }
 
 #[derive(Debug)]
@@ -747,6 +741,22 @@ enum EventStreamOutcome {
         durable_tail: u64,
         forwarded: usize,
     },
+}
+
+/// DF-08: the v1 snapshot wire was deleted in 0.22.0 — an events stream
+/// that emits any legacy envelope event name is a server regression the
+/// automation client must fail on, never forward.
+fn reject_legacy_v1_notification(notification: &Value) -> CliResult<()> {
+    let event = notification["params"]["event"].as_str().unwrap_or_default();
+    if matches!(
+        event,
+        "session_updated" | "status_changed" | "controller_changed"
+    ) {
+        return Err(CliError::fatal(format!(
+            "events.subscribe received removed v1 envelope event '{event}' (SSE wire v1 was deleted in 0.22.0)"
+        )));
+    }
+    Ok(())
 }
 
 fn resync_durable_tail(notification: &Value) -> CliResult<Option<u64>> {
@@ -788,6 +798,7 @@ where
             CliError::fatal(format!("failed to read SSE event stream: {error}"))
         })?;
         for notification in parser.push(&chunk) {
+            reject_legacy_v1_notification(&notification)?;
             if let Some(durable_tail) = resync_durable_tail(&notification)? {
                 return Ok(EventStreamOutcome::ResyncRequired {
                     data: notification["params"]["data"].clone(),
@@ -800,6 +811,7 @@ where
         }
     }
     for notification in parser.finish() {
+        reject_legacy_v1_notification(&notification)?;
         if let Some(durable_tail) = resync_durable_tail(&notification)? {
             return Ok(EventStreamOutcome::ResyncRequired {
                 data: notification["params"]["data"].clone(),
@@ -869,7 +881,7 @@ where
                 data,
                 durable_tail,
                 forwarded,
-            } if opened.wire_version == BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION => {
+            } => {
                 consecutive_resyncs = if forwarded == 0 {
                     consecutive_resyncs.saturating_add(1)
                 } else {
@@ -895,14 +907,8 @@ where
                 }
                 opened = OpenedEventStream {
                     response,
-                    wire_version: BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
                     recovery: None,
                 };
-            }
-            EventStreamOutcome::ResyncRequired { .. } => {
-                return Err(CliError::fatal(
-                    "events.subscribe received a v2 resync event on the legacy v1 stream",
-                ));
             }
         }
     }
@@ -1066,13 +1072,36 @@ mod tests {
     fn sse_parser_emits_json_rpc_notifications() {
         let mut parser = SseParser::default();
 
-        let output = parser
-            .push(b"event: session_updated\ndata: {\"seq\":1,\"type\":\"session_updated\"}\n\n");
+        let output =
+            parser.push(b"event: code_workflow\ndata: {\"cursor\":1,\"kind\":\"status\"}\n\n");
 
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["method"], "events.notification");
-        assert_eq!(output[0]["params"]["event"], "session_updated");
-        assert_eq!(output[0]["params"]["data"]["seq"], 1);
+        assert_eq!(output[0]["params"]["event"], "code_workflow");
+        assert_eq!(output[0]["params"]["data"]["cursor"], 1);
+    }
+
+    /// DF-08: any removed v1 envelope event name on the (v2-only) stream
+    /// must fail the subscription instead of being forwarded.
+    #[test]
+    fn removed_v1_event_names_fail_the_subscription() {
+        for legacy in ["session_updated", "status_changed", "controller_changed"] {
+            let notification = json!({
+                "method": "events.notification",
+                "params": { "event": legacy, "data": {} }
+            });
+            let error = reject_legacy_v1_notification(&notification)
+                .expect_err("legacy event names must be rejected");
+            assert!(
+                error.to_string().contains("deleted in 0.22.0"),
+                "removal guidance expected: {error}"
+            );
+        }
+        let ok = json!({
+            "method": "events.notification",
+            "params": { "event": "code_workflow", "data": {"cursor": 1} }
+        });
+        assert!(reject_legacy_v1_notification(&ok).is_ok());
     }
 
     #[test]
@@ -1109,7 +1138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_stream_retries_v1_when_v2_requires_a_durable_session() {
+    async fn event_stream_surfaces_durable_session_requirement_without_v1_fallback() {
         #[derive(Default)]
         struct MockState {
             wires: Mutex<Vec<String>>,
@@ -1159,27 +1188,30 @@ mod tests {
         });
 
         let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
-        let opened = open_event_stream(&Client::new(), &base_url, 41)
-            .await
-            .expect("v1 fallback stream");
-        assert_eq!(opened.wire_version, LEGACY_CODE_EVENTS_SSE_WIRE_VERSION);
-        assert_eq!(opened.response.status(), StatusCode::OK);
+        // DF-08: the v1 fallback is gone — the durable-session requirement
+        // surfaces directly, with removal guidance, after exactly ONE
+        // (v2) request.
+        let message = match open_event_stream(&Client::new(), &base_url, 41).await {
+            Ok(_) => panic!("no durable session must be a terminal error now"),
+            Err(error) => error.to_string(),
+        };
         assert!(
-            opened
-                .response
-                .text()
-                .await
-                .expect("SSE body")
-                .contains("session_updated")
+            message.contains("WIRE_V2_REQUIRES_DURABLE_SESSION")
+                && message.contains("removed in 0.22.0"),
+            "durable-session error with removal guidance expected: {message}"
         );
-        assert_eq!(*state.wires.lock().await, ["2:41", "1:-"]);
+        assert_eq!(
+            *state.wires.lock().await,
+            ["2:41"],
+            "the client must not retry with the removed wire v1"
+        );
 
         let _ = shutdown_tx.send(());
         let _ = server.await;
     }
 
     #[tokio::test]
-    async fn event_stream_v1_fallback_forwards_legacy_notifications() {
+    async fn event_stream_durable_session_requirement_reaches_the_handler_caller() {
         async fn events(Query(query): Query<HashMap<String, String>>) -> Response {
             if query.get("wire").map(String::as_str) == Some("2") {
                 return (
@@ -1216,16 +1248,22 @@ mod tests {
 
         let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
         let mut notifications = Vec::new();
-        stream_events_with_handler(&Client::new(), &base_url, 9, |notification| {
+        let error = stream_events_with_handler(&Client::new(), &base_url, 9, |notification| {
             notifications.push(notification.clone());
             Ok(())
         })
         .await
-        .expect("v1 fallback notification forwarding");
-
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0]["params"]["event"], "session_updated");
-        assert_eq!(notifications[0]["params"]["data"]["seq"], 1);
+        .expect_err("DF-08: no v1 fallback — the 503 must reach the caller");
+        assert!(
+            error
+                .to_string()
+                .contains("WIRE_V2_REQUIRES_DURABLE_SESSION"),
+            "stable code expected: {error}"
+        );
+        assert!(
+            notifications.is_empty(),
+            "no legacy notifications may be forwarded"
+        );
 
         let _ = shutdown_tx.send(());
         let _ = server.await;
@@ -1273,7 +1311,6 @@ mod tests {
         let opened = open_event_stream(&Client::new(), &base_url, 17)
             .await
             .expect("v2 event stream");
-        assert_eq!(opened.wire_version, BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION);
         assert_eq!(opened.response.status(), StatusCode::OK);
         assert!(
             opened

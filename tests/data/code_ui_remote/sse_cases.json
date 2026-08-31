@@ -12,31 +12,6 @@
   },
   "cases": [
     {
-      "name": "sse_initial_connect_replays_session_updated_with_full_snapshot",
-      "priority": "P0",
-      "steps": [
-        {
-          "name": "open stream",
-          "op": "openEvents",
-          "stream": "events",
-          "wire": 1,
-          "timeoutMs": 5000
-        },
-        {
-          "name": "first event is initial snapshot",
-          "op": "expectEvent",
-          "stream": "events",
-          "event": "session_updated",
-          "expect": {
-            "assertions": [
-              "event_data_has_transcript_array",
-              "event_data_has_controller"
-            ]
-          }
-        }
-      ]
-    },
-    {
       "name": "sse_emits_status_changed_when_submit_starts_thinking",
       "priority": "P0",
       "steps": [
@@ -121,64 +96,6 @@
           "expect": {
             "assertions": [
               "event_transcript_contains:fake assistant: hello from the Web harness"
-            ]
-          }
-        }
-      ]
-    },
-    {
-      "name": "sse_emits_controller_changed_on_attach_and_detach",
-      "priority": "P0",
-      "steps": [
-        {
-          "name": "open stream",
-          "op": "openEvents",
-          "stream": "events",
-          "wire": 1,
-          "timeoutMs": 5000
-        },
-        {
-          "name": "attach automation",
-          "op": "attach",
-          "kind": "automation",
-          "clientId": "sse-controller",
-          "auth": "valid_control",
-          "expect": {
-            "status": 200,
-            "saveToken": "current"
-          }
-        },
-        {
-          "name": "controller changed to automation",
-          "op": "collectEventsUntil",
-          "stream": "events",
-          "event": "controller_changed",
-          "timeoutMs": 5000,
-          "expect": {
-            "assertions": [
-              "event_data_controller_kind_automation"
-            ]
-          }
-        },
-        {
-          "name": "detach automation",
-          "op": "detach",
-          "clientId": "sse-controller",
-          "token": "current",
-          "auth": "valid_control",
-          "expect": {
-            "status": 200
-          }
-        },
-        {
-          "name": "controller changed away from automation",
-          "op": "collectEventsUntil",
-          "stream": "events",
-          "event": "controller_changed",
-          "timeoutMs": 5000,
-          "expect": {
-            "assertions": [
-              "event_data_controller_kind_none"
             ]
           }
         }

@@ -241,8 +241,8 @@ pub enum Step {
     },
     /// Read the very next event off `stream` and assert it has the
     /// requested `event:` field plus all expected assertions. Use
-    /// this when the next event is deterministic (e.g. SSE initial
-    /// replay always emits `session_updated` first).
+    /// this when the next event is deterministic (e.g. a v2 durable
+    /// replay emits `code_workflow` frames from the cursor).
     ExpectEvent {
         name: String,
         stream: String,
@@ -266,17 +266,17 @@ pub enum Step {
         timeout_ms: u64,
         expect: AssertionsExpect,
     },
-    /// Wave 4 / PR 4 — drain every `session_updated` event off
-    /// `stream` until either:
+    /// Wave 4 / PR 4 — drain the stream's v2 `code_workflow`
+    /// projection deltas (transcript upserts) until either:
     ///
-    ///   * the snapshot contained in the latest event has
-    ///     `status == "idle"` (terminal state), OR
+    ///   * a status projection reported non-idle then idle AND a
+    ///     completed assistant transcript projection was seen, OR
     ///   * `timeoutMs` elapses (whichever comes first).
     ///
     /// Run multi-event assertions on the COLLECTED sequence — e.g.
     /// `assistant_content_monotonic` walks the assistant message
-    /// content across each session_updated and asserts it grows
-    /// monotonically (no truncation, no shrink).
+    /// content across each collected transcript projection and asserts
+    /// it grows monotonically (no truncation, no shrink).
     CollectSessionUpdates {
         name: String,
         stream: String,
@@ -453,8 +453,9 @@ fn default_event_timeout_ms() -> u64 {
     5_000
 }
 
-/// DF-05: compatibility matrices consume durable delta/cursor wire v2 unless
-/// a case explicitly opts into the legacy snapshot wire.
+/// DF-05 defaulted compatibility matrices to the durable delta/cursor wire
+/// v2; DF-08 removed the legacy snapshot wire entirely, so v2 is the only
+/// wire a case may name.
 pub const DEFAULT_SSE_WIRE_VERSION: u8 = 2;
 
 fn default_sse_wire_version() -> u8 {
@@ -1035,6 +1036,7 @@ impl CaseRuntime<'_> {
         let received = event_stream
             .next_event(timeout)?
             .ok_or_else(|| anyhow!("timed out waiting for SSE event '{event}' on '{stream}'"))?;
+        reject_legacy_v1_event(&received)?;
         if received.event != event {
             bail!(
                 "expected SSE event '{event}' on '{stream}', got '{}': {}",
@@ -1078,12 +1080,11 @@ impl CaseRuntime<'_> {
         // consume the entire test budget without ever reaching
         // the target.
         //
-        // Wave 4 fix: the initial-replay `session_updated` carries
-        // the snapshot at SUBSCRIPTION time (typically idle, empty
-        // transcript). For an assertion like
-        // `event_transcript_contains:<reply>` the first matching
-        // event won't satisfy it — the assistant hasn't streamed
-        // yet. Treat assertion failure as "this isn't the event we
+        // Wave 4 fix (kept for v2): the durable replay's earliest
+        // `code_workflow` frames predate the submitted turn. For an
+        // assertion like `event_transcript_contains:<reply>` the first
+        // matching event won't satisfy it — the assistant hasn't
+        // streamed yet. Treat assertion failure as "this isn't the event we
         // want, keep waiting" and only surface the LAST error on
         // timeout. The rule guarantees we don't silently lose a
         // genuinely failing assertion: if the deadline elapses,
@@ -1110,6 +1111,7 @@ impl CaseRuntime<'_> {
                 None => continue,
             };
             reject_v2_control_event(&event)?;
+            reject_legacy_v1_event(&event)?;
             if event.event != target_event {
                 continue;
             }
@@ -1150,12 +1152,10 @@ impl CaseRuntime<'_> {
             )
         })?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        // The initial replay can be idle before a submitted turn starts,
-        // so only treat idle as terminal after a non-idle status. Wire v1
-        // publishes the final transcript snapshot before its terminal idle
-        // event. Wire v2 projection deltas are independently persisted and
-        // can arrive in the opposite order, so v2 must also observe the
-        // completed assistant projection before collection finishes.
+        // v2 (the only wire since DF-08 removed v1): projection deltas are
+        // independently persisted and can arrive in either order, so
+        // collection finishes only after a non-idle status, an idle status,
+        // AND a completed assistant transcript projection were all seen.
         let mut collected: Vec<Value> = Vec::new();
         let mut saw_non_idle = false;
         let mut saw_idle = false;
@@ -1170,10 +1170,8 @@ impl CaseRuntime<'_> {
                 None => break,
             };
             reject_v2_control_event(&event)?;
-            if event.event != "session_updated"
-                && event.event != "status_changed"
-                && event.event != "code_workflow"
-            {
+            reject_legacy_v1_event(&event)?;
+            if event.event != "code_workflow" {
                 continue;
             }
             let payload = parse_event_data(&event).with_context(|| {
@@ -1183,16 +1181,8 @@ impl CaseRuntime<'_> {
                 )
             })?;
             validate_v2_event_shape(&event, &payload)?;
-            let status = payload
-                .pointer("/data/status")
-                .and_then(Value::as_str)
-                .or_else(|| projection_payload(&payload, "status").and_then(Value::as_str));
+            let status = projection_payload(&payload, "status").and_then(Value::as_str);
             let is_idle = status.is_some_and(|status| status == "idle");
-            // Track the turn lifecycle from BOTH event streams.
-            // status_changed: thinking flips the gate; the
-            // matching status_changed: idle (which fires after
-            // every transcript mutation has already produced its
-            // session_updated) closes the collection.
             if status.is_some_and(|status| status != "idle") {
                 saw_non_idle = true;
             }
@@ -1211,13 +1201,10 @@ impl CaseRuntime<'_> {
             }) {
                 saw_completed_assistant = true;
             }
-            let is_v1_snapshot = event.event == "session_updated";
-            if is_v1_snapshot || transcript_projection.is_some() {
+            if transcript_projection.is_some() {
                 collected.push(payload);
             }
-            if saw_non_idle
-                && ((is_v1_snapshot && is_idle) || (saw_idle && saw_completed_assistant))
-            {
+            if saw_non_idle && saw_idle && saw_completed_assistant {
                 break;
             }
         }
@@ -2076,14 +2063,31 @@ fn snapshot_tool_call_has_status(snapshot: &Value, id: &str, status: &str) -> bo
         .unwrap_or(false)
 }
 
-/// Parse an SSE event's `data:` field as JSON. The `/api/code/events`
-/// handler always serialises a `CodeUiEventEnvelope` via
-/// `Event::json_data`, so a deserialisation failure here means the
-/// runtime emitted a malformed envelope — surface as an error rather
-/// than silently empty.
+/// Parse an SSE event's `data:` field as JSON. Since DF-08 the
+/// `/api/code/events` handler serialises only v2 `code_workflow`
+/// envelopes (`{ cursor, eventId, kind, at, payload }`), so a
+/// deserialisation failure here means the runtime emitted a malformed
+/// envelope — surface as an error rather than silently empty.
 fn parse_event_data(event: &SseEvent) -> Result<Value> {
     serde_json::from_str(&event.data)
         .with_context(|| format!("failed to parse SSE data as JSON: {}", event.data))
+}
+
+/// DF-08: the v1 snapshot wire is gone — a v2 stream that emits any of the
+/// legacy envelope event names is a server regression, never something a
+/// case may silently skip past.
+fn reject_legacy_v1_event(event: &SseEvent) -> Result<()> {
+    if matches!(
+        event.event.as_str(),
+        "session_updated" | "status_changed" | "controller_changed"
+    ) {
+        bail!(
+            "wire v2 stream emitted removed v1 envelope event '{}' (SSE wire v1 was deleted in 0.22.0): {}",
+            event.event,
+            event.data
+        );
+    }
+    Ok(())
 }
 
 fn reject_v2_control_event(event: &SseEvent) -> Result<()> {
@@ -2122,94 +2126,25 @@ fn transcript_projection_entry(payload: &Value) -> Option<&Value> {
 
 fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) -> Result<()> {
     match assertion {
-        "event_data_has_transcript_array" => {
-            // Initial replay must include the snapshot's transcript
-            // array so a fresh subscriber renders the room state.
-            let transcript = payload
-                .pointer("/data/transcript")
-                .and_then(Value::as_array);
-            if transcript.is_none() {
-                bail!("payload missing /data/transcript array");
-            }
-        }
-        "event_data_has_controller" => {
-            let controller = payload.pointer("/data/controller");
-            if !controller.is_some_and(Value::is_object) {
-                bail!("payload missing /data/controller object");
-            }
-        }
         "event_data_status_thinking" => {
-            let status = payload
-                .pointer("/data/status")
+            // v2-only (DF-08): the status must come from the durable
+            // status projection delta — a v1 `/data/status` payload
+            // smuggled inside a `code_workflow` frame must fail.
+            let status = projection_payload(payload, "status")
                 .and_then(Value::as_str)
-                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
                 .unwrap_or("");
             if status != "thinking" {
-                bail!("expected /data/status == 'thinking', got '{status}'");
-            }
-        }
-        "event_data_status_idle" => {
-            let status = payload
-                .pointer("/data/status")
-                .and_then(Value::as_str)
-                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
-                .unwrap_or("");
-            if status != "idle" {
-                bail!("expected /data/status == 'idle', got '{status}'");
-            }
-        }
-        "event_data_status_executing_tool" => {
-            let status = payload
-                .pointer("/data/status")
-                .and_then(Value::as_str)
-                .or_else(|| projection_payload(payload, "status").and_then(Value::as_str))
-                .unwrap_or("");
-            if status != "executing_tool" {
-                bail!("expected /data/status == 'executing_tool', got '{status}'");
-            }
-        }
-        "event_data_controller_kind_automation" => {
-            let kind = payload
-                .pointer("/data/controller/kind")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    projection_payload(payload, "controller")?
-                        .get("kind")
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("");
-            if kind != "automation" {
-                bail!("expected /data/controller.kind == 'automation', got '{kind}'");
-            }
-        }
-        "event_data_controller_kind_none" => {
-            // W5-02: see `controller_kind_none`.
-            let kind = payload
-                .pointer("/data/controller/kind")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    projection_payload(payload, "controller")?
-                        .get("kind")
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("");
-            if kind != "none" {
-                bail!("expected /data/controller.kind 'none', got '{kind}'");
+                bail!("expected status projection payload 'thinking', got '{status}'");
             }
         }
         other if other.starts_with("event_transcript_contains:") => {
             let needle = other.trim_start_matches("event_transcript_contains:");
-            let haystack = if let Some(transcript) = payload
-                .pointer("/data/transcript")
-                .and_then(Value::as_array)
-            {
-                serde_json::to_string(transcript).unwrap_or_default()
-            } else if let Some(entry) = transcript_projection_entry(payload) {
+            // v2-only (DF-08): only the transcript_upsert projection
+            // counts — a v1 `/data/transcript` payload must fail.
+            let haystack = if let Some(entry) = transcript_projection_entry(payload) {
                 serde_json::to_string(entry).unwrap_or_default()
             } else {
-                return Err(anyhow!(
-                    "payload missing a v1 transcript or v2 transcript_upsert projection"
-                ));
+                return Err(anyhow!("payload missing a v2 transcript_upsert projection"));
             };
             if !haystack.contains(needle) {
                 bail!("transcript did not contain '{needle}'; serialised transcript:\n{haystack}");
@@ -2224,8 +2159,9 @@ fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) 
 }
 
 /// Evaluate an assertion across a sequence of collected SSE
-/// payloads. Used by `Step::CollectSessionUpdates`. Each payload
-/// is the full envelope (`{ seq, type, at, data: snapshot }`).
+/// payloads. Used by `Step::CollectSessionUpdates`. Since DF-08 each
+/// payload is a v2 `code_workflow` envelope carrying a
+/// `transcript_upsert` projection delta.
 ///
 /// New cross-event assertions live here; per-event assertions
 /// stay on `evaluate_event_assertion`. Suffix assertions of the
@@ -2241,26 +2177,10 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
             // streaming pipeline.
             let mut prev: Option<String> = None;
             for (idx, payload) in collected.iter().enumerate() {
-                let assistant_content = payload
-                    .pointer("/data/transcript")
-                    .and_then(Value::as_array)
-                    .and_then(|transcript| {
-                        transcript.iter().rev().find_map(|entry| {
-                            (entry.pointer("/kind").and_then(Value::as_str)
-                                == Some("assistant_message"))
-                            .then(|| {
-                                entry
-                                    .pointer("/content")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .flatten()
-                        })
-                    })
-                    .or_else(|| {
-                        let entry = transcript_projection_entry(payload)?;
-                        (entry.pointer("/kind").and_then(Value::as_str)
-                            == Some("assistant_message"))
+                // v2-only (DF-08): read the transcript_upsert projection.
+                let assistant_content = (|| {
+                    let entry = transcript_projection_entry(payload)?;
+                    (entry.pointer("/kind").and_then(Value::as_str) == Some("assistant_message"))
                         .then(|| {
                             entry
                                 .pointer("/content")
@@ -2268,7 +2188,7 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
                                 .map(str::to_string)
                         })
                         .flatten()
-                    });
+                })();
                 let Some(current) = assistant_content else {
                     // Snapshots before the first assistant chunk
                     // legitimately have no assistant message yet.
@@ -2298,16 +2218,12 @@ fn evaluate_collected_assertion(assertion: &str, collected: &[Value]) -> Result<
                 anyhow!("event_transcript_contains assertion needs at least one collected event")
             })?;
             let needle = other.trim_start_matches("event_transcript_contains:");
-            let haystack = if let Some(transcript) =
-                last.pointer("/data/transcript").and_then(Value::as_array)
-            {
-                serde_json::to_string(transcript).unwrap_or_default()
-            } else if let Some(entry) = transcript_projection_entry(last) {
+            // v2-only (DF-08): the final collected payload must carry a
+            // transcript_upsert projection.
+            let haystack = if let Some(entry) = transcript_projection_entry(last) {
                 serde_json::to_string(entry).unwrap_or_default()
             } else {
-                return Err(anyhow!(
-                    "payload missing a v1 transcript or v2 transcript_upsert projection"
-                ));
+                return Err(anyhow!("payload missing a v2 transcript_upsert projection"));
             };
             if !haystack.contains(needle) {
                 bail!("transcript did not contain '{needle}'; serialised transcript:\n{haystack}");
@@ -2714,4 +2630,73 @@ fn evaluate_command_output_assertion(assertion: &str, output: &Output) -> Result
         return Ok(());
     }
     bail!("unsupported command output assertion '{assertion}'")
+}
+
+#[cfg(test)]
+mod df08_tests {
+    use serde_json::Value;
+
+    use super::{SseEvent, reject_legacy_v1_event};
+
+    /// DF-08 regression: a v1 snapshot payload smuggled inside a
+    /// `code_workflow` frame must FAIL the v2 assertions — the `/data/…`
+    /// compatibility arms are gone, only projection deltas count.
+    #[test]
+    fn v1_payload_in_code_workflow_clothing_fails_v2_assertions() {
+        let event = SseEvent {
+            event: "code_workflow".to_string(),
+            data: String::new(),
+        };
+        let smuggled: Value = serde_json::json!({
+            "cursor": 1,
+            "kind": "status",
+            "data": {
+                "status": "thinking",
+                "transcript": [{ "kind": "assistant_message", "content": "hi" }]
+            }
+        });
+        assert!(
+            super::evaluate_event_assertion("event_data_status_thinking", &event, &smuggled)
+                .is_err(),
+            "a /data/status payload must not satisfy the status assertion"
+        );
+        assert!(
+            super::evaluate_event_assertion("event_transcript_contains:hi", &event, &smuggled)
+                .is_err(),
+            "a /data/transcript payload must not satisfy the transcript assertion"
+        );
+
+        let genuine: Value = serde_json::json!({
+            "cursor": 2,
+            "kind": "code_ui_projection_delta:status",
+            "payload": { "payload": "thinking" }
+        });
+        assert!(
+            super::evaluate_event_assertion("event_data_status_thinking", &event, &genuine).is_ok(),
+            "the real v2 status projection must still pass"
+        );
+    }
+
+    /// DF-08 regression: a v2 stream that emits any removed v1 envelope
+    /// event name must fail the case loudly instead of being skipped.
+    #[test]
+    fn legacy_v1_event_names_fail_the_stream() {
+        for legacy in ["session_updated", "status_changed", "controller_changed"] {
+            let event = SseEvent {
+                event: legacy.to_string(),
+                data: "{}".to_string(),
+            };
+            let error = reject_legacy_v1_event(&event)
+                .expect_err("legacy v1 envelope events must be rejected");
+            assert!(
+                error.to_string().contains("deleted in 0.22.0"),
+                "removal guidance expected: {error}"
+            );
+        }
+        let ok = SseEvent {
+            event: "code_workflow".to_string(),
+            data: "{}".to_string(),
+        };
+        assert!(reject_legacy_v1_event(&ok).is_ok());
+    }
 }
