@@ -193,16 +193,6 @@ jobs:
       # ABORTS rather than failing. The real CLI runs those futures on the
       # 8 MiB main thread, so this is a harness limit, not a product one.
       RUST_MIN_STACK: "16777216"
-      # Hermetic global-config isolation: the self-hosted runner user's real
-      # ~/.libra/config.db can carry a schema NEWER than the binary under test
-      # (observed 2026082503 vs supported 2026082401), which makes every
-      # command emit the future-schema warning on stderr and touch the process
-      # warning tracker — failing the mv_test clean-stderr assertions and the
-      # status_wave0 API-path warning-isolation contract. Pointing the global
-      # config DB at a per-job temp path that does not exist keeps the suite
-      # hermetic regardless of host state (tests that need a global config
-      # create their own via per-command LIBRA_CONFIG_GLOBAL_DB overrides).
-      LIBRA_CONFIG_GLOBAL_DB: ${{ github.workspace }}/.ci-global-config.db
 
     steps:
       - name: Checkout repository
@@ -268,6 +258,11 @@ jobs:
 
       - name: Run tests (L1 + L2 + L3)
         env:
+          # Isolate dirs::home_dir for direct in-process tests without
+          # overriding child tests that deliberately choose their own HOME.
+          HOME: ${{ runner.temp }}/libra-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
           LIBRA_TEST_GITHUB_TOKEN: ${{ secrets.LIBRA_TEST_GITHUB_TOKEN }}
           LIBRA_TEST_GITHUB_NAMESPACE: ${{ secrets.LIBRA_TEST_GITHUB_NAMESPACE }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -305,6 +300,10 @@ jobs:
       # dropped because `libra code` TUI support was removed upstream; the
       # PTY/TUI-driven scenario targets (code_ui_scenarios, harness_self_test,
       # lease/SSE/state matrices, ...) no longer describe product behavior.
+      # The compatibility guard still inventories these disabled targets:
+      #   --test code_codex_default_web_test
+      #   --test ai_code_ui_headless_test
+      #   --test code_codex_runtime_test
       # The test files remain in the repo for local reference; restore this
       # step from git history if a Code UI surface returns.
 
@@ -312,6 +311,9 @@ jobs:
       # (required-features excludes it from the default `cargo test --all`).
       - name: Run OTLP telemetry wire test (--features otlp)
         env:
+          HOME: ${{ runner.temp }}/libra-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
           LIBRA_SKIP_WEB_BUILD: "1"
         run: |
           cargo test --features otlp --test otlp_telemetry -- --test-threads=1
@@ -320,6 +322,9 @@ jobs:
       # (debug builds only honor the mock env; headless-safe).
       - name: Run keyring auth backend test (--features keyring)
         env:
+          HOME: ${{ runner.temp }}/libra-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
           LIBRA_SKIP_WEB_BUILD: "1"
         run: |
           cargo test --features keyring --test auth_keyring_backend -- --test-threads=1
@@ -329,6 +334,9 @@ jobs:
       # so a release build cannot alter the trust root even with LIBRA_TEST=1.
       - name: Run auto-upgrade tests (--features test-upgrade)
         env:
+          HOME: ${{ runner.temp }}/libra-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
           LIBRA_SKIP_WEB_BUILD: "1"
           LIBRA_TEST: "1"
         run: |
@@ -360,10 +368,6 @@ jobs:
       LIBRA_SKIP_WEB_BUILD: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "1"
-      # Same hermetic global-config isolation as compat-offline-core: keep the
-      # network test layer from reading the runner host's real global config
-      # DB (its schema may be newer than the binary under test).
-      LIBRA_CONFIG_GLOBAL_DB: ${{ github.workspace }}/.ci-global-config.db
 
     steps:
       - name: Checkout repository
@@ -387,4 +391,8 @@ jobs:
       # the `compat-live-*` (workflow_dispatch) jobs, which are intentionally not
       # GitHub required-checks.
       - name: Run network-remote tests
+        env:
+          HOME: ${{ runner.temp }}/libra-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
         run: cargo test --features test-network --test network_remotes_test -- --test-threads=1
