@@ -3055,7 +3055,7 @@ mod tests {
     #[test]
     fn seam_write_bind_set_exact() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        let policy = SandboxPolicy::ReadOnly;
+        let _policy = SandboxPolicy::ReadOnly;
         let store = cwd.path().join("opencode-store");
         std::fs::create_dir(&store).unwrap();
         let store_s = store.to_string_lossy().into_owned();
@@ -3122,7 +3122,7 @@ mod tests {
     #[test]
     fn seam_seatbelt_store_write_segment() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        let policy = SandboxPolicy::ReadOnly;
+        let _policy = SandboxPolicy::ReadOnly;
         let store = cwd.path().join("store");
         std::fs::create_dir(&store).unwrap();
         let binds = [WritableBind {

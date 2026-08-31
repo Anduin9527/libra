@@ -1946,7 +1946,8 @@ printf 'offline-ok'"#,
         std::fs::write(&fake, b"#!/bin/sh\nexec \"$@\"\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = assemble_sandboxed_export(&bin, Some(&fake))
-            .expect_err("user-writable bwrap must fail closed");
+            .err()
+            .expect("user-writable bwrap must fail closed");
         let text = format!("{err:#}");
         assert!(
             text.contains("writable")
@@ -1966,7 +1967,8 @@ printf 'offline-ok'"#,
         let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
         let missing = dir.path().join("no-such-bwrap");
         let err = assemble_sandboxed_export(&bin, Some(&missing))
-            .expect_err("missing bwrap must fail closed");
+            .err()
+            .expect("missing bwrap must fail closed");
         let text = format!("{err:#}");
         assert!(
             text.contains("Required")
