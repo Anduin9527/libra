@@ -1919,12 +1919,14 @@ printf 'offline-ok'"#,
             Some(bin.to_string_lossy().as_ref()),
             "command tail must be the exporter binary; args={args:?}"
         );
-        assert!(
-            assembled
-                .program
-                .canonicalize()
-                .unwrap_or(assembled.program.clone())
-                .ends_with("true"),
+        let program = assembled
+            .program
+            .canonicalize()
+            .unwrap_or_else(|_| assembled.program.clone());
+        let expected = trusted.canonicalize().unwrap_or_else(|_| trusted.clone());
+        assert_eq!(
+            program,
+            expected,
             "program must be the injected trusted path, got {}",
             assembled.program.display()
         );
