@@ -5,9 +5,18 @@ on:
     tags:
       - 'v*' # Trigger when pushing tags starting with v, e.g., v1.0.0
 
+env:
+  RCLONE_VERSION: '1.75.0'
+  RCLONE_LINUX_AMD64_SHA256: 'aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa'
+  RCLONE_LINUX_ARM64_SHA256: 'd0ad88ba4c8e285b7c9efa591e0ab643280a91741e13c27f3a9c0957ccfa5203'
+  RCLONE_OSX_ARM64_SHA256: '35e8f2a666ce789b29111db0dd843ddabc0d59c6b609d07bcaae5d1a07cba6f8'
+  RCLONE_WINDOWS_AMD64_SHA256: '203581f0a7baeae873f2347483a798c79e2eaf5c384a4e9d866aa374f1c89ac0'
+
 jobs:
   build-and-upload:
     runs-on: ${{ matrix.target.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: true # if it is set to true, then one job failed the other jobs will be cancelled  together.
       matrix:
@@ -20,18 +29,18 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
 
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: stable
           target: ${{ matrix.target.rust }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: "22"
 
@@ -49,19 +58,19 @@ jobs:
           sudo apt-get update
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ matrix.target.rust }}-${{ hashFiles('**/Cargo.lock') }}
@@ -72,7 +81,6 @@ jobs:
       # passes an explicit feature list; this guard fails the release if the
       # test feature is ever spliced into the release build command.
       - name: Reject test-upgrade feature in release build
-        if: matrix.target.os != 'windows'
         shell: bash
         run: |
           if grep -nE -- '--features[^\n]*test-upgrade' .github/workflows/release.yml; then
@@ -112,7 +120,9 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME
-          $binaryName = "${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          # This is the public release-contract name, including the separate
+          # suffixless object consumed by signed manifests.
+          $binaryName = "libra-windows-amd64"
 
           Write-Output "Building $binaryName for target ${{ matrix.target.rust }}..."
 
@@ -121,7 +131,18 @@ jobs:
 
           # Create build directory and copy binary
           New-Item -ItemType Directory -Force -Path "build" | Out-Null
-          Copy-Item "target\${{ matrix.target.rust }}\release\${{ matrix.component }}.exe" "build\$binaryName.exe"
+          $sourceBinary = "target\${{ matrix.target.rust }}\release\${{ matrix.component }}.exe"
+          $sourceHash = (Get-FileHash -Algorithm SHA256 $sourceBinary).Hash.ToLowerInvariant()
+          Copy-Item $sourceBinary "build\$binaryName.exe"
+          # The signed-manifest URL grammar has no `.exe` suffix. Publish a
+          # byte-identical second name and verify both copied release objects.
+          Copy-Item "build\$binaryName.exe" "build\$binaryName"
+          $exeHash = (Get-FileHash -Algorithm SHA256 "build\$binaryName.exe").Hash.ToLowerInvariant()
+          $suffixlessHash = (Get-FileHash -Algorithm SHA256 "build\$binaryName").Hash.ToLowerInvariant()
+          if ($sourceHash -ne $exeHash -or $sourceHash -ne $suffixlessHash) {
+            throw "Windows release copies do not match the built executable"
+          }
+          Set-Content -NoNewline -Path "build\$binaryName.sha256" -Value $exeHash
 
           Write-Output "Built binary: $binaryName"
 
@@ -136,25 +157,57 @@ jobs:
           RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           RCLONE_CONFIG_R2_ACL: private
         run: |
-          # Install rclone
-          if [[ "${{ matrix.target.os }}" == "darwin" ]]; then
-            brew install rclone
+          set -euo pipefail
+          rclone_version="$RCLONE_VERSION"
+          case "${{ matrix.target.os }}-${{ matrix.target.arch }}" in
+            linux-amd64)
+              rclone_platform="linux-amd64"
+              rclone_sha256="$RCLONE_LINUX_AMD64_SHA256"
+              ;;
+            linux-arm64)
+              rclone_platform="linux-arm64"
+              rclone_sha256="$RCLONE_LINUX_ARM64_SHA256"
+              ;;
+            darwin-arm64)
+              rclone_platform="osx-arm64"
+              rclone_sha256="$RCLONE_OSX_ARM64_SHA256"
+              ;;
+            *)
+              echo "::error::unsupported rclone platform '${{ matrix.target.os }}-${{ matrix.target.arch }}'"
+              exit 1
+              ;;
+          esac
+          rclone_zip="rclone-v${rclone_version}-${rclone_platform}.zip"
+          curl -fsSL --connect-timeout 10 --max-time 120 -o "$rclone_zip" \
+            "https://github.com/rclone/rclone/releases/download/v${rclone_version}/${rclone_zip}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${rclone_sha256}  ${rclone_zip}" | sha256sum -c -
           else
-            curl https://rclone.org/install.sh | sudo bash
+            echo "${rclone_sha256}  ${rclone_zip}" | shasum -a 256 -c -
           fi
+          unzip -q "$rclone_zip"
+          rclone_bin="$PWD/rclone-v${rclone_version}-${rclone_platform}/rclone"
+          chmod +x "$rclone_bin"
 
           # Upload binaries to R2
-          rclone copy ./build/ r2:${{ secrets.R2_BUCKET_NAME }}/libra/releases/${{ github.ref_name }}/ -v
+          "$rclone_bin" copy ./build/ r2:${{ secrets.R2_BUCKET_NAME }}/libra/releases/${{ github.ref_name }}/ -v
 
           echo "Upload completed for ${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
 
-      - name: Upload Homebrew sha256 artifact
+      - name: Upload release sha256 artifact
         if: matrix.target.os != 'windows'
-        continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: homebrew-sha256-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: build/${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.sha256
+          if-no-files-found: error
+
+      - name: Upload Windows release sha256 artifact
+        if: matrix.target.os == 'windows'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: homebrew-sha256-windows-amd64
+          path: build/libra-windows-amd64.sha256
           if-no-files-found: error
 
       - name: Upload to Cloudflare R2 (Windows)
@@ -168,23 +221,34 @@ jobs:
           RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           RCLONE_CONFIG_R2_ACL: private
         run: |
-          # Install rclone via choco
-          choco install rclone -y
+          $ErrorActionPreference = "Stop"
+          $rcloneVersion = $env:RCLONE_VERSION
+          $rcloneSha256 = $env:RCLONE_WINDOWS_AMD64_SHA256
+          $rcloneZip = "rclone-v$($rcloneVersion)-windows-amd64.zip"
+          Invoke-WebRequest -Uri "https://github.com/rclone/rclone/releases/download/v$($rcloneVersion)/$rcloneZip" -OutFile $rcloneZip -TimeoutSec 120
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 $rcloneZip).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $rcloneSha256) {
+            throw "rclone archive SHA-256 mismatch: expected $rcloneSha256, got $actualSha256"
+          }
+          Expand-Archive -Path $rcloneZip -DestinationPath rclone-extract -Force
+          $rcloneBin = (Resolve-Path "rclone-extract\rclone-v$($rcloneVersion)-windows-amd64\rclone.exe").Path
 
           # Upload binaries to R2
-          rclone copy ./build/ r2:${{ secrets.R2_BUCKET_NAME }}/libra/releases/${{ github.ref_name }}/ -v
+          & $rcloneBin copy ./build/ r2:${{ secrets.R2_BUCKET_NAME }}/libra/releases/${{ github.ref_name }}/ -v
 
           Write-Output "Upload completed for ${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
 
   upload-install-scripts:
     needs: build-and-upload
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     concurrency:
       group: libra-release-install-scripts
       cancel-in-progress: false
     steps:
       - name: Checkout tagged commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.ref }}
 
@@ -261,8 +325,8 @@ jobs:
           RCLONE_CONFIG_R2_ACL: private
         run: |
           set -euo pipefail
-          rclone_version="1.75.0"
-          rclone_sha256="aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa"
+          rclone_version="$RCLONE_VERSION"
+          rclone_sha256="$RCLONE_LINUX_AMD64_SHA256"
           rclone_zip="rclone-v${rclone_version}-linux-amd64.zip"
           curl -fsSL --connect-timeout 10 --max-time 120 -o "$rclone_zip" \
             "https://github.com/rclone/rclone/releases/download/v${rclone_version}/${rclone_zip}"
@@ -310,21 +374,21 @@ jobs:
       actions: read
     steps:
       - name: Download darwin arm64 sha256 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         continue-on-error: true
         with:
           name: homebrew-sha256-darwin-arm64
           path: homebrew-sha256/darwin-arm64
 
       - name: Download linux amd64 sha256 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         continue-on-error: true
         with:
           name: homebrew-sha256-linux-amd64
           path: homebrew-sha256/linux-amd64
 
       - name: Download linux arm64 sha256 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         continue-on-error: true
         with:
           name: homebrew-sha256-linux-arm64
@@ -444,7 +508,7 @@ jobs:
       # already-up-to-date paths must publish it, and the latter exits early.
       - name: Upload the formula commit sha
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: formula-commit-sha
           path: formula-commit-sha.txt
@@ -453,6 +517,7 @@ jobs:
   verify-homebrew-formula:
     needs: update-homebrew-tap
     runs-on: macos-latest
+    permissions: {}
     steps:
       - name: Install and verify Homebrew formula
         shell: bash

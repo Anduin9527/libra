@@ -18,7 +18,11 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.22.0"
+DEFAULT_VERSION="v0.22.1"
+# Public-only trust anchor for stable-manifest verification. It deliberately
+# has no environment override; A1-05 consumes it when signed install flow lands.
+LIBRA_RELEASE_MANIFEST_KEY_ID="libra-release-1"
+LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_HEX="68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3"
 
 # ─── theme (Dusk) ────────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${LIBRA_NO_TUI:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
