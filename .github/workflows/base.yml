@@ -202,7 +202,7 @@ jobs:
       # config DB at a per-job temp path that does not exist keeps the suite
       # hermetic regardless of host state (tests that need a global config
       # create their own via per-command LIBRA_CONFIG_GLOBAL_DB overrides).
-      LIBRA_CONFIG_GLOBAL_DB: ${{ runner.temp }}/libra-ci-global-config.db
+      LIBRA_CONFIG_GLOBAL_DB: ${{ github.workspace }}/.ci-global-config.db
 
     steps:
       - name: Checkout repository
@@ -363,7 +363,7 @@ jobs:
       # Same hermetic global-config isolation as compat-offline-core: keep the
       # network test layer from reading the runner host's real global config
       # DB (its schema may be newer than the binary under test).
-      LIBRA_CONFIG_GLOBAL_DB: ${{ runner.temp }}/libra-ci-global-config.db
+      LIBRA_CONFIG_GLOBAL_DB: ${{ github.workspace }}/.ci-global-config.db
 
     steps:
       - name: Checkout repository
