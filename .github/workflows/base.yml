@@ -252,6 +252,10 @@ jobs:
           echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
           echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
 
+      - name: Prepare isolated test home
+        shell: bash
+        run: mkdir -p "$RUNNER_TEMP/libra-ci-home/.config"
+
       - name: Check compatibility matrix drift
         run: cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact
 
@@ -402,6 +406,10 @@ jobs:
           # toolchains and registry cache.
           echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
           echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+
+      - name: Prepare isolated test home
+        shell: bash
+        run: mkdir -p "$RUNNER_TEMP/libra-ci-home/.config"
 
       # Network-only test layer (`test-network` feature gate). Tests requiring outbound
       # network but no secrets are surfaced through this job; tests requiring real
