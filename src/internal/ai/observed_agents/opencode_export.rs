@@ -16,11 +16,14 @@
 //!   session store but never a credential.
 //! - **Bounds** (GC-DR-04): the child's stdout is an inherited anonymous FILE
 //!   (probe-verified: the CLI truncates large exports into backpressured pipes
-//!   while exiting success), bounded three ways — a `RLIMIT_FSIZE` write-time
-//!   cap terminates a runaway child at the byte limit before it fills disk,
-//!   the file size is actively polled against the same cap while the child
-//!   runs, and it is re-checked after exit; over-cap always kills and errors,
-//!   never returns truncated content. The whole run sits under a wall-clock
+//!   while exiting success). The `max_bytes` cap is enforced by actively
+//!   polling that file while the child runs and re-checking after exit;
+//!   over-cap always kills and errors, never returns truncated content.
+//!   `RLIMIT_FSIZE` backs this with a write-time bound — strict
+//!   (`max_bytes + 1`) on Linux (GC-SBX-01 pre-plan behavior, isolated
+//!   tmpfs scratch), a coarse 8 GiB disk backstop on macOS where the
+//!   process-wide limit would SIGXFSZ OpenCode's SQLite WAL checkpoint on
+//!   a large store (FIX-SBX-01). The whole run sits under a wall-clock
 //!   deadline (default 3 s — expiry kills the child's process group). stderr
 //!   is capped and redacted before it can appear in any error text
 //!   (GC-DR-13). A child that leaves descendants in its process group after
@@ -228,13 +231,22 @@ async fn run_bounded_exporter(
         .try_clone()
         .context("clone export stdout handle")?;
     let mut command = tokio::process::Command::new(program);
-    // GC-DR-04 write-time bound: cap the child's file writes at the byte cap
-    // (+1 so overflow is DETECTED, not silently truncated). The kernel
-    // delivers SIGXFSZ / EFBIG at the limit, terminating a runaway exporter
-    // immediately instead of letting it fill disk until the deadline.
+    // The export *stdout* byte cap is the tempfile poll below on every
+    // platform. RLIMIT_FSIZE is per-OS: Linux keeps the strict write-time
+    // cap (GC-SBX-01: pre-plan Linux semantics unchanged); macOS raises it
+    // to a coarse disk backstop because the limit is process-wide and a
+    // max_bytes cap SIGXFSZes OpenCode's WAL checkpoint on a store larger
+    // than max_bytes (FIX-SBX-01: a ~1 GiB `opencode.db` failed
+    // `PRAGMA wal_checkpoint` under 16 MiB).
     #[cfg(unix)]
     {
-        let fsize_limit = limits.max_bytes.saturating_add(1);
+        #[cfg(target_os = "macos")]
+        let fsize_limit: u64 = {
+            const EXPORT_RLIMIT_FSIZE_BACKSTOP: u64 = 8 * 1024 * 1024 * 1024;
+            EXPORT_RLIMIT_FSIZE_BACKSTOP.max(limits.max_bytes.saturating_add(1))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let fsize_limit: u64 = limits.max_bytes.saturating_add(1);
         unsafe {
             command.pre_exec(move || {
                 let lim = libc::rlimit {
@@ -540,6 +552,12 @@ fn assemble_sandboxed_export(
         }
     }
 
+    // FIX-SBX-01: real `opencode export` mkdirs `/tmp/opencode` and WAL-
+    // checkpoints sqlite there. Bind only that subdirectory (never host
+    // `/tmp` / `/private/tmp`). Linux already gets an isolated tmpfs `/tmp`.
+    #[cfg(target_os = "macos")]
+    writable_binds.push(macos_opencode_scratch_bind()?);
+
     let spec = CommandSpec {
         program: binary.to_string_lossy().into_owned(),
         args: Vec::new(),
@@ -581,6 +599,110 @@ fn assemble_sandboxed_export(
         pre_args: command,
         keep_fds,
     })
+}
+
+/// Narrow Darwin scratch for OpenCode: `/tmp/opencode` only (canonical
+/// `/private/tmp/opencode`). The last component is pinned with
+/// `O_NOFOLLOW|O_DIRECTORY` so a hostile `/tmp/opencode` symlink cannot
+/// redirect the writable-bind (FIX-SBX-01 R1 P0).
+#[cfg(target_os = "macos")]
+fn macos_opencode_scratch_bind() -> Result<crate::internal::ai::sandbox::WritableBind> {
+    scratch_bind_under(
+        std::path::Path::new("/tmp"),
+        std::path::Path::new("/private/tmp/opencode"),
+    )
+}
+
+/// mkdir 0700 `base/opencode` (an existing dir is tolerated), pin the final
+/// component with `O_NOFOLLOW|O_DIRECTORY`, then enforce on the PINNED fd
+/// (no path re-lookup): the dir must be owned by our euid — a foreign-owned
+/// `/tmp/opencode` is refused outright, since its owner could rename it
+/// under sticky `/tmp` after the check and redirect the bind — and any
+/// group/other mode bits are tightened to 0700 via `fchmod` on the fd
+/// (FIX-SBX-01 R2: the pre-existing dir on a dev host is 0755).
+/// `F_GETPATH` must resolve exactly to `expected`.
+#[cfg(target_os = "macos")]
+fn scratch_bind_under(
+    base: &std::path::Path,
+    expected: &std::path::Path,
+) -> Result<crate::internal::ai::sandbox::WritableBind> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    use crate::internal::ai::sandbox::WritableBind;
+
+    let scratch = base.join("opencode");
+    match std::fs::DirBuilder::new().mode(0o700).create(&scratch) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(err).context(
+                "cannot create /tmp/opencode for the OpenCode seatbelt scratch bind \
+                 (fail-closed)",
+            );
+        }
+    }
+    let fd = pin_store_under(base).context(
+        "pin /tmp/opencode (O_NOFOLLOW directory); a symlink here is refused \
+         (fail-closed)",
+    )?;
+    enforce_scratch_owner_and_mode(&fd)?;
+    let pinned = resolve_pinned_store_path(&fd)?;
+    drop(fd);
+    if pinned != expected {
+        bail!(
+            "OpenCode scratch pin resolved to {}, expected {}; refusing \
+             (fail-closed)",
+            pinned.display(),
+            expected.display()
+        );
+    }
+    Ok(WritableBind {
+        source: pinned.clone(),
+        destination: pinned,
+    })
+}
+
+/// `fstat` the pinned scratch fd and enforce ownership, then tighten wide
+/// modes in place. Operating on the fd keeps the check free of path
+/// re-lookup races.
+#[cfg(target_os = "macos")]
+fn enforce_scratch_owner_and_mode(fd: &std::os::fd::OwnedFd) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat fills `st` for an fd we own; zeroed stat is a valid
+    // out-param.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("fstat the OpenCode scratch dir (fail-closed)");
+    }
+    // SAFETY: geteuid has no failure mode.
+    let euid = unsafe { libc::geteuid() };
+    validate_scratch_owner(st.st_uid, euid)?;
+    if u32::from(st.st_mode) & 0o077 != 0 {
+        // We own it (checked above), so tightening through the pinned fd is
+        // authoritative and race-free.
+        // SAFETY: fchmod on an fd we own.
+        if unsafe { libc::fchmod(fd.as_raw_fd(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("fchmod 0700 the OpenCode scratch dir (fail-closed)");
+        }
+    }
+    Ok(())
+}
+
+/// Pure ownership decision for the scratch dir: a foreign owner is refused
+/// (they could rename the dir under sticky `/tmp` and redirect the
+/// writable-bind, and its contents would be exposed to them).
+#[cfg(target_os = "macos")]
+fn validate_scratch_owner(st_uid: libc::uid_t, euid: libc::uid_t) -> Result<()> {
+    if st_uid != euid {
+        bail!(
+            "/tmp/opencode is owned by uid {st_uid}, not our euid {euid}; \
+             refusing the seatbelt scratch bind (fail-closed)"
+        );
+    }
+    Ok(())
 }
 
 /// Whether `/usr/bin/sandbox-exec` is present. Tests may force a missing
@@ -1395,9 +1517,10 @@ printf 'offline-ok'"#,
         assert!(format!("{err:#}").contains("not trusted"), "got {err:#}");
     }
 
-    /// SBX-03: execution stays `run_bounded_exporter` (file-backed stdout,
-    /// RLIMIT, process group, 3s wall clock, 16 MiB). Linux keep_fds store
-    /// fd is non-CLOEXEC.
+    /// SBX-03: execution stays `run_bounded_exporter` (file-backed stdout
+    /// with the 16 MiB poll cap, per-OS RLIMIT_FSIZE — strict on Linux, 8
+    /// GiB backstop on macOS (FIX-SBX-01) — process group, 3s wall clock).
+    /// Linux keep_fds store fd is non-CLOEXEC.
     #[tokio::test]
     async fn runner_controls_preserved() {
         assert_eq!(EXPORT_MAX_BYTES, 16 * 1024 * 1024);
@@ -1606,9 +1729,77 @@ printf 'offline-ok'"#,
             "store write segment missing in {joined}"
         );
         assert!(
+            joined.contains("(allow file-ioctl\n"),
+            "seatbelt must emit the generated bind-scoped file-ioctl section \
+             for SQLite WAL (the base policy's single-line tty ioctl clauses \
+             do not count): {joined}"
+        );
+        assert!(
+            joined.contains("/private/tmp/opencode") || joined.contains("/tmp/opencode"),
+            "narrow OpenCode scratch bind missing in {joined}"
+        );
+        assert!(
+            !joined
+                .lines()
+                .any(|l| l.ends_with("=/private/tmp") || l.ends_with("=/tmp")),
+            "must not bind whole host /tmp: {joined}"
+        );
+        assert!(
             !joined.contains("network-outbound"),
             "Denied network must keep the seatbelt network segment empty"
         );
+        let scratch = macos_opencode_scratch_bind().expect("scratch pin");
+        assert_eq!(
+            scratch.destination.as_os_str(),
+            "/private/tmp/opencode",
+            "scratch writable-bind must be exactly /private/tmp/opencode"
+        );
+    }
+
+    /// FIX-SBX-01 R2: a pre-existing wide-mode scratch dir we own (the dev
+    /// host ships /tmp/opencode as 0755) is tightened to 0700 through the
+    /// pinned fd, not accepted as-is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_scratch_bind_tightens_wide_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("opencode");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let expected = scratch.canonicalize().unwrap();
+        let bind = scratch_bind_under(tmp.path(), &expected).expect("owned wide dir tightened");
+        assert_eq!(bind.destination, expected);
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "group/other bits must be stripped");
+    }
+
+    /// FIX-SBX-01 R2: a scratch dir owned by another uid is refused —
+    /// its owner could rename it under sticky /tmp and redirect the bind.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_scratch_bind_rejects_foreign_owner() {
+        // SAFETY: geteuid has no failure mode.
+        let euid = unsafe { libc::geteuid() };
+        let err = validate_scratch_owner(euid.wrapping_add(1), euid)
+            .expect_err("foreign owner must be refused");
+        assert!(format!("{err:#}").contains("fail-closed"), "got {err:#}");
+        validate_scratch_owner(euid, euid).expect("our own dir is acceptable");
+    }
+
+    /// FIX-SBX-01: a symlink planted at the scratch path cannot redirect
+    /// the writable-bind (O_NOFOLLOW pin refuses it).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_scratch_bind_refuses_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("opencode")).unwrap();
+        let expected = target.canonicalize().unwrap();
+        let err = scratch_bind_under(tmp.path(), &expected)
+            .expect_err("symlinked scratch must be refused");
+        assert!(format!("{err:#}").contains("fail-closed"), "got {err:#}");
     }
 
     /// SBX-04: missing sandbox-exec → fail-closed, no unsandboxed export.

@@ -1405,23 +1405,30 @@ fn build_macos_file_write_policy(
         writable_folder_policies.push(format!("(require-all {} )", require_parts.join(" ")));
     }
 
+    let mut ioctl_folder_policies = Vec::new();
     for (bind_index, dest) in extra_write_dests.iter().enumerate() {
         let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
         let dest_param = format!("WRITABLE_BIND_{bind_index}");
         file_write_params.push((dest_param.clone(), canonical_dest));
-        writable_folder_policies.push(format!("(subpath (param \"{dest_param}\"))"));
+        let clause = format!("(subpath (param \"{dest_param}\"))");
+        writable_folder_policies.push(clause.clone());
+        // file-ioctl only on export writable-binds (SQLite F_FULLFSYNC),
+        // never on WorkspaceWrite roots which may include host /tmp.
+        ioctl_folder_policies.push(clause);
     }
 
     if writable_folder_policies.is_empty() {
         ("".to_string(), file_write_params)
     } else {
-        (
-            format!(
-                "(allow file-write*\n{}\n)",
-                writable_folder_policies.join(" ")
-            ),
-            file_write_params,
-        )
+        let folders = writable_folder_policies.join(" ");
+        let mut policy = format!("(allow file-write*\n{folders}\n)");
+        if !ioctl_folder_policies.is_empty() {
+            policy.push_str(&format!(
+                "\n(allow file-ioctl\n{}\n)",
+                ioctl_folder_policies.join(" ")
+            ));
+        }
+        (policy, file_write_params)
     }
 }
 
@@ -3148,6 +3155,24 @@ mod tests {
                 profile.contains("(subpath (param \"WRITABLE_BIND_0\"))"),
                 "missing store write subpath: {profile}"
             );
+            // The newline anchor selects the generated bind-scoped section;
+            // the base policy's single-line tty ioctl clauses must not
+            // satisfy this (they would make the check vacuous).
+            let ioctl = profile
+                .split("(allow file-ioctl\n")
+                .nth(1)
+                .expect("generated ioctl section must exist for the store bind")
+                .split("\n)")
+                .next()
+                .expect("generated ioctl section must close");
+            assert!(
+                !ioctl.contains("WRITABLE_ROOT_"),
+                "file-ioctl must not cover WorkspaceWrite roots: {profile}"
+            );
+            assert!(
+                ioctl.contains("WRITABLE_BIND_0"),
+                "file-ioctl must name the writable-bind: {profile}"
+            );
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3167,6 +3192,77 @@ mod tests {
                 "linux stand-in for seatbelt store write: --bind src dest in {args:?}"
             );
         }
+    }
+
+    /// FIX-SBX-01 R2: with a real WorkspaceWrite root in play, file-ioctl
+    /// must cover exactly the writable-binds and never the workspace roots —
+    /// and with no binds at all the ioctl section must not exist, so the
+    /// AgentRuntime WorkspaceWrite seatbelt profile stays byte-identical.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seam_seatbelt_ioctl_scoped_to_binds_only() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let root = cwd.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let store = cwd.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![root],
+            network_access: NetworkAccess::Denied,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+            allow_metadata_writes: false,
+        };
+        let manager = SandboxManager::new();
+        let profile_for = |binds: &[WritableBind]| -> String {
+            let env = manager
+                .transform(seam_readonly_request(&policy, cwd.path(), &[], binds, None))
+                .expect("seatbelt transform");
+            env.command
+                .windows(2)
+                .find(|w| w[0] == "-p")
+                .map(|w| w[1].clone())
+                .unwrap_or_default()
+        };
+
+        let binds = [WritableBind {
+            source: PathBuf::from("/proc/self/fd/4"),
+            destination: store,
+        }];
+        let with_bind = profile_for(&binds);
+        assert!(
+            with_bind.contains("WRITABLE_ROOT_0"),
+            "workspace root param must be present (non-vacuous fixture): {with_bind}"
+        );
+        // "(allow file-ioctl\n" (with the newline) is the generated
+        // bind-scoped section; the base policy's tty clauses are single-line
+        // "(allow file-ioctl (…)" and must not satisfy these assertions.
+        let ioctl = with_bind
+            .split("(allow file-ioctl\n")
+            .nth(1)
+            .expect("generated ioctl section must exist when binds are present")
+            .split("\n)")
+            .next()
+            .expect("generated ioctl section must close");
+        assert!(
+            ioctl.contains("WRITABLE_BIND_0"),
+            "file-ioctl must name the writable-bind: {with_bind}"
+        );
+        assert!(
+            !ioctl.contains("WRITABLE_ROOT_"),
+            "file-ioctl must not cover WorkspaceWrite roots: {with_bind}"
+        );
+
+        let without_bind = profile_for(&[]);
+        assert!(
+            without_bind.contains("WRITABLE_ROOT_0"),
+            "workspace root param must survive without binds: {without_bind}"
+        );
+        assert!(
+            !without_bind.contains("(allow file-ioctl\n"),
+            "no binds must mean no generated ioctl section (WorkspaceWrite \
+             profile byte-unchanged): {without_bind}"
+        );
     }
 
     #[cfg(target_os = "linux")]

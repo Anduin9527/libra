@@ -461,8 +461,10 @@ async fn opencode_export_binary_trust_revalidates() {
 }
 
 /// opencode_export_oversize_session_degrades: an over-cap export terminates
-/// the child (RLIMIT_FSIZE) and degrades to metadata-only — no truncated
-/// content claim, the write still succeeds.
+/// the child (the 16 MiB stdout poll on every OS; Linux additionally holds
+/// the strict RLIMIT_FSIZE write cap — FIX-SBX-01 keeps macOS at a coarse 8
+/// GiB disk backstop) and degrades to metadata-only — no truncated content
+/// claim, the write still succeeds.
 #[tokio::test]
 async fn opencode_export_oversize_session_degrades() {
     // 32 MiB of zeros — well past the 16 MiB cap.
@@ -532,7 +534,12 @@ async fn opencode_export_seatbelt_fake_exporter() {
         "/private/tmp/libra-sbx05-seatbelt-deny-{}",
         std::process::id()
     ));
+    let scratch_probe = std::path::PathBuf::from(format!(
+        "/tmp/opencode/libra-sbx-fix-probe-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&host_tmp);
+    let _ = std::fs::remove_file(&scratch_probe);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
     let port = listener.local_addr().expect("addr").port();
@@ -561,6 +568,7 @@ async fn opencode_export_seatbelt_fake_exporter() {
         r#"touch "{store}" || {{ echo store-unwritable >&2; exit 4; }}
 if echo x > "{outside}"; then echo host-write-open >&2; exit 5; fi
 if echo x > "{host_tmp}"; then echo host-tmp-open >&2; exit 8; fi
+touch "{scratch}" || {{ echo scratch-unwritable >&2; exit 9; }}
 command -v python3 >/dev/null || {{ echo python3-missing >&2; exit 7; }}
 if python3 -c "import socket; socket.create_connection(('127.0.0.1', {port}), 1)"; then
   echo net-open >&2; exit 6
@@ -570,6 +578,7 @@ printf '{{"info":{{}},"messages":[]}}'
         store = store_probe.display(),
         outside = outside.display(),
         host_tmp = host_tmp.display(),
+        scratch = scratch_probe.display(),
         port = port,
     );
     std::fs::write(&exporter, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -605,7 +614,12 @@ printf '{{"info":{{}},"messages":[]}}'
         !host_tmp.exists(),
         "write to host /private/tmp sibling must stay denied (not a host-/tmp bind)"
     );
+    assert!(
+        scratch_probe.exists(),
+        "exporter must be able to write inside /tmp/opencode (FIX-SBX-01 narrow scratch)"
+    );
     let _ = std::fs::remove_file(&host_tmp);
+    let _ = std::fs::remove_file(&scratch_probe);
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = accept_thread.join();
     assert!(
