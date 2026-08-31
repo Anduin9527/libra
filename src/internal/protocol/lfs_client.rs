@@ -1197,11 +1197,9 @@ mod tests {
     }
 
     fn test_lfs_client(base_url: &str) -> LFSClient {
-        LFSClient {
-            batch_url: Url::parse(&format!("{base_url}objects/batch")).unwrap(),
-            lfs_url: Url::parse(base_url).unwrap(),
-            client: Client::builder().no_proxy().build().unwrap(),
-        }
+        let mut client = LFSClient::from_remote_url(base_url).unwrap();
+        client.client = Client::builder().no_proxy().build().unwrap();
+        client
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

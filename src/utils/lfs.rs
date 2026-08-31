@@ -172,13 +172,21 @@ fn generate_git_lfs_server_url(mut url: String) -> String {
 /// Preserve repository scope for Mega's standard `/info/lfs` router.
 /// Example: `http://localhost:8000/project/demo` becomes
 /// `http://localhost:8000/project/demo.git/info/lfs`.
+/// A host-only HTTP remote keeps the legacy root LFS endpoints.
 fn generate_mono_lfs_server_url(url: String) -> String {
+    if let Ok(mut parsed) = Url::parse(&url)
+        && matches!(parsed.scheme(), "http" | "https")
+        && parsed.path().trim_end_matches('/').is_empty()
+    {
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
     generate_git_lfs_server_url(url)
 }
 
 /// Generate LFS Server Url from repo Url.
 /// - Automatically detect git or mono repo by domain
-/// - Caution: without trailing slash `/`
+/// - Callers normalize the trailing slash before joining endpoint paths.
 pub fn generate_lfs_server_url(url_str: String) -> String {
     let url = match Url::parse(&url_str) {
         Ok(url) => url,
@@ -543,6 +551,17 @@ mod tests {
             generate_lfs_server_url(LOCAL_LFS_SERVER_URL.to_owned()),
             "http://localhost:8000/xxx/yyy.git/info/lfs"
         );
+        for (remote, expected) in [
+            ("http://127.0.0.1:8000", "http://127.0.0.1:8000/"),
+            ("http://localhost:8000/", "http://localhost:8000/"),
+            ("https://gitmono.com", "https://gitmono.com/"),
+            (
+                "http://[::1]:8000/?tenant=one#ref",
+                "http://[::1]:8000/?tenant=one",
+            ),
+        ] {
+            assert_eq!(generate_lfs_server_url(remote.to_owned()), expected);
+        }
     }
 
     #[test]

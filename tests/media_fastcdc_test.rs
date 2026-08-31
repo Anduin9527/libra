@@ -262,7 +262,7 @@ fn relative_reassembly_target_is_replaced_only_after_verification() {
 /// See Mega docs/lfs-api.md for the two-process invocation.
 #[tokio::test]
 #[ignore = "requires Mega serve_libra_interop and MEGA_FASTCDC_READY_FILE"]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 async fn mega_fastcdc_http_interop() {
     use libra::{
         internal::protocol::lfs_client::LFSClient,

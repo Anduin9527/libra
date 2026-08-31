@@ -338,7 +338,7 @@ recorded, with its governing number, in
 | log | common-user-flow | porcelain-machine, config-aware, plumbing-compatible | — | — |
 | ls-files | conflict-aware | common-user-flow, porcelain-machine, plumbing-compatible | — | — |
 | ls-remote | common-user-flow | plumbing-compatible | — | — |
-| media | intentionally-different | Feature-gated FastCDC extension (`fastcdc`, default OFF): chunk, inspect, verify, probe; versioned manifests and raw SHA-256 chunks outside the Git object graph. Feature-enabled LFS transfers use Mega's authenticated user/repository-scoped media protocol for missing-chunk uploads, verified finalize with full standard-LFS fallback, and cached-chunk downloads with atomic destination replacement. Frozen in-tree `fastcdc-v1` parameters; `media_oid` is always full-content SHA-256. Other remotes use standard LFS; `lfs.fastcdc=false` disables the extension. Shared repository ACLs, server orphan GC/quota/fsck/heal/obliteration and range hydration remain deferred. See `docs/commands/media.md`. |
+| media | — | config-aware | — | common-user-flow |
 | merge | — | common-user-flow, conflict-aware, config-aware | — | — |
 | pull | common-user-flow | porcelain-machine, config-aware | — | — |
 | push | common-user-flow | porcelain-machine, config-aware | — | — |

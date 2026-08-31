@@ -37,6 +37,9 @@ repository path (`<repo>.git/info/lfs`); capability discovery uses
 `libra/media/v1/capabilities` below that URL. Set `libra config lfs.fastcdc false`
 to disable the extension in a repository.
 
+Host-only HTTP remotes retain the legacy root LFS endpoints (for example,
+`http://localhost:8000/locks`). Use a repository path for scoped FastCDC transfers.
+
 Normal LFS uploads send missing chunks and finalize a verified full object;
 downloads reuse verified local chunks. Standard LFS pointers remain unchanged,
 and unsupported remotes or missing manifests use full-object LFS. Mega isolates
