@@ -273,8 +273,11 @@ export LIBRA_E2E_REQUIRE=1                         # fail-closed (completion evi
 pnpm --dir web test:e2e
 ```
 
-CI job `compat-web-e2e` (`.github/workflows/base.yml`) builds `--features test-provider`,
-starts the deterministic runtime, installs Chromium, and runs `test:e2e` with
+CI job `compat-web-e2e` (`.github/workflows/base.yml`) — **temporarily disabled
+2026-08-31** (self-hosted runner `sudo` cannot complete
+`playwright install --with-deps`; restore from git history once the runner
+regains passwordless sudo) — builds `--features test-provider`, starts the
+deterministic runtime, installs Chromium, and runs `test:e2e` with
 `LIBRA_E2E_REQUIRE=1`. Soft-skip is refused there.
 
 Without `LIBRA_E2E_REQUIRE=1` / `CI=true`, missing Chromium or unreachable
