@@ -528,6 +528,11 @@ async fn opencode_export_seatbelt_fake_exporter() {
     std::fs::create_dir_all(&bin_dir).unwrap();
     let outside = home.join("outside-store");
     let store_probe = xdg.join("opencode").join("probe");
+    let host_tmp = std::path::PathBuf::from(format!(
+        "/private/tmp/libra-sbx05-seatbelt-deny-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&host_tmp);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
     let port = listener.local_addr().expect("addr").port();
@@ -555,6 +560,7 @@ async fn opencode_export_seatbelt_fake_exporter() {
     let body = format!(
         r#"touch "{store}" || {{ echo store-unwritable >&2; exit 4; }}
 if echo x > "{outside}"; then echo host-write-open >&2; exit 5; fi
+if echo x > "{host_tmp}"; then echo host-tmp-open >&2; exit 8; fi
 command -v python3 >/dev/null || {{ echo python3-missing >&2; exit 7; }}
 if python3 -c "import socket; socket.create_connection(('127.0.0.1', {port}), 1)"; then
   echo net-open >&2; exit 6
@@ -563,6 +569,7 @@ printf '{{"info":{{}},"messages":[]}}'
 "#,
         store = store_probe.display(),
         outside = outside.display(),
+        host_tmp = host_tmp.display(),
         port = port,
     );
     std::fs::write(&exporter, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -594,6 +601,11 @@ printf '{{"info":{{}},"messages":[]}}'
         !outside.exists(),
         "write outside the store must be denied by seatbelt"
     );
+    assert!(
+        !host_tmp.exists(),
+        "write to host /private/tmp sibling must stay denied (not a host-/tmp bind)"
+    );
+    let _ = std::fs::remove_file(&host_tmp);
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = accept_thread.join();
     assert!(
