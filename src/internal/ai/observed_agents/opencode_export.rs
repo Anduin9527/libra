@@ -26,11 +26,14 @@
 //!   (GC-DR-13). A child that leaves descendants in its process group after
 //!   exit is killed without its output being accepted.
 //!
-//! Sandbox: the Required bwrap offline profile lives in
-//! [`run_export_subprocess_sandboxed`] — network unshared, host paths and
+//! Sandbox: the Required offline profile lives in
+//! [`run_export_subprocess_sandboxed`] — assembled via
+//! `SandboxManager::transform`. Linux: network unshared, host paths and
 //! HOME read-only, tmpfs `/tmp`, with ONE probe-verified exception: the
 //! opencode data dir is bound read-write because its WAL-mode SQLite store
-//! needs write access even for reads. Fail-closed without bwrap/non-Linux.
+//! needs write access even for reads. macOS: seatbelt (`sandbox-exec`)
+//! denies host writes outside the store and network; reads are not confined.
+//! Fail-closed without a usable sandbox backend.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -407,24 +410,24 @@ async fn run_bounded_exporter(
 /// (`SandboxEnforcement::Required` semantics). Assembly is delegated to
 /// [`crate::internal::ai::sandbox::SandboxManager::transform`]; execution
 /// stays in [`run_bounded_exporter`] (file-backed stdout, `RLIMIT_FSIZE`,
-/// process group, wall clock, 16 MiB). Linux uses trusted bwrap. Fail-CLOSED
-/// when the sandbox cannot be provided (bwrap missing, non-Linux): the
-/// capability is unavailable — never a degraded unsandboxed run (GC-DR-14).
-/// macOS stays fail-closed here until SBX-04 enables seatbelt.
+/// process group, wall clock, 16 MiB). Linux uses trusted bwrap; macOS uses
+/// seatbelt (`sandbox-exec`). Fail-CLOSED when the sandbox cannot be
+/// provided: the capability is unavailable — never a degraded unsandboxed
+/// run (GC-DR-14).
 pub async fn run_export_subprocess_sandboxed(
     binary: &std::path::Path,
     session_id: &str,
     limits: ExportLimits,
 ) -> Result<Vec<u8>> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (binary, session_id, limits);
         bail!(
-            "the OpenCode export sandbox profile is Linux-only for now; \
-             refusing an unsandboxed export (fail-closed, GC-DR-14)"
+            "the OpenCode export sandbox profile requires Linux bubblewrap or \
+             macOS seatbelt; refusing an unsandboxed export (fail-closed, GC-DR-14)"
         );
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if !valid_session_id(session_id) {
             bail!("invalid OpenCode session id (expected alnum/dash/underscore, ≤64 chars)");
@@ -432,8 +435,20 @@ pub async fn run_export_subprocess_sandboxed(
         if !binary.is_absolute() {
             bail!("exporter binary path must be absolute (trusted provenance)");
         }
-        let bwrap = resolve_trusted_bwrap()?;
-        let assembled = assemble_sandboxed_export(binary, &bwrap)?;
+        #[cfg(target_os = "linux")]
+        let trusted_bwrap = Some(resolve_trusted_bwrap()?);
+        #[cfg(target_os = "macos")]
+        let trusted_bwrap: Option<PathBuf> = {
+            if !sandbox_exec_available() {
+                bail!(
+                    "macOS seatbelt (sandbox-exec) is required for the OpenCode \
+                     export sandbox and was not found; refusing an unsandboxed \
+                     export (fail-closed, GC-DR-14)"
+                );
+            }
+            None
+        };
+        let assembled = assemble_sandboxed_export(binary, trusted_bwrap.as_deref())?;
         run_bounded_exporter(
             &assembled.program,
             &assembled.pre_args,
@@ -446,40 +461,36 @@ pub async fn run_export_subprocess_sandboxed(
 }
 
 /// Assembled Required-sandbox argv plus caller-held store fds.
-/// `program` is the trusted bwrap; `pre_args` is everything transform placed
-/// after it (including `--` and the exporter binary). `export <sid>` is
-/// appended by [`run_bounded_exporter`].
-#[cfg(target_os = "linux")]
+/// `program` is the sandbox backend (trusted bwrap or `sandbox-exec`);
+/// `pre_args` is everything transform placed after it (including `--` and
+/// the exporter binary). `export <sid>` is appended by [`run_bounded_exporter`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct AssembledExport {
     program: PathBuf,
     pre_args: Vec<String>,
     keep_fds: PinnedFds,
 }
 
-/// Assemble the export bwrap vector through `SandboxManager::transform`.
+/// Assemble the export sandbox vector through `SandboxManager::transform`.
 ///
-/// `trusted_bwrap` is the integrity-checked product of
-/// [`resolve_trusted_bwrap`]. Transform consumes it via `trusted_bwrap_exe`
-/// and does not rediscover `LIBRA_BWRAP_BINARY` or `linux_sandbox_exe`.
-/// Retained store fds stay with the caller (`keep_fds`); they never enter
-/// `ExecEnv`.
-#[cfg(target_os = "linux")]
+/// On Linux, `trusted_bwrap` is the integrity-checked product of
+/// [`resolve_trusted_bwrap`] and is consumed via `trusted_bwrap_exe` (no
+/// `LIBRA_BWRAP_BINARY` / `linux_sandbox_exe` rediscovery). On macOS it is
+/// `None` and `select_initial` chooses seatbelt. Retained store fds stay
+/// with the caller (`keep_fds`); they never enter `ExecEnv`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assemble_sandboxed_export(
     binary: &std::path::Path,
-    trusted_bwrap: &std::path::Path,
+    trusted_bwrap: Option<&std::path::Path>,
 ) -> Result<AssembledExport> {
-    use std::os::fd::AsRawFd;
-
     use crate::internal::ai::sandbox::{
         CommandSpec, SandboxEnforcement, SandboxManager, SandboxPermissions, SandboxPolicy,
         SandboxTransformRequest, WritableBind,
     };
 
-    // ReadOnly + Denied network: policy cwd is ro-bound, /tmp is tmpfs, net
-    // is unshared. cwd must not be /tmp (that would shadow the tmpfs). Use
-    // the binary's parent, which the builder already ro-binds as the empty
-    // writable-roots fallback. The command tail is only the binary;
-    // `export <sid>` is appended by the shared runner.
+    // ReadOnly + Denied network. cwd must not be /tmp (Linux tmpfs shadow).
+    // Use the binary's parent, which the bwrap builder already ro-binds as
+    // the empty writable-roots fallback.
     let sandbox_cwd = binary
         .parent()
         .map(std::path::Path::to_path_buf)
@@ -494,21 +505,39 @@ fn assemble_sandboxed_export(
             extra_ro.push(dir);
         }
     }
-    // Binary parent is already `--ro-bind`ed as `sandbox_cwd` (ReadOnly
-    // empty writable-roots fallback). ADR-SBX-02 same-effect mount table
-    // allows omitting the trailing defensive duplicate.
 
     let mut keep_fds: PinnedFds = Vec::new();
     let mut writable_binds = Vec::new();
-    // WAL-mode SQLite needs WRITE even for reads. Pin the store inode and
-    // bind `/proc/self/fd/N → dest` after HOME/XDG ro-binds so the RW mount
-    // wins. The retained fd stays in `keep_fds` (non-CLOEXEC).
-    if let Some((fd, dest)) = pin_opencode_store() {
-        writable_binds.push(WritableBind {
-            source: PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
-            destination: PathBuf::from(dest),
-        });
-        keep_fds.push(fd);
+    // WAL-mode SQLite needs WRITE even for reads. Linux binds
+    // `/proc/self/fd/N → dest`; macOS seatbelt allows `file-write*` on the
+    // F_GETPATH destination (path-level, ADR-SBX-03).
+    match pin_opencode_store() {
+        Ok(Some((fd, dest))) => {
+            let dest_path = PathBuf::from(dest);
+            let source = {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::fd::AsRawFd;
+                    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    dest_path.clone()
+                }
+            };
+            writable_binds.push(WritableBind {
+                source,
+                destination: dest_path,
+            });
+            keep_fds.push(fd);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(err).context(
+                "failed to resolve the pinned OpenCode store path; refusing \
+                 an unsandboxed export (fail-closed)",
+            );
+        }
     }
 
     let spec = CommandSpec {
@@ -534,7 +563,7 @@ fn assemble_sandboxed_export(
             deny_read_paths: &[],
             extra_ro_bind_paths: &extra_ro,
             writable_binds: &writable_binds,
-            trusted_bwrap_exe: Some(trusted_bwrap),
+            trusted_bwrap_exe: trusted_bwrap,
             seccomp_policy_path: None,
         })
         .context(
@@ -552,6 +581,17 @@ fn assemble_sandboxed_export(
         pre_args: command,
         keep_fds,
     })
+}
+
+/// Whether `/usr/bin/sandbox-exec` is present. Tests may force a missing
+/// backend via [`macos_test_hooks`].
+#[cfg(target_os = "macos")]
+fn sandbox_exec_available() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = macos_test_hooks::SANDBOX_EXEC_AVAILABLE.with(|c| c.get()) {
+        return forced;
+    }
+    std::path::Path::new("/usr/bin/sandbox-exec").is_file()
 }
 
 #[cfg(target_os = "linux")]
@@ -717,41 +757,191 @@ pub fn trusted_bwrap_available() -> bool {
 /// Pin the OpenCode WAL store for a race-safe RW bind, returning the pinned fd
 /// and the sandbox destination path (where the exporter expects its store).
 /// Reads the data root from `XDG_DATA_HOME` (absolute) or `HOME/.local/share`.
-#[cfg(target_os = "linux")]
-fn pin_opencode_store() -> Option<(std::os::fd::OwnedFd, String)> {
-    let base = std::env::var_os("XDG_DATA_HOME")
+///
+/// Missing/unpinnable store → `Ok(None)` (skip the RW exception). A successful
+/// pin whose destination cannot be resolved (macOS `F_GETPATH` failure) is
+/// `Err` (fail-closed).
+#[cfg(unix)]
+fn pin_opencode_store() -> Result<Option<(std::os::fd::OwnedFd, String)>> {
+    pin_opencode_store_with(resolve_store_destination)
+}
+
+#[cfg(unix)]
+fn pin_opencode_store_with(
+    resolve: impl FnOnce(&std::os::fd::OwnedFd, &std::path::Path) -> Result<String>,
+) -> Result<Option<(std::os::fd::OwnedFd, String)>> {
+    let Some(base) = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .map(|h| h.join(".local/share"))
-        })?;
+        })
+    else {
+        return Ok(None);
+    };
     match pin_store_under(&base) {
         Ok(fd) => {
-            let dest = base.join("opencode").to_string_lossy().into_owned();
-            Some((fd, dest))
+            let dest = resolve(&fd, &base)?;
+            Ok(Some((fd, dest)))
         }
         Err(err) => {
-            tracing::warn!(
-                error = %format!("{err:#}"),
-                base = %base.display(),
-                "cannot pin opencode data dir for RW bind; skipping (export may degrade)"
-            );
-            None
+            let absent = err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            });
+            if absent {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    base = %base.display(),
+                    "cannot pin opencode data dir for RW bind; skipping (export may degrade)"
+                );
+                return Ok(None);
+            }
+            Err(err).context(
+                "OpenCode store exists but could not be pinned (symlink/non-directory \
+                 or other pin failure); refusing an unsandboxed export (fail-closed)",
+            )
         }
     }
 }
 
-/// Resolution + pin as ONE atomic `openat` (Codex M3 R4 P1): open the data
-/// root, then `openat` the literal `opencode` entry with
-/// `O_PATH|O_DIRECTORY|O_NOFOLLOW`. Because the returned fd IS the validated
-/// directory — there is no separate `stat` then re-`open` of the same path —
-/// a concurrent rename/exchange of `opencode` between validation and bind
-/// cannot make the bound directory differ from the checked one. `O_NOFOLLOW`
-/// rejects a symlinked entry; `O_DIRECTORY` requires a directory. CLOEXEC is
-/// cleared so the bwrap child inherits the fd for `/proc/self/fd/N` resolution.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+fn resolve_store_destination(fd: &std::os::fd::OwnedFd, base: &std::path::Path) -> Result<String> {
+    #[cfg(test)]
+    if let Some(forced) = PIN_PATH_RESOLVER.with(|slot| *slot.borrow()) {
+        return forced(fd, base);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        Ok(base.join("opencode").to_string_lossy().into_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = base;
+        resolve_pinned_store_path(fd).map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (fd, base);
+        bail!(
+            "OpenCode store pin destination resolution is only implemented on \
+             Linux and macOS; refusing (fail-closed)"
+        )
+    }
+}
+
+/// macOS path-level pin: `fcntl(F_GETPATH)` then re-check the snapshot is an
+/// existing directory. Failure is fail-closed (ADR-SBX-02/03).
+#[cfg(target_os = "macos")]
+fn resolve_pinned_store_path(fd: &std::os::fd::OwnedFd) -> Result<PathBuf> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX
+    // bytes into our buffer; the fd is owned by us.
+    let rc = unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_GETPATH,
+            buf.as_mut_ptr() as *mut libc::c_char,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("F_GETPATH on pinned OpenCode store fd");
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len]));
+    if !path.is_absolute() {
+        bail!(
+            "F_GETPATH returned a non-absolute path {}; refusing (fail-closed)",
+            path.display()
+        );
+    }
+    let meta = std::fs::metadata(&path).with_context(|| {
+        format!(
+            "pinned store path {} vanished after F_GETPATH; refusing (fail-closed)",
+            path.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        bail!(
+            "pinned store path {} is not a directory; refusing (fail-closed)",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+#[cfg(test)]
+type PinPathResolver = fn(&std::os::fd::OwnedFd, &std::path::Path) -> Result<String>;
+
+#[cfg(test)]
+thread_local! {
+    static PIN_PATH_RESOLVER: std::cell::RefCell<Option<PinPathResolver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static SANDBOX_EXEC_AVAILABLE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub struct SandboxExecMissingGuard {
+        previous: Option<bool>,
+    }
+
+    impl SandboxExecMissingGuard {
+        pub fn install() -> Self {
+            let previous = SANDBOX_EXEC_AVAILABLE.with(|c| c.replace(Some(false)));
+            Self { previous }
+        }
+    }
+
+    impl Drop for SandboxExecMissingGuard {
+        fn drop(&mut self) {
+            SANDBOX_EXEC_AVAILABLE.with(|c| c.set(self.previous));
+        }
+    }
+
+    /// Injects a `F_GETPATH` resolver for `macos_pin_fgetpath_failure`.
+    /// Lives here (not in `mod tests`) so Linux `cfg(test)` builds do not
+    /// define an unused type under `clippy -D warnings`.
+    pub struct PinPathResolverGuard {
+        previous: Option<super::PinPathResolver>,
+    }
+
+    impl PinPathResolverGuard {
+        pub fn install(resolver: super::PinPathResolver) -> Self {
+            let previous = super::PIN_PATH_RESOLVER.with(|slot| slot.replace(Some(resolver)));
+            Self { previous }
+        }
+    }
+
+    impl Drop for PinPathResolverGuard {
+        fn drop(&mut self) {
+            super::PIN_PATH_RESOLVER.with(|slot| slot.replace(self.previous));
+        }
+    }
+}
+
+/// Resolution + pin as ONE atomic `openat`: open the data root, then `openat`
+/// the literal `opencode` entry with `O_DIRECTORY|O_NOFOLLOW`. Because the
+/// returned fd IS the validated directory, a concurrent rename/exchange of
+/// `opencode` cannot make the bound directory differ from the checked one.
+/// `O_NOFOLLOW` rejects a symlinked entry; `O_DIRECTORY` requires a directory.
+///
+/// Linux uses `O_PATH` and clears CLOEXEC so bwrap can bind `/proc/self/fd/N`.
+/// macOS has no `O_PATH`; it opens `O_RDONLY` and keeps CLOEXEC — seatbelt
+/// matches the `F_GETPATH` snapshot, not the fd (ADR-SBX-03).
+#[cfg(unix)]
 fn pin_store_under(base: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
     use std::os::{
         fd::{AsRawFd, FromRawFd},
@@ -763,13 +953,14 @@ fn pin_store_under(base: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
     // Anchor the child lookup to a handle on the data root. Following symlinks
     // in the root's own ancestry is fine — only the final `opencode` component
     // must not be a symlink, which the openat below enforces.
+    #[cfg(target_os = "linux")]
+    let base_flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let base_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let base_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: base_c is a valid C string; the fd is wrapped for RAII below.
-    let base_raw = unsafe {
-        libc::open(
-            base_c.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
+    let base_raw = unsafe { libc::open(base_c.as_ptr(), base_flags) };
     if base_raw < 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("open opencode data root {}", base.display()));
@@ -779,30 +970,32 @@ fn pin_store_under(base: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
 
     // INVARIANT: a constant literal with no interior NUL.
     let name = std::ffi::CString::new("opencode").expect("literal has no NUL");
+    #[cfg(target_os = "linux")]
+    let child_flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let child_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: base_fd is a valid dir fd; name is a valid C string; the result
     // is wrapped for RAII.
-    let raw = unsafe {
-        libc::openat(
-            base_fd.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
+    let raw = unsafe { libc::openat(base_fd.as_raw_fd(), name.as_ptr(), child_flags) };
     if raw < 0 {
         return Err(std::io::Error::last_os_error())
             .context("pin opencode store (openat, no-follow directory)");
     }
     // SAFETY: fresh owned fd from openat(2).
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    // Clear CLOEXEC so the bwrap child inherits it and can resolve
-    // /proc/self/fd/N when it establishes the bind mount.
-    // SAFETY: fcntl on our own fd; F_GETFD/F_SETFD have no memory effects.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error()).context("F_GETFD on pinned store fd");
-    }
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("clear CLOEXEC on pinned store fd");
+    #[cfg(target_os = "linux")]
+    {
+        // Clear CLOEXEC so the bwrap child inherits it and can resolve
+        // /proc/self/fd/N when it establishes the bind mount.
+        // SAFETY: fcntl on our own fd; F_GETFD/F_SETFD have no memory effects.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error()).context("F_GETFD on pinned store fd");
+        }
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("clear CLOEXEC on pinned store fd");
+        }
     }
     Ok(fd)
 }
@@ -1292,19 +1485,151 @@ printf 'offline-ok'"#,
         }
     }
 
-    /// SBX-03: macOS export remains fail-closed (seatbelt enable is SBX-04).
+    /// SBX-04: pin succeeds on a real directory, rejects a non-directory, and
+    /// rejects a symlink (O_NOFOLLOW). Production classification
+    /// (`pin_opencode_store`) treats only an absent store as `Ok(None)`.
     #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn macos_kept_fail_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = fake_exporter(dir.path(), "echo hi");
-        let err = run_export_subprocess_sandboxed(&bin, "sess", ExportLimits::default())
-            .await
-            .expect_err("macOS must stay fail-closed until SBX-04");
+    #[serial_test::serial(export_sandbox_env)]
+    #[test]
+    fn macos_pin_three_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", tmp.path().to_str().expect("utf8"));
+        let store = tmp.path().join("opencode");
+        std::fs::create_dir(&store).unwrap();
+        pin_store_under(tmp.path()).expect("pin real opencode dir");
+        assert!(
+            pin_opencode_store()
+                .expect("present store Result")
+                .is_some(),
+            "real store must pin"
+        );
+
+        std::fs::remove_dir_all(&store).unwrap();
+        assert!(
+            pin_opencode_store().expect("absent store Result").is_none(),
+            "absent store must skip (Ok(None))"
+        );
+
+        std::fs::write(&store, b"not-a-dir").unwrap();
+        assert!(
+            pin_store_under(tmp.path()).is_err(),
+            "non-directory opencode entry must be refused"
+        );
+        assert!(
+            pin_opencode_store().is_err(),
+            "non-directory store must fail closed, not skip"
+        );
+
+        std::fs::remove_file(&store).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), &store).unwrap();
+        assert!(
+            pin_store_under(tmp.path()).is_err(),
+            "symlinked opencode entry must be refused"
+        );
+        assert!(
+            pin_opencode_store().is_err(),
+            "symlink store must fail closed, not skip"
+        );
+    }
+
+    /// SBX-04: F_GETPATH / canonical path resolution failure is fail-closed.
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(export_sandbox_env)]
+    #[test]
+    fn macos_pin_fgetpath_failure() {
+        fn fail_resolve(_: &std::os::fd::OwnedFd, _: &std::path::Path) -> Result<String> {
+            bail!("injected F_GETPATH failure");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("opencode")).unwrap();
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", tmp.path().to_str().expect("utf8"));
+        let _guard = macos_test_hooks::PinPathResolverGuard::install(fail_resolve);
+        let err = pin_opencode_store().expect_err("F_GETPATH failure must fail closed");
         let text = format!("{err:#}");
         assert!(
-            text.contains("Linux-only") && text.contains("fail-closed"),
-            "expected Linux-only fail-closed bail, got {text}"
+            text.contains("F_GETPATH") || text.contains("injected"),
+            "got {text}"
+        );
+    }
+
+    /// SBX-04: macOS pin shares `pin_store_under` with Linux.
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(export_sandbox_env)]
+    #[test]
+    fn macos_pin_shares_pin_store_under() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("opencode")).unwrap();
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", tmp.path().to_str().expect("utf8"));
+        let under = pin_store_under(tmp.path()).expect("pin_store_under");
+        let (fd, dest) = pin_opencode_store()
+            .expect("pin_opencode_store Result")
+            .expect("store present");
+        let via_fgetpath = resolve_pinned_store_path(&under).expect("F_GETPATH");
+        assert_eq!(
+            PathBuf::from(&dest),
+            via_fgetpath,
+            "pin_opencode_store must use pin_store_under + F_GETPATH dest"
+        );
+        drop(fd);
+    }
+
+    /// SBX-04: transform on macOS selects seatbelt (`sandbox-exec`).
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(export_sandbox_env)]
+    #[test]
+    fn macos_transform_selects_seatbelt() {
+        assert!(
+            std::path::Path::new("/usr/bin/sandbox-exec").is_file(),
+            "sandbox-exec must be present (DEP-SBX-02)"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let bin = fake_exporter(&bin_dir, r#"printf 'ok'"#);
+        let store_root = tmp.path().join("xdg");
+        std::fs::create_dir_all(store_root.join("opencode")).unwrap();
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", store_root.to_str().expect("utf8"));
+        let assembled = assemble_sandboxed_export(&bin, None).expect("macOS transform");
+        assert_eq!(
+            assembled.program.as_os_str(),
+            "/usr/bin/sandbox-exec",
+            "transform must select seatbelt, got {}",
+            assembled.program.display()
+        );
+        let joined = assembled.pre_args.join("\n");
+        assert!(
+            assembled.pre_args.iter().any(|a| a == "-p"),
+            "seatbelt profile missing in {joined}"
+        );
+        assert!(
+            joined.contains("(allow file-write*") || joined.contains("WRITABLE_BIND_"),
+            "store write segment missing in {joined}"
+        );
+        assert!(
+            !joined.contains("network-outbound"),
+            "Denied network must keep the seatbelt network segment empty"
+        );
+    }
+
+    /// SBX-04: missing sandbox-exec → fail-closed, no unsandboxed export.
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(export_sandbox_env)]
+    #[tokio::test]
+    async fn macos_sandbox_exec_missing_degrades() {
+        let _missing = macos_test_hooks::SandboxExecMissingGuard::install();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
+        let err = run_export_subprocess_sandboxed(&bin, "sess", ExportLimits::default())
+            .await
+            .expect_err("missing sandbox-exec must fail closed");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("sandbox-exec") && text.contains("fail-closed"),
+            "got {text}"
+        );
+        assert!(
+            !text.contains("unsandboxed export ran"),
+            "must not fall back to unsandboxed execution: {text}"
         );
     }
 
@@ -1368,7 +1693,8 @@ printf 'offline-ok'"#,
             EnvVarGuard::set("XDG_CONFIG_HOME", xdg_config.to_str().expect("utf8 config"));
 
         let trusted = system_true_binary();
-        let assembled = assemble_sandboxed_export(&bin, &trusted).expect("assemble export sandbox");
+        let assembled =
+            assemble_sandboxed_export(&bin, Some(&trusted)).expect("assemble export sandbox");
         let args = &assembled.pre_args;
         let home_s = home.to_string_lossy().into_owned();
         let data_s = xdg_data.to_string_lossy().into_owned();
@@ -1428,7 +1754,7 @@ printf 'offline-ok'"#,
         let fake = dir.path().join("bwrap");
         std::fs::write(&fake, b"#!/bin/sh\nexec \"$@\"\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err = assemble_sandboxed_export(&bin, &fake)
+        let err = assemble_sandboxed_export(&bin, Some(&fake))
             .expect_err("user-writable bwrap must fail closed");
         let text = format!("{err:#}");
         assert!(
@@ -1448,8 +1774,8 @@ printf 'offline-ok'"#,
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
         let missing = dir.path().join("no-such-bwrap");
-        let err =
-            assemble_sandboxed_export(&bin, &missing).expect_err("missing bwrap must fail closed");
+        let err = assemble_sandboxed_export(&bin, Some(&missing))
+            .expect_err("missing bwrap must fail closed");
         let text = format!("{err:#}");
         assert!(
             text.contains("Required")
@@ -1481,7 +1807,7 @@ printf 'offline-ok'"#,
         );
         let trusted = system_true_binary();
         let assembled =
-            assemble_sandboxed_export(&bin, &trusted).expect("injected trusted_bwrap_exe");
+            assemble_sandboxed_export(&bin, Some(&trusted)).expect("injected trusted_bwrap_exe");
         let program = assembled
             .program
             .canonicalize()
@@ -1503,13 +1829,11 @@ printf 'offline-ok'"#,
         );
     }
 
-    #[cfg(target_os = "linux")]
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
     }
 
-    #[cfg(target_os = "linux")]
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
@@ -1521,7 +1845,6 @@ printf 'offline-ok'"#,
         }
     }
 
-    #[cfg(target_os = "linux")]
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             // SAFETY: callers are serialized with `#[serial_test::serial(export_sandbox_env)]`.
