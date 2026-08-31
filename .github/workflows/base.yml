@@ -505,3 +505,70 @@ jobs:
       # GitHub required-checks.
       - name: Run network-remote tests
         run: cargo test --features test-network --test network_remotes_test -- --test-threads=1
+
+  # plan-20260830 SBX-03 / DEP-SBX-03: Linux-only export-bridge e2e with a
+  # trusted bwrap preflight. compat-offline-core is self-hosted and does not
+  # guarantee Linux+apt+bwrap, so this job is the D-group oracle
+  # (`runs-on: ubuntu-latest`, uname pin, apt install bubblewrap, named
+  # gates must not skip).
+  opencode-export-linux:
+    name: opencode-export-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+      LIBRA_SKIP_WEB_BUILD: "1"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Pin Linux platform
+        run: |
+          test "$(uname -s)" = "Linux" || {
+            echo "FAIL: uname -s is $(uname -s), expected Linux"
+            exit 1
+          }
+
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          command -v bwrap
+          bwrap --version
+
+      - name: Run Linux export sandbox gates
+        run: |
+          set -euo pipefail
+          list=$(cargo test --lib internal::ai::observed_agents::opencode_export -- --list) \
+            || { echo "ERROR: --list failed"; exit 2; }
+          run_gate() {
+            full=$(printf '%s\n' "$list" | sed -n "s/^\(.*::$1\): test$/\1/p" | head -n1)
+            [ -n "$full" ] || { echo "FAIL: $1 missing"; exit 1; }
+            cargo test --lib "$full" -- --exact --include-ignored \
+              || { echo "FAIL: $1"; exit 1; }
+          }
+          run_gate runner_controls_preserved
+          run_gate trusted_bwrap_preflight
+          run_gate bwrap_argv_equivalent
+          run_gate trusted_bwrap_rejects_user_writable
+          run_gate backend_missing_degrades_metadata_only
+          run_gate trusted_bwrap_exe_channel_used
+
+      - name: Run OpenCode export bridge e2e (must not skip)
+        run: |
+          set -euo pipefail
+          cargo test --test agent_opencode_bridge_test -- --nocapture | tee /tmp/opencode-bridge.log
+          if grep -F "skipped (no trusted, usable bwrap)" /tmp/opencode-bridge.log; then
+            echo "FAIL: agent_opencode_bridge_test skipped on Linux D-group"
+            exit 1
+          fi

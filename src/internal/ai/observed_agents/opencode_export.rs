@@ -404,12 +404,13 @@ async fn run_bounded_exporter(
 }
 
 /// Run the export under the DR-04b minimal offline sandbox profile
-/// (`SandboxEnforcement::Required` semantics): Linux bubblewrap with
-/// `--unshare-net` (no network), read-only host paths + read-only HOME (the
-/// exporter's session store/config), tmpfs `/tmp` as the only writable
-/// location, `--die-with-parent`, no shell anywhere. Fail-CLOSED when the
-/// sandbox cannot be provided (bwrap missing, non-Linux): the capability is
-/// unavailable — never a degraded unsandboxed run (GC-DR-14).
+/// (`SandboxEnforcement::Required` semantics). Assembly is delegated to
+/// [`crate::internal::ai::sandbox::SandboxManager::transform`]; execution
+/// stays in [`run_bounded_exporter`] (file-backed stdout, `RLIMIT_FSIZE`,
+/// process group, wall clock, 16 MiB). Linux uses trusted bwrap. Fail-CLOSED
+/// when the sandbox cannot be provided (bwrap missing, non-Linux): the
+/// capability is unavailable — never a degraded unsandboxed run (GC-DR-14).
+/// macOS stays fail-closed here until SBX-04 enables seatbelt.
 pub async fn run_export_subprocess_sandboxed(
     binary: &std::path::Path,
     session_id: &str,
@@ -432,78 +433,125 @@ pub async fn run_export_subprocess_sandboxed(
             bail!("exporter binary path must be absolute (trusted provenance)");
         }
         let bwrap = resolve_trusted_bwrap()?;
-
-        use crate::internal::ai::sandbox::{
-            policy::SandboxPolicy, proxy::NetworkAccessMode, runtime::create_bwrap_command_args,
-        };
-        // ReadOnly policy + Denied network: the policy cwd is ro-bound,
-        // /tmp is tmpfs (the ONLY writable location), net is unshared. The
-        // policy cwd must NOT be /tmp — a later ro-bind would shadow the
-        // tmpfs mount and leave the exporter with no writable scratch (bwrap
-        // applies mounts in order). Use the binary's parent, which is
-        // ro-bound anyway. The command tail handed to the builder is only
-        // the binary; `export <sid>` is appended by the shared runner.
-        let sandbox_cwd = binary
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("/usr"));
-        let mut args = create_bwrap_command_args(
-            vec![binary.to_string_lossy().into_owned()],
-            NetworkAccessMode::Denied,
-            &SandboxPolicy::ReadOnly,
-            &sandbox_cwd,
-            &[],
-        );
-        // The exporter must READ its own session store/config: ro-bind HOME
-        // (and the XDG dirs when set) before the `--` separator.
-        let sep = args
-            .iter()
-            .position(|a| a == "--")
-            .ok_or_else(|| anyhow!("bwrap arg builder produced no separator"))?;
-        let mut extra: Vec<String> = Vec::new();
-        for var in ["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
-            if let Some(dir) = std::env::var_os(var).map(std::path::PathBuf::from)
-                && dir.is_absolute()
-                && dir.is_dir()
-            {
-                let d = dir.to_string_lossy().into_owned();
-                extra.extend(["--ro-bind".to_string(), d.clone(), d]);
-            }
-        }
-        // Task-card-verified exception (opencode 1.17.x probe, 2026-07-14):
-        // the session store is WAL-mode SQLite, whose -wal/-shm side files
-        // need WRITE access even for pure reads — a read-only bind makes
-        // `export` fail with a generic error. Bind ONLY the opencode data
-        // dir read-write (mounted after the ro HOME bind so it wins);
-        // network stays unshared and everything else read-only.
-        //
-        // The store is resolved and PINNED in a SINGLE atomic `openat`
-        // (Codex M3 R4 P1) that rejects a symlinked `opencode` entry
-        // (`O_NOFOLLOW`) and requires a directory (`O_DIRECTORY`); the pinned
-        // fd IS the validated directory, so a concurrent rename/exchange of
-        // `opencode` cannot make the bound directory differ from the checked
-        // one. It is bound via `/proc/self/fd/N` so the RW mount references the
-        // exact pinned inode.
-        let mut keep_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-        if let Some((fd, dest)) = pin_opencode_store() {
-            use std::os::fd::AsRawFd;
-            let src = format!("/proc/self/fd/{}", fd.as_raw_fd());
-            extra.extend(["--bind".to_string(), src, dest]);
-            keep_fds.push(fd);
-        }
-        // The trusted binary itself may live outside the standard host paths
-        // (e.g. ~/.opencode/bin) — HOME ro-bind above usually covers it; add
-        // its parent dir defensively when it does not.
-        if let Some(parent) = binary.parent() {
-            let p = parent.to_string_lossy().into_owned();
-            extra.extend(["--ro-bind".to_string(), p.clone(), p]);
-        }
-        let tail = args.split_off(sep);
-        args.extend(extra);
-        args.extend(tail);
-
-        run_bounded_exporter(&bwrap, &args, session_id, limits, keep_fds).await
+        let assembled = assemble_sandboxed_export(binary, &bwrap)?;
+        run_bounded_exporter(
+            &assembled.program,
+            &assembled.pre_args,
+            session_id,
+            limits,
+            assembled.keep_fds,
+        )
+        .await
     }
+}
+
+/// Assembled Required-sandbox argv plus caller-held store fds.
+/// `program` is the trusted bwrap; `pre_args` is everything transform placed
+/// after it (including `--` and the exporter binary). `export <sid>` is
+/// appended by [`run_bounded_exporter`].
+#[cfg(target_os = "linux")]
+struct AssembledExport {
+    program: PathBuf,
+    pre_args: Vec<String>,
+    keep_fds: PinnedFds,
+}
+
+/// Assemble the export bwrap vector through `SandboxManager::transform`.
+///
+/// `trusted_bwrap` is the integrity-checked product of
+/// [`resolve_trusted_bwrap`]. Transform consumes it via `trusted_bwrap_exe`
+/// and does not rediscover `LIBRA_BWRAP_BINARY` or `linux_sandbox_exe`.
+/// Retained store fds stay with the caller (`keep_fds`); they never enter
+/// `ExecEnv`.
+#[cfg(target_os = "linux")]
+fn assemble_sandboxed_export(
+    binary: &std::path::Path,
+    trusted_bwrap: &std::path::Path,
+) -> Result<AssembledExport> {
+    use std::os::fd::AsRawFd;
+
+    use crate::internal::ai::sandbox::{
+        CommandSpec, SandboxEnforcement, SandboxManager, SandboxPermissions, SandboxPolicy,
+        SandboxTransformRequest, WritableBind,
+    };
+
+    // ReadOnly + Denied network: policy cwd is ro-bound, /tmp is tmpfs, net
+    // is unshared. cwd must not be /tmp (that would shadow the tmpfs). Use
+    // the binary's parent, which the builder already ro-binds as the empty
+    // writable-roots fallback. The command tail is only the binary;
+    // `export <sid>` is appended by the shared runner.
+    let sandbox_cwd = binary
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr"));
+
+    let mut extra_ro = Vec::new();
+    for var in ["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
+        if let Some(dir) = std::env::var_os(var).map(std::path::PathBuf::from)
+            && dir.is_absolute()
+            && dir.is_dir()
+        {
+            extra_ro.push(dir);
+        }
+    }
+    // Binary parent is already `--ro-bind`ed as `sandbox_cwd` (ReadOnly
+    // empty writable-roots fallback). ADR-SBX-02 same-effect mount table
+    // allows omitting the trailing defensive duplicate.
+
+    let mut keep_fds: PinnedFds = Vec::new();
+    let mut writable_binds = Vec::new();
+    // WAL-mode SQLite needs WRITE even for reads. Pin the store inode and
+    // bind `/proc/self/fd/N → dest` after HOME/XDG ro-binds so the RW mount
+    // wins. The retained fd stays in `keep_fds` (non-CLOEXEC).
+    if let Some((fd, dest)) = pin_opencode_store() {
+        writable_binds.push(WritableBind {
+            source: PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
+            destination: PathBuf::from(dest),
+        });
+        keep_fds.push(fd);
+    }
+
+    let spec = CommandSpec {
+        program: binary.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        cwd: sandbox_cwd.clone(),
+        env: std::collections::HashMap::new(),
+        clear_env: true,
+        stdin: None,
+        timeout_ms: None,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        justification: Some("opencode export Required sandbox".to_string()),
+    };
+
+    let env = SandboxManager::new()
+        .transform(SandboxTransformRequest {
+            spec,
+            policy: Some(&SandboxPolicy::ReadOnly),
+            sandbox_policy_cwd: &sandbox_cwd,
+            linux_sandbox_exe: None,
+            use_linux_sandbox_bwrap: false,
+            enforcement: SandboxEnforcement::Required,
+            deny_read_paths: &[],
+            extra_ro_bind_paths: &extra_ro,
+            writable_binds: &writable_binds,
+            trusted_bwrap_exe: Some(trusted_bwrap),
+            seccomp_policy_path: None,
+        })
+        .context(
+            "failed to assemble the OpenCode export sandbox \
+             (SandboxEnforcement::Required); refusing an unsandboxed export",
+        )?;
+
+    let mut command = env.command;
+    if command.is_empty() {
+        bail!("sandbox transform produced an empty command");
+    }
+    let program = PathBuf::from(command.remove(0));
+    Ok(AssembledExport {
+        program,
+        pre_args: command,
+        keep_fds,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1152,5 +1200,338 @@ printf 'offline-ok'"#,
             .await
             .expect_err("no trust record must fail closed");
         assert!(format!("{err:#}").contains("not trusted"), "got {err:#}");
+    }
+
+    /// SBX-03: execution stays `run_bounded_exporter` (file-backed stdout,
+    /// RLIMIT, process group, 3s wall clock, 16 MiB). Linux keep_fds store
+    /// fd is non-CLOEXEC.
+    #[tokio::test]
+    async fn runner_controls_preserved() {
+        assert_eq!(EXPORT_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(EXPORT_DEADLINE, Duration::from_secs(3));
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), r#"printf 'ok'"#);
+        let out = run_bounded_exporter(&bin, &[], "sess1", ExportLimits::default(), Vec::new())
+            .await
+            .expect("run_bounded_exporter still executes");
+        assert_eq!(out, b"ok");
+
+        let over = fake_exporter(dir.path(), "head -c 5000 /dev/zero");
+        let err = run_bounded_exporter(
+            &over,
+            &[],
+            "s1",
+            ExportLimits {
+                max_bytes: 1024,
+                deadline: Duration::from_secs(5),
+            },
+            Vec::new(),
+        )
+        .await
+        .expect_err("byte cap must still fail closed");
+        assert!(format!("{err:#}").contains("byte cap"), "got {err:#}");
+
+        let hung = fake_exporter(dir.path(), "sleep 30");
+        let started = std::time::Instant::now();
+        let err = run_bounded_exporter(
+            &hung,
+            &[],
+            "s1",
+            ExportLimits {
+                max_bytes: 1024,
+                deadline: Duration::from_millis(300),
+            },
+            Vec::new(),
+        )
+        .await
+        .expect_err("deadline must still kill");
+        assert!(format!("{err:#}").contains("deadline"), "got {err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "deadline kill must be prompt, waited {:?}",
+            started.elapsed()
+        );
+
+        let descendant = fake_exporter(dir.path(), "sleep 30 & printf 'apparently-done'");
+        let err = run_bounded_exporter(
+            &descendant,
+            &[],
+            "s1",
+            ExportLimits {
+                max_bytes: 1024,
+                deadline: Duration::from_secs(5),
+            },
+            Vec::new(),
+        )
+        .await
+        .expect_err("process-group descendants must still be refused");
+        assert!(
+            format!("{err:#}").contains("descendant processes"),
+            "got {err:#}"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(tmp.path().join("opencode")).unwrap();
+            let fd = pin_store_under(tmp.path()).expect("pin store");
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD on pinned store fd");
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "keep_fds store fd must not be CLOEXEC"
+            );
+            let ok = fake_exporter(dir.path(), r#"printf 'pinned'"#);
+            let out = run_bounded_exporter(&ok, &[], "s1", ExportLimits::default(), vec![fd])
+                .await
+                .expect("runner must accept caller-held keep_fds");
+            assert_eq!(out, b"pinned");
+        }
+    }
+
+    /// SBX-03: macOS export remains fail-closed (seatbelt enable is SBX-04).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_kept_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), "echo hi");
+        let err = run_export_subprocess_sandboxed(&bin, "sess", ExportLimits::default())
+            .await
+            .expect_err("macOS must stay fail-closed until SBX-04");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("Linux-only") && text.contains("fail-closed"),
+            "expected Linux-only fail-closed bail, got {text}"
+        );
+    }
+
+    /// SBX-03 D-group: a trusted, usable bwrap must be present. Missing or
+    /// user-writable bwrap is a hard failure (never a skip-green).
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(export_sandbox_env)]
+    #[test]
+    fn trusted_bwrap_preflight() {
+        assert!(
+            trusted_bwrap_available(),
+            "Linux D-group requires a trusted, usable bwrap (install bubblewrap)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn system_true_binary() -> PathBuf {
+        for candidate in ["/usr/bin/true", "/bin/true"] {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+        panic!("no /usr/bin/true or /bin/true on this Linux host");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bwrap_bind_index(args: &[String], source_prefix: &str, dest: &str) -> Option<usize> {
+        args.windows(3)
+            .position(|w| w[0] == "--bind" && w[1].starts_with(source_prefix) && w[2] == dest)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bwrap_ro_bind_index(args: &[String], path: &str) -> Option<usize> {
+        args.windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == path && w[2] == path)
+    }
+
+    /// SBX-03: new-path argv matches the same-effect mount table (HOME/XDG
+    /// before store bind, FD-pinned `/proc/self/fd/N → store`, binary-parent
+    /// via sandbox_cwd, `--` then the exporter).
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(export_sandbox_env)]
+    #[test]
+    fn bwrap_argv_equivalent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let xdg_data = tmp.path().join("xdg-data");
+        let xdg_config = tmp.path().join("xdg-config");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&xdg_data).unwrap();
+        std::fs::create_dir(&xdg_config).unwrap();
+        std::fs::create_dir(&bin_dir).unwrap();
+        std::fs::create_dir(xdg_data.join("opencode")).unwrap();
+        let bin = fake_exporter(&bin_dir, r#"printf 'ok'"#);
+
+        let _home = EnvVarGuard::set("HOME", home.to_str().expect("utf8 home"));
+        let _xdg_data = EnvVarGuard::set("XDG_DATA_HOME", xdg_data.to_str().expect("utf8 data"));
+        let _xdg_config =
+            EnvVarGuard::set("XDG_CONFIG_HOME", xdg_config.to_str().expect("utf8 config"));
+
+        let trusted = system_true_binary();
+        let assembled = assemble_sandboxed_export(&bin, &trusted).expect("assemble export sandbox");
+        let args = &assembled.pre_args;
+        let home_s = home.to_string_lossy().into_owned();
+        let data_s = xdg_data.to_string_lossy().into_owned();
+        let config_s = xdg_config.to_string_lossy().into_owned();
+        let cwd_s = bin_dir.to_string_lossy().into_owned();
+        let store_s = xdg_data.join("opencode").to_string_lossy().into_owned();
+
+        let home_i = bwrap_ro_bind_index(args, &home_s).expect("HOME ro-bind");
+        let data_i = bwrap_ro_bind_index(args, &data_s).expect("XDG_DATA_HOME ro-bind");
+        let config_i = bwrap_ro_bind_index(args, &config_s).expect("XDG_CONFIG_HOME ro-bind");
+        let cwd_i = bwrap_ro_bind_index(args, &cwd_s).expect("sandbox_cwd/binary-parent ro-bind");
+        let store_i = bwrap_bind_index(args, "/proc/self/fd/", &store_s)
+            .expect("FD-pinned store writable-bind");
+        assert!(
+            home_i < store_i && data_i < store_i && config_i < store_i,
+            "HOME/XDG ro-bind must precede store bind; home={home_i} data={data_i} \
+             config={config_i} store={store_i} args={args:?}"
+        );
+        assert!(
+            cwd_i < store_i,
+            "sandbox_cwd (binary parent) must be bound before the store overlay; \
+             cwd={cwd_i} store={store_i}"
+        );
+        let sep = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("bwrap argv must contain --");
+        assert!(store_i < sep, "store bind must precede --");
+        assert_eq!(
+            args.get(sep + 1).map(String::as_str),
+            Some(bin.to_string_lossy().as_ref()),
+            "command tail must be the exporter binary; args={args:?}"
+        );
+        assert!(
+            assembled
+                .program
+                .canonicalize()
+                .unwrap_or(assembled.program.clone())
+                .ends_with("true"),
+            "program must be the injected trusted path, got {}",
+            assembled.program.display()
+        );
+        assert_eq!(
+            assembled.keep_fds.len(),
+            1,
+            "store pin must retain exactly one fd"
+        );
+    }
+
+    /// SBX-03: user-writable trusted_bwrap_exe → Required fail-closed; no
+    /// export bytes (hence no claim) are produced.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_bwrap_rejects_user_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
+        let fake = dir.path().join("bwrap");
+        std::fs::write(&fake, b"#!/bin/sh\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = assemble_sandboxed_export(&bin, &fake)
+            .expect_err("user-writable bwrap must fail closed");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("writable")
+                || text.contains("fail-closed")
+                || text.contains("refusing")
+                || text.contains("Required"),
+            "unexpected error: {text}"
+        );
+    }
+
+    /// SBX-03: missing bwrap backend → transform/assembly fails; the export
+    /// capability degrades (no authorized bytes to claim).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_missing_degrades_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
+        let missing = dir.path().join("no-such-bwrap");
+        let err =
+            assemble_sandboxed_export(&bin, &missing).expect_err("missing bwrap must fail closed");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("Required")
+                || text.contains("cannot be resolved")
+                || text.contains("refusing")
+                || text.contains("sandbox"),
+            "unexpected error: {text}"
+        );
+    }
+
+    /// SBX-03: trusted_bwrap_exe is the only bwrap channel — transform must
+    /// not consume `LIBRA_BWRAP_BINARY` or `linux_sandbox_exe`.
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(export_sandbox_env)]
+    #[test]
+    fn trusted_bwrap_exe_channel_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), r#"printf 'ok'"#);
+        let sentinel = dir.path().join("sentinel-bwrap");
+        std::fs::write(&sentinel, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _bwrap_bin = EnvVarGuard::set(
+            "LIBRA_BWRAP_BINARY",
+            sentinel.to_str().expect("utf8 sentinel"),
+        );
+        let _linux_exe = EnvVarGuard::set(
+            "LIBRA_LINUX_SANDBOX_EXE",
+            sentinel.to_str().expect("utf8 sentinel"),
+        );
+        let trusted = system_true_binary();
+        let assembled =
+            assemble_sandboxed_export(&bin, &trusted).expect("injected trusted_bwrap_exe");
+        let program = assembled
+            .program
+            .canonicalize()
+            .unwrap_or(assembled.program.clone());
+        let expected = trusted.canonicalize().unwrap_or(trusted);
+        assert_eq!(
+            program, expected,
+            "transform must exec trusted_bwrap_exe, not LIBRA_BWRAP_BINARY / linux_sandbox_exe"
+        );
+        let joined = assembled.pre_args.join("\n");
+        assert!(
+            !joined.contains(sentinel.to_string_lossy().as_ref()),
+            "LIBRA_BWRAP_BINARY/linux_sandbox_exe sentinel must not appear in argv: {joined}"
+        );
+        assert!(
+            !assembled.pre_args.iter().any(|a| a == "--sandbox-policy"),
+            "linux_sandbox_exe helper protocol must not be used: {:?}",
+            assembled.pre_args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: callers are serialized with `#[serial_test::serial(export_sandbox_env)]`.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers are serialized with `#[serial_test::serial(export_sandbox_env)]`.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 }
