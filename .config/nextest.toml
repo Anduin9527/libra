@@ -296,6 +296,10 @@ filter = 'test(/(^|::)local_capture_smoke_opencode$/)'
 test-group = 'external'
 
 [[profile.default.overrides]]
+filter = 'test(/(^|::)local_capture_smoke_opencode_macos$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
 filter = 'test(/(^|::)manifest_roles_oids_and_lengths_match_actual_blobs$/)'
 test-group = 'external'
 

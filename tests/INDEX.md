@@ -97,7 +97,7 @@
 | `agent_subagent_content_test` | 1 | plan-20260713 M5 DR-06 Claude subagent disk content E2E: provider-root-relative source identity, malformed-line partial capture, independent unresolved content checkpoint, repeat-discovery single current leaf, deadline-killed durability probes, uncataloged traces ancestry, and existing-corrupt-object rejection for supplied cloud catalogs | `src/internal/ai/subagent_content.rs`, `src/internal/ai/hooks/runtime.rs`, `src/internal/ai/history.rs`, `sql/migrations/2026071406_agent_subagent_content.sql` |
 | `agent_graph_test` | 1 | plan-20260713 M6 DR-07 read-only capture graph: indexed revision history, shared checkpoint visibility, legacy `unindexed`, resolved/unresolved subagents, erased/unknown distinction, `--repo` preflight, JSON/machine schema, privacy allowlist, W5-08 interactive-entry refusal with migration hint, and zero capture/import/export mutations | `src/command/agent/graph.rs`, `src/command/agent/mod.rs`, `src/cli.rs` |
 | `agent_live_gate_test` | 3 | plan-20260713 live agent gate (feature `test-live-agent` + env `LIBRA_RUN_LIVE_AGENT_GATE=1`): real by-id lookups against ~/.claude and ~/.codex, real Required-bwrap OpenCode export, fail-closed M4 three-provider historical import, M5 real Claude subagent-file content/replay/unresolved attribution plus real Codex native boundary evidence, and M6 real capture graph JSON/privacy/non-TTY/zero-write validation; ordinary non-gated runs may skip, but gated provider absence fails | `src/internal/ai/{agent_import,subagent_content}.rs`, `src/internal/ai/observed_agents/{builtin,opencode_export.rs}`, `src/command/agent/{import,graph}.rs` |
-| `agent_opencode_bridge_test` | 1 | plan-20260713 DR-04b OpenCode export-bridge e2e through the real `libra agent hooks opencode stop` path with a deterministic fake exporter (bwrap-gated skip): whole-session idempotence (two idles → one checkpoint, claims channel `export`, job converges), plaintext-never-persists (AKIA secret absent, REDACTED present), trusted-binary revalidation drift → degrade, oversize/untrusted → degrade — trust seeded into repo `config_kv` via the lib's own `compute_provenance` | `src/internal/ai/observed_agents/opencode_export.rs`, `src/internal/ai/export_job.rs`, `src/internal/ai/hooks/runtime.rs` |
+| `agent_opencode_bridge_test` | 1 | plan-20260713 DR-04b / plan-20260830 SBX-03/04 OpenCode export-bridge e2e: bwrap-gated CLI hook path plus Darwin-non-skip `opencode_export_seatbelt_fake_exporter` (sandbox-exec gate, not bwrap skip) | `src/internal/ai/observed_agents/opencode_export.rs`, `src/internal/ai/export_job.rs`, `src/internal/ai/hooks/runtime.rs`, `src/internal/ai/sandbox/` |
 | `agent_checkpoint_redaction_test` | 1 | AG-19 redaction-before-persist (plan.md Task A4): prompt and tool_response secrets scrubbed before the `agent_session` row lands, `redaction_report` records the rule hits, token absent from all `agent session` CLI JSON | `src/internal/ai/hooks/runtime.rs` |
 | `agent_hook_span_test` | 1 | AG-19 `agent.hook.ingest` / `agent.redaction.apply` span fake-sink assertion (plan.md Task A4): required fields present (provider/verb/event_kind/frame_bytes/validated/partial), `rules_hit>=1` on a secret-bearing prompt, unknown-event `partial=true` + `unknown_event_type` warn, `validated=false` on a bad envelope, raw prompt/secret absent — own binary to avoid tracing callsite-cache races | `src/internal/ai/hooks/runtime.rs` |
 | `agent_hook_crash_test` | 1 | AG-19 强制补强项 #10 crash regression (plan.md Task A4): SIGKILL before/mid stdin read, injected panic after read+validate (`LIBRA_TEST_HOOK_PANIC_AFTER_READ`), and SIGKILL racing a `stop` checkpoint write all leave no partial `agent_session`/`agent_checkpoint` state visible and never echo raw stdin | `src/internal/ai/hooks/runtime.rs` |
@@ -273,8 +273,11 @@ export LIBRA_E2E_REQUIRE=1                         # fail-closed (completion evi
 pnpm --dir web test:e2e
 ```
 
-CI job `compat-web-e2e` (`.github/workflows/base.yml`) builds `--features test-provider`,
-starts the deterministic runtime, installs Chromium, and runs `test:e2e` with
+CI job `compat-web-e2e` (`.github/workflows/base.yml`) — **temporarily disabled
+2026-08-31** (self-hosted runner `sudo` cannot complete
+`playwright install --with-deps`; restore from git history once the runner
+regains passwordless sudo) — builds `--features test-provider`, starts the
+deterministic runtime, installs Chromium, and runs `test:e2e` with
 `LIBRA_E2E_REQUIRE=1`. Soft-skip is refused there.
 
 Without `LIBRA_E2E_REQUIRE=1` / `CI=true`, missing Chromium or unreachable
@@ -416,7 +419,7 @@ dedicated feature-on steps.
 
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
-| `agent_local_capture_smoke_test` | 7 | A6.5 first-batch hard gate: drives the real local `codex`/`claude`/`opencode` CLIs (one paid session each; `#[ignore]` + env-gate, serial) through hook install → capture → session/checkpoint/traces/doctor assertions → uninstall smoke; driver in `tests/harness/agent_local_capture.rs` | `src/command/agent/`, `src/command/hooks.rs`, `src/internal/ai/hooks/` |
+| `agent_local_capture_smoke_test` | 7 | A6.5 first-batch hard gate: drives the real local `codex`/`claude`/`opencode` CLIs (one paid session each; `#[ignore]` + env-gate, serial) through hook install → capture → session/checkpoint/traces/doctor assertions → uninstall smoke; SBX-05 adds Darwin `local_capture_smoke_opencode_macos` (content capture) and `linux_a65_criteria_unchanged`; driver in `tests/harness/agent_local_capture.rs` | `src/command/agent/`, `src/command/hooks.rs`, `src/internal/ai/hooks/` |
 
 ---
 
