@@ -460,6 +460,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
+          bwrap_path=$(command -v bwrap)
+          # GitHub-hosted Ubuntu runners may disable unprivileged user
+          # namespaces. Bubblewrap's documented setuid mode keeps this
+          # D-group probe usable without running the test suite as root.
+          sudo chmod u+s "$bwrap_path"
           command -v bwrap
           bwrap --version
 

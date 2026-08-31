@@ -3055,6 +3055,7 @@ mod tests {
     #[test]
     fn seam_write_bind_set_exact() {
         let cwd = tempfile::tempdir().expect("tempdir");
+        #[cfg(target_os = "macos")]
         let policy = SandboxPolicy::ReadOnly;
         let store = cwd.path().join("opencode-store");
         std::fs::create_dir(&store).unwrap();
@@ -3122,6 +3123,7 @@ mod tests {
     #[test]
     fn seam_seatbelt_store_write_segment() {
         let cwd = tempfile::tempdir().expect("tempdir");
+        #[cfg(target_os = "macos")]
         let policy = SandboxPolicy::ReadOnly;
         let store = cwd.path().join("store");
         std::fs::create_dir(&store).unwrap();
