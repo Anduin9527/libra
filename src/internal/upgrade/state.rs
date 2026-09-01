@@ -483,12 +483,15 @@ fn read_floors_file(install_dir: &InstallDir) -> Result<Option<UpgradeState>, St
 /// Durably record an ACCEPTED manifest's monotone floors, independently of
 /// the main upgrade lock (§A.6/§A.7 anti-rollback).
 ///
-/// The side file has its own micro-lock whose holders only ever perform this
-/// one atomic read-merge-write, so the blocking wait here is always short —
-/// a busy or even wedged MAIN upgrade lock can neither delay nor starve
-/// floor persistence, and the write completes before the caller returns
-/// (no detached work that a process exit could drop). `read_state` folds the
-/// side file into every consumer's view.
+/// The side file has its own micro-lock whose holders only ever perform one
+/// atomic read-merge-write, so under normal concurrency (including a busy or
+/// wedged MAIN upgrade lock) the write completes before this returns.
+/// Exception, by design: if an EXTERNALLY-STALLED holder (e.g. SIGSTOP
+/// mid-write) keeps the micro-lock past the bounded wait, this returns an
+/// error and the attempt's floors are not yet persisted — a process that
+/// exits right then loses them until the next successful manifest check
+/// re-derives them; the detached worker still lands the merge if the holder
+/// resumes. `read_state` folds the side file into every consumer's view.
 pub fn record_acceptance_floors(
     install_dir: &InstallDir,
     accepted: &UpgradeState,

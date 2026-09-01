@@ -351,13 +351,12 @@ fn failure_backoff_state(
 
 /// Durably record an accepted manifest's monotone floors through the floors
 /// SIDE FILE (`record_acceptance_floors`), which has its own micro-lock —
-/// the MAIN upgrade lock is never taken here. The write completes before
-/// this returns (nothing detached that a process exit could drop), a busy
-/// or wedged install lock cannot delay or starve it, and the side lock's
-/// holders only ever perform one atomic read-merge-write, so the wait is
-/// always short. `read_state` folds the side file into every consumer's
-/// view. I/O errors are silently non-fatal to the user's command; the next
-/// successful check re-derives the floors from the manifest.
+/// the MAIN upgrade lock is never taken here, so a busy or wedged install
+/// lock cannot delay or starve it. Under normal concurrency the write
+/// completes before this returns; only an externally-stalled micro-lock
+/// holder can exhaust the bounded wait, in which case the error is silently
+/// non-fatal to the user's command and the next successful check re-derives
+/// the floors (see `record_acceptance_floors` for the exact contract).
 async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accepted: UpgradeState) {
     let _ = tokio::task::spawn_blocking(move || {
         let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
