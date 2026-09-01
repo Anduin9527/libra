@@ -365,12 +365,15 @@ fn merge_floors_locked(dir: &InstallDir, accepted: &UpgradeState) -> Result<bool
     Ok(true)
 }
 
-/// Retry [`merge_floors_locked`] briefly while another process holds the
-/// upgrade lock. Lock holders finish quickly (downloads happen outside the
-/// lock), so a short bounded wait recovers nearly every contention window;
-/// I/O errors abort silently (the next accepted manifest re-advances).
+/// Persist [`merge_floors_locked`] against lock contention: a few fast
+/// non-blocking attempts, then ONE blocking acquisition so the merge cannot
+/// be starved out — floors, once proven, must reach disk. Lock holders never
+/// perform network I/O under the lock (downloads happen in Phase A), so the
+/// blocking wait is bounded by local I/O plus the probe timeout, and flock
+/// releases automatically if a holder dies. I/O errors abort silently (the
+/// next accepted manifest re-advances the floors).
 async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accepted: UpgradeState) {
-    const LOCK_RETRIES: u32 = 8;
+    const LOCK_RETRIES: u32 = 4;
     for _ in 0..LOCK_RETRIES {
         let path = dir_path.clone();
         let snapshot = accepted.clone();
@@ -384,6 +387,19 @@ async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accept
             _ => return,
         }
     }
+    // Still contended: take the lock in blocking mode (kernel-queued, no
+    // starvation) and merge under it.
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
+        let _lock = dir.lock_blocking().map_err(|_| ())?;
+        let current = read_state(&dir).map_err(|_| ())?;
+        let merged = merge_acceptance_floors(&current, &accepted);
+        if merged != current {
+            write_state(&dir, &merged).map_err(|_| ())?;
+        }
+        Ok::<(), ()>(())
+    })
+    .await;
 }
 
 /// Persist a failure backoff only when the state observed before Phase A is
