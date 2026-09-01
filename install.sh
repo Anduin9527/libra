@@ -18,7 +18,7 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.22.8"
+DEFAULT_VERSION="v0.22.9"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script, never through
@@ -690,8 +690,13 @@ verify_stable_manifest() {
     # contain quotes and every numeric field is bounded to nine digits (so
     # later shell integer comparisons can never overflow), and nothing can
     # precede, follow, or hide inside the artifacts array to spoof a value.
-    grammar_row='\{"platform":"[^"]{1,32}","url":"[^"]{1,256}","sha256":"[0-9a-f]{64}","size":(0|[1-9][0-9]{0,8})\}'
-    grammar_head='^\{"channel":"[^"]{1,32}","version":"[^"]{1,64}","control_revision":(0|[1-9][0-9]{0,8}),"published_at":"[^"]{1,64}","expires_at":"[^"]{1,64}","min_key_generation":(0|[1-9][0-9]{0,8}),"paused":(true|false),"revoked_versions":\[[^]]{0,1024}\],"artifacts":\['
+    # PORTABILITY: every {n,m} bound must stay <= 255 — BSD grep (macOS)
+    # rejects larger repetition counts with "maximum repetition exceeds 255"
+    # and the gate would then fail closed on every Mac. The revoked list uses
+    # an unbounded bracket-free class instead: entries are re-validated one
+    # by one below, and the whole payload is already capped at 1 MiB.
+    grammar_row='\{"platform":"[^"]{1,32}","url":"[^"]{1,255}","sha256":"[0-9a-f]{64}","size":(0|[1-9][0-9]{0,8})\}'
+    grammar_head='^\{"channel":"[^"]{1,32}","version":"[^"]{1,64}","control_revision":(0|[1-9][0-9]{0,8}),"published_at":"[^"]{1,64}","expires_at":"[^"]{1,64}","min_key_generation":(0|[1-9][0-9]{0,8}),"paused":(true|false),"revoked_versions":\[[^]]*\],"artifacts":\['
     if ! grep -qE "${grammar_head}${grammar_row}(,${grammar_row})*\\]\\}\$" "$payload_file"; then
         rm -rf "$work_dir"
         error_exit "signed manifest payload does not match the canonical serialization" "verify" \

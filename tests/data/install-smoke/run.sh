@@ -47,6 +47,10 @@ grep -q 'LIBRA_RELEASE_MANIFEST_PUBLIC_KEY[^=]*:-' "$INSTALLER" \
     && fail "trust constants must not read the environment" || true
 grep -q 'LIBRA_RELEASE_MANIFEST_ORIGIN[^=]*:-' "$INSTALLER" \
     && fail "pinned origin must not read the environment" || true
+# BSD grep (macOS) rejects {n,m} repetition counts above 255; any such bound
+# in either installer's regexes would fail closed on every Mac.
+grep -oE '\{[0-9]+,[0-9]+\}' "$INSTALLER" "$REPO_ROOT/install.ps1" | awk -F'[{,}]' '$3 > 255 {print; exit 1}' \
+    || fail "found a regex repetition bound above BSD grep's 255 ceiling"
 
 # ── fixture server ──────────────────────────────────────────────────────────
 
