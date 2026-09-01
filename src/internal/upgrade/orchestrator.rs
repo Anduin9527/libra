@@ -387,19 +387,28 @@ async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accept
             _ => return,
         }
     }
-    // Still contended: take the lock in blocking mode (kernel-queued, no
-    // starvation) and merge under it.
-    let _ = tokio::task::spawn_blocking(move || {
-        let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
-        let _lock = dir.lock_blocking().map_err(|_| ())?;
-        let current = read_state(&dir).map_err(|_| ())?;
-        let merged = merge_acceptance_floors(&current, &accepted);
-        if merged != current {
-            write_state(&dir, &merged).map_err(|_| ())?;
-        }
-        Ok::<(), ()>(())
-    })
-    .await;
+    // Still contended: hand the merge to a DETACHED thread that takes the
+    // lock in blocking mode (kernel-queued, no starvation). The caller waits
+    // only a bounded moment so a wedged lock holder can never stall the
+    // user's command; past that the thread still completes the merge the
+    // moment the lock frees (for as long as this process lives), and the
+    // next successful check re-derives the floors from the manifest anyway.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), ()>>(1);
+    std::thread::spawn(move || {
+        let merge = || -> Result<(), ()> {
+            let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
+            let _lock = dir.lock_blocking().map_err(|_| ())?;
+            let current = read_state(&dir).map_err(|_| ())?;
+            let merged = merge_acceptance_floors(&current, &accepted);
+            if merged != current {
+                write_state(&dir, &merged).map_err(|_| ())?;
+            }
+            Ok(())
+        };
+        let _ = tx.send(merge());
+    });
+    let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(3)))
+        .await;
 }
 
 /// Persist a failure backoff only when the state observed before Phase A is
@@ -765,6 +774,56 @@ mod tests {
                 .generation_floor,
             3
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contended_floor_merge_completes_after_the_lock_frees() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("test directory must be created");
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test directory must canonicalize");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test directory permissions must be set");
+        let dir = InstallDir::open_validated(&path).expect("test directory must validate");
+        write_state(&dir, &UpgradeState::default()).expect("baseline state must persist");
+
+        // Hold the lock PAST the fast-path retries (4 x 250 ms) so the merge
+        // has to go through the detached blocking-lock fallback.
+        let lock = dir
+            .try_lock()
+            .expect("lock probe must not error")
+            .expect("test must own the lock first");
+        let accepted = UpgradeState {
+            generation_floor: 5,
+            ..UpgradeState::default()
+        };
+        let merge = merge_acceptance_floors_with_retry(path.clone(), accepted);
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            drop(lock);
+        };
+        tokio::join!(merge, release);
+
+        // The detached thread may land the write just after the bounded wait
+        // returns; poll briefly instead of racing it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let floor = read_state(&dir)
+                .expect("state must stay readable")
+                .generation_floor;
+            if floor == 5 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "contended floor merge never landed (floor still {floor})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[test]
