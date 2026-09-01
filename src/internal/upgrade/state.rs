@@ -558,11 +558,22 @@ pub fn record_acceptance_floors(
             },
         });
     }
-    // 15 s: long enough to outlive the commit fence (txn.rs), which holds
-    // the floors lock only across ONE state read plus ONE journal write +
-    // fsync (the commit tail itself runs unfenced under the PostProbePassed
-    // recovery contract) — this bound is sufficient by construction.
-    match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
+    // 15 s + one 15 s second chance: sized against the commit fence
+    // (txn.rs), which holds the floors lock only across ONE state read plus
+    // ONE journal write + fsync (the commit tail runs unfenced under the
+    // PostProbePassed recovery contract). On a pathological filesystem
+    // stall even this can expire; the failure is then TRANSIENT hardening
+    // loss, not a policy bypass — pause/revocation/version decisions are
+    // re-evaluated from the LIVE manifest on every round, and the very
+    // manifest that proved these floors re-establishes them on the next
+    // accepted check.
+    let outcome = match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            receiver.recv_timeout(std::time::Duration::from_secs(15))
+        }
+        other => other,
+    };
+    match outcome {
         Ok(result) => result,
         Err(_) => Err(StateStoreError::WriteFailed {
             path,

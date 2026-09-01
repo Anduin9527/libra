@@ -464,13 +464,32 @@ write_official_marker() {
     fi
     # Match the Rust InstallDir policy (§A.5): group- OR others-writable
     # install dirs are refused by `libra upgrade`, and default umask 002
-    # creates exactly such dirs — so TIGHTEN the mode here (the dir is
-    # user-owned per the check above) instead of shipping an install the
-    # upgrade subsystem would immediately reject.
+    # creates exactly such dirs. TIGHTEN the mode — but only for the
+    # script's OWN default layout ($LIBRA_HOME/bin): a custom -d directory
+    # may be group-shared on purpose, and silently stripping its group
+    # write bit is not this installer's call.
     case "$dir_ls" in
         ????????w*|?????w*)
+            if [ "$INSTALL_DIR" != "$LIBRA_HOME/bin" ]; then
+                warn_fact "provenance" "custom install dir is group/world-writable, which 'libra upgrade' refuses — official-install marker skipped; run: chmod go-w '$INSTALL_DIR' if that is acceptable"
+                return 0
+            fi
             if chmod go-w "$INSTALL_DIR" 2>/dev/null; then
                 fact "provenance" "tightened install dir permissions (chmod go-w) for upgrade management"
+                # Re-verify after the change: the owner must still be us and
+                # the writable bits must actually be gone (a swapped path or
+                # a filesystem ignoring the chmod skips the marker).
+                dir_ls=$(ls -ldn "$INSTALL_DIR" 2>/dev/null) || dir_ls=""
+                case "$dir_ls" in
+                    ????????w*|?????w*|"")
+                        warn_fact "provenance" "install dir permissions could not be verified after tightening — official-install marker skipped"
+                        return 0
+                        ;;
+                esac
+                if [ "$(printf '%s\n' "$dir_ls" | awk '{print $3}')" != "$(id -u)" ]; then
+                    warn_fact "provenance" "install dir changed owner unexpectedly — official-install marker skipped"
+                    return 0
+                fi
             else
                 warn_fact "provenance" "install dir is group/world-writable and could not be tightened — official-install marker skipped; run: chmod go-w '$INSTALL_DIR'"
                 return 0
@@ -485,7 +504,7 @@ write_official_marker() {
     # `mv file dir` would silently move INTO it. Clear a regular file (the
     # normal overwrite case), refuse anything else.
     marker_dst="${INSTALL_DIR}/.libra-official-install.json"
-    if [ -e "$marker_dst" ] && [ ! -f "$marker_dst" ]; then
+    if [ -L "$marker_dst" ] || { [ -e "$marker_dst" ] && [ ! -f "$marker_dst" ]; }; then
         rm -rf "$marker_dir" 2>/dev/null
         warn_fact "provenance" "'$marker_dst' exists and is not a regular file — official-install marker skipped; remove it and re-run this installer"
         return 0
@@ -495,7 +514,7 @@ write_official_marker() {
         "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_dir/marker.json" \
         && chmod 644 "$marker_dir/marker.json" \
         && mv "$marker_dir/marker.json" "$marker_dst" \
-        && [ -f "$marker_dst" ]; then
+        && [ -f "$marker_dst" ] && [ ! -L "$marker_dst" ]; then
         MARKER_WRITTEN=1
         fact "provenance" "official-install marker written (enables 'libra upgrade')"
     else

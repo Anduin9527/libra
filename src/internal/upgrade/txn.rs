@@ -271,6 +271,38 @@ fn finish_abort_absent(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnErr
 
 /// Post-probe the installed target and branch to commit or rollback/abort
 /// (§A.7 CandidateInstalled → …).
+/// Bounded floors-lock acquisition + policy comparison shared by the
+/// commit fence's default arm: 50 × 100 ms non-blocking probes (a stuck
+/// holder must not hang recovery), then one state read under the guard.
+/// `Ok(None)` = veto (lock unobtainable, or the transaction is superseded
+/// by a higher persisted generation/control floor).
+fn default_fence(
+    dir: &InstallDir,
+    txn_state: &UpgradeState,
+) -> Result<Option<super::lock::UpgradeLock>, TxnError> {
+    let mut guard = None;
+    for _ in 0..50 {
+        match dir.try_lock_floors() {
+            Ok(Some(g)) => {
+                guard = Some(g);
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(TxnError::State(format!("floors lock: {e}"))),
+        }
+    }
+    let Some(guard) = guard else {
+        return Ok(None);
+    };
+    let current = read_state(dir).map_err(|e| TxnError::State(e.to_string()))?;
+    if current.generation_floor > txn_state.generation_floor
+        || current.max_control_revision > txn_state.max_control_revision
+    {
+        return Ok(None);
+    }
+    Ok(Some(guard))
+}
+
 fn probe_and_resolve(
     dir: &InstallDir,
     txn: &mut Txn,
@@ -301,18 +333,19 @@ fn probe_and_resolve(
                 }
                 None => true,
             },
-            None => {
-                let current = read_state(dir).map_err(|e| TxnError::State(e.to_string()))?;
-                if current.generation_floor > txn.new_state.generation_floor
-                    || current.max_control_revision > txn.new_state.max_control_revision
-                {
-                    true
-                } else {
+            // No custom fence (recovery, tests): the DEFAULT check uses the
+            // same bounded floors-lock acquisition so the policy read and
+            // the journal write are atomic against side-floor writers too —
+            // an unobtainable lock vetoes rather than committing blind.
+            None => match default_fence(dir, &txn.new_state)? {
+                Some(guard) => {
                     txn.state = TxnState::PostProbePassed;
                     store_txn(dir, txn)?;
+                    drop(guard);
                     false
                 }
-            }
+                None => true,
+            },
         };
         if vetoed {
             // Vetoed: a newer control decision superseded this plan after
