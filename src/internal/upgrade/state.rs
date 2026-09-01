@@ -35,6 +35,12 @@ use super::{
 /// no-follow discipline enforced by the locked accessors of §A.5).
 pub const STATE_FILE_NAME: &str = ".libra-upgrade-state.json";
 
+/// Monotone acceptance-floors side file. Written under its own micro-lock
+/// (never the main upgrade lock) so an accepted manifest's floors can be
+/// made durable even while an install holds the main lock; `read_state`
+/// folds it into every read.
+pub const FLOORS_FILE_NAME: &str = ".libra-upgrade-floors.json";
+
 /// Grace applied around the HTTPS `Date` and the local clock (§A.6: 300 s).
 pub const TIME_SLACK_SECONDS: i64 = 300;
 
@@ -423,8 +429,9 @@ pub enum StateStoreError {
     },
 }
 
-/// Read the state file inside `install_dir`. Missing file → default state.
-/// Corrupt file → error (fail closed; see [`StateStoreError::Corrupt`]).
+/// Read the state file inside `install_dir` and fold in the monotone floors
+/// side file. Missing files → default state. A corrupt main OR side file →
+/// error (fail closed; see [`StateStoreError::Corrupt`]).
 pub fn read_state(install_dir: &InstallDir) -> Result<UpgradeState, StateStoreError> {
     let path = install_dir.path().join(STATE_FILE_NAME);
     let Some(bytes) =
@@ -435,12 +442,78 @@ pub fn read_state(install_dir: &InstallDir) -> Result<UpgradeState, StateStoreEr
                 source,
             })?
     else {
-        return Ok(UpgradeState::default());
+        let base = UpgradeState::default();
+        return Ok(match read_floors_file(install_dir)? {
+            Some(floors) => merge_acceptance_floors(&base, &floors),
+            None => base,
+        });
     };
-    serde_json::from_slice(&bytes).map_err(|err| StateStoreError::Corrupt {
-        path,
-        detail: err.to_string(),
+    let base: UpgradeState =
+        serde_json::from_slice(&bytes).map_err(|err| StateStoreError::Corrupt {
+            path,
+            detail: err.to_string(),
+        })?;
+    Ok(match read_floors_file(install_dir)? {
+        Some(floors) => merge_acceptance_floors(&base, &floors),
+        None => base,
     })
+}
+
+/// Raw side-file read; `Ok(None)` when it does not exist.
+fn read_floors_file(install_dir: &InstallDir) -> Result<Option<UpgradeState>, StateStoreError> {
+    let path = install_dir.path().join(FLOORS_FILE_NAME);
+    let Some(bytes) =
+        install_dir
+            .read_file(FLOORS_FILE_NAME)
+            .map_err(|source| StateStoreError::Unreadable {
+                path: path.clone(),
+                source,
+            })?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|err| StateStoreError::Corrupt {
+            path,
+            detail: err.to_string(),
+        })
+}
+
+/// Durably record an ACCEPTED manifest's monotone floors, independently of
+/// the main upgrade lock (§A.6/§A.7 anti-rollback).
+///
+/// The side file has its own micro-lock whose holders only ever perform this
+/// one atomic read-merge-write, so the blocking wait here is always short —
+/// a busy or even wedged MAIN upgrade lock can neither delay nor starve
+/// floor persistence, and the write completes before the caller returns
+/// (no detached work that a process exit could drop). `read_state` folds the
+/// side file into every consumer's view.
+pub fn record_acceptance_floors(
+    install_dir: &InstallDir,
+    accepted: &UpgradeState,
+) -> Result<(), StateStoreError> {
+    let path = install_dir.path().join(FLOORS_FILE_NAME);
+    let _lock =
+        install_dir
+            .lock_floors_blocking()
+            .map_err(|source| StateStoreError::Unreadable {
+                path: path.clone(),
+                source,
+            })?;
+    let current = read_floors_file(install_dir)?.unwrap_or_default();
+    let merged = merge_acceptance_floors(&current, accepted);
+    if merged == current {
+        return Ok(());
+    }
+    let mut bytes = serde_json::to_vec_pretty(&merged).map_err(|err| StateStoreError::Corrupt {
+        path: path.clone(),
+        detail: format!("cannot serialize floors: {err}"),
+    })?;
+    bytes.push(b'\n');
+    install_dir
+        .write_file_atomic(FLOORS_FILE_NAME, &bytes, 0o600)
+        .map_err(|source| StateStoreError::WriteFailed { path, source })
 }
 
 /// Atomically persist `state` inside `install_dir` (`0600` on Unix). The

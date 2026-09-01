@@ -31,7 +31,7 @@ use super::{
     settings::{UpgradeMode, effective_mode_for_upgrade},
     state::{
         UpgradeState, backoff_defers, cooldown_permits_skip, merge_acceptance_floors, read_state,
-        register_failure_backoff, write_state,
+        record_acceptance_floors, register_failure_backoff, write_state,
     },
     trusted_keys::active_trust_table,
     txn::{self, CANDIDATE_NAME, OldTarget, TxnError, TxnOutcome},
@@ -349,66 +349,21 @@ fn failure_backoff_state(
     register_failure_backoff(&base, local_now)
 }
 
-/// Merge the monotone acceptance floors onto the CURRENT on-disk state under
-/// the lock, with no baseline requirement: floors only ever advance, so this
-/// is safe over ANY concurrent progress (unlike backoff/cooldown writes,
-/// which stay behind the state CAS). `Ok(false)` = lock busy, try again.
-fn merge_floors_locked(dir: &InstallDir, accepted: &UpgradeState) -> Result<bool, ()> {
-    let Some(_lock) = dir.try_lock().map_err(|_| ())? else {
-        return Ok(false);
-    };
-    let current = read_state(dir).map_err(|_| ())?;
-    let merged = merge_acceptance_floors(&current, accepted);
-    if merged != current {
-        write_state(dir, &merged).map_err(|_| ())?;
-    }
-    Ok(true)
-}
-
-/// Persist [`merge_floors_locked`] against lock contention: a few fast
-/// non-blocking attempts, then ONE blocking acquisition so the merge cannot
-/// be starved out — floors, once proven, must reach disk. Lock holders never
-/// perform network I/O under the lock (downloads happen in Phase A), so the
-/// blocking wait is bounded by local I/O plus the probe timeout, and flock
-/// releases automatically if a holder dies. I/O errors abort silently (the
-/// next accepted manifest re-advances the floors).
+/// Durably record an accepted manifest's monotone floors through the floors
+/// SIDE FILE (`record_acceptance_floors`), which has its own micro-lock —
+/// the MAIN upgrade lock is never taken here. The write completes before
+/// this returns (nothing detached that a process exit could drop), a busy
+/// or wedged install lock cannot delay or starve it, and the side lock's
+/// holders only ever perform one atomic read-merge-write, so the wait is
+/// always short. `read_state` folds the side file into every consumer's
+/// view. I/O errors are silently non-fatal to the user's command; the next
+/// successful check re-derives the floors from the manifest.
 async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accepted: UpgradeState) {
-    const LOCK_RETRIES: u32 = 4;
-    for _ in 0..LOCK_RETRIES {
-        let path = dir_path.clone();
-        let snapshot = accepted.clone();
-        let done = tokio::task::spawn_blocking(move || {
-            let dir = InstallDir::open_validated(&path).map_err(|_| ())?;
-            merge_floors_locked(&dir, &snapshot)
-        })
-        .await;
-        match done {
-            Ok(Ok(false)) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
-            _ => return,
-        }
-    }
-    // Still contended: hand the merge to a DETACHED thread that takes the
-    // lock in blocking mode (kernel-queued, no starvation). The caller waits
-    // only a bounded moment so a wedged lock holder can never stall the
-    // user's command; past that the thread still completes the merge the
-    // moment the lock frees (for as long as this process lives), and the
-    // next successful check re-derives the floors from the manifest anyway.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), ()>>(1);
-    std::thread::spawn(move || {
-        let merge = || -> Result<(), ()> {
-            let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
-            let _lock = dir.lock_blocking().map_err(|_| ())?;
-            let current = read_state(&dir).map_err(|_| ())?;
-            let merged = merge_acceptance_floors(&current, &accepted);
-            if merged != current {
-                write_state(&dir, &merged).map_err(|_| ())?;
-            }
-            Ok(())
-        };
-        let _ = tx.send(merge());
-    });
-    let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(3)))
-        .await;
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
+        record_acceptance_floors(&dir, &accepted).map_err(|_| ())
+    })
+    .await;
 }
 
 /// Persist a failure backoff only when the state observed before Phase A is
@@ -726,7 +681,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn floors_merge_applies_over_a_changed_baseline() {
+    fn floors_side_file_merges_over_any_baseline_and_never_regresses() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("test directory must be created");
@@ -747,16 +702,14 @@ mod tests {
         };
         write_state(&dir, &moved).expect("moved state fixture must persist");
 
-        // Merging an accepted floor-3 snapshot needs no baseline match and
-        // leaves the concurrent backoff untouched.
+        // Recording an accepted floor-3 snapshot needs no baseline match and
+        // leaves the concurrent backoff untouched (side file, not the CAS'd
+        // main state).
         let accepted = UpgradeState {
             generation_floor: 3,
             ..UpgradeState::default()
         };
-        assert!(
-            merge_floors_locked(&dir, &accepted).expect("floor merge must not error"),
-            "an uncontended lock must merge"
-        );
+        record_acceptance_floors(&dir, &accepted).expect("floor recording must not error");
         let current = read_state(&dir).expect("merged state must be readable");
         assert_eq!(current.generation_floor, 3);
         assert_eq!(current.backoff_not_before, Some(9_999));
@@ -767,7 +720,7 @@ mod tests {
             generation_floor: 1,
             ..UpgradeState::default()
         };
-        assert!(merge_floors_locked(&dir, &lower).expect("floor merge must not error"));
+        record_acceptance_floors(&dir, &lower).expect("floor recording must not error");
         assert_eq!(
             read_state(&dir)
                 .expect("state must stay readable")
@@ -778,7 +731,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn contended_floor_merge_completes_after_the_lock_frees() {
+    async fn floors_persist_even_while_the_main_upgrade_lock_is_held() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("test directory must be created");
@@ -791,39 +744,25 @@ mod tests {
         let dir = InstallDir::open_validated(&path).expect("test directory must validate");
         write_state(&dir, &UpgradeState::default()).expect("baseline state must persist");
 
-        // Hold the lock PAST the fast-path retries (4 x 250 ms) so the merge
-        // has to go through the detached blocking-lock fallback.
-        let lock = dir
+        // Another process holds (or wedges) the MAIN upgrade lock for the
+        // whole duration: floors must still become durable before the call
+        // returns, because they go through the independent side-file lock.
+        let _main_lock = dir
             .try_lock()
             .expect("lock probe must not error")
-            .expect("test must own the lock first");
+            .expect("test must own the main lock first");
         let accepted = UpgradeState {
             generation_floor: 5,
             ..UpgradeState::default()
         };
-        let merge = merge_acceptance_floors_with_retry(path.clone(), accepted);
-        let release = async {
-            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-            drop(lock);
-        };
-        tokio::join!(merge, release);
-
-        // The detached thread may land the write just after the bounded wait
-        // returns; poll briefly instead of racing it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let floor = read_state(&dir)
+        merge_acceptance_floors_with_retry(path.clone(), accepted).await;
+        assert_eq!(
+            read_state(&dir)
                 .expect("state must stay readable")
-                .generation_floor;
-            if floor == 5 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "contended floor merge never landed (floor still {floor})"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+                .generation_floor,
+            5,
+            "floors must be durable before the call returns, main lock or not"
+        );
     }
 
     #[test]
