@@ -79,9 +79,10 @@ document.
   or skip), its anti-rollback floors are persisted; a floor-persist failure
   is an error, never silently ignored. Declining an offer needs no extra
   bookkeeping — the floors are already on disk.
-- **Bounded network**: the manifest fetch/decision has a 30-second total
-  budget and the artifact download a 300-second one; a stalled or trickling
-  server times out instead of hanging the terminal.
+- **Bounded network**: each manifest fetch has a 30-second wall-clock
+  budget (the local signature/policy decision after it is effectively
+  instant) and the artifact download a 300-second one; a stalled or
+  trickling server times out instead of hanging the terminal.
 
 - **Publisher pause** (`paused=true` in the signed manifest): reported as an
   emergency stop; nothing is installed.

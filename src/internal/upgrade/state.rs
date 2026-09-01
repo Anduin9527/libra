@@ -558,10 +558,10 @@ pub fn record_acceptance_floors(
             },
         });
     }
-    // 15 s: long enough to outlive a concurrent manual install transaction
-    // holding the floors lock across its pre-commit policy window (probe +
-    // journal, typically seconds) — a shorter wait made a concurrent
-    // process drop verified floors exactly when they mattered most.
+    // 15 s: long enough to outlive the commit fence (txn.rs), which holds
+    // the floors lock only across the commit tail — journal + state/marker
+    // writes + fsyncs, no probes — so this bound is sufficient by
+    // construction rather than by hoping a probe finishes in time.
     match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
         Ok(result) => result,
         Err(_) => Err(StateStoreError::WriteFailed {

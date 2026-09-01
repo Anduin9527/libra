@@ -490,16 +490,14 @@ async fn run_locked_install(
             write_state(&dir, &backed_off).map_err(|e| TxnError::State(e.to_string()))?;
             return Ok(Some(TxnOutcome::NoOp));
         }
-        // A newer control decision may have landed in the floors side file
-        // while we staged and probed (its writer does not take the main
-        // lock): re-check right before the transaction, and HOLD the floors
-        // micro-lock from this read through the transaction itself, so a
-        // side-floor write cannot slip between the policy check and the
-        // commit. Writers block for up to 15 s (state.rs), which outlives
-        // the probe+journal window this lock covers.
-        let _floors_gate = dir
-            .lock_floors_blocking()
-            .map_err(|e| TxnError::State(format!("floors lock: {e}")))?;
+        // Early policy re-check (cheap, unlocked): a control decision that
+        // already landed aborts before the expensive probe work. The
+        // AUTHORITATIVE check is the commit fence below — it re-reads under
+        // the floors micro-lock after the post-install probe and holds that
+        // lock through the whole commit, so a side-floor write can never
+        // slip between the final check and the committed state. The fence
+        // window is only journal + state/marker writes + fsyncs, so the
+        // floors writers' 15 s bounded wait covers it by construction.
         let latest = read_state(&dir).map_err(|e| TxnError::State(e.to_string()))?;
         if latest.generation_floor > staged.new_state.generation_floor
             || latest.max_control_revision > staged.new_state.max_control_revision
@@ -513,6 +511,22 @@ async fn run_locked_install(
         let expected = version.to_string();
         let probe =
             move |d: &InstallDir| sync_post_install_probe(d, &expected, RECOVERY_PROBE_TIMEOUT);
+        let fence_generation_floor = staged.new_state.generation_floor;
+        let fence_control_revision = staged.new_state.max_control_revision;
+        let fence = move |d: &InstallDir| -> Result<Option<super::lock::UpgradeLock>, TxnError> {
+            let guard = d
+                .lock_floors_blocking()
+                .map_err(|e| TxnError::State(format!("floors lock: {e}")))?;
+            let current = read_state(d).map_err(|e| TxnError::State(e.to_string()))?;
+            if current.generation_floor > fence_generation_floor
+                || current.max_control_revision > fence_control_revision
+            {
+                // Superseded at the last moment: veto (drops the guard) and
+                // the transaction rolls back like a failed probe.
+                return Ok(None);
+            }
+            Ok(Some(guard))
+        };
         txn::run_install(
             &dir,
             old_target,
@@ -521,6 +535,7 @@ async fn run_locked_install(
             staged.marker,
             staged.new_state,
             &probe,
+            Some(&fence),
         )
         .map(Some)
     })
@@ -693,24 +708,28 @@ impl ManualUpgrade {
             .as_deref()
             .and_then(parse_http_date_to_unix);
         self.install_from_envelope(
-            &client,
             &fetched.bytes,
             https_date_unix,
             local_now,
             active_trust_table(),
+            CandidateSource::Download(&client),
         )
         .await
     }
 
-    /// The re-verify + download + transact core, parameterized on the
-    /// envelope so the test build can drive it without a network.
+    /// The re-verify + candidate + transact core, parameterized on where the
+    /// candidate bytes come from so the production path and the test hooks
+    /// run the IDENTICAL revalidation/floors/staging code. Production always
+    /// passes [`CandidateSource::Download`]; only `test-upgrade` hooks may
+    /// inject bytes (the sha256/size gate of the download itself is
+    /// enforced by `download_artifact_to` and covered by its own tests).
     async fn install_from_envelope(
         self,
-        client: &reqwest::Client,
         envelope_bytes: &[u8],
         https_date_unix: Option<i64>,
         local_now: i64,
         trust: &[super::trusted_keys::TrustedKey],
+        source: CandidateSource<'_>,
     ) -> Result<ManualInstallReport, ManualUpgradeError> {
         // Fresh baseline: the confirmation window is unbounded, so both the
         // decision AND phase-b's CAS must run against the CURRENT state.
@@ -752,22 +771,37 @@ impl ManualUpgrade {
         let expected_state =
             read_state(&self.ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
 
-        let mut candidate: Vec<u8> = Vec::new();
-        tokio::time::timeout(
-            MANUAL_DOWNLOAD_BUDGET,
-            download_artifact_to(
-                client,
-                &plan.artifact.url,
-                plan.artifact.size,
-                &plan.artifact.sha256,
-                &mut candidate,
-            ),
-        )
-        .await
-        .map_err(|_| ManualUpgradeError::Timeout("artifact download"))??;
-
+        let candidate: Vec<u8> = match source {
+            CandidateSource::Download(client) => {
+                let mut buf = Vec::new();
+                tokio::time::timeout(
+                    MANUAL_DOWNLOAD_BUDGET,
+                    download_artifact_to(
+                        client,
+                        &plan.artifact.url,
+                        plan.artifact.size,
+                        &plan.artifact.sha256,
+                        &mut buf,
+                    ),
+                )
+                .await
+                .map_err(|_| ManualUpgradeError::Timeout("artifact download"))??;
+                buf
+            }
+            #[cfg(feature = "test-upgrade")]
+            CandidateSource::Injected(bytes) => bytes,
+        };
         finish_manual_install(&self.ctx, plan, expected_state, candidate, local_now).await
     }
+}
+
+/// Where a manual install's candidate bytes come from.
+enum CandidateSource<'a> {
+    /// The signed artifact URL, streamed through the sha256/size gate.
+    Download(&'a reqwest::Client),
+    /// Test-injected bytes (`test-upgrade` hooks only).
+    #[cfg(feature = "test-upgrade")]
+    Injected(Vec<u8>),
 }
 
 /// The shared post-download tail of a manual install: stage the candidate
@@ -879,9 +913,21 @@ pub async fn manual_upgrade_check(
     let Some(ctx) = resolve_install_context() else {
         return Ok(ManualCheckOutcome::NotOfficialInstall);
     };
-    // The platform/marker gates live in manual_check_with_envelope (single
-    // source, exercised by the test hooks too); duplicating the MARKER gate
-    // here would only save one manifest fetch on pre-marker installs.
+    // Fast-path duplicates of the authoritative gates inside
+    // manual_check_with_envelope: an unmanageable install must get its
+    // actionable outcome WITHOUT a network round-trip (and without a
+    // network error masking it). The shared core re-checks the same gates,
+    // so the test hooks still exercise them.
+    if ctx.platform.support() != PlatformSupport::Supported {
+        return Ok(ManualCheckOutcome::UnsupportedPlatform);
+    }
+    if official_marker_for_target(&ctx.dir, ctx.platform.as_str())
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Ok(ManualCheckOutcome::NotOfficialInstall);
+    }
     let client = upgrade_http_client()?;
     let fetched = tokio::time::timeout(MANUAL_CHECK_BUDGET, fetch_manifest(&client, MANIFEST_URL))
         .await
@@ -999,6 +1045,9 @@ pub mod manual_test_hooks {
     }
 
     /// Run the install core with an injected envelope + candidate download.
+    /// Run the REAL install core with injected candidate bytes (only the
+    /// network download is swapped out; revalidation, floors, staging and
+    /// the transaction are the production code path).
     pub async fn install_with_envelope_and_candidate(
         upgrade: ManualUpgrade,
         envelope_bytes: &[u8],
@@ -1007,43 +1056,15 @@ pub mod manual_test_hooks {
         candidate: Vec<u8>,
         trust: &[super::super::trusted_keys::TrustedKey],
     ) -> Result<ManualInstallReport, ManualUpgradeError> {
-        // Reuse install_from_envelope's decision/floors path but swap the
-        // download for the injected bytes by re-implementing its tail.
-        let state =
-            read_state(&upgrade.ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
-        let decision = decide_for_state(
-            &upgrade.ctx,
-            &state,
-            envelope_bytes,
-            https_date_unix,
-            local_now,
-            upgrade.installed,
-            trust,
-        )?;
-        let plan = match decision {
-            UpgradeDecision::Install(plan) if plan.version == upgrade.latest => plan,
-            UpgradeDecision::Install(plan) => {
-                persist_floors_strict(upgrade.ctx.dir_path.clone(), plan.new_state.clone()).await?;
-                return Ok(ManualInstallReport::ControlChanged {
-                    detail: format!(
-                        "the signed channel now offers v{} instead of the confirmed v{}",
-                        plan.version, upgrade.latest
-                    ),
-                });
-            }
-            UpgradeDecision::Skip { reason, new_state } => {
-                persist_floors_strict(upgrade.ctx.dir_path.clone(), new_state).await?;
-                return Ok(ManualInstallReport::ControlChanged {
-                    detail: skip_reason_human(&reason),
-                });
-            }
-        };
-        persist_floors_strict(upgrade.ctx.dir_path.clone(), plan.new_state.clone()).await?;
-        let expected_state =
-            read_state(&upgrade.ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
-        let _ = state;
-        // Same tail as the production path (mapping included).
-        finish_manual_install(&upgrade.ctx, plan, expected_state, candidate, local_now).await
+        upgrade
+            .install_from_envelope(
+                envelope_bytes,
+                https_date_unix,
+                local_now,
+                trust,
+                CandidateSource::Injected(candidate),
+            )
+            .await
     }
 }
 

@@ -449,14 +449,25 @@ download_file_pinned() {
 # MARKER_WRITTEN feeds the final summary so a failure is never silent.
 MARKER_WRITTEN=0
 write_official_marker() {
-    if [ ! -O "$INSTALL_DIR" ] 2>/dev/null; then
+    # POSIX-portable ownership + world-writability preflight (`test -O` and
+    # `find -maxdepth` are not portable to dash/BSD): `ls -ldn` prints the
+    # numeric owner uid in field 3 and the mode string's 9th character is
+    # the others-write bit.
+    dir_ls=$(ls -ldn "$INSTALL_DIR" 2>/dev/null) || {
+        warn_fact "provenance" "cannot inspect the install dir — official-install marker skipped; re-run this installer to enable 'libra upgrade'"
+        return 0
+    }
+    dir_uid=$(printf '%s\n' "$dir_ls" | awk '{print $3}')
+    if [ "$dir_uid" != "$(id -u)" ]; then
         warn_fact "provenance" "install dir is not owned by you — official-install marker skipped; 'libra upgrade' will not manage this install"
         return 0
     fi
-    if [ -n "$(find "$INSTALL_DIR" -maxdepth 0 -perm -0002 2>/dev/null)" ]; then
-        warn_fact "provenance" "install dir is world-writable — official-install marker skipped; run: chmod o-w '$INSTALL_DIR'"
-        return 0
-    fi
+    case "$dir_ls" in
+        ????????w*)
+            warn_fact "provenance" "install dir is world-writable — official-install marker skipped; run: chmod o-w '$INSTALL_DIR'"
+            return 0
+            ;;
+    esac
     marker_dir=$(mktemp -d "${INSTALL_DIR}/.libra-marker.XXXXXX" 2>/dev/null) || {
         warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
         return 0
@@ -1065,6 +1076,11 @@ screen_already_installed() {
         agent_say "libra ${VERSION} is already installed at ${EXISTING_PATH}. The optional lba shorthand is ready too."
     else
         agent_say "libra ${VERSION} is already installed at ${EXISTING_PATH}. Nothing else to install."
+    fi
+    # The bootstrap re-run exists to write the marker; a failure here would
+    # otherwise hide behind the normal success screen.
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ] && [ "${MARKER_WRITTEN:-0}" != "1" ]; then
+        warn_fact "provenance" "upgrade management NOT enabled (the official-install marker was not written) — 'libra upgrade' will ask you to re-run this installer"
     fi
 
     section "installed"

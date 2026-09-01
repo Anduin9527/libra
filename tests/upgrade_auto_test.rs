@@ -449,6 +449,7 @@ fn upgrade_present_txn_commit_then_marker_is_official() {
         marker_for("2.0.0", b"NEW"),
         UpgradeState::default(),
         &pass,
+        None,
     )
     .unwrap();
     assert_eq!(outcome, TxnOutcome::Installed);
@@ -486,6 +487,7 @@ fn upgrade_present_probe_failure_rolls_back_and_restores_marker() {
         marker_for("2.0.0", b"NEW"),
         UpgradeState::default(),
         &fail,
+        None,
     )
     .unwrap();
     assert_eq!(outcome, TxnOutcome::RolledBack);

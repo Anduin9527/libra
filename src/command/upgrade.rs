@@ -512,8 +512,9 @@ async fn run_available(
             .with_hint("run `libra upgrade` again to see the current state"))
         }
         ManualInstallReport::RolledBack => Err(CliError::failure(
-            "the downloaded version failed its post-install self-check and the previous \
-             binary was RESTORED — nothing changed",
+            "the previous binary was RESTORED — the downloaded version failed its \
+             post-install self-check, or a newer publisher control decision superseded it \
+             at the last moment; nothing changed",
         )
         .with_stable_code(StableErrorCode::RepoStateInvalid)
         .with_hint(
@@ -595,6 +596,12 @@ fn manual_error_to_cli(prefix: &str, error: ManualUpgradeError) -> CliError {
         // The peer violated the channel's contract (redirects, wrong URL,
         // size bounds, digest mismatch, non-https) — protocol, not weather.
         ManualUpgradeError::Fetch(_) => StableErrorCode::NetworkProtocol,
+        // A missing/out-of-lifetime HTTPS Date is the PEER violating the
+        // channel contract, not local state damage.
+        ManualUpgradeError::Verify(FlowError::State(
+            crate::internal::upgrade::state::StateRejection::MissingHttpsDate
+            | crate::internal::upgrade::state::StateRejection::HttpsDateOutsideLifetime { .. },
+        )) => StableErrorCode::NetworkProtocol,
         ManualUpgradeError::Verify(FlowError::State(_)) => StableErrorCode::RepoStateInvalid,
         ManualUpgradeError::Verify(_) => StableErrorCode::NetworkProtocol,
         ManualUpgradeError::State(_) | ManualUpgradeError::Txn(_) => {

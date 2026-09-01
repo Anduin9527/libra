@@ -111,6 +111,16 @@ pub enum TxnError {
 /// Injected so recovery is testable without spawning a real binary.
 pub type PostProbe<'a> = dyn Fn(&InstallDir) -> Result<bool, TxnError> + 'a;
 
+/// Commit fence (§A.6 policy): consulted AFTER the post-install probe passes
+/// and BEFORE the commit writes anything. `Ok(Some(guard))` proceeds with the
+/// guard held through the whole commit (the caller uses it to hold the floors
+/// micro-lock, so a concurrent control write cannot land between the final
+/// policy check and the committed state); `Ok(None)` VETOES the commit and the
+/// transaction rolls back exactly like a failed probe. `None` fence (recovery,
+/// tests) commits unconditionally.
+pub type CommitFence<'a> =
+    dyn Fn(&InstallDir) -> Result<Option<super::lock::UpgradeLock>, TxnError> + 'a;
+
 fn load_txn(dir: &InstallDir) -> Result<Option<Txn>, TxnError> {
     let Some(bytes) = dir.read_file(TXN_FILE_NAME)? else {
         return Ok(None);
@@ -265,11 +275,39 @@ fn probe_and_resolve(
     dir: &InstallDir,
     txn: &mut Txn,
     post_probe: &PostProbe<'_>,
+    commit_fence: Option<&CommitFence<'_>>,
 ) -> Result<TxnOutcome, TxnError> {
     if post_probe(dir)? {
+        // The fence guard (when present) is held from the final policy check
+        // through the entire commit — the protected window is only journal +
+        // state/marker writes + fsyncs, so it is bounded by construction.
+        let fence_guard = match commit_fence {
+            Some(fence) => match fence(dir)? {
+                Some(guard) => Some(guard),
+                None => {
+                    // Vetoed: a newer control decision superseded this plan
+                    // after the probe. Undo exactly like a failed probe.
+                    return match txn.old_target {
+                        OldTarget::Absent => {
+                            txn.state = TxnState::AbortAbsentIntent;
+                            store_txn(dir, txn)?;
+                            finish_abort_absent(dir, txn)
+                        }
+                        OldTarget::Present { .. } => {
+                            txn.state = TxnState::RollbackIntent;
+                            store_txn(dir, txn)?;
+                            finish_rollback(dir, txn)
+                        }
+                    };
+                }
+            },
+            None => None,
+        };
         txn.state = TxnState::PostProbePassed;
         store_txn(dir, txn)?;
-        finish_commit(dir, txn)
+        let outcome = finish_commit(dir, txn);
+        drop(fence_guard);
+        outcome
     } else {
         match txn.old_target {
             OldTarget::Absent => {
@@ -314,7 +352,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
                 // rename landed but state was not yet advanced.
                 txn.state = TxnState::CandidateInstalled;
                 store_txn(dir, &txn)?;
-                probe_and_resolve(dir, &mut txn, post_probe)
+                probe_and_resolve(dir, &mut txn, post_probe, None)
             } else {
                 Err(fatal("Prepared/Absent layout unrecognized"))
             }
@@ -333,7 +371,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             {
                 txn.state = TxnState::BackupDurable;
                 store_txn(dir, &txn)?;
-                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe)
+                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe, None)
             } else {
                 Err(fatal("Prepared/Present layout unrecognized"))
             }
@@ -342,14 +380,14 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             let candidate_new = layout.candidate.as_deref() == Some(new.as_str());
             let backup_old = layout.backup.as_deref() == Some(hash.as_str());
             if layout.target.as_deref() == Some(hash.as_str()) && candidate_new && backup_old {
-                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe)
+                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe, None)
             } else if layout.target.as_deref() == Some(new.as_str())
                 && layout.candidate.is_none()
                 && backup_old
             {
                 txn.state = TxnState::CandidateInstalled;
                 store_txn(dir, &txn)?;
-                probe_and_resolve(dir, &mut txn, post_probe)
+                probe_and_resolve(dir, &mut txn, post_probe, None)
             } else {
                 Err(fatal("BackupDurable layout unrecognized"))
             }
@@ -361,7 +399,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             if layout.target.as_deref() != Some(new.as_str()) {
                 return Err(fatal("CandidateInstalled but target is not the new hash"));
             }
-            probe_and_resolve(dir, &mut txn, post_probe)
+            probe_and_resolve(dir, &mut txn, post_probe, None)
         }
         (TxnState::PostProbePassed, _) => {
             if layout.target.as_deref() != Some(new.as_str()) {
@@ -387,17 +425,21 @@ fn continue_overwrite_from_backup_durable(
     dir: &InstallDir,
     txn: &mut Txn,
     post_probe: &PostProbe<'_>,
+    commit_fence: Option<&CommitFence<'_>>,
 ) -> Result<TxnOutcome, TxnError> {
     dir.rename_entry(CANDIDATE_NAME, TARGET_BINARY_NAME)?;
     dir.fsync_dir()?;
     txn.state = TxnState::CandidateInstalled;
     store_txn(dir, txn)?;
-    probe_and_resolve(dir, txn, post_probe)
+    probe_and_resolve(dir, txn, post_probe, commit_fence)
 }
 
 /// Drive a fresh transaction to completion. The caller has already written
 /// the verified candidate to [`CANDIDATE_NAME`] (via [`InstallDir`]) and
 /// holds the §A.5 lock. `old_target` reflects the pre-install target.
+// The transaction inputs are all independently sourced (§A.7); bundling
+// them into a struct would only add ceremony at the two call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn run_install(
     dir: &InstallDir,
     old_target: OldTarget,
@@ -406,6 +448,7 @@ pub fn run_install(
     marker: InstallMarker,
     new_state: UpgradeState,
     post_probe: &PostProbe<'_>,
+    commit_fence: Option<&CommitFence<'_>>,
 ) -> Result<TxnOutcome, TxnError> {
     let mut txn = Txn {
         schema_version: 1,
@@ -425,7 +468,7 @@ pub fn run_install(
             dir.fsync_dir()?;
             txn.state = TxnState::CandidateInstalled;
             store_txn(dir, &txn)?;
-            probe_and_resolve(dir, &mut txn, post_probe)
+            probe_and_resolve(dir, &mut txn, post_probe, commit_fence)
         }
         OldTarget::Present { .. } => {
             // Upgrade: durable backup BEFORE overwrite.
@@ -433,7 +476,7 @@ pub fn run_install(
             dir.fsync_dir()?;
             txn.state = TxnState::BackupDurable;
             store_txn(dir, &txn)?;
-            continue_overwrite_from_backup_durable(dir, &mut txn, post_probe)
+            continue_overwrite_from_backup_durable(dir, &mut txn, post_probe, commit_fence)
         }
     }
 }
@@ -494,6 +537,7 @@ mod tests {
             marker_for("1.0.0", b"NEW"),
             UpgradeState::default(),
             &pass(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::Installed);
@@ -533,6 +577,7 @@ mod tests {
             marker_for("1.0.0", b"NEW"),
             UpgradeState::default(),
             &fail(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::AbortedAbsent);
@@ -566,6 +611,7 @@ mod tests {
             marker_for("2.0.0", b"NEW"),
             UpgradeState::default(),
             &pass(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::Installed);
@@ -602,6 +648,7 @@ mod tests {
             marker_for("2.0.0", b"NEW"),
             UpgradeState::default(),
             &fail(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::RolledBack);
