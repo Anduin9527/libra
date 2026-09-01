@@ -21,7 +21,11 @@ fn bare_rclone_variables(input: &str) -> Vec<&str> {
 }
 
 #[test]
-fn release_workflow_does_not_export_rclone_option_environment_variables() {
+fn release_workflow_uses_no_rclone_and_no_long_term_r2_credentials() {
+    // plan-20260821 A1-09: uploads go through the Backend credential broker
+    // (per-object presigned PUT URLs); rclone and the long-term secrets.R2_*
+    // credentials are gone from the workflow entirely (GC-UP01-1 forbids
+    // ever bringing the long-term credentials back).
     let workflow = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/release.yml"
@@ -29,14 +33,18 @@ fn release_workflow_does_not_export_rclone_option_environment_variables() {
     .expect("read release workflow");
 
     assert!(
-        workflow.contains("LIBRA_RCLONE_VERSION:"),
-        "release workflow must retain an explicit pinned rclone version"
+        !workflow.to_lowercase().contains("rclone"),
+        "release.yml must not reference rclone: uploads go through the broker"
     );
-
+    assert!(
+        !workflow.contains("secrets.R2_"),
+        "release.yml must not reference long-term R2 credentials (GC-UP01-1)"
+    );
+    // If rclone ever returns, the bare-variable rule below applies again.
     let bare_rclone_variables = bare_rclone_variables(&workflow);
     assert!(
         bare_rclone_variables.is_empty(),
-        "rclone treats bare RCLONE_* environment variables as CLI options; use LIBRA_RCLONE_* for release constants and reserve only RCLONE_CONFIG_R2_* for the configured remote: {bare_rclone_variables:?}"
+        "rclone treats bare RCLONE_* environment variables as CLI options: {bare_rclone_variables:?}"
     );
 }
 
