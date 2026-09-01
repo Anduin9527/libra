@@ -49,17 +49,38 @@ revocations) are never forgotten.
 | `--check` | Only report whether a newer signed version exists; never install. Exits 0 in every informational state. | `libra upgrade --check` |
 | `-y`, `--yes` | Install a newer version without the confirmation prompt (for scripts and non-interactive shells). Conflicts with `--check`. | `libra upgrade --yes` |
 
-With the global `--json` flag the command emits a machine-readable status
-document instead of human text:
+With the global `--json` flag the command emits the standard machine
+envelope; the payload lives under `data`:
 
 ```json
-{"status": "available", "installed": "0.22.9", "latest": "0.22.10"}
+{
+  "ok": true,
+  "command": "upgrade",
+  "data": {"status": "available", "installed": "0.22.9", "latest": "0.22.10"}
+}
 ```
 
-`status` is one of `up_to_date`, `available`, `installed`, `declined`,
-`paused`, `latest_revoked`, `not_official_install`, `unsupported_platform`.
+`data.status` is one of `up_to_date`, `available`, `installed`, `declined`,
+`control_changed`, `paused`, `latest_revoked`, `not_official_install`,
+`unsupported_platform`. Machine modes (`--json`/`--machine`) and `--quiet`
+never prompt: an available upgrade without `--yes` or `--check` is refused
+with the exact flags to use, so stdout always stays a clean machine
+document.
 
 ## Behaviour in edge states
+
+- **Re-verification after confirmation**: the prompt can stay open for any
+  amount of time, so after you confirm, the manifest is fetched and verified
+  AGAIN before anything is downloaded. A pause, a revocation, or a different
+  version published while you were deciding wins — the command reports
+  `control_changed`, installs nothing, and asks you to re-run.
+- **Durable floors at check time**: the moment a manifest is accepted (offer
+  or skip), its anti-rollback floors are persisted; a floor-persist failure
+  is an error, never silently ignored. Declining an offer needs no extra
+  bookkeeping — the floors are already on disk.
+- **Bounded network**: the manifest fetch/decision has a 30-second total
+  budget and the artifact download a 300-second one; a stalled or trickling
+  server times out instead of hanging the terminal.
 
 - **Publisher pause** (`paused=true` in the signed manifest): reported as an
   emergency stop; nothing is installed.

@@ -74,8 +74,10 @@ Only installs performed by the official signed script installer are eligible.
 Homebrew, from-source builds, manual copies, and third-party package managers
 are never marked official and never auto-upgrade — an official-install marker
 is written only after a verified signed-manifest install, and it must match the
-actual binary's version, size, and hash. A binary hashing itself, or a marker
-copied next to a different binary, never qualifies.
+actual binary's platform, size, and sha256 (its version field is
+informational; the install's own self-check probes pin version↔digest). A
+binary hashing itself, or a marker copied next to a different binary, never
+qualifies.
 
 ## Recovery and safety
 

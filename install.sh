@@ -436,6 +436,29 @@ download_file_pinned() {
     fi
 }
 
+# Official-install marker (§A.2/§A.4): records the signed provenance of the
+# target so `libra upgrade` and `upgrade.mode=auto` accept this install as
+# upgrade-manageable. Called ONLY on the verified path — an unverified
+# fallback must never claim official provenance. mktemp creates the staging
+# file exclusively (O_EXCL), so a pre-created symlink can never redirect the
+# write to another file.
+write_official_marker() {
+    marker_tmp=$(mktemp "${INSTALL_DIR}/.libra-official-install.json.XXXXXX" 2>/dev/null) || {
+        warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
+        return 0
+    }
+    if printf '{"schema_version":1,"installed_at":"%s","install_source":"official_signed_manifest","platform":"%s","version":"%s","sha256":"%s","size":%s,"manifest_key_id":"%s"}' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${OS}-${ARCH}" "$STABLE_VERSION" \
+        "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_tmp" \
+        && chmod 644 "$marker_tmp" \
+        && mv "$marker_tmp" "${INSTALL_DIR}/.libra-official-install.json"; then
+        fact "provenance" "official-install marker written (enables 'libra upgrade')"
+    else
+        rm -f "$marker_tmp" 2>/dev/null
+        warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
+    fi
+}
+
 # Print sha256 hex of "$1", or empty string if no hashing tool is available.
 sha256_of() {
     file=$1
@@ -1105,21 +1128,7 @@ screen_install() {
         || error_exit "could not install to $target" "install"
 
     if [ "${INSTALL_VERIFIED:-0}" = "1" ]; then
-        # Official-install marker (§A.2/§A.4): records the signed provenance
-        # of the target so `libra upgrade` and `upgrade.mode=auto` accept
-        # this install as upgrade-manageable. Written ONLY on the verified
-        # path — an unverified fallback must never claim official provenance.
-        marker_tmp="${INSTALL_DIR}/.libra-official-install.json.tmp.$$"
-        if printf '{"schema_version":1,"installed_at":"%s","install_source":"official_signed_manifest","platform":"%s","version":"%s","sha256":"%s","size":%s,"manifest_key_id":"%s"}' \
-            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${OS}-${ARCH}" "$STABLE_VERSION" \
-            "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_tmp" \
-            && chmod 644 "$marker_tmp" \
-            && mv "$marker_tmp" "${INSTALL_DIR}/.libra-official-install.json"; then
-            fact "provenance" "official-install marker written (enables 'libra upgrade')"
-        else
-            rm -f "$marker_tmp" 2>/dev/null
-            warn_fact "provenance" "could not record the official-install marker — 'libra upgrade' will ask you to re-run this installer"
-        fi
+        write_official_marker
     else
         # An unverified install must not sit next to a stale official marker.
         rm -f "${INSTALL_DIR}/.libra-official-install.json" 2>/dev/null || true
@@ -1385,6 +1394,11 @@ main() {
             fi
         fi
         if [ "$skip_ok" = "1" ]; then
+            # Bootstrap: the already-installed binary just matched the SIGNED
+            # manifest digest, so (re)write the official marker — installs
+            # made by older script versions carry none, and this no-op branch
+            # is exactly where their re-run lands.
+            [ "${INSTALL_VERIFIED:-0}" = "1" ] && write_official_marker
             # Re-running the installer repairs a missing/legacy alias even when
             # the binary itself does not need to be downloaded again.
             ensure_lba_alias

@@ -286,8 +286,12 @@ use std::io::{IsTerminal, Write};
 use clap::Parser;
 
 use crate::{
-    internal::upgrade::orchestrator::{
-        ManualCheckOutcome, ManualInstallReport, ManualUpgradeError, manual_upgrade_check,
+    internal::upgrade::{
+        flow::FlowError,
+        orchestrator::{
+            ManualCheckOutcome, ManualInstallReport, ManualUpgrade, ManualUpgradeError,
+            manual_upgrade_check,
+        },
     },
     utils::{error::StableErrorCode, output::OutputConfig},
 };
@@ -306,7 +310,8 @@ EXAMPLES:
 
 The check and the install both run the fully verified pipeline: the Ed25519-signed
 stable manifest, anti-rollback floors, sha256/size-enforced download, and a locked
-install transaction with a self-check probe and automatic rollback.
+install transaction with a self-check probe and automatic rollback. Machine modes
+(--json/--machine) never prompt: combine them with --check or --yes.
 ";
 
 #[derive(Parser, Debug)]
@@ -329,7 +334,7 @@ pub async fn execute_safe(args: UpgradeArgs, output: &OutputConfig) -> CliResult
 
     let outcome = manual_upgrade_check(local_now)
         .await
-        .map_err(check_error_to_cli)?;
+        .map_err(|e| manual_error_to_cli("upgrade check failed", e))?;
 
     match outcome {
         ManualCheckOutcome::NotOfficialInstall => {
@@ -411,13 +416,15 @@ pub async fn execute_safe(args: UpgradeArgs, output: &OutputConfig) -> CliResult
 async fn run_available(
     args: UpgradeArgs,
     output: &OutputConfig,
-    upgrade: crate::internal::upgrade::orchestrator::ManualUpgrade,
+    upgrade: ManualUpgrade,
 ) -> CliResult<()> {
     let installed = upgrade.installed();
     let latest = upgrade.latest();
     let size_mb = upgrade.artifact_size() as f64 / 1_048_576.0;
 
     if args.check {
+        // The accepted manifest's floors are already durable (the check
+        // persisted them before returning Available).
         report_status(
             output,
             "available",
@@ -428,25 +435,30 @@ async fn run_available(
                  signed) — run `libra upgrade` to install"
             ),
         )?;
-        upgrade.decline().await;
         return Ok(());
-    }
-
-    if !output.is_json() && !output.quiet {
-        println!("  installed  v{installed}");
-        println!("  latest     v{latest}  ({size_mb:.1} MB, signed stable channel)");
-        println!();
     }
 
     let proceed = if args.yes {
         true
+    } else if output.is_json() || output.quiet {
+        // Machine/quiet modes never prompt: stdout must stay a clean
+        // machine document and quiet must stay quiet.
+        return Err(CliError::failure(format!(
+            "a newer version v{latest} is available, but machine/quiet output modes never \
+             prompt for confirmation"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("re-run with --yes to install non-interactively")
+        .with_hint("or use --check to only report availability"));
     } else if std::io::stdin().is_terminal() {
+        println!("  installed  v{installed}");
+        println!("  latest     v{latest}  ({size_mb:.1} MB, signed stable channel)");
+        println!();
         confirm(&format!("Upgrade to v{latest} now?")).map_err(|error| {
             CliError::failure(format!("could not read the confirmation answer: {error}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
         })?
     } else {
-        upgrade.decline().await;
         return Err(CliError::failure(format!(
             "a newer version v{latest} is available, but stdin is not a terminal so libra \
              cannot ask for confirmation"
@@ -457,7 +469,6 @@ async fn run_available(
     };
 
     if !proceed {
-        upgrade.decline().await;
         report_status(
             output,
             "declined",
@@ -471,7 +482,10 @@ async fn run_available(
     if !output.is_json() && !output.quiet {
         println!("  downloading v{latest} ({size_mb:.1} MB, sha256-verified) ...");
     }
-    let report = upgrade.install().await.map_err(install_error_to_cli)?;
+    let report = upgrade
+        .install()
+        .await
+        .map_err(|e| manual_error_to_cli("upgrade failed", e))?;
     match report {
         ManualInstallReport::Installed(version) => {
             report_status(
@@ -481,6 +495,22 @@ async fn run_available(
                 Some(version.to_string()),
                 &format!(
                     "upgraded to v{version} — the new version takes effect on your next command"
+                ),
+            )?;
+            Ok(())
+        }
+        ManualInstallReport::ControlChanged { detail } => {
+            // The publisher's decision changed while the prompt was open;
+            // refusing to install the stale plan is the CORRECT outcome, so
+            // this is informational (exit 0), stated plainly.
+            report_status(
+                output,
+                "control_changed",
+                Some(installed.to_string()),
+                Some(latest.to_string()),
+                &format!(
+                    "nothing was installed: {detail} — run `libra upgrade` again to see the \
+                     current state"
                 ),
             )?;
             Ok(())
@@ -524,7 +554,7 @@ fn report_status(
     if !output.quiet {
         match status {
             "up_to_date" | "installed" => println!("✓ {human}"),
-            "paused" | "latest_revoked" => println!("! {human}"),
+            "paused" | "latest_revoked" | "control_changed" => println!("! {human}"),
             _ => println!("{human}"),
         }
     }
@@ -536,32 +566,51 @@ fn parse_confirmation(raw: &str) -> bool {
     matches!(raw.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// The prompt goes to STDERR so a piped stdout never receives it.
 fn confirm(question: &str) -> std::io::Result<bool> {
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
+    let read = std::io::stdin().read_line(&mut line)?;
+    if read == 0 {
+        // EOF declines (the [y/N] default).
+        eprintln!();
+        return Ok(false);
+    }
     Ok(parse_confirmation(&line))
 }
 
-fn check_error_to_cli(error: ManualUpgradeError) -> CliError {
+/// Map a manual-flow error onto the closest stable code: network transport
+/// issues are NET-001, protocol/verification violations NET-002, persisted
+/// anti-rollback rejections and upgrade-state problems REPO-003 (the
+/// upgrade subsystem's established state code), floor-write failures the IO
+/// write code.
+fn manual_error_to_cli(prefix: &str, error: ManualUpgradeError) -> CliError {
     let code = match &error {
-        ManualUpgradeError::Fetch(_) => StableErrorCode::NetworkUnavailable,
+        ManualUpgradeError::Fetch(_) | ManualUpgradeError::Timeout(_) => {
+            StableErrorCode::NetworkUnavailable
+        }
+        ManualUpgradeError::Verify(FlowError::State(_)) => StableErrorCode::RepoStateInvalid,
         ManualUpgradeError::Verify(_) => StableErrorCode::NetworkProtocol,
-        ManualUpgradeError::State(_) => StableErrorCode::RepoStateInvalid,
+        ManualUpgradeError::State(_) | ManualUpgradeError::Txn(_) => {
+            StableErrorCode::RepoStateInvalid
+        }
+        ManualUpgradeError::FloorPersist(_) => StableErrorCode::IoWriteFailed,
     };
-    let mut cli =
-        CliError::failure(format!("upgrade check failed: {error}")).with_stable_code(code);
-    if matches!(error, ManualUpgradeError::Fetch(_)) {
-        cli = cli.with_hint("check the network connection and retry");
-    }
+    let mut cli = CliError::failure(format!("{prefix}: {error}")).with_stable_code(code);
+    cli = match &error {
+        ManualUpgradeError::Fetch(_) | ManualUpgradeError::Timeout(_) => {
+            cli.with_hint("check the network connection and retry")
+        }
+        ManualUpgradeError::Txn(_) => cli.with_hint(
+            "the next libra command runs automatic recovery for any interrupted transaction",
+        ),
+        ManualUpgradeError::FloorPersist(_) => cli.with_hint(
+            "the install directory next to the libra binary must be writable by this user",
+        ),
+        _ => cli,
+    };
     cli
-}
-
-fn install_error_to_cli(error: ManualUpgradeError) -> CliError {
-    CliError::failure(format!("upgrade download failed: {error}"))
-        .with_stable_code(StableErrorCode::NetworkUnavailable)
-        .with_hint("nothing was changed; re-run `libra upgrade` to retry")
 }
 
 #[cfg(test)]
@@ -584,5 +633,25 @@ mod upgrade_cli_tests {
         assert!(UpgradeArgs::try_parse_from(["upgrade", "--check", "--yes"]).is_err());
         assert!(UpgradeArgs::try_parse_from(["upgrade", "--check"]).is_ok());
         assert!(UpgradeArgs::try_parse_from(["upgrade", "-y"]).is_ok());
+    }
+
+    #[test]
+    fn error_mapping_distinguishes_state_rejections_from_protocol() {
+        // Anti-rollback/state rejections are LBR-REPO-003, not a network code.
+        let state_rejection = ManualUpgradeError::State("corrupt".into());
+        assert_eq!(
+            manual_error_to_cli("x", state_rejection).stable_code(),
+            StableErrorCode::RepoStateInvalid
+        );
+        let floors = ManualUpgradeError::FloorPersist("read-only".into());
+        assert_eq!(
+            manual_error_to_cli("x", floors).stable_code(),
+            StableErrorCode::IoWriteFailed
+        );
+        let timeout = ManualUpgradeError::Timeout("manifest fetch");
+        assert_eq!(
+            manual_error_to_cli("x", timeout).stable_code(),
+            StableErrorCode::NetworkUnavailable
+        );
     }
 }

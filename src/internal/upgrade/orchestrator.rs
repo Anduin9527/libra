@@ -66,9 +66,14 @@ struct InstallContext {
 
 fn resolve_install_context() -> Option<InstallContext> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    // The normal installed target is named `libra`; anything else (a dev
-    // binary, a renamed copy) is not upgrade-manageable.
-    if exe.file_name()?.to_str()? != TARGET_BINARY_NAME {
+    // The normal installed target is named `libra` (`libra.exe` on Windows,
+    // so an official Windows install classifies as its platform's
+    // unsupported-upgrade state rather than as "not official"); anything
+    // else (a dev binary, a renamed copy) is not upgrade-manageable.
+    let name = exe.file_name()?.to_str()?;
+    let name_matches =
+        name == TARGET_BINARY_NAME || (cfg!(windows) && name.eq_ignore_ascii_case("libra.exe"));
+    if !name_matches {
         return None;
     }
     let dir_path = exe.parent()?.to_path_buf();
@@ -414,14 +419,34 @@ fn persist_if_state_unchanged(
 /// install it under the single §A.5 lock via the transaction.
 async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeReport {
     let version = staged.version;
+    let accepted_floors = staged.new_state.clone();
+    match run_locked_install(ctx, staged).await {
+        Ok(Ok(Some(TxnOutcome::Installed))) => AutoUpgradeReport::Installed(version),
+        Ok(Ok(Some(TxnOutcome::RolledBack))) => AutoUpgradeReport::RolledBack,
+        Ok(Ok(None)) => {
+            // Lock busy: the install is skipped, but the verified floors are
+            // still merged (with a short retry) so they cannot be lost.
+            merge_acceptance_floors_with_retry(ctx.dir_path.clone(), accepted_floors).await;
+            AutoUpgradeReport::Skipped
+        }
+        _ => AutoUpgradeReport::Skipped,
+    }
+}
+
+/// The locked stage→probe→transact core shared by the auto and manual paths:
+/// re-opens a dedicated InstallDir on a blocking task, takes the §A.5 lock
+/// (`Ok(None)` = busy), CASes the state baseline, durably advances the
+/// floors, stages the candidate, probes it and runs the install transaction.
+/// The auto wrapper degrades every error to a silent skip; the manual path
+/// surfaces them to the user.
+async fn run_locked_install(
+    ctx: &InstallContext,
+    staged: StagedInstall,
+) -> Result<Result<Option<TxnOutcome>, TxnError>, tokio::task::JoinError> {
+    let version = staged.version;
     let dir_path = ctx.dir_path.clone();
     let platform = ctx.platform;
-    let accepted_floors = staged.new_state.clone();
-    // Re-open a dedicated InstallDir for the blocking transaction task.
-    // `Ok(None)` = the lock was busy; the caller then merges the accepted
-    // floors with retry, because even an install this process cannot perform
-    // must not forget the manifest it verified.
-    let outcome = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let dir = InstallDir::open_validated(&dir_path).map_err(TxnError::Dir)?;
         let Some(_lock) = dir.try_lock()? else {
             // Another process holds the lock — skip this round.
@@ -494,19 +519,7 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
         )
         .map(Some)
     })
-    .await;
-
-    match outcome {
-        Ok(Ok(Some(TxnOutcome::Installed))) => AutoUpgradeReport::Installed(version),
-        Ok(Ok(Some(TxnOutcome::RolledBack))) => AutoUpgradeReport::RolledBack,
-        Ok(Ok(None)) => {
-            // Lock busy: the install is skipped, but the verified floors are
-            // still merged (with a short retry) so they cannot be lost.
-            merge_acceptance_floors_with_retry(ctx.dir_path.clone(), accepted_floors).await;
-            AutoUpgradeReport::Skipped
-        }
-        _ => AutoUpgradeReport::Skipped,
-    }
+    .await
 }
 
 /// Snapshot the current target as the transaction's `old_target`.
@@ -553,6 +566,19 @@ fn now_rfc3339(local_now: i64) -> String {
 // rollback), but on explicit user request — so it ignores the auto cadence
 // gates (`should_check_now`, backoff) and reports real diagnostics instead
 // of degrading every failure to a silent skip.
+//
+// Two invariants the manual path adds on top of the auto flow:
+// 1. The moment a manifest is ACCEPTED (whether it offers an install or a
+//    skip), its monotone floors are persisted durably and FALLIBLY — the
+//    command fails rather than silently forgetting a control decision.
+// 2. The confirmation window is unbounded (a human is thinking), so
+//    `install()` re-fetches and re-decides before touching anything: a
+//    pause/revocation/rotation published while the prompt was open wins.
+
+/// Total wall-clock budget for a manual manifest fetch + decision.
+pub const MANUAL_CHECK_BUDGET: Duration = Duration::from_secs(30);
+/// Total wall-clock budget for the manual artifact download (≤128 MiB).
+pub const MANUAL_DOWNLOAD_BUDGET: Duration = Duration::from_secs(300);
 
 /// A manual check/install failure with a user-facing description.
 #[derive(Debug, thiserror::Error)]
@@ -567,6 +593,17 @@ pub enum ManualUpgradeError {
     /// The upgrade state next to the installed binary could not be read.
     #[error("cannot read the upgrade state next to the installed binary: {0}")]
     State(String),
+    /// The accepted manifest's floors could not be persisted durably; the
+    /// command fails closed rather than proceed on volatile control state.
+    #[error("cannot persist the accepted anti-rollback floors: {0}")]
+    FloorPersist(String),
+    /// A network operation exceeded its total wall-clock budget.
+    #[error("{0} timed out")]
+    Timeout(&'static str),
+    /// The install transaction itself failed after the download; the next
+    /// libra command runs startup recovery for any journaled remainder.
+    #[error("the install transaction failed: {0}")]
+    Txn(String),
 }
 
 /// Outcome of the manual availability check.
@@ -589,7 +626,8 @@ pub enum ManualCheckOutcome {
         installed: ReleaseVersion,
         revoked: ReleaseVersion,
     },
-    /// A newer signed version is ready to install.
+    /// A newer signed version is ready to install. Its monotone floors are
+    /// ALREADY persisted by the time this is returned.
     Available(Box<ManualUpgrade>),
 }
 
@@ -604,18 +642,19 @@ pub enum ManualInstallReport {
     /// Nothing was changed: another process holds the upgrade lock, made
     /// concurrent progress, or the candidate failed its pre-install probe.
     NotApplied,
+    /// The publisher's control decision changed between the confirmation
+    /// prompt and the install (pause/revocation/a different version):
+    /// nothing was installed; `detail` says what changed.
+    ControlChanged { detail: String },
 }
 
-/// A decided, verified, not-yet-downloaded manual upgrade. Consume it with
-/// [`ManualUpgrade::install`] or [`ManualUpgrade::decline`] — either way the
-/// accepted manifest's monotone floors are persisted (declining a newer
-/// version must not forget the control decisions the manifest proved).
+/// A decided, verified manual upgrade whose floors are already durable.
+/// `install()` re-verifies the live manifest before downloading anything.
 pub struct ManualUpgrade {
     ctx: InstallContext,
-    expected_state: UpgradeState,
-    plan: Box<super::flow::InstallPlan>,
     installed: ReleaseVersion,
-    local_now: i64,
+    latest: ReleaseVersion,
+    artifact_size: u64,
 }
 
 impl ManualUpgrade {
@@ -624,64 +663,185 @@ impl ManualUpgrade {
         self.installed
     }
 
-    /// The verified newer version the manifest offers.
+    /// The verified newer version the manifest offered at check time.
     pub fn latest(&self) -> ReleaseVersion {
-        self.plan.version
+        self.latest
     }
 
     /// Signed artifact size in bytes (download + install budget).
     pub fn artifact_size(&self) -> u64 {
-        self.plan.artifact.size
+        self.artifact_size
     }
 
-    /// Persist the accepted floors without installing.
-    pub async fn decline(self) {
-        merge_acceptance_floors_with_retry(self.ctx.dir_path.clone(), self.plan.new_state.clone())
-            .await;
-    }
-
-    /// Download the artifact (sha256/size enforced, ≤128 MiB) and run the
-    /// locked install transaction with pre/post probes and auto-rollback.
+    /// Re-verify the live manifest, download the artifact (sha256/size
+    /// enforced, ≤128 MiB, bounded wall clock) and run the locked install
+    /// transaction with pre/post probes and auto-rollback.
     pub async fn install(self) -> Result<ManualInstallReport, ManualUpgradeError> {
         let client = upgrade_http_client()?;
-        let mut candidate: Vec<u8> = Vec::new();
-        if let Err(error) = download_artifact_to(
+        let fetched =
+            tokio::time::timeout(MANUAL_CHECK_BUDGET, fetch_manifest(&client, MANIFEST_URL))
+                .await
+                .map_err(|_| ManualUpgradeError::Timeout("manifest re-fetch"))??;
+        let local_now = unix_now();
+        let https_date_unix = fetched
+            .https_date
+            .as_deref()
+            .and_then(parse_http_date_to_unix);
+        self.install_from_envelope(
             &client,
-            &self.plan.artifact.url,
-            self.plan.artifact.size,
-            &self.plan.artifact.sha256,
-            &mut candidate,
+            &fetched.bytes,
+            https_date_unix,
+            local_now,
+            active_trust_table(),
         )
         .await
-        {
-            // The manifest WAS accepted; its floors survive a failed download.
-            merge_acceptance_floors_with_retry(
-                self.ctx.dir_path.clone(),
-                self.plan.new_state.clone(),
-            )
-            .await;
-            return Err(error.into());
-        }
-        let staged = StagedInstall {
-            version: self.plan.version,
-            marker: self.plan.marker,
-            new_state: self.plan.new_state,
-            expected_state: self.expected_state,
-            candidate,
-            local_now: self.local_now,
-        };
-        Ok(match phase_b(&self.ctx, staged).await {
-            AutoUpgradeReport::Installed(version) => ManualInstallReport::Installed(version),
-            AutoUpgradeReport::RolledBack => ManualInstallReport::RolledBack,
-            AutoUpgradeReport::Skipped => ManualInstallReport::NotApplied,
-        })
     }
+
+    /// The re-verify + download + transact core, parameterized on the
+    /// envelope so the test build can drive it without a network.
+    async fn install_from_envelope(
+        self,
+        client: &reqwest::Client,
+        envelope_bytes: &[u8],
+        https_date_unix: Option<i64>,
+        local_now: i64,
+        trust: &[super::trusted_keys::TrustedKey],
+    ) -> Result<ManualInstallReport, ManualUpgradeError> {
+        // Fresh baseline: the confirmation window is unbounded, so both the
+        // decision AND phase-b's CAS must run against the CURRENT state.
+        let state =
+            read_state(&self.ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
+        let decision = decide_for_state(
+            &self.ctx,
+            &state,
+            envelope_bytes,
+            https_date_unix,
+            local_now,
+            self.installed,
+            trust,
+        )?;
+        let plan = match decision {
+            UpgradeDecision::Install(plan) if plan.version == self.latest => plan,
+            UpgradeDecision::Install(plan) => {
+                persist_floors_strict(self.ctx.dir_path.clone(), plan.new_state.clone()).await?;
+                return Ok(ManualInstallReport::ControlChanged {
+                    detail: format!(
+                        "the signed channel now offers v{} instead of the confirmed v{}",
+                        plan.version, self.latest
+                    ),
+                });
+            }
+            UpgradeDecision::Skip { reason, new_state } => {
+                persist_floors_strict(self.ctx.dir_path.clone(), new_state).await?;
+                return Ok(ManualInstallReport::ControlChanged {
+                    detail: skip_reason_human(&reason),
+                });
+            }
+        };
+        // Durable floors before any download/staging (crash windows included).
+        persist_floors_strict(self.ctx.dir_path.clone(), plan.new_state.clone()).await?;
+
+        let mut candidate: Vec<u8> = Vec::new();
+        tokio::time::timeout(
+            MANUAL_DOWNLOAD_BUDGET,
+            download_artifact_to(
+                client,
+                &plan.artifact.url,
+                plan.artifact.size,
+                &plan.artifact.sha256,
+                &mut candidate,
+            ),
+        )
+        .await
+        .map_err(|_| ManualUpgradeError::Timeout("artifact download"))??;
+
+        let staged = StagedInstall {
+            version: plan.version,
+            marker: plan.marker,
+            new_state: plan.new_state,
+            expected_state: state,
+            candidate,
+            local_now,
+        };
+        match run_locked_install(&self.ctx, staged).await {
+            Ok(Ok(Some(TxnOutcome::Installed))) => Ok(ManualInstallReport::Installed(plan.version)),
+            Ok(Ok(Some(TxnOutcome::RolledBack))) => Ok(ManualInstallReport::RolledBack),
+            Ok(Ok(Some(_))) | Ok(Ok(None)) => Ok(ManualInstallReport::NotApplied),
+            Ok(Err(error)) => Err(ManualUpgradeError::Txn(error.to_string())),
+            Err(join) => Err(ManualUpgradeError::Txn(join.to_string())),
+        }
+    }
+}
+
+/// Unix seconds now (0 on a pre-epoch clock, matching the auto hook).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Human sentence for a skip reason surfaced through `ControlChanged`.
+fn skip_reason_human(reason: &super::flow::SkipReason) -> String {
+    use super::flow::SkipReason;
+    match reason {
+        SkipReason::NotNewer { installed, .. } => {
+            format!("the installed v{installed} is already the latest signed release")
+        }
+        SkipReason::Paused => "the publisher has PAUSED releases (emergency stop)".to_string(),
+        SkipReason::RevokedTarget(v) => {
+            format!("the offered v{v} has been REVOKED by the publisher")
+        }
+        SkipReason::UnsupportedPlatform(_) | SkipReason::PlatformNotInMatrix => {
+            "this platform left the supported upgrade matrix".to_string()
+        }
+    }
+}
+
+/// Durably persist accepted monotone floors, PROPAGATING failure — the
+/// manual path must fail closed rather than proceed on volatile control
+/// state (the auto path's best-effort variant stays separate).
+async fn persist_floors_strict(
+    dir_path: PathBuf,
+    accepted: UpgradeState,
+) -> Result<(), ManualUpgradeError> {
+    tokio::task::spawn_blocking(move || {
+        let dir =
+            InstallDir::open_validated(&dir_path).map_err(|e| format!("install directory: {e}"))?;
+        record_acceptance_floors(&dir, &accepted).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| ManualUpgradeError::FloorPersist(e.to_string()))?
+    .map_err(ManualUpgradeError::FloorPersist)
+}
+
+/// Pure decision step shared by the check and the pre-install re-check.
+fn decide_for_state(
+    ctx: &InstallContext,
+    state: &UpgradeState,
+    envelope_bytes: &[u8],
+    https_date: Option<i64>,
+    local_now: i64,
+    installed: ReleaseVersion,
+    trust: &[super::trusted_keys::TrustedKey],
+) -> Result<UpgradeDecision, ManualUpgradeError> {
+    let ctx_dec = DecisionContext {
+        state,
+        https_date,
+        local_now,
+        trust,
+        platform: Some(ctx.platform),
+        installed_version: installed,
+        installed_at_rfc3339: &now_rfc3339(local_now),
+    };
+    Ok(decide_from_envelope(&ctx_dec, envelope_bytes)?)
 }
 
 /// Manual availability check: verify the live signed manifest and decide.
 /// Unlike the auto check this reports every failure to the caller and does
 /// not consult the auto cadence/backoff gates; like the auto check, every
-/// verified control decision (even a skip) durably advances the floors.
+/// verified control decision (install offer or skip) durably advances the
+/// floors — and here a floor-persist failure is an ERROR, not a shrug.
 pub async fn manual_upgrade_check(
     local_now: i64,
 ) -> Result<ManualCheckOutcome, ManualUpgradeError> {
@@ -704,36 +864,57 @@ pub async fn manual_upgrade_check(
     {
         return Ok(ManualCheckOutcome::NotOfficialInstall);
     }
-    let state = read_state(&ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
-
     let client = upgrade_http_client()?;
-    let fetched = fetch_manifest(&client, MANIFEST_URL).await?;
-    let https_date = fetched
+    let fetched = tokio::time::timeout(MANUAL_CHECK_BUDGET, fetch_manifest(&client, MANIFEST_URL))
+        .await
+        .map_err(|_| ManualUpgradeError::Timeout("manifest fetch"))??;
+    let https_date_unix = fetched
         .https_date
         .as_deref()
         .and_then(parse_http_date_to_unix);
+    manual_check_with_envelope(ctx, &fetched.bytes, https_date_unix, local_now, trust).await
+}
+
+/// The decision half of the manual check, parameterized on the envelope so
+/// the test build can drive it without a network.
+async fn manual_check_with_envelope(
+    ctx: InstallContext,
+    envelope_bytes: &[u8],
+    https_date_unix: Option<i64>,
+    local_now: i64,
+    trust: &[super::trusted_keys::TrustedKey],
+) -> Result<ManualCheckOutcome, ManualUpgradeError> {
+    let state = read_state(&ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
     let installed = ReleaseVersion::parse(env!("CARGO_PKG_VERSION")).ok_or_else(|| {
         ManualUpgradeError::State("the running binary's version is not canonical X.Y.Z".to_string())
     })?;
-    let ctx_dec = DecisionContext {
-        state: &state,
-        https_date,
+    let decision = decide_for_state(
+        &ctx,
+        &state,
+        envelope_bytes,
+        https_date_unix,
         local_now,
+        installed,
         trust,
-        platform: Some(ctx.platform),
-        installed_version: installed,
-        installed_at_rfc3339: &now_rfc3339(local_now),
-    };
-    let decision = decide_from_envelope(&ctx_dec, &fetched.bytes)?;
+    )?;
     Ok(match decision {
-        UpgradeDecision::Install(plan) => ManualCheckOutcome::Available(Box::new(ManualUpgrade {
-            expected_state: state,
-            ctx,
-            plan,
-            installed,
-            local_now,
-        })),
+        UpgradeDecision::Install(plan) => {
+            // Floors become durable the moment the manifest is accepted —
+            // BEFORE the unbounded confirmation window opens (a concurrent
+            // process must see the new generation/control floor at once).
+            persist_floors_strict(ctx.dir_path.clone(), plan.new_state.clone()).await?;
+            ManualCheckOutcome::Available(Box::new(ManualUpgrade {
+                ctx,
+                installed,
+                latest: plan.version,
+                artifact_size: plan.artifact.size,
+            }))
+        }
         UpgradeDecision::Skip { reason, new_state } => {
+            // Same acceptance semantics for a skip: floors first (fallibly),
+            // then the auto path's best-effort full-state persist for the
+            // shared cooldown bookkeeping.
+            persist_floors_strict(ctx.dir_path.clone(), new_state.clone()).await?;
             persist_accepted_skip_state(&ctx, state.clone(), new_state).await;
             use super::flow::SkipReason;
             match reason {
@@ -754,6 +935,92 @@ pub async fn manual_upgrade_check(
             }
         }
     })
+}
+
+/// Test-only manual-flow harness (§A.11): drive the check and install cores
+/// against an arbitrary validated install directory and in-memory envelopes,
+/// skipping only the exe-name/marker resolution (which needs a real official
+/// install). Compiled solely with `--features test-upgrade`.
+#[cfg(feature = "test-upgrade")]
+pub mod manual_test_hooks {
+    use super::*;
+
+    /// Run the manual check decision core against `dir_path` + envelope.
+    pub async fn manual_check_from_parts(
+        dir_path: &std::path::Path,
+        platform: Platform,
+        envelope_bytes: &[u8],
+        https_date_unix: Option<i64>,
+        local_now: i64,
+        trust: &[super::super::trusted_keys::TrustedKey],
+    ) -> Result<ManualCheckOutcome, ManualUpgradeError> {
+        let dir = InstallDir::open_validated(dir_path)
+            .map_err(|e| ManualUpgradeError::State(e.to_string()))?;
+        let ctx = InstallContext {
+            dir,
+            dir_path: dir_path.to_path_buf(),
+            platform,
+        };
+        manual_check_with_envelope(ctx, envelope_bytes, https_date_unix, local_now, trust).await
+    }
+
+    /// Run the install core with an injected envelope + candidate download.
+    pub async fn install_with_envelope_and_candidate(
+        upgrade: ManualUpgrade,
+        envelope_bytes: &[u8],
+        https_date_unix: Option<i64>,
+        local_now: i64,
+        candidate: Vec<u8>,
+        trust: &[super::super::trusted_keys::TrustedKey],
+    ) -> Result<ManualInstallReport, ManualUpgradeError> {
+        // Reuse install_from_envelope's decision/floors path but swap the
+        // download for the injected bytes by re-implementing its tail.
+        let state =
+            read_state(&upgrade.ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
+        let decision = decide_for_state(
+            &upgrade.ctx,
+            &state,
+            envelope_bytes,
+            https_date_unix,
+            local_now,
+            upgrade.installed,
+            trust,
+        )?;
+        let plan = match decision {
+            UpgradeDecision::Install(plan) if plan.version == upgrade.latest => plan,
+            UpgradeDecision::Install(plan) => {
+                persist_floors_strict(upgrade.ctx.dir_path.clone(), plan.new_state.clone()).await?;
+                return Ok(ManualInstallReport::ControlChanged {
+                    detail: format!(
+                        "the signed channel now offers v{} instead of the confirmed v{}",
+                        plan.version, upgrade.latest
+                    ),
+                });
+            }
+            UpgradeDecision::Skip { reason, new_state } => {
+                persist_floors_strict(upgrade.ctx.dir_path.clone(), new_state).await?;
+                return Ok(ManualInstallReport::ControlChanged {
+                    detail: skip_reason_human(&reason),
+                });
+            }
+        };
+        persist_floors_strict(upgrade.ctx.dir_path.clone(), plan.new_state.clone()).await?;
+        let staged = StagedInstall {
+            version: plan.version,
+            marker: plan.marker,
+            new_state: plan.new_state,
+            expected_state: state,
+            candidate,
+            local_now,
+        };
+        match run_locked_install(&upgrade.ctx, staged).await {
+            Ok(Ok(Some(TxnOutcome::Installed))) => Ok(ManualInstallReport::Installed(plan.version)),
+            Ok(Ok(Some(TxnOutcome::RolledBack))) => Ok(ManualInstallReport::RolledBack),
+            Ok(Ok(Some(_))) | Ok(Ok(None)) => Ok(ManualInstallReport::NotApplied),
+            Ok(Err(error)) => Err(ManualUpgradeError::Txn(error.to_string())),
+            Err(join) => Err(ManualUpgradeError::Txn(join.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
