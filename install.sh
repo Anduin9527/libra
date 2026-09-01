@@ -410,6 +410,16 @@ download_file() {
     fi
 }
 
+# Verified-channel variant: redirects are refused so the signed, origin-pinned
+# URL cannot be bounced to another host by the (untrusted) transport.
+download_file_pinned() {
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -fsS --max-redirs 0 --connect-timeout 10 --max-time 300 "$1" -o "$2"
+    else
+        wget -q --max-redirect=0 --timeout=30 --tries=3 "$1" -O "$2"
+    fi
+}
+
 # Print sha256 hex of "$1", or empty string if no hashing tool is available.
 sha256_of() {
     file=$1
@@ -506,10 +516,12 @@ sha256_of_stdin() {
 }
 
 # Fetch the stable manifest into "$1". Prints one of: ok / missing / error.
+# Redirects are NOT followed: the pinned origin must serve the manifest
+# directly, a 3xx is treated as an error (fail closed), never as content.
 fetch_stable_manifest() {
     manifest_url="${LIBRA_RELEASE_MANIFEST_ORIGIN}/libra/releases/stable/manifest-v1.json"
     if [ "$DOWNLOADER" = "curl" ]; then
-        http_code=$(curl -sSL --connect-timeout 10 --max-time 60 \
+        http_code=$(curl -sS --max-redirs 0 --connect-timeout 10 --max-time 60 \
             -o "$1" -w '%{http_code}' "$manifest_url" 2>/dev/null) || http_code=000
         case "$http_code" in
             200) printf 'ok' ;;
@@ -517,9 +529,11 @@ fetch_stable_manifest() {
             *)   printf 'error' ;;
         esac
     else
-        wget_out=$(wget -q --server-response --timeout=30 --tries=2 \
-            -O "$1" "$manifest_url" 2>&1)
-        wget_rc=$?
+        # set -e guard: the || arm must capture wget's status, otherwise a 404
+        # aborts the whole script here and the "missing" state is unreachable.
+        wget_rc=0
+        wget_out=$(wget -q --max-redirect=0 --server-response --timeout=30 --tries=2 \
+            -O "$1" "$manifest_url" 2>&1) || wget_rc=$?
         if [ "$wget_rc" -eq 0 ]; then
             printf 'ok'
         elif printf '%s' "$wget_out" | grep -q ' 404 '; then
@@ -533,6 +547,22 @@ fetch_stable_manifest() {
 # POSIX lexicographic strictly-less (test's "<" is not portable).
 lex_less() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort | head -n1)" = "$1" ]
+}
+
+# Strict canonical X.Y.Z (no leading "v", no leading zeros), the exact grammar
+# of the native manifest contract. Signed payloads using any other spelling
+# are rejected so revocation/floor comparisons can never be format-bypassed.
+is_canonical_semver() {
+    printf '%s' "$1" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+}
+
+# Numeric semver strictly-less over two canonical X.Y.Z strings.
+semver_less() {
+    sl_a1=${1%%.*}; sl_rest=${1#*.}; sl_a2=${sl_rest%%.*}; sl_a3=${sl_rest#*.}
+    sl_b1=${2%%.*}; sl_rest=${2#*.}; sl_b2=${sl_rest%%.*}; sl_b3=${sl_rest#*.}
+    if [ "$sl_a1" -ne "$sl_b1" ]; then [ "$sl_a1" -lt "$sl_b1" ]; return $?; fi
+    if [ "$sl_a2" -ne "$sl_b2" ]; then [ "$sl_a2" -lt "$sl_b2" ]; return $?; fi
+    [ "$sl_a3" -lt "$sl_b3" ]
 }
 
 # Extract the value of a "key":"value" string field from compact JSON in $2.
@@ -578,19 +608,42 @@ verify_stable_manifest() {
     fi
 
     payload_file="$work_dir/payload.bin"
-    channel=$(json_string_field channel "$payload_file")
-    STABLE_VERSION=$(json_string_field version "$payload_file")
-    expires_at=$(json_string_field expires_at "$payload_file")
-    paused=$(sed -n 's/.*"paused":\(true\|false\).*/\1/p' "$payload_file" | head -n1)
+    # Scalar fields are extracted ONLY from the payload head — everything
+    # before the canonical trailing "artifacts" array — so artifact URL
+    # contents can never spoof a top-level field for the sed extraction.
+    head_file="$work_dir/payload-head.bin"
+    sed 's/"artifacts":.*//' "$payload_file" > "$head_file"
+    channel=$(json_string_field channel "$head_file")
+    STABLE_VERSION=$(json_string_field version "$head_file")
+    expires_at=$(json_string_field expires_at "$head_file")
+    paused=$(sed -n 's/.*"paused":\(true\|false\).*/\1/p' "$head_file" | head -n1)
 
     [ "$channel" = "stable" ] || { rm -rf "$work_dir"; error_exit "signed manifest channel '${channel:-?}' is not 'stable'" "verify" "refusing to install"; }
     [ -n "$STABLE_VERSION" ] || { rm -rf "$work_dir"; error_exit "signed manifest carries no version" "verify" "refusing to install"; }
-    # RFC3339 UTC timestamps compare lexicographically; refuse expired manifests.
+    if ! is_canonical_semver "$STABLE_VERSION"; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest version '${STABLE_VERSION}' is not canonical X.Y.Z" "verify" \
+            "refusing to install — versions must match the release contract exactly"
+    fi
+    # Stateless anti-replay floor: this installer was published alongside
+    # DEFAULT_VERSION, so a signed manifest older than that baseline can only
+    # be a replayed stale manifest — refuse it outright (no fallback).
+    if semver_less "$STABLE_VERSION" "${DEFAULT_VERSION#v}"; then
+        rm -rf "$work_dir"
+        error_exit "signed stable manifest carries ${STABLE_VERSION}, older than this installer's baseline ${DEFAULT_VERSION#v}" "verify" \
+            "possible replay of a stale manifest — re-download install.sh and retry"
+    fi
+    # Expiry must be canonical UTC ("Z", optional fractional seconds): an
+    # offset timestamp would defeat the lexicographic comparison below.
+    if ! printf '%s' "$expires_at" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$'; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest expires_at '${expires_at:-?}' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ)" "verify" "refusing to install"
+    fi
     now_utc=$(date -u '+%Y-%m-%dT%H:%M:%S')
     expires_cmp=$(printf '%s' "$expires_at" | cut -c1-19)
-    if [ -z "$expires_cmp" ] || ! lex_less "$now_utc" "$expires_cmp"; then
+    if ! lex_less "$now_utc" "$expires_cmp"; then
         rm -rf "$work_dir"
-        error_exit "signed stable manifest is expired (expires_at ${expires_at:-?})" "verify" \
+        error_exit "signed stable manifest is expired (expires_at ${expires_at})" "verify" \
             "the publisher must renew the manifest — refusing to install"
     fi
     if [ "$paused" = "true" ]; then
@@ -598,11 +651,28 @@ verify_stable_manifest() {
         error_exit "releases are PAUSED by the publisher (signed manifest paused=true)" "verify" \
             "an emergency stop is active — try again later or check github.com/libra-tools/libra"
     fi
-    if printf '%s' "$(sed -n 's/.*"revoked_versions":\[\([^]]*\)\].*/\1/p' "$payload_file")" \
-        | grep -q "\"${STABLE_VERSION}\""; then
-        rm -rf "$work_dir"
-        error_exit "signed stable version ${STABLE_VERSION} is REVOKED by a newer control decision" "verify" \
-            "refusing to install a revoked build"
+    # Revoked versions are compared entry-by-entry in the same canonical
+    # grammar as the version itself — no substring or format bypass.
+    revoked_list=$(sed -n 's/.*"revoked_versions":\[\([^]]*\)\].*/\1/p' "$head_file" | head -n1)
+    if [ -n "$revoked_list" ]; then
+        old_ifs=$IFS
+        IFS=','
+        for revoked_entry in $revoked_list; do
+            revoked_entry=${revoked_entry#\"}
+            revoked_entry=${revoked_entry%\"}
+            if ! is_canonical_semver "$revoked_entry"; then
+                IFS=$old_ifs
+                rm -rf "$work_dir"
+                error_exit "signed manifest revoked_versions entry '${revoked_entry}' is not canonical X.Y.Z" "verify" "refusing to install"
+            fi
+            if [ "$revoked_entry" = "$STABLE_VERSION" ]; then
+                IFS=$old_ifs
+                rm -rf "$work_dir"
+                error_exit "signed stable version ${STABLE_VERSION} is REVOKED by a newer control decision" "verify" \
+                    "refusing to install a revoked build"
+            fi
+        done
+        IFS=$old_ifs
     fi
 
     platform_key="${OS}-${ARCH}"
@@ -615,11 +685,13 @@ verify_stable_manifest() {
     STABLE_URL=$(printf '%s' "$artifact_row" | awk '{print $1}')
     STABLE_SHA256=$(printf '%s' "$artifact_row" | awk '{print $2}')
     STABLE_SIZE=$(printf '%s' "$artifact_row" | awk '{print $3}')
-    case "$STABLE_URL" in
-        "https://download.libra.tools/libra/releases/"*) ;;
-        *) error_exit "signed artifact URL is outside the pinned origin: $STABLE_URL" "verify" \
-            "refusing to install" ;;
-    esac
+    # Exact URL binding — origin, layout AND the tag derived from the signed
+    # version. A signed row cannot point this version's install at another
+    # tag's bytes, and prefix tricks under the pinned origin are impossible.
+    if [ "$STABLE_URL" != "https://download.libra.tools/libra/releases/v${STABLE_VERSION}/libra-${platform_key}" ]; then
+        error_exit "signed artifact URL does not match the pinned origin/version layout: $STABLE_URL" "verify" \
+            "refusing to install"
+    fi
     [ -n "$STABLE_SHA256" ] && [ -n "$STABLE_SIZE" ] \
         || error_exit "signed manifest artifact row is incomplete" "verify" "refusing to install"
 }
@@ -861,7 +933,9 @@ screen_install() {
             "pick a writable path with LIBRA_HOME or -d (we never sudo)"
     fi
 
-    run_step "fetch $binary_name" download_file "$download_url" "$temp_file" \
+    fetcher=download_file
+    [ "${INSTALL_VERIFIED:-0}" = "1" ] && fetcher=download_file_pinned
+    run_step "fetch $binary_name" "$fetcher" "$download_url" "$temp_file" \
         || error_exit "download failed" "install" "url: $download_url"
 
     [ -s "$temp_file" ] || error_exit "downloaded file is empty" "install" "the mirror may be corrupted — please retry"
@@ -1144,12 +1218,26 @@ main() {
     screen_detect
 
     # Short-circuit: same version already installed → don't touch anything.
+    # On the verified channel the existing binary must also HASH to the signed
+    # manifest's digest — a self-reported version string alone is not proof
+    # (a tampered binary can print any version it likes).
     if [ -n "$EXISTING_VERSION" ] && [ "$EXISTING_VERSION" = "$VERSION" ]; then
-        # Re-running the installer repairs a missing/legacy alias even when the
-        # binary itself does not need to be downloaded again.
-        ensure_lba_alias
-        screen_already_installed
-        exit 0
+        skip_ok=1
+        if [ "${INSTALL_VERIFIED:-0}" = "1" ]; then
+            existing_sha=$(sha256_of "$EXISTING_PATH")
+            existing_size=$(wc -c <"$EXISTING_PATH" 2>/dev/null | awk '{print $1}')
+            if [ "$existing_sha" != "$STABLE_SHA256" ] || [ "$existing_size" != "$STABLE_SIZE" ]; then
+                skip_ok=0
+                warn_fact "verify" "installed ${EXISTING_VERSION} does not match the signed manifest digest — reinstalling"
+            fi
+        fi
+        if [ "$skip_ok" = "1" ]; then
+            # Re-running the installer repairs a missing/legacy alias even when
+            # the binary itself does not need to be downloaded again.
+            ensure_lba_alias
+            screen_already_installed
+            exit 0
+        fi
     fi
 
     screen_method

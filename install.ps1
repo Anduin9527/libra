@@ -198,7 +198,9 @@ function Resolve-StableChannel {
     $raw = $null
     try {
         $ProgressPreference = "SilentlyContinue"
-        $response = Invoke-WebRequest -Uri $manifestUrl -UseBasicParsing
+        # Redirects are refused: the pinned origin must serve the manifest
+        # directly, a 3xx fails closed instead of following the transport.
+        $response = Invoke-WebRequest -Uri $manifestUrl -UseBasicParsing -MaximumRedirection 0
         $raw = $response.Content
     } catch {
         $status = $null
@@ -231,21 +233,51 @@ function Resolve-StableChannel {
         throw "stable manifest SIGNATURE VERIFICATION FAILED - refusing to install (the download origin may be compromised)"
     }
 
-    $payload = [System.Text.Encoding]::UTF8.GetString($payloadBytes) | ConvertFrom-Json
+    $payloadText = [System.Text.Encoding]::UTF8.GetString($payloadBytes)
+    $payload = $payloadText | ConvertFrom-Json
     if ($payload.channel -ne "stable") { throw "signed manifest channel '$($payload.channel)' is not 'stable'" }
-    if ([datetime]::UtcNow -ge ([datetime]::Parse($payload.expires_at, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal))) {
-        throw "signed stable manifest is expired (expires_at $($payload.expires_at)) - the publisher must renew it"
+    # Canonical X.Y.Z only (no leading "v", no leading zeros) — the exact
+    # grammar of the native contract, so revocation/floor comparisons can
+    # never be format-bypassed.
+    $canonicalSemver = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+    if ([string]$payload.version -notmatch $canonicalSemver) {
+        throw "signed manifest version '$($payload.version)' is not canonical X.Y.Z - refusing to install"
+    }
+    # Stateless anti-replay floor: this installer shipped alongside
+    # $DefaultVersion, so a signed manifest older than that baseline can only
+    # be a replayed stale manifest.
+    if ([version][string]$payload.version -lt [version]$DefaultVersion.TrimStart("v")) {
+        throw "signed stable manifest carries $($payload.version), older than this installer's baseline $($DefaultVersion.TrimStart('v')) - possible replay of a stale manifest; re-download install.ps1 and retry"
+    }
+    # Expiry must be canonical UTC ("Z", optional fractional seconds); an
+    # offset timestamp is rejected rather than silently normalized. The RAW
+    # payload text is consulted because ConvertFrom-Json eagerly converts
+    # ISO-8601 strings to [datetime], destroying the original spelling.
+    $expiresRaw = if ($payloadText -match '"expires_at":"([^"]*)"') { $Matches[1] } else { "" }
+    if ($expiresRaw -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$') {
+        throw "signed manifest expires_at '$expiresRaw' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ) - refusing to install"
+    }
+    if ([datetime]::UtcNow -ge ([datetime]::Parse($expiresRaw, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal))) {
+        throw "signed stable manifest is expired (expires_at $expiresRaw) - the publisher must renew it"
     }
     if ($payload.paused -eq $true) {
         throw "releases are PAUSED by the publisher (signed manifest paused=true) - an emergency stop is active"
     }
-    if (@($payload.revoked_versions) -contains [string]$payload.version) {
-        throw "signed stable version $($payload.version) is REVOKED - refusing to install"
+    foreach ($revoked in @($payload.revoked_versions)) {
+        if ([string]$revoked -notmatch $canonicalSemver) {
+            throw "signed manifest revoked_versions entry '$revoked' is not canonical X.Y.Z - refusing to install"
+        }
+        if ([string]$revoked -eq [string]$payload.version) {
+            throw "signed stable version $($payload.version) is REVOKED - refusing to install"
+        }
     }
     $artifact = @($payload.artifacts) | Where-Object { $_.platform -eq "windows-amd64" } | Select-Object -First 1
     if ($null -eq $artifact) { throw "signed manifest has no artifact for windows-amd64" }
-    if ($artifact.url -notlike "https://download.libra.tools/libra/releases/*") {
-        throw "signed artifact URL is outside the pinned origin: $($artifact.url)"
+    # Exact URL binding: origin, layout AND the tag derived from the signed
+    # version (the manifest URL grammar carries no .exe suffix).
+    $expectedUrl = "https://download.libra.tools/libra/releases/v$($payload.version)/libra-windows-amd64"
+    if ([string]$artifact.url -cne $expectedUrl) {
+        throw "signed artifact URL does not match the pinned origin/version layout: $($artifact.url)"
     }
     return @{
         Version = "v$($payload.version)"
@@ -441,7 +473,11 @@ if ($null -ne $stable) {
     $downloadUrl = "$DownloadBaseUrl/libra/releases/$Version/$ReleaseAsset"
 }
 
-$tempDir = Join-Path $env:TEMP "libra-install"
+# Unique, unpredictable staging directory: a fixed shared path would let
+# another local process pre-create or swap files between the hash check and
+# the final move.
+$tempBase = if ([string]::IsNullOrWhiteSpace($env:TEMP)) { [System.IO.Path]::GetTempPath() } else { $env:TEMP }
+$tempDir = Join-Path $tempBase ("libra-install-" + [System.IO.Path]::GetRandomFileName())
 $tempExe = Join-Path $tempDir $ReleaseAsset
 $targetExe = Join-Path $InstallDir $ExeName
 
@@ -453,7 +489,13 @@ Ensure-Directory $InstallDir
 
 try {
     $ProgressPreference = "SilentlyContinue"
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing
+    if ($null -ne $stable) {
+        # Verified channel: redirects are refused so the signed, origin-pinned
+        # URL cannot be bounced to another host by the transport.
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing -MaximumRedirection 0
+    } else {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing
+    }
 
     if (-not (Test-Path -LiteralPath $tempExe)) {
         throw "Download failed: $downloadUrl"
@@ -461,19 +503,42 @@ try {
 
     if ($null -ne $stable) {
         # Signed path: size and sha256 come from the verified manifest and are
-        # MANDATORY - any mismatch aborts before anything is installed.
-        $actualSize = (Get-Item -LiteralPath $tempExe).Length
-        if ($actualSize -ne $stable.Size) {
-            throw "size mismatch (signed manifest says $($stable.Size) bytes, got $actualSize) - refusing to install"
+        # MANDATORY - any mismatch aborts before anything is installed. The
+        # bytes are read once through an EXCLUSIVE handle, hashed in memory,
+        # and those same verified bytes are what lands in the target: the
+        # staged file cannot be swapped between the check and the install.
+        $stream = [System.IO.File]::Open($tempExe, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+        try {
+            $buffer = New-Object System.IO.MemoryStream
+            $stream.CopyTo($buffer)
+            $verifiedBytes = $buffer.ToArray()
+        } finally {
+            $stream.Dispose()
         }
-        $actualSha = (Get-FileHash -LiteralPath $tempExe -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($verifiedBytes.LongLength -ne $stable.Size) {
+            throw "size mismatch (signed manifest says $($stable.Size) bytes, got $($verifiedBytes.LongLength)) - refusing to install"
+        }
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $actualSha = ([BitConverter]::ToString($sha256.ComputeHash($verifiedBytes)) -replace "-", "").ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
         if ($actualSha -ne $stable.Sha256) {
             throw "sha256 mismatch against the SIGNED manifest (expected $($stable.Sha256), got $actualSha) - refusing to install"
         }
         Write-Info "sha256 + size match the signed manifest"
+        $stagedExe = Join-Path $InstallDir ("." + [System.IO.Path]::GetRandomFileName() + ".staged.exe")
+        try {
+            [System.IO.File]::WriteAllBytes($stagedExe, $verifiedBytes)
+            Move-Item -LiteralPath $stagedExe -Destination $targetExe -Force
+        } catch {
+            Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue
+            throw
+        }
+    } else {
+        Move-Item -LiteralPath $tempExe -Destination $targetExe -Force
     }
-
-    Move-Item -LiteralPath $tempExe -Destination $targetExe -Force
     Write-Info "Installed to: $targetExe"
 
     Add-UserPath $InstallDir

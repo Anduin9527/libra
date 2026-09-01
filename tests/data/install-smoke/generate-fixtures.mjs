@@ -50,18 +50,19 @@ async function envelope(payload) {
 }
 
 function payloadFor(binaryByPlatform, mutate = {}) {
+  const version = mutate.version ?? VERSION;
   return {
     channel: "stable",
-    version: VERSION,
+    version,
     control_revision: 3,
     published_at: "2026-01-01T00:00:00.000Z",
-    expires_at: "2028-01-01T00:00:00.000Z",
+    expires_at: mutate.expires_at ?? "2028-01-01T00:00:00.000Z",
     min_key_generation: 1,
-    paused: false,
-    revoked_versions: [],
+    paused: mutate.paused ?? false,
+    revoked_versions: mutate.revoked_versions ?? [],
     artifacts: PLATFORMS.map((platform) => ({
       platform,
-      url: `https://download.libra.tools/libra/releases/v${VERSION}/libra-${platform}`,
+      url: `https://download.libra.tools/libra/releases/v${version}/libra-${platform}`,
       sha256: mutate.sha256 ?? sha256Hex(binaryByPlatform[platform]),
       size: mutate.size ?? binaryByPlatform[platform].length,
     })),
@@ -129,4 +130,38 @@ writeFixture(
 writeFixture(
   "fixtures/manifest-size-mismatch.json",
   await envelope(payloadFor(binaries, { size: 1 })),
+);
+
+// Policy branches: each properly SIGNED, so only the policy check can refuse.
+writeFixture(
+  "fixtures/manifest-expired.json",
+  await envelope(payloadFor(binaries, { expires_at: "2020-01-01T00:00:00.000Z" })),
+);
+writeFixture(
+  "fixtures/manifest-paused.json",
+  await envelope(payloadFor(binaries, { paused: true })),
+);
+writeFixture(
+  "fixtures/manifest-revoked.json",
+  await envelope(payloadFor(binaries, { revoked_versions: [VERSION] })),
+);
+// Signed and unexpired but older than the installer's pinned baseline
+// (the harness rewrites DEFAULT_VERSION to v9.9.8): the anti-replay floor.
+writeFixture(
+  "fixtures/manifest-stale-replay.json",
+  await envelope(payloadFor(binaries, { version: "1.0.0" })),
+);
+
+// Valid signature over the ORIGINAL payload, but the payload was swapped
+// afterwards: byte-level tamper distinct from the flipped-signature case.
+const tampered = JSON.parse(await envelope(payloadFor(binaries)));
+const tamperedPayload = JSON.parse(
+  Buffer.from(tampered.payload, "base64").toString(),
+);
+tamperedPayload.paused = false;
+tamperedPayload.version = "9.9.10";
+tampered.payload = Buffer.from(JSON.stringify(tamperedPayload)).toString("base64");
+writeFixture(
+  "fixtures/manifest-tampered-payload.json",
+  `${JSON.stringify(tampered)}\n`,
 );

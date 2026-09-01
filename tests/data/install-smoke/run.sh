@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh smoke harness — seven scenario families (plan-20260821 A1-05).
+# install.sh smoke harness — thirteen scenarios (plan-20260821 A1-05).
 #
 #   bash tests/data/install-smoke/run.sh
 #
@@ -189,21 +189,38 @@ run_scenario sha-mismatch manifest-sha-mismatch.json fail no "sha256 mismatch ag
 # 4. Signed size does not match the artifact → fail closed.
 run_scenario size-mismatch manifest-size-mismatch.json fail no "size mismatch"
 
-# 5. Manifest 404 (chain not enabled) without opt-in → explicit stop.
+# 5. Expired signed manifest → fail closed (no fallback offer).
+run_scenario expired manifest-expired.json fail no "is expired"
+
+# 6. paused=true emergency brake → fail closed.
+run_scenario paused manifest-paused.json fail no "PAUSED"
+
+# 7. Signed version present in its own revoked_versions → fail closed.
+run_scenario revoked manifest-revoked.json fail no "REVOKED"
+
+# 8. Signed + unexpired but older than the installer's pinned baseline →
+#    the stateless anti-replay floor refuses it.
+run_scenario stale-replay manifest-stale-replay.json fail no "older than this installer's baseline"
+
+# 9. Payload swapped after signing (signature is over the ORIGINAL bytes) →
+#    verification fails before any policy field is trusted.
+run_scenario tampered-payload manifest-tampered-payload.json fail no "SIGNATURE VERIFICATION FAILED"
+
+# 10. Manifest 404 (chain not enabled) without opt-in → explicit stop.
 run_scenario transition-404 -none- fail no "signature chain is not enabled yet"
 
-# 6. Manifest 404 + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED legacy install.
+# 11. Manifest 404 + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED legacy install.
 run_scenario transition-404-fallback -none- ok yes "proceeding UNVERIFIED" \
     LIBRA_ALLOW_FALLBACK=1
 cmp -s "$WORK/home-transition-404-fallback/.libra/bin/libra" \
     "$FIXTURES/tree/libra/releases/v9.9.8/libra-$HOST_PLATFORM" \
     || fail "transition-404-fallback: legacy binary content mismatch"
 
-# 7. Verifier unavailable without opt-in → explicit stop (third state).
+# 12. Verifier unavailable without opt-in → explicit stop (third state).
 SMOKE_PATH="$WORK/no-openssl:$PATH"
 run_scenario verifier-unavailable manifest-valid.json fail no "signature verifier unavailable"
 
-# 8. Verifier unavailable + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED install.
+# 13. Verifier unavailable + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED install.
 run_scenario verifier-unavailable-fallback manifest-valid.json ok yes "proceeding UNVERIFIED" \
     LIBRA_ALLOW_FALLBACK=1
 SMOKE_PATH=""
@@ -212,5 +229,5 @@ SMOKE_PATH=""
 cmp -s "$INSTALLER" "$WORK/install.sh.orig" \
     || fail "the production install.sh was modified by the harness"
 
-[ "$SCENARIOS_RUN" -eq 8 ] || fail "expected 8 scenarios, ran $SCENARIOS_RUN"
+[ "$SCENARIOS_RUN" -eq 13 ] || fail "expected 13 scenarios, ran $SCENARIOS_RUN"
 echo "install-smoke: all $SCENARIOS_RUN scenarios passed"
