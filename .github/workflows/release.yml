@@ -17,7 +17,9 @@ jobs:
     permissions:
       contents: read
       id-token: write # only to obtain short-term upload URLs from the broker
-    environment: release-artifacts
+    # Per-leg environments: the broker derives the write scope from this
+    # claim, so each leg can only presign its OWN platform's objects.
+    environment: release-artifacts-${{ matrix.target.os }}-${{ matrix.target.arch }}
     strategy:
       fail-fast: true # if it is set to true, then one job failed the other jobs will be cancelled  together.
       matrix:
