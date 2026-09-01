@@ -273,6 +273,39 @@ fn verified(
 }
 
 #[test]
+fn up01_vector_fixture_matches_the_backend_handover_when_present() {
+    // DEP-07 cross-repo attestation, executable form: on machines carrying
+    // the sibling libra-backend checkout (the dev/acceptance machine where
+    // the plan's gates run; override with LIBRA_BACKEND_CHECKOUT), the
+    // handover copy must be BYTE-identical to the backend's current
+    // fixture — a backend regeneration that updated only its own pin fails
+    // HERE instead of silently validating an obsolete contract. Without a
+    // sibling checkout this prints skipped (the dual digest pins still
+    // force a conscious two-repo lockstep update).
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("LIBRA_BACKEND_CHECKOUT") {
+        candidates.push(std::path::PathBuf::from(root));
+    }
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../libra-backend"));
+    let Some(backend_fixture) = candidates
+        .iter()
+        .map(|root| root.join("tests/fixtures/up01-transition-vectors-v1.json"))
+        .find(|path| path.is_file())
+    else {
+        eprintln!("skipped (no sibling libra-backend checkout; set LIBRA_BACKEND_CHECKOUT)");
+        return;
+    };
+    let backend_bytes = std::fs::read(&backend_fixture).expect("backend fixture readable");
+    let client_bytes = std::fs::read(VECTOR_FILE).expect("client fixture readable");
+    assert_eq!(
+        backend_bytes,
+        client_bytes,
+        "the client handover copy drifted from the backend fixture at {}",
+        backend_fixture.display()
+    );
+}
+
+#[test]
 fn up01_vector_schema_is_complete() {
     let doc = vector_document();
     assert_eq!(doc["schema_version"], 1);
