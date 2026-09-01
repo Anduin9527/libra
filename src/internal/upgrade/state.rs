@@ -493,13 +493,11 @@ pub fn record_acceptance_floors(
     install_dir: &InstallDir,
     accepted: &UpgradeState,
 ) -> Result<(), StateStoreError> {
-    // Fast path: the dedicated micro-lock, retried briefly. Holders only
-    // ever perform one atomic read-merge-write, so contention clears in
-    // milliseconds; the bounded retry also caps the wait when a holder is
-    // externally stalled (a SIGSTOP mid-fsync must not wedge user commands).
-    const LOCK_ATTEMPTS: u32 = 40;
+    // Fast path: a few non-blocking probes. Holders only ever perform one
+    // atomic read-merge-write, so this wins almost always.
+    const FAST_ATTEMPTS: u32 = 4;
     let path = install_dir.path().join(FLOORS_FILE_NAME);
-    for attempt in 0..LOCK_ATTEMPTS {
+    for attempt in 0..FAST_ATTEMPTS {
         let lock = install_dir
             .try_lock_floors()
             .map_err(|source| StateStoreError::Unreadable {
@@ -507,35 +505,82 @@ pub fn record_acceptance_floors(
                 source,
             })?;
         if let Some(_lock) = lock {
-            let current = read_floors_file(install_dir)?.unwrap_or_default();
-            let merged = merge_acceptance_floors(&current, accepted);
-            if merged == current {
-                return Ok(());
-            }
-            return write_floors_file(install_dir, &merged);
+            return merge_floors_locked_rmw(install_dir, accepted);
         }
-        if attempt + 1 < LOCK_ATTEMPTS {
+        if attempt + 1 < FAST_ATTEMPTS {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-    // Timed out behind a stalled holder. Deliberately do NOT write without
-    // the lock: an unlocked write is last-writer-wins and a stale fallback
-    // writer could overwrite a higher floor another writer just persisted
-    // (a real regression). Every write stays lock-serialized RMW, so the
-    // PERSISTED floors can never regress; the cost is that THIS attempt's
-    // floors stay unpersisted behind an externally-stalled holder (SIGSTOP
-    // mid-write — an actor with that power already owns the account). The
-    // caller treats this as non-fatal and the next successful manifest
-    // check re-derives the floors.
-    Err(StateStoreError::WriteFailed {
-        path,
-        source: InstallDirError::Io {
-            name: FLOORS_FILE_NAME.to_string(),
-            detail: "floors micro-lock stayed held past the bounded wait; \
-                     refusing an unserialized write"
-                .into(),
-        },
-    })
+
+    // Contended: take the KERNEL-QUEUED blocking lock on a worker thread —
+    // unlike repeated probes it cannot be starved by a stream of short-lived
+    // holders — and wait a bounded moment for it, so an externally-stalled
+    // holder (SIGSTOP mid-write) can never wedge a user command. Every write
+    // stays lock-serialized (never unlocked), so the persisted floors can
+    // never regress. On timeout this returns an error (the caller treats it
+    // as non-fatal and the next check re-derives the floors); if the stalled
+    // holder later resumes, the detached worker still lands the merge under
+    // the lock — a safe, monotone bonus, not the guarantee.
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<(), StateStoreError>>(1);
+    let dir_path = install_dir.path().to_path_buf();
+    let accepted_snapshot = accepted.clone();
+    let spawned = std::thread::Builder::new()
+        .name("libra-upgrade-floors".into())
+        .spawn(move || {
+            let merge = || -> Result<(), StateStoreError> {
+                let dir = InstallDir::open_validated(&dir_path).map_err(|source| {
+                    StateStoreError::Unreadable {
+                        path: dir_path.join(FLOORS_FILE_NAME),
+                        source,
+                    }
+                })?;
+                let _lock =
+                    dir.lock_floors_blocking()
+                        .map_err(|source| StateStoreError::Unreadable {
+                            path: dir.path().join(FLOORS_FILE_NAME),
+                            source,
+                        })?;
+                merge_floors_locked_rmw(&dir, &accepted_snapshot)
+            };
+            let _ = sender.send(merge());
+        });
+    if spawned.is_err() {
+        // Thread creation failed (resource exhaustion): fail soft, never
+        // panic in the user's command path.
+        return Err(StateStoreError::WriteFailed {
+            path,
+            source: InstallDirError::Io {
+                name: FLOORS_FILE_NAME.to_string(),
+                detail: "could not spawn the floors-merge worker".into(),
+            },
+        });
+    }
+    match receiver.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(result) => result,
+        Err(_) => Err(StateStoreError::WriteFailed {
+            path,
+            source: InstallDirError::Io {
+                name: FLOORS_FILE_NAME.to_string(),
+                detail: "floors micro-lock stayed held past the bounded wait; \
+                         this attempt's floors were not persisted"
+                    .into(),
+            },
+        }),
+    }
+}
+
+/// One locked read-merge-write of the floors side file. The caller (or the
+/// worker thread) already holds the floors micro-lock.
+fn merge_floors_locked_rmw(
+    install_dir: &InstallDir,
+    accepted: &UpgradeState,
+) -> Result<(), StateStoreError> {
+    let current = read_floors_file(install_dir)?.unwrap_or_default();
+    let merged = merge_acceptance_floors(&current, accepted);
+    if merged == current {
+        return Ok(());
+    }
+    write_floors_file(install_dir, &merged)
 }
 
 fn write_floors_file(

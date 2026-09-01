@@ -387,6 +387,27 @@ mod unix_impl {
             )
         }
 
+        /// Blocking floors micro-lock: kernel-queued, so unlike repeated
+        /// non-blocking probes it cannot be starved by a stream of short-lived
+        /// holders. Callers bound the wait externally (worker thread +
+        /// timeout) because flock itself has none.
+        pub fn lock_floors_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
+            let file = self.openat(
+                FLOORS_LOCK_FILE_NAME,
+                libc::O_RDWR | libc::O_CREAT,
+                0o600 as libc::c_int,
+            )?;
+            // SAFETY: flock on an owned fd.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(InstallDirError::Io {
+                    name: FLOORS_LOCK_FILE_NAME.to_string(),
+                    detail: std::io::Error::last_os_error().to_string(),
+                });
+            }
+            Ok(UpgradeLock { _file: file })
+        }
+
         /// Non-blocking floors micro-lock (see [`FLOORS_LOCK_FILE_NAME`]):
         /// `Ok(None)` when another process holds it. Callers retry briefly —
         /// holders only perform one atomic read-merge-write, so contention
@@ -496,6 +517,10 @@ impl InstallDir {
     }
 
     pub fn lock_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn lock_floors_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
         Err(InstallDirError::UnsupportedPlatform)
     }
 
