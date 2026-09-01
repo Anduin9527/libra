@@ -493,20 +493,68 @@ pub fn record_acceptance_floors(
     install_dir: &InstallDir,
     accepted: &UpgradeState,
 ) -> Result<(), StateStoreError> {
+    // Fast path: the dedicated micro-lock, retried briefly. Holders only
+    // ever perform one atomic read-merge-write, so contention clears in
+    // milliseconds; the bounded retry also caps the wait when a holder is
+    // externally stalled (a SIGSTOP mid-fsync must not wedge user commands).
+    const LOCK_ATTEMPTS: u32 = 40;
     let path = install_dir.path().join(FLOORS_FILE_NAME);
-    let _lock =
-        install_dir
-            .lock_floors_blocking()
+    for attempt in 0..LOCK_ATTEMPTS {
+        let lock = install_dir
+            .try_lock_floors()
             .map_err(|source| StateStoreError::Unreadable {
                 path: path.clone(),
                 source,
             })?;
-    let current = read_floors_file(install_dir)?.unwrap_or_default();
-    let merged = merge_acceptance_floors(&current, accepted);
-    if merged == current {
-        return Ok(());
+        if let Some(_lock) = lock {
+            let current = read_floors_file(install_dir)?.unwrap_or_default();
+            let merged = merge_acceptance_floors(&current, accepted);
+            if merged == current {
+                return Ok(());
+            }
+            return write_floors_file(install_dir, &merged);
+        }
+        if attempt + 1 < LOCK_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
-    let mut bytes = serde_json::to_vec_pretty(&merged).map_err(|err| StateStoreError::Corrupt {
+    // Timed out behind a stalled holder: fall back to an UNLOCKED monotone
+    // merge-write with re-read verification. Renames are atomic, so readers
+    // never see torn bytes; the verify loop folds our floors back in if a
+    // concurrent (resumed) writer overwrote them from a stale read. The
+    // residual loss window — a holder stalled mid-write that resumes and
+    // clobbers AFTER our last verification, with no later check in this
+    // process — is accepted and re-derived by the next successful manifest
+    // check (a locally SIGSTOP-wielding actor already controls the account).
+    for _ in 0..3 {
+        let current = read_floors_file(install_dir)?.unwrap_or_default();
+        let merged = merge_acceptance_floors(&current, accepted);
+        if merged == current {
+            return Ok(());
+        }
+        write_floors_file(install_dir, &merged)?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let current = read_floors_file(install_dir)?.unwrap_or_default();
+    if merge_acceptance_floors(&current, accepted) == current {
+        Ok(())
+    } else {
+        Err(StateStoreError::WriteFailed {
+            path,
+            source: InstallDirError::Io {
+                name: FLOORS_FILE_NAME.to_string(),
+                detail: "floors write kept being overwritten by a stalled concurrent writer".into(),
+            },
+        })
+    }
+}
+
+fn write_floors_file(
+    install_dir: &InstallDir,
+    floors: &UpgradeState,
+) -> Result<(), StateStoreError> {
+    let path = install_dir.path().join(FLOORS_FILE_NAME);
+    let mut bytes = serde_json::to_vec_pretty(floors).map_err(|err| StateStoreError::Corrupt {
         path: path.clone(),
         detail: format!("cannot serialize floors: {err}"),
     })?;

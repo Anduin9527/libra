@@ -466,6 +466,19 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
             write_state(&dir, &backed_off).map_err(|e| TxnError::State(e.to_string()))?;
             return Ok(Some(TxnOutcome::NoOp));
         }
+        // A newer control decision may have landed in the floors side file
+        // while we staged and probed (its writer does not take the main
+        // lock): re-check right before the transaction so a mid-flight floor
+        // or control-revision raise aborts this candidate instead of
+        // installing under superseded policy.
+        let latest = read_state(&dir).map_err(|e| TxnError::State(e.to_string()))?;
+        if latest.generation_floor > staged.new_state.generation_floor
+            || latest.max_control_revision > staged.new_state.max_control_revision
+        {
+            dir.remove_file(CANDIDATE_NAME)?;
+            dir.fsync_dir()?;
+            return Ok(Some(TxnOutcome::NoOp));
+        }
         let old_target = current_old_target(&dir, platform)?;
         let new_hash = staged.marker.sha256.clone();
         let expected = version.to_string();
