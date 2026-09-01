@@ -2368,6 +2368,10 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    crate::internal::upgrade::orchestrator::AUTO_ADVISORY_SUPPRESSED.store(
+        output.is_json() || output.quiet,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let report = run_auto_upgrade_check(local_now).await;
     if output.is_json() || output.quiet {
         return;
@@ -2380,7 +2384,8 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
         }
         AutoUpgradeReport::RolledBack => {
             utils::error::emit_advisory_warning(
-                "an auto-upgrade failed its self-check and was rolled back to the current version",
+                "an auto-upgrade attempt was rolled back (self-check failure or a superseding \
+                 publisher control decision); the current version is unchanged",
             );
         }
         AutoUpgradeReport::Skipped => {}

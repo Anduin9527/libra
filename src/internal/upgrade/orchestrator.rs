@@ -362,6 +362,12 @@ fn failure_backoff_state(
 /// holder can exhaust the bounded wait, in which case the error is silently
 /// non-fatal to the user's command and the next successful check re-derives
 /// the floors (see `record_acceptance_floors` for the exact contract).
+/// When set, the auto path's floor-persist failure warning is suppressed
+/// (JSON/machine/quiet modes promise a silent auto hook); the failure is
+/// still traced. Set by the CLI hook before running the auto check.
+pub static AUTO_ADVISORY_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accepted: UpgradeState) {
     let outcome = tokio::task::spawn_blocking(move || {
         let dir =
@@ -378,10 +384,13 @@ async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accept
         Err(join) => Some(join.to_string()),
     };
     if let Some(detail) = failure {
-        crate::utils::error::emit_advisory_warning(format!(
-            "a verified upgrade control update could not be persisted ({detail}); run \
-             `libra upgrade --check` to retry it"
-        ));
+        tracing::warn!("upgrade floor persistence failed: {detail}");
+        if !AUTO_ADVISORY_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::utils::error::emit_advisory_warning(format!(
+                "a verified upgrade control update could not be persisted ({detail}); run \
+                 `libra upgrade --check` to retry it"
+            ));
+        }
     }
 }
 
@@ -438,13 +447,16 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
     match run_locked_install(ctx, staged).await {
         Ok(Ok(Some(TxnOutcome::Installed))) => AutoUpgradeReport::Installed(version),
         Ok(Ok(Some(TxnOutcome::RolledBack))) => AutoUpgradeReport::RolledBack,
-        Ok(Ok(None)) => {
-            // Lock busy: the install is skipped, but the verified floors are
-            // still merged (with a short retry) so they cannot be lost.
+        Ok(Ok(Some(_))) => AutoUpgradeReport::Skipped,
+        // Lock busy AND every transaction error path: the install is
+        // skipped, but the manifest WAS accepted — its anti-replay floors
+        // must still be merged (loudly on failure). An early write_state or
+        // journal error inside the locked task otherwise silently dropped
+        // exactly the state that rejects a replayed older manifest.
+        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
             merge_acceptance_floors_with_retry(ctx.dir_path.clone(), accepted_floors).await;
             AutoUpgradeReport::Skipped
         }
-        _ => AutoUpgradeReport::Skipped,
     }
 }
 

@@ -113,9 +113,11 @@ pub type PostProbe<'a> = dyn Fn(&InstallDir) -> Result<bool, TxnError> + 'a;
 
 /// Commit fence (§A.6 policy): consulted AFTER the post-install probe passes
 /// and BEFORE the commit writes anything. `Ok(Some(guard))` proceeds with the
-/// guard held through the whole commit (the caller uses it to hold the floors
-/// micro-lock, so a concurrent control write cannot land between the final
-/// policy check and the committed state); `Ok(None)` VETOES the commit and the
+/// guard held through the durable `PostProbePassed` journal write ONLY — the
+/// commit tail (state/marker writes, cleanup) runs after the guard drops,
+/// under the same contract crash recovery grants that journaled state — so a
+/// concurrent control write cannot land between the final policy check and
+/// the journaled decision; `Ok(None)` VETOES the commit and the
 /// transaction rolls back exactly like a failed probe. A `None` fence
 /// (recovery, tests) does NOT commit unconditionally: it goes through
 /// [`default_fence`] — the same bounded floors-lock acquisition and
@@ -320,7 +322,7 @@ fn probe_and_resolve(
         // durable, committing without a fence is the same contract crash
         // recovery already has for that state.
         //
-        // With no custom fence (recovery, tests) a LOCKLESS default check
+        // With no custom fence (recovery, tests) the bounded-LOCKED default check
         // still compares the persisted floors against the transaction: a
         // pause/revocation/rotation accepted while this transaction was in
         // flight vetoes the commit instead of resurrecting a superseded
