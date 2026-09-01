@@ -130,6 +130,22 @@ mod tests {
         assert!(install_sh.contains(
             "LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_HEX=\"68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3\""
         ));
+        // The PEM constant install.sh feeds to `openssl pkeyutl` must be the
+        // SAME key: SubjectPublicKeyInfo DER = fixed Ed25519 prefix + raw key.
+        {
+            use base64::Engine as _;
+            let mut spki = vec![
+                0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+            ];
+            spki.extend_from_slice(&key.ed25519_pubkey);
+            let expected_pem_body = base64::engine::general_purpose::STANDARD.encode(&spki);
+            assert!(
+                install_sh.contains(&format!(
+                    "-----BEGIN PUBLIC KEY-----\n{expected_pem_body}\n-----END PUBLIC KEY-----"
+                )),
+                "install.sh PEM constant must encode the production trust root"
+            );
+        }
 
         let install_ps1 = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/install.ps1"));
         assert!(install_ps1.contains("$ReleaseManifestKeyId = \"libra-release-1\""));

@@ -385,7 +385,8 @@ dedicated feature-on steps.
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `upgrade_auto_test` | 1 | plan-20260714 §A.11 auto-upgrade end-to-end: signature+decision chain, anti-rollback/revocation replay, real-binary `__upgrade-probe` self-check, install/rollback transaction (`--features test-upgrade`) | `src/internal/upgrade/`, `src/command/upgrade.rs` |
-| `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs` |
+| `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations; plan-20260821 A1-06 Backend B1-02 transition contract vectors (cross-implementation verify, anti-vv placeholder) (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs`, `tests/data/up01-transition-vectors-v1.json` |
+| `install_smoke_test` | 1 | plan-20260821 A1-05 installer verification smoke: eight `install.sh` scenarios (signed install, tampered signature, sha/size mismatch, manifest-404 and verifier-unavailable transitions ± `LIBRA_ALLOW_FALLBACK`) plus the `install.ps1` runner when `pwsh` exists; needs bash+python3+openssl, otherwise prints skipped | `install.sh`, `install.ps1`, `tests/data/install-smoke/` |
 
 ## Wave 4 — Live AI (test-live-ai / DEEPSEEK_API_KEY)
 

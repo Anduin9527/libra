@@ -11,6 +11,9 @@ so it can never break or change the outcome of your normal commands.
 > a missing or invalid manifest fails closed. The persisted monotonic
 > key-generation floor described below ships with `0.22.3` — released
 > clients up to `v0.22.2` enforce only the manifest and compiled floors.
+> The install scripts (`install.sh` / `install.ps1`) verify the SAME signed
+> stable manifest on their default path before downloading anything; see
+> `docs/installation.md` for the bootstrap trust model.
 
 ## Enabling it
 
