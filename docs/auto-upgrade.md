@@ -9,8 +9,9 @@ so it can never break or change the outcome of your normal commands.
 > root (releases up to `v0.22.0` remain inert without it), but auto-upgrade
 > still installs nothing until a valid, signed stable manifest is published;
 > a missing or invalid manifest fails closed. The persisted monotonic
-> key-generation floor described below ships with `0.22.3` — released
-> clients up to `v0.22.2` enforce only the manifest and compiled floors.
+> key-generation floor described below ships with the A1-01 release
+> (`0.22.6` on the merged baseline) — clients released before it enforce
+> only the manifest and compiled floors.
 > The install scripts (`install.sh` / `install.ps1`) verify the SAME signed
 > stable manifest on their default path before downloading anything; see
 > `docs/installation.md` for the bootstrap trust model.
