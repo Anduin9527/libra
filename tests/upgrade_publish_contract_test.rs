@@ -487,7 +487,35 @@ fn up01_transition_semantics_match_backend_expectations() {
     );
 
     let resume = vector_by_id(&doc, "emergency-resume");
-    assert!(!verified(&doc, resume).paused);
+    let pre = &resume["pre_state"];
+    let m = verified(&doc, resume);
+    assert!(!m.paused);
+    // Resume must change ONLY paused/time/revision: everything else is
+    // pinned against the pre-state.
+    assert_eq!(
+        m.control_revision,
+        pre["control_revision"].as_u64().unwrap() + 1
+    );
+    assert_eq!(m.version_raw, pre["version"].as_str().unwrap());
+    assert_eq!(
+        m.min_key_generation,
+        pre["min_key_generation"].as_u64().unwrap() as u32
+    );
+    let pre_revoked: Vec<&str> = pre["revoked_versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let got_revoked: Vec<String> = m.revoked_versions.iter().map(|v| v.to_string()).collect();
+    assert_eq!(got_revoked, pre_revoked);
+    for row in pre["artifacts"].as_array().unwrap() {
+        let platform = Platform::parse(row["platform"].as_str().unwrap()).unwrap();
+        let artifact = m.artifact_for(platform).unwrap();
+        assert_eq!(artifact.url, row["url"].as_str().unwrap());
+        assert_eq!(artifact.sha256, row["sha256"].as_str().unwrap());
+        assert_eq!(artifact.size, row["size"].as_u64().unwrap());
+    }
 
     let revoke = vector_by_id(&doc, "emergency-revoke-append");
     let pre = &revoke["pre_state"];
