@@ -171,29 +171,69 @@ const VECTOR_FILE: &str = concat!(
 );
 const VECTOR_TEST_KEY_ID: &str = "libra-release-test-1";
 const MANIFEST_LIFETIME_SECONDS: i64 = 90 * 24 * 60 * 60;
+/// Handover integrity (DEP-07): the CLIENT pins the whole fixture by digest
+/// and the complete test trust root by value. The test private key is
+/// intentionally public, so nothing inside the file is self-authenticating —
+/// only these pinned constants are. Regenerating vectors on the backend
+/// requires updating this digest together with the copied file.
+const VECTOR_FILE_SHA256: &str = "1103cec7b531a3009cc89cc4d05ad13626a666ee1b725006635c5147d36d9239";
+const VECTOR_TEST_PUBLIC_KEY_HEX: &str =
+    "a8a00ded13ddafaad525fabddc13efc717b29ebed50cd6d653196057fa8f8a43";
+const VECTOR_TEST_KEY_NOT_BEFORE: i64 = 1_767_225_600;
+const VECTOR_TEST_KEY_NOT_AFTER: i64 = 1_830_297_600;
+/// The exact vector corpus (backend B1-02): dropping any ID must fail.
+const VECTOR_REQUIRED_IDS: [&str; 18] = [
+    "publish-first-control-revision-1",
+    "publish-upgrade-inherits-controls",
+    "publish-version-regression",
+    "publish-same-version-idempotent",
+    "publish-same-version-conflict",
+    "publish-key-window-expiry",
+    "publish-before-not-before",
+    "renew-skip-above-60d",
+    "renew-applied-below-60d",
+    "renew-key-window",
+    "emergency-pause",
+    "emergency-resume",
+    "emergency-revoke-append",
+    "emergency-revoke-duplicate",
+    "emergency-pause-noop",
+    "publish-anti-vv-placeholder",
+    "publish-version-beyond-u64",
+    "publish-version-above-2p53",
+];
 
 fn vector_document() -> serde_json::Value {
     let raw = std::fs::read(VECTOR_FILE).expect("DEP-07 vector file present");
+    // Whole-file digest pin: any edit (payloads, signatures, expectations,
+    // even re-signed ones) fails here before anything else runs.
+    use sha2::Digest as _;
+    let digest = hex::encode(sha2::Sha256::digest(&raw));
+    assert_eq!(
+        digest, VECTOR_FILE_SHA256,
+        "vector fixture digest drifted from the pinned handover"
+    );
     serde_json::from_slice(&raw).expect("vector file is valid JSON")
 }
 
-/// Trust table built from the vector file's declared test key. Every header
-/// field is pinned so a silently regenerated key or window cannot pass.
+/// Trust table built from PINNED constants; the file's declared header must
+/// match them exactly (a silently regenerated key/window cannot pass).
 fn vector_trust(doc: &serde_json::Value) -> Vec<TrustedKey> {
     let key = &doc["test_key"];
     assert_eq!(key["key_id"], VECTOR_TEST_KEY_ID);
     assert_eq!(key["generation"], 1);
-    let pubkey_hex = key["public_key_hex"].as_str().unwrap();
-    assert_eq!(pubkey_hex.len(), 64);
+    assert_eq!(key["public_key_hex"], VECTOR_TEST_PUBLIC_KEY_HEX);
+    assert_eq!(key["not_before"].as_i64(), Some(VECTOR_TEST_KEY_NOT_BEFORE));
+    assert_eq!(key["not_after"].as_i64(), Some(VECTOR_TEST_KEY_NOT_AFTER));
     let mut pubkey = [0u8; 32];
     for (i, byte) in pubkey.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&pubkey_hex[i * 2..i * 2 + 2], 16).unwrap();
+        *byte = u8::from_str_radix(&VECTOR_TEST_PUBLIC_KEY_HEX[i * 2..i * 2 + 2], 16).unwrap();
     }
     vec![TrustedKey {
         key_id: VECTOR_TEST_KEY_ID,
         ed25519_pubkey: pubkey,
-        not_before: key["not_before"].as_i64().unwrap(),
-        not_after: key["not_after"].as_i64().unwrap(),
+        not_before: VECTOR_TEST_KEY_NOT_BEFORE,
+        not_after: VECTOR_TEST_KEY_NOT_AFTER,
         generation: 1,
     }]
 }
@@ -239,6 +279,20 @@ fn up01_vector_schema_is_complete() {
     let digest = doc["vectors_digest_sha256"].as_str().unwrap();
     assert_eq!(digest.len(), 64);
     assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    // Exactly the required corpus, no more, no less: a dropped key-window or
+    // boundary vector must fail loudly, not shrink coverage silently.
+    let ids: Vec<&str> = vectors(&doc)
+        .iter()
+        .map(|v| v["id"].as_str().expect("vector id"))
+        .collect();
+    assert_eq!(ids.len(), VECTOR_REQUIRED_IDS.len(), "vector corpus size");
+    for required in VECTOR_REQUIRED_IDS {
+        assert!(
+            ids.contains(&required),
+            "missing required vector '{required}'"
+        );
+    }
 
     for vector in vectors(&doc) {
         let id = vector["id"].as_str().expect("vector id");
@@ -322,7 +376,20 @@ fn up01_accepted_vectors_verify_and_match_result_payload() {
             assert_eq!(artifact.size, row["size"].as_u64().unwrap());
         }
     }
-    assert!(accepted >= 6, "expected at least 6 accepted vectors");
+    assert_eq!(
+        accepted, 8,
+        "exactly the eight accepted vectors must verify"
+    );
+
+    // Precision boundary: a component above 2^53 survives verbatim (the
+    // backend serializes it without float rounding, the client parses u64).
+    let above = vector_by_id(&doc, "publish-version-above-2p53");
+    let m = verified(&doc, above);
+    assert_eq!(m.version_raw, "9007199254740993.0.0");
+    assert_eq!(
+        above["asserts"]["version_round_trip"],
+        "9007199254740993.0.0"
+    );
 }
 
 #[test]

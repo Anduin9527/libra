@@ -10,7 +10,7 @@
     "not_after": 1830297600,
     "note": "test-only keypair; the private half is committed in up01-contract-vectors.ts and protects nothing"
   },
-  "vectors_digest_sha256": "4f4b5cfbd303501a9d9db204e3b4ee379d1c61bf7047bb4ae18077cbc4562299",
+  "vectors_digest_sha256": "5c68689ae925e0fb83f030b35f451439796d0e5734a56eb813e997681706b8ba",
   "vectors": [
     {
       "id": "publish-first-control-revision-1",
@@ -1248,6 +1248,133 @@
           {
             "key_id": "libra-release-test-1",
             "signature": "ybZZ8Jy+JjYWpNwHD1K3CHEevBuPbZDDgUX6GugddQb91AcXMRvO4w/b+U1Qy3V92zUwxzsf+WHrKcno7MGVCA=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "publish-version-beyond-u64",
+      "operation": "publish",
+      "description": "A version component above u64::MAX must be rejected exactly like the Rust parser rejects it",
+      "pre_state": null,
+      "input": {
+        "publish": {
+          "version": "18446744073709551616.0.0",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1785542400,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "invalid_version"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: version components carry u64 bounds and full integer precision"
+    },
+    {
+      "id": "publish-version-above-2p53",
+      "operation": "publish",
+      "description": "A version component above 2^53 keeps full integer precision (no float rounding) end to end",
+      "pre_state": null,
+      "input": {
+        "publish": {
+          "version": "9007199254740993.0.0",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1785542400,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: version components carry u64 bounds and full integer precision",
+      "asserts": {
+        "version_round_trip": "9007199254740993.0.0"
+      },
+      "result_payload": {
+        "channel": "stable",
+        "version": "9007199254740993.0.0",
+        "control_revision": 1,
+        "published_at": "2026-08-01T00:00:00.000Z",
+        "expires_at": "2026-10-30T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-linux-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-linux-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-darwin-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-windows-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "58002baa2850572011c6feffcad14290fdf841f714de4fbe66d509c5c258bfa4",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjkwMDcxOTkyNTQ3NDA5OTMuMC4wIiwiY29udHJvbF9yZXZpc2lvbiI6MSwicHVibGlzaGVkX2F0IjoiMjAyNi0wOC0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6IjIwMjYtMTAtMzBUMDA6MDA6MDAuMDAwWiIsIm1pbl9rZXlfZ2VuZXJhdGlvbiI6MSwicGF1c2VkIjpmYWxzZSwicmV2b2tlZF92ZXJzaW9ucyI6W10sImFydGlmYWN0cyI6W3sicGxhdGZvcm0iOiJsaW51eC1hbWQ2NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjkwMDcxOTkyNTQ3NDA5OTMuMC4wL2xpYnJhLWxpbnV4LWFtZDY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDB9LHsicGxhdGZvcm0iOiJsaW51eC1hcm02NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjkwMDcxOTkyNTQ3NDA5OTMuMC4wL2xpYnJhLWxpbnV4LWFybTY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDF9LHsicGxhdGZvcm0iOiJkYXJ3aW4tYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3Y5MDA3MTk5MjU0NzQwOTkzLjAuMC9saWJyYS1kYXJ3aW4tYXJtNjQiLCJzaGEyNTYiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwic2l6ZSI6MTAwMDAwMn0seyJwbGF0Zm9ybSI6IndpbmRvd3MtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3Y5MDA3MTk5MjU0NzQwOTkzLjAuMC9saWJyYS13aW5kb3dzLWFtZDY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDN9XX0=",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "njUWg5omyrBlpRXIF4cqvyQ4MOusdO+D3IfUQh7yGdIQGhqHSaXMHPkgg/TvehUEwuUGedbAo2pSOV7sMgCkBQ=="
           }
         ]
       }
