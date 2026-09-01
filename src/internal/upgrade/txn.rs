@@ -278,36 +278,59 @@ fn probe_and_resolve(
     commit_fence: Option<&CommitFence<'_>>,
 ) -> Result<TxnOutcome, TxnError> {
     if post_probe(dir)? {
-        // The fence guard (when present) is held from the final policy check
-        // through the entire commit — the protected window is only journal +
-        // state/marker writes + fsyncs, so it is bounded by construction.
-        let fence_guard = match commit_fence {
+        // Policy fence. The guard (when present) is held ONLY from the
+        // final policy check through the durable `PostProbePassed` journal
+        // write — one read + one journal fsync, microseconds of I/O — and
+        // is dropped BEFORE the commit tail. Once `PostProbePassed` is
+        // durable, committing without a fence is the same contract crash
+        // recovery already has for that state.
+        //
+        // With no custom fence (recovery, tests) a LOCKLESS default check
+        // still compares the persisted floors against the transaction: a
+        // pause/revocation/rotation accepted while this transaction was in
+        // flight vetoes the commit instead of resurrecting a superseded
+        // plan. (Test fixtures start from default state, whose floors never
+        // exceed a transaction's own, so they are unaffected.)
+        let vetoed = match commit_fence {
             Some(fence) => match fence(dir)? {
-                Some(guard) => Some(guard),
-                None => {
-                    // Vetoed: a newer control decision superseded this plan
-                    // after the probe. Undo exactly like a failed probe.
-                    return match txn.old_target {
-                        OldTarget::Absent => {
-                            txn.state = TxnState::AbortAbsentIntent;
-                            store_txn(dir, txn)?;
-                            finish_abort_absent(dir, txn)
-                        }
-                        OldTarget::Present { .. } => {
-                            txn.state = TxnState::RollbackIntent;
-                            store_txn(dir, txn)?;
-                            finish_rollback(dir, txn)
-                        }
-                    };
+                Some(guard) => {
+                    txn.state = TxnState::PostProbePassed;
+                    store_txn(dir, txn)?;
+                    drop(guard);
+                    false
                 }
+                None => true,
             },
-            None => None,
+            None => {
+                let current = read_state(dir).map_err(|e| TxnError::State(e.to_string()))?;
+                if current.generation_floor > txn.new_state.generation_floor
+                    || current.max_control_revision > txn.new_state.max_control_revision
+                {
+                    true
+                } else {
+                    txn.state = TxnState::PostProbePassed;
+                    store_txn(dir, txn)?;
+                    false
+                }
+            }
         };
-        txn.state = TxnState::PostProbePassed;
-        store_txn(dir, txn)?;
-        let outcome = finish_commit(dir, txn);
-        drop(fence_guard);
-        outcome
+        if vetoed {
+            // Vetoed: a newer control decision superseded this plan after
+            // the probe. Undo exactly like a failed probe.
+            return match txn.old_target {
+                OldTarget::Absent => {
+                    txn.state = TxnState::AbortAbsentIntent;
+                    store_txn(dir, txn)?;
+                    finish_abort_absent(dir, txn)
+                }
+                OldTarget::Present { .. } => {
+                    txn.state = TxnState::RollbackIntent;
+                    store_txn(dir, txn)?;
+                    finish_rollback(dir, txn)
+                }
+            };
+        }
+        finish_commit(dir, txn)
     } else {
         match txn.old_target {
             OldTarget::Absent => {
@@ -522,6 +545,112 @@ mod tests {
     }
     fn fail() -> Box<PostProbe<'static>> {
         Box::new(|_| Ok(false))
+    }
+
+    /// An approving fence takes the real floors lock, journals
+    /// PostProbePassed under it, and the install commits — pinning both the
+    /// fence contract and that a dropped fence argument cannot pass review
+    /// silently (the veto twin below fails without one).
+    #[test]
+    fn fence_approval_commits_with_the_floors_lock_held() {
+        let (_g, d) = dir();
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let fence = |dd: &InstallDir| -> Result<Option<super::super::lock::UpgradeLock>, TxnError> {
+            let guard = dd
+                .try_lock_floors()
+                .expect("floors lock probe")
+                .expect("floors lock free in a fresh dir");
+            Ok(Some(guard))
+        };
+        let out = run_install(
+            &d,
+            OldTarget::Absent,
+            "1.0.0",
+            &hash(b"NEW"),
+            marker_for("1.0.0", b"NEW"),
+            UpgradeState::default(),
+            &pass(),
+            Some(&fence),
+        )
+        .expect("test fixture operation should succeed");
+        assert_eq!(out, TxnOutcome::Installed);
+    }
+
+    /// A vetoing fence rolls the upgrade back exactly like a failed probe:
+    /// the previous target is restored byte-for-byte.
+    #[test]
+    fn fence_veto_rolls_back_and_restores_the_old_target() {
+        let (_g, d) = dir();
+        d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let veto = |_: &InstallDir| -> Result<Option<super::super::lock::UpgradeLock>, TxnError> {
+            Ok(None)
+        };
+        let out = run_install(
+            &d,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+            "2.0.0",
+            &hash(b"NEW"),
+            marker_for("2.0.0", b"NEW"),
+            UpgradeState::default(),
+            &pass(),
+            Some(&veto),
+        )
+        .expect("test fixture operation should succeed");
+        assert_eq!(out, TxnOutcome::RolledBack);
+        let restored = d
+            .read_file(TARGET_BINARY_NAME)
+            .expect("test fixture operation should succeed")
+            .expect("target present");
+        assert_eq!(restored, b"OLD");
+    }
+
+    /// With no custom fence, the DEFAULT policy check still vetoes a
+    /// transaction superseded by a higher persisted control floor — this is
+    /// the crash-recovery guarantee for the CandidateInstalled window.
+    #[test]
+    fn default_fence_vetoes_a_superseded_transaction() {
+        let (_g, d) = dir();
+        d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        // A concurrent control decision already persisted revision 9.
+        let newer = UpgradeState {
+            max_control_revision: 9,
+            ..UpgradeState::default()
+        };
+        write_state(&d, &newer).expect("test fixture operation should succeed");
+        let txn_state = UpgradeState {
+            max_control_revision: 7,
+            ..UpgradeState::default()
+        };
+        let out = run_install(
+            &d,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+            "2.0.0",
+            &hash(b"NEW"),
+            marker_for("2.0.0", b"NEW"),
+            txn_state,
+            &pass(),
+            None,
+        )
+        .expect("test fixture operation should succeed");
+        assert_eq!(out, TxnOutcome::RolledBack);
+        let restored = d
+            .read_file(TARGET_BINARY_NAME)
+            .expect("test fixture operation should succeed")
+            .expect("target present");
+        assert_eq!(restored, b"OLD");
     }
 
     #[test]

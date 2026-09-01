@@ -462,21 +462,40 @@ write_official_marker() {
         warn_fact "provenance" "install dir is not owned by you — official-install marker skipped; 'libra upgrade' will not manage this install"
         return 0
     fi
+    # Match the Rust InstallDir policy (§A.5): group- OR others-writable
+    # install dirs are refused by `libra upgrade`, and default umask 002
+    # creates exactly such dirs — so TIGHTEN the mode here (the dir is
+    # user-owned per the check above) instead of shipping an install the
+    # upgrade subsystem would immediately reject.
     case "$dir_ls" in
-        ????????w*)
-            warn_fact "provenance" "install dir is world-writable — official-install marker skipped; run: chmod o-w '$INSTALL_DIR'"
-            return 0
+        ????????w*|?????w*)
+            if chmod go-w "$INSTALL_DIR" 2>/dev/null; then
+                fact "provenance" "tightened install dir permissions (chmod go-w) for upgrade management"
+            else
+                warn_fact "provenance" "install dir is group/world-writable and could not be tightened — official-install marker skipped; run: chmod go-w '$INSTALL_DIR'"
+                return 0
+            fi
             ;;
     esac
     marker_dir=$(mktemp -d "${INSTALL_DIR}/.libra-marker.XXXXXX" 2>/dev/null) || {
         warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
         return 0
     }
+    # The destination must not be a directory/symlink someone pre-created:
+    # `mv file dir` would silently move INTO it. Clear a regular file (the
+    # normal overwrite case), refuse anything else.
+    marker_dst="${INSTALL_DIR}/.libra-official-install.json"
+    if [ -e "$marker_dst" ] && [ ! -f "$marker_dst" ]; then
+        rm -rf "$marker_dir" 2>/dev/null
+        warn_fact "provenance" "'$marker_dst' exists and is not a regular file — official-install marker skipped; remove it and re-run this installer"
+        return 0
+    fi
     if printf '{"schema_version":1,"installed_at":"%s","install_source":"official_signed_manifest","platform":"%s","version":"%s","sha256":"%s","size":%s,"manifest_key_id":"%s"}' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${OS}-${ARCH}" "$STABLE_VERSION" \
         "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_dir/marker.json" \
         && chmod 644 "$marker_dir/marker.json" \
-        && mv "$marker_dir/marker.json" "${INSTALL_DIR}/.libra-official-install.json"; then
+        && mv "$marker_dir/marker.json" "$marker_dst" \
+        && [ -f "$marker_dst" ]; then
         MARKER_WRITTEN=1
         fact "provenance" "official-install marker written (enables 'libra upgrade')"
     else

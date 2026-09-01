@@ -514,9 +514,24 @@ async fn run_locked_install(
         let fence_generation_floor = staged.new_state.generation_floor;
         let fence_control_revision = staged.new_state.max_control_revision;
         let fence = move |d: &InstallDir| -> Result<Option<super::lock::UpgradeLock>, TxnError> {
-            let guard = d
-                .lock_floors_blocking()
-                .map_err(|e| TxnError::State(format!("floors lock: {e}")))?;
+            // BOUNDED acquisition: 50 × 100 ms. A floors-lock holder stuck in
+            // I/O must not hang the user's terminal — after the budget the
+            // fence VETOES (rollback, previous binary restored) instead of
+            // waiting forever; the user simply retries.
+            let mut guard = None;
+            for _ in 0..50 {
+                match d.try_lock_floors() {
+                    Ok(Some(g)) => {
+                        guard = Some(g);
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                    Err(e) => return Err(TxnError::State(format!("floors lock: {e}"))),
+                }
+            }
+            let Some(guard) = guard else {
+                return Ok(None);
+            };
             let current = read_state(d).map_err(|e| TxnError::State(e.to_string()))?;
             if current.generation_floor > fence_generation_floor
                 || current.max_control_revision > fence_control_revision
@@ -909,6 +924,14 @@ pub async fn manual_upgrade_check(
         // A build with no trust table cannot verify anything — treat it like
         // a non-official install (dev builds hit the same guidance).
         return Ok(ManualCheckOutcome::NotOfficialInstall);
+    }
+    // Platforms outside the upgrade matrix (Windows R0, unlisted targets)
+    // must report as such even though InstallDir validation — and therefore
+    // resolve_install_context — cannot succeed for them.
+    if let Some(platform) = Platform::current()
+        && platform.support() != PlatformSupport::Supported
+    {
+        return Ok(ManualCheckOutcome::UnsupportedPlatform);
     }
     let Some(ctx) = resolve_install_context() else {
         return Ok(ManualCheckOutcome::NotOfficialInstall);

@@ -559,9 +559,9 @@ pub fn record_acceptance_floors(
         });
     }
     // 15 s: long enough to outlive the commit fence (txn.rs), which holds
-    // the floors lock only across the commit tail — journal + state/marker
-    // writes + fsyncs, no probes — so this bound is sufficient by
-    // construction rather than by hoping a probe finishes in time.
+    // the floors lock only across ONE state read plus ONE journal write +
+    // fsync (the commit tail itself runs unfenced under the PostProbePassed
+    // recovery contract) — this bound is sufficient by construction.
     match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
         Ok(result) => result,
         Err(_) => Err(StateStoreError::WriteFailed {
