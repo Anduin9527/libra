@@ -250,7 +250,11 @@ function Resolve-StableChannel {
     # and cannot distinguish a nested field from a top-level one for a regex).
     # String fields cannot contain quotes, so once this anchor matches, every
     # captured group is pinned to the REAL top-level value.
-    $headPattern = '^\{"channel":"(?<channel>[^"]*)","version":"(?<version>[^"]*)","control_revision":(?:0|[1-9][0-9]*),"published_at":"(?<published>[^"]*)","expires_at":"(?<expires>[^"]*)","min_key_generation":(?<mkg>0|[1-9][0-9]*),"paused":(?:true|false),"revoked_versions":\[[^\]]*\],"artifacts":\['
+    # Numeric fields are bounded to nine digits so integer conversions can
+    # never overflow, and the payload must END with well-formed artifact rows
+    # (nothing can trail the array to mimic an artifact row).
+    $rowPattern = '\{"platform":"[^"]{1,32}","url":"[^"]{1,256}","sha256":"[0-9a-f]{64}","size":(?:0|[1-9][0-9]{0,8})\}'
+    $headPattern = '^\{"channel":"(?<channel>[^"]{1,32})","version":"(?<version>[^"]{1,64})","control_revision":(?:0|[1-9][0-9]{0,8}),"published_at":"(?<published>[^"]{1,64})","expires_at":"(?<expires>[^"]{1,64})","min_key_generation":(?<mkg>0|[1-9][0-9]{0,8}),"paused":(?:true|false),"revoked_versions":\[[^\]]{0,1024}\],"artifacts":\[' + $rowPattern + '(,' + $rowPattern + ')*\]\}$'
     if ($payloadText -cnotmatch $headPattern) {
         throw "signed manifest payload does not match the canonical serialization - refusing to install"
     }
@@ -289,8 +293,14 @@ function Resolve-StableChannel {
     }
     $utcStyle = [System.Globalization.DateTimeStyles]::AdjustToUniversal
     $inv = [cultureinfo]::InvariantCulture
-    $publishedAt = [datetime]::Parse($publishedRaw, $inv, $utcStyle)
-    $expiresAt = [datetime]::Parse($expiresRaw, $inv, $utcStyle)
+    try {
+        $publishedAt = [datetime]::Parse($publishedRaw, $inv, $utcStyle)
+        $expiresAt = [datetime]::Parse($expiresRaw, $inv, $utcStyle)
+    } catch {
+        # Field ranges alone admit impossible dates like 2026-09-31; .NET's
+        # calendar-aware parse is the authority, mirroring native RFC3339.
+        throw "signed manifest timestamps are not valid calendar dates (published_at $publishedRaw, expires_at $expiresRaw) - refusing to install"
+    }
     if ($publishedAt -ge $expiresAt) {
         throw "signed manifest published_at is not before expires_at - refusing to install"
     }
@@ -543,30 +553,39 @@ Ensure-Directory $InstallDir
 try {
     $ProgressPreference = "SilentlyContinue"
     if ($null -ne $stable) {
-        # Verified channel: redirects are refused so the signed, origin-pinned
-        # URL cannot be bounced to another host by the transport.
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing -MaximumRedirection 0
-    } else {
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing
-    }
-
-    if (-not (Test-Path -LiteralPath $tempExe)) {
-        throw "Download failed: $downloadUrl"
-    }
-
-    if ($null -ne $stable) {
-        # Signed path: size and sha256 come from the verified manifest and are
-        # MANDATORY - any mismatch aborts before anything is installed. The
-        # bytes are read once through an EXCLUSIVE handle, hashed in memory,
-        # and those same verified bytes are what lands in the target: the
-        # staged file cannot be swapped between the check and the install.
-        $stream = [System.IO.File]::Open($tempExe, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+        # Verified channel: redirects are refused, and the transfer is
+        # streamed with a hard cap at the SIGNED size — a hostile origin
+        # streaming more than the manifest promised is cut off instead of
+        # filling memory or disk. The bytes never touch disk before they are
+        # verified: the same in-memory bytes are hashed and then installed,
+        # so no check-then-swap window exists at all.
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $client = [System.Net.Http.HttpClient]::new($handler)
         try {
+            $client.Timeout = [TimeSpan]::FromSeconds(300)
+            $response = $client.GetAsync($downloadUrl, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            if (-not $response.IsSuccessStatusCode) {
+                throw "Download failed: HTTP $([int]$response.StatusCode) from $downloadUrl"
+            }
+            $contentLength = $response.Content.Headers.ContentLength
+            if ($null -ne $contentLength -and $contentLength -ne $stable.Size) {
+                throw "download Content-Length $contentLength does not match the signed size $($stable.Size) - refusing to install"
+            }
+            $bodyStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             $buffer = New-Object System.IO.MemoryStream
-            $stream.CopyTo($buffer)
+            $chunk = New-Object byte[] 81920
+            while ($true) {
+                $read = $bodyStream.Read($chunk, 0, $chunk.Length)
+                if ($read -le 0) { break }
+                if (($buffer.Length + $read) -gt $stable.Size) {
+                    throw "download exceeded the signed size $($stable.Size) - refusing to install"
+                }
+                $buffer.Write($chunk, 0, $read)
+            }
             $verifiedBytes = $buffer.ToArray()
         } finally {
-            $stream.Dispose()
+            $client.Dispose()
         }
         if ($verifiedBytes.LongLength -ne $stable.Size) {
             throw "size mismatch (signed manifest says $($stable.Size) bytes, got $($verifiedBytes.LongLength)) - refusing to install"
@@ -590,6 +609,12 @@ try {
             throw
         }
     } else {
+        # Legacy (explicitly consented, UNVERIFIED) path: plain download to a
+        # unique staging dir, then move into place.
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing
+        if (-not (Test-Path -LiteralPath $tempExe)) {
+            throw "Download failed: $downloadUrl"
+        }
         Move-Item -LiteralPath $tempExe -Destination $targetExe -Force
     }
     Write-Info "Installed to: $targetExe"

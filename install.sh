@@ -418,12 +418,18 @@ download_file() {
 }
 
 # Verified-channel variant: redirects are refused so the signed, origin-pinned
-# URL cannot be bounced to another host by the (untrusted) transport.
+# URL cannot be bounced to another host by the (untrusted) transport, and the
+# transfer is bounded by the SIGNED size — a hostile origin streaming more
+# than the manifest promised is cut off instead of filling the disk.
 download_file_pinned() {
     if [ "$DOWNLOADER" = "curl" ]; then
-        curl -fsS --max-redirs 0 --connect-timeout 10 --max-time 300 "$1" -o "$2"
+        curl -fsS --max-redirs 0 --max-filesize "$STABLE_SIZE" \
+            --connect-timeout 10 --max-time 300 "$1" -o "$2"
     else
-        wget -q --max-redirect=0 --timeout=30 --tries=3 "$1" -O "$2"
+        # head caps the stream at size+1: an oversized response yields a file
+        # one byte too large, which the mandatory size check then refuses.
+        wget -q --max-redirect=0 --timeout=30 --tries=3 -O - "$1" \
+            | head -c $((STABLE_SIZE + 1)) > "$2"
     fi
 }
 
@@ -580,6 +586,32 @@ is_canonical_utc() {
         '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]+)?Z$'
 }
 
+# Full calendar validity on top of the field ranges: the day must exist in
+# the given month/year (leap-year aware), so 2026-09-31 is refused like the
+# native RFC3339 parser would.
+is_calendar_valid_utc() {
+    is_canonical_utc "$1" || return 1
+    cal_y=$(printf '%s' "$1" | cut -c1-4)
+    cal_m=$(printf '%s' "$1" | cut -c6-7)
+    cal_d=$(printf '%s' "$1" | cut -c9-10)
+    # Strip leading zeros so $((...)) cannot misread them as octal.
+    cal_y=${cal_y#0}; cal_y=${cal_y#0}; cal_y=${cal_y#0}
+    cal_d=${cal_d#0}
+    case "$cal_m" in
+        01|03|05|07|08|10|12) cal_max=31 ;;
+        04|06|09|11) cal_max=30 ;;
+        02)
+            if [ $((cal_y % 4)) -eq 0 ] && { [ $((cal_y % 100)) -ne 0 ] || [ $((cal_y % 400)) -eq 0 ]; }; then
+                cal_max=29
+            else
+                cal_max=28
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    [ "$cal_d" -le "$cal_max" ]
+}
+
 # Extract the value of a "key":"value" string field from compact JSON in $2.
 json_string_field() {
     sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$2" | head -n1
@@ -599,14 +631,22 @@ verify_stable_manifest() {
     work_dir=$(mktemp -d 2>/dev/null) \
         || error_exit "mktemp failed" "verify" "make sure \$TMPDIR is writable"
 
-    schema=$(sed -n 's/.*"schema_version":\([0-9][0-9]*\).*/\1/p' "$manifest_file" | head -n1)
+    # ENVELOPE extraction runs on a whitespace-stripped copy so both compact
+    # and pretty-printed envelope spellings are accepted (the values — base64,
+    # key ids, digits — contain no whitespace, so stripping is lossless). The
+    # PAYLOAD below stays byte-exact: it is signature-bound and must be the
+    # canonical compact serialization.
+    norm_file="$work_dir/envelope-normalized.json"
+    tr -d ' \t\r\n' < "$manifest_file" > "$norm_file"
+
+    schema=$(sed -n 's/.*"schema_version":\([0-9][0-9]*\).*/\1/p' "$norm_file" | head -n1)
     [ "$schema" = "1" ] || { rm -rf "$work_dir"; error_exit "stable manifest has unsupported schema_version '${schema:-?}'" "verify" \
         "refusing to install — report at github.com/libra-tools/libra/issues"; }
 
-    payload_b64=$(json_string_field payload "$manifest_file")
+    payload_b64=$(json_string_field payload "$norm_file")
     # The first signature entry carrying our key id (dual-signed rotations put
     # key_id before signature, as the backend serializer guarantees).
-    sig_b64=$(sed -n "s/.*\"key_id\":\"${LIBRA_RELEASE_MANIFEST_KEY_ID}\",\"signature\":\"\\([^\"]*\\)\".*/\\1/p" "$manifest_file" | head -n1)
+    sig_b64=$(sed -n "s/.*\"key_id\":\"${LIBRA_RELEASE_MANIFEST_KEY_ID}\",\"signature\":\"\\([^\"]*\\)\".*/\\1/p" "$norm_file" | head -n1)
     if [ -z "$payload_b64" ] || [ -z "$sig_b64" ]; then
         rm -rf "$work_dir"
         error_exit "stable manifest carries no signature from key '${LIBRA_RELEASE_MANIFEST_KEY_ID}'" "verify" \
@@ -629,13 +669,15 @@ verify_stable_manifest() {
     fi
 
     payload_file="$work_dir/payload.bin"
-    # Structural grammar gate: the payload must START with the exact canonical
-    # top-level field sequence (channel, version, control_revision,
-    # published_at, expires_at, min_key_generation, paused, revoked_versions,
-    # artifacts). String fields cannot contain quotes, so once this anchor
-    # matches, every sed extraction below is pinned to the REAL top-level
-    # value — no nested or unknown field can spoof one.
-    if ! grep -qE '^\{"channel":"[^"]*","version":"[^"]*","control_revision":(0|[1-9][0-9]*),"published_at":"[^"]*","expires_at":"[^"]*","min_key_generation":(0|[1-9][0-9]*),"paused":(true|false),"revoked_versions":\[[^]]*\],"artifacts":\[' "$payload_file"; then
+    # Structural grammar gate over the ENTIRE payload: the exact canonical
+    # top-level field sequence, then artifact rows of the exact four-field
+    # shape, then end-of-payload — anchored both ends. String fields cannot
+    # contain quotes and every numeric field is bounded to nine digits (so
+    # later shell integer comparisons can never overflow), and nothing can
+    # precede, follow, or hide inside the artifacts array to spoof a value.
+    grammar_row='\{"platform":"[^"]{1,32}","url":"[^"]{1,256}","sha256":"[0-9a-f]{64}","size":(0|[1-9][0-9]{0,8})\}'
+    grammar_head='^\{"channel":"[^"]{1,32}","version":"[^"]{1,64}","control_revision":(0|[1-9][0-9]{0,8}),"published_at":"[^"]{1,64}","expires_at":"[^"]{1,64}","min_key_generation":(0|[1-9][0-9]{0,8}),"paused":(true|false),"revoked_versions":\[[^]]{0,1024}\],"artifacts":\['
+    if ! grep -qE "${grammar_head}${grammar_row}(,${grammar_row})*\\]\\}\$" "$payload_file"; then
         rm -rf "$work_dir"
         error_exit "signed manifest payload does not match the canonical serialization" "verify" \
             "refusing to install — the payload field layout is not the release contract"
@@ -660,8 +702,12 @@ verify_stable_manifest() {
             "refusing to install — versions must match the release contract exactly"
     fi
     # Key policy (§7, mirroring the native verifier): generation floor first,
-    # then the pinned key's validity window around the SIGNED lifetime.
-    if [ -z "$min_key_generation" ] || [ "$min_key_generation" -gt "$LIBRA_RELEASE_MANIFEST_KEY_GENERATION" ]; then
+    # then the pinned key's validity window around the SIGNED lifetime. The
+    # bounded-digits re-check keeps the -gt comparison overflow-proof even if
+    # the extraction ever drifts from the grammar gate.
+    if [ -z "$min_key_generation" ] \
+        || ! printf '%s' "$min_key_generation" | grep -qE '^(0|[1-9][0-9]{0,8})$' \
+        || [ "$min_key_generation" -gt "$LIBRA_RELEASE_MANIFEST_KEY_GENERATION" ]; then
         rm -rf "$work_dir"
         error_exit "signed manifest min_key_generation ${min_key_generation:-?} is above this installer's pinned key generation ${LIBRA_RELEASE_MANIFEST_KEY_GENERATION}" "verify" \
             "a key rotation has retired this installer's trust anchor — re-download install.sh"
@@ -674,13 +720,14 @@ verify_stable_manifest() {
         error_exit "signed stable manifest carries ${STABLE_VERSION}, older than this installer's baseline ${DEFAULT_VERSION#v}" "verify" \
             "possible replay of a stale manifest — re-download install.sh and retry"
     fi
-    # Timestamps must be canonical, calendar-valid UTC ("Z"): offsets or
-    # nonsense field values would defeat the lexicographic comparisons below.
-    if ! is_canonical_utc "$expires_at"; then
+    # Timestamps must be canonical, calendar-valid UTC ("Z"): offsets, bogus
+    # field values, or impossible dates (2026-09-31) would defeat the
+    # lexicographic comparisons below.
+    if ! is_calendar_valid_utc "$expires_at"; then
         rm -rf "$work_dir"
         error_exit "signed manifest expires_at '${expires_at:-?}' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ)" "verify" "refusing to install"
     fi
-    if ! is_canonical_utc "$published_at"; then
+    if ! is_calendar_valid_utc "$published_at"; then
         rm -rf "$work_dir"
         error_exit "signed manifest published_at '${published_at:-?}' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ)" "verify" "refusing to install"
     fi
@@ -736,7 +783,7 @@ verify_stable_manifest() {
     fi
 
     platform_key="${OS}-${ARCH}"
-    artifact_row=$(sed -n "s/.*{\"platform\":\"${platform_key}\",\"url\":\"\\([^\"]*\\)\",\"sha256\":\"\\([0-9a-f]*\\)\",\"size\":\\([0-9][0-9]*\\)}.*/\\1 \\2 \\3/p" "$payload_file" | head -n1)
+    artifact_row=$(sed -n "s/.*{\"platform\":\"${platform_key}\",\"url\":\"\\([^\"]*\\)\",\"sha256\":\"\\([0-9a-f]\\{64\\}\\)\",\"size\":\\([0-9]\\{1,9\\}\\)}.*/\\1 \\2 \\3/p" "$payload_file" | head -n1)
     rm -rf "$work_dir"
     if [ -z "$artifact_row" ]; then
         error_exit "signed manifest has no artifact for ${platform_key}" "verify" \

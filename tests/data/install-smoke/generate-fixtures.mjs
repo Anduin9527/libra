@@ -39,14 +39,18 @@ async function sign(payloadBytes) {
   return Buffer.from(await crypto.subtle.sign("Ed25519", key, message));
 }
 
-async function envelope(payload) {
+async function envelope(payload, { pretty = false } = {}) {
   const payloadBytes = Buffer.from(JSON.stringify(payload));
   const signature = await sign(payloadBytes);
-  return `${JSON.stringify({
+  const doc = {
     schema_version: 1,
     payload: payloadBytes.toString("base64"),
     signatures: [{ key_id: KEY_ID, signature: signature.toString("base64") }],
-  })}\n`;
+  };
+  // The PAYLOAD is always the canonical compact serialization (it is
+  // signature-bound); the ENVELOPE spelling is free — pretty-printed
+  // envelopes must verify identically.
+  return `${JSON.stringify(doc, null, pretty ? 2 : undefined)}\n`;
 }
 
 function payloadFor(binaryByPlatform, mutate = {}) {
@@ -55,7 +59,7 @@ function payloadFor(binaryByPlatform, mutate = {}) {
     channel: "stable",
     version,
     control_revision: 3,
-    published_at: "2026-01-01T00:00:00.000Z",
+    published_at: mutate.published_at ?? "2026-01-01T00:00:00.000Z",
     expires_at: mutate.expires_at ?? "2027-12-31T00:00:00.000Z",
     min_key_generation: mutate.min_key_generation ?? 1,
     paused: mutate.paused ?? false,
@@ -64,7 +68,9 @@ function payloadFor(binaryByPlatform, mutate = {}) {
       platform,
       url: `https://download.libra.tools/libra/releases/v${version}/libra-${platform}`,
       sha256: mutate.sha256 ?? sha256Hex(binaryByPlatform[platform]),
-      size: mutate.size ?? binaryByPlatform[platform].length,
+      size:
+        mutate.size ??
+        binaryByPlatform[platform].length + (mutate.sizeDelta ?? 0),
     })),
   };
 }
@@ -127,9 +133,11 @@ writeFixture(
   "fixtures/manifest-sha-mismatch.json",
   await envelope(payloadFor(binaries, { sha256: "f".repeat(64) })),
 );
+// Signed size LARGER than the artifact (a too-small signed size is cut off
+// by the bounded download instead — that is the undersized scenario).
 writeFixture(
   "fixtures/manifest-size-mismatch.json",
-  await envelope(payloadFor(binaries, { size: 1 })),
+  await envelope(payloadFor(binaries, { sizeDelta: 4096 })),
 );
 
 // Policy branches: each properly SIGNED, so only the policy check can refuse.
@@ -190,6 +198,48 @@ writeFixture(
   };
   writeFixture("fixtures/manifest-noncanonical.json", await envelope(injected));
 }
+
+// Round-3 branches (all signed with the test key unless noted):
+// impossible calendar date — field ranges pass, the calendar check must not.
+writeFixture(
+  "fixtures/manifest-bad-calendar.json",
+  await envelope(
+    payloadFor(binaries, { published_at: "2026-09-31T00:00:00.000Z" }),
+  ),
+);
+// min_key_generation wider than the bounded nine-digit numeric grammar: the
+// structural gate must refuse it before any shell integer comparison.
+writeFixture(
+  "fixtures/manifest-huge-min-key.json",
+  await envelope(payloadFor(binaries, { min_key_generation: 10000000000 })),
+);
+// A field TRAILING the artifacts array shaped like an artifact row: the
+// full-payload grammar's end anchor must refuse it.
+writeFixture(
+  "fixtures/manifest-trailing-artifact.json",
+  await envelope({
+    ...payloadFor(binaries),
+    // Spread preserves insertion order, so this serializes AFTER artifacts.
+    metadata: {
+      platform: "linux-amd64",
+      url: "https://download.libra.tools/libra/releases/v0.0.1/libra-linux-amd64",
+      sha256: "0".repeat(64),
+      size: 1,
+    },
+  }),
+);
+// Pretty-printed ENVELOPE around the canonical compact payload: must verify
+// and install identically (the envelope spelling is not signature-bound).
+writeFixture(
+  "fixtures/manifest-pretty-envelope.json",
+  await envelope(payloadFor(binaries), { pretty: true }),
+);
+// Signed size one byte SMALLER than the served artifact: the bounded
+// download must cut off / refuse instead of accepting extra bytes.
+writeFixture(
+  "fixtures/manifest-undersized.json",
+  await envelope(payloadFor(binaries, { sizeDelta: -1 })),
+);
 
 // Valid signature over the ORIGINAL payload, but the payload was swapped
 // afterwards: byte-level tamper distinct from the flipped-signature case.

@@ -1,4 +1,4 @@
-# install.ps1 smoke harness — fifteen scenarios (plan-20260821 A1-05).
+# install.ps1 smoke harness — twenty scenarios (plan-20260821 A1-05).
 #
 #   pwsh -NoProfile -File tests/data/install-smoke/run.ps1
 #
@@ -136,7 +136,7 @@ httpd.serve_forever()
     Run-Scenario "valid" "manifest-valid.json" "ok" "yes" "Signed stable manifest verified"
     Run-Scenario "bad-signature" "manifest-bad-signature.json" "fail" "no" "SIGNATURE VERIFICATION FAILED"
     Run-Scenario "sha-mismatch" "manifest-sha-mismatch.json" "fail" "no" "sha256 mismatch against the SIGNED manifest"
-    Run-Scenario "size-mismatch" "manifest-size-mismatch.json" "fail" "no" "size mismatch"
+    Run-Scenario "size-mismatch" "manifest-size-mismatch.json" "fail" "no" "does not match the signed size"
     Run-Scenario "expired" "manifest-expired.json" "fail" "no" "is expired"
     Run-Scenario "paused" "manifest-paused.json" "fail" "no" "PAUSED"
     Run-Scenario "revoked" "manifest-revoked.json" "fail" "no" "REVOKED"
@@ -146,6 +146,11 @@ httpd.serve_forever()
     Run-Scenario "future-min-key" "manifest-future-min-key.json" "fail" "no" "min_key_generation"
     Run-Scenario "key-window" "manifest-key-window.json" "fail" "no" "validity window"
     Run-Scenario "noncanonical" "manifest-noncanonical.json" "fail" "no" "canonical serialization"
+    Run-Scenario "bad-calendar" "manifest-bad-calendar.json" "fail" "no" "2026-09-31"
+    Run-Scenario "huge-min-key" "manifest-huge-min-key.json" "fail" "no" "canonical serialization"
+    Run-Scenario "trailing-artifact" "manifest-trailing-artifact.json" "fail" "no" "canonical serialization"
+    Run-Scenario "pretty-envelope" "manifest-pretty-envelope.json" "ok" "yes" "Signed stable manifest verified"
+    Run-Scenario "undersized" "manifest-undersized.json" "fail" "no" "does not match the signed size"
     Run-Scenario "transition-404" "-none-" "fail" "no" "signature chain is not enabled yet"
     Run-Scenario "transition-404-fallback" "-none-" "ok" "yes" "proceeding UNVERIFIED" @{ LIBRA_ALLOW_FALLBACK = "1" }
 
@@ -154,7 +159,7 @@ httpd.serve_forever()
     if (-not [System.Linq.Enumerable]::SequenceEqual($OriginalBytes, $after)) {
         Fail "the production install.ps1 was modified by the harness"
     }
-    if ($ScenariosRun -ne 15) { Fail "expected 15 scenarios, ran $ScenariosRun" }
+    if ($ScenariosRun -ne 20) { Fail "expected 20 scenarios, ran $ScenariosRun" }
     Write-Host "install.ps1 smoke: all $ScenariosRun scenarios passed"
 } finally {
     Cleanup
