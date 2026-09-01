@@ -1,6 +1,6 @@
 //! CI carrier for the installer verification smoke (plan-20260821 A1-05).
 //!
-//! Drives `tests/data/install-smoke/run.sh`: twenty-two scenarios covering the
+//! Drives `tests/data/install-smoke/run.sh`: twenty-four scenarios covering the
 //! signed stable channel (verified install, tampered signature and tampered
 //! payload, sha256 and size mismatches, expired / paused / revoked policy
 //! branches, the stale-replay anti-downgrade floor, zero-size and
@@ -49,7 +49,7 @@ fn install_sh_smoke_scenarios() {
         "install-smoke harness failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(
-        stdout.contains("all 22 scenarios passed"),
+        stdout.contains("all 24 scenarios passed"),
         "harness did not report full coverage:\n{stdout}"
     );
 }

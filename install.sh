@@ -421,13 +421,16 @@ download_file() {
 # URL cannot be bounced to another host by the (untrusted) transport, and the
 # transfer is bounded by the SIGNED size — a hostile origin streaming more
 # than the manifest promised is cut off instead of filling the disk.
+# Both branches cap the stream at size+1 via head: an oversized response —
+# chunked or not, Content-Length or not — yields at most one byte too many,
+# which the mandatory size check then refuses. curl's --max-filesize adds an
+# early abort when the length is declared up front.
 download_file_pinned() {
     if [ "$DOWNLOADER" = "curl" ]; then
         curl -fsS --max-redirs 0 --max-filesize "$STABLE_SIZE" \
-            --connect-timeout 10 --max-time 300 "$1" -o "$2"
+            --connect-timeout 10 --max-time 300 "$1" \
+            | head -c $((STABLE_SIZE + 1)) > "$2"
     else
-        # head caps the stream at size+1: an oversized response yields a file
-        # one byte too large, which the mandatory size check then refuses.
         wget -q --max-redirect=0 --timeout=30 --tries=3 -O - "$1" \
             | head -c $((STABLE_SIZE + 1)) > "$2"
     fi
@@ -565,8 +568,11 @@ lex_less() {
 # Strict canonical X.Y.Z (no leading "v", no leading zeros), the exact grammar
 # of the native manifest contract. Signed payloads using any other spelling
 # are rejected so revocation/floor comparisons can never be format-bypassed.
+# Components are bounded to nine digits so the shell integer comparisons in
+# semver_less can never overflow (stricter than the native u64 grammar — a
+# ten-digit component fails closed here, which is the safe direction).
 is_canonical_semver() {
-    printf '%s' "$1" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+    printf '%s' "$1" | grep -qE '^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
 }
 
 # Numeric semver strictly-less over two canonical X.Y.Z strings.
@@ -669,6 +675,15 @@ verify_stable_manifest() {
     fi
 
     payload_file="$work_dir/payload.bin"
+    # The canonical payload is printable ASCII on a single line. grep/sed are
+    # line-oriented, so a payload smuggling a second line (a canonical first
+    # line plus trailing artifact rows) must be refused BEFORE the grammar
+    # gate — any byte outside 0x20-0x7E is grounds for rejection.
+    if [ "$(LC_ALL=C tr -d ' -~' < "$payload_file" | wc -c)" -ne 0 ]; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest payload does not match the canonical serialization (non-printable bytes)" "verify" \
+            "refusing to install — the payload field layout is not the release contract"
+    fi
     # Structural grammar gate over the ENTIRE payload: the exact canonical
     # top-level field sequence, then artifact rows of the exact four-field
     # shape, then end-of-payload — anchored both ends. String fields cannot

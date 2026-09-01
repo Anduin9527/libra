@@ -39,8 +39,7 @@ async function sign(payloadBytes) {
   return Buffer.from(await crypto.subtle.sign("Ed25519", key, message));
 }
 
-async function envelope(payload, { pretty = false } = {}) {
-  const payloadBytes = Buffer.from(JSON.stringify(payload));
+async function envelopeFromBytes(payloadBytes, { pretty = false } = {}) {
   const signature = await sign(payloadBytes);
   const doc = {
     schema_version: 1,
@@ -51,6 +50,10 @@ async function envelope(payload, { pretty = false } = {}) {
   // signature-bound); the ENVELOPE spelling is free — pretty-printed
   // envelopes must verify identically.
   return `${JSON.stringify(doc, null, pretty ? 2 : undefined)}\n`;
+}
+
+async function envelope(payload, opts = {}) {
+  return envelopeFromBytes(Buffer.from(JSON.stringify(payload)), opts);
 }
 
 function payloadFor(binaryByPlatform, mutate = {}) {
@@ -239,6 +242,26 @@ writeFixture(
 writeFixture(
   "fixtures/manifest-undersized.json",
   await envelope(payloadFor(binaries, { sizeDelta: -1 })),
+);
+
+// Round-4 branches:
+// SIGNED multi-line payload — a fully canonical first line plus a trailing
+// artifact row on a second line. Line-oriented tools would see a valid first
+// line; the printable-ASCII single-line gate must refuse the whole payload.
+writeFixture(
+  "fixtures/manifest-multiline-payload.json",
+  await envelopeFromBytes(
+    Buffer.from(
+      `${JSON.stringify(payloadFor(binaries))}\n` +
+        `{"platform":"linux-arm64","url":"https://download.libra.tools/libra/releases/v9.9.9/libra-linux-arm64","sha256":"${"0".repeat(64)}","size":1}`,
+    ),
+  ),
+);
+// SemVer component wider than the bounded nine-digit grammar: shell integer
+// comparison could overflow, so the canonical check must refuse it first.
+writeFixture(
+  "fixtures/manifest-huge-semver.json",
+  await envelope(payloadFor(binaries, { version: "99999999999.0.0" })),
 );
 
 // Valid signature over the ORIGINAL payload, but the payload was swapped

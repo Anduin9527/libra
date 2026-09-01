@@ -244,6 +244,12 @@ function Resolve-StableChannel {
     }
 
     $payloadText = [System.Text.Encoding]::UTF8.GetString($payloadBytes)
+    # The canonical payload is printable ASCII on a single line; embedded
+    # newlines or control bytes could let character classes span lines and
+    # confuse the anchored extraction below.
+    if ($payloadText -cmatch '[^\x20-\x7e]') {
+        throw "signed manifest payload does not match the canonical serialization (non-printable bytes) - refusing to install"
+    }
     # Structural grammar gate: the payload must START with the exact canonical
     # top-level field sequence. The RAW text is authoritative for the scalar
     # values (ConvertFrom-Json eagerly converts ISO-8601 strings to [datetime]
@@ -267,7 +273,9 @@ function Resolve-StableChannel {
     # Canonical X.Y.Z only (no leading "v", no leading zeros) — the exact
     # grammar of the native contract, so revocation/floor comparisons can
     # never be format-bypassed.
-    $canonicalSemver = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+    # Components bounded to nine digits (stricter than native u64 — a wider
+    # component fails closed, the safe direction).
+    $canonicalSemver = '^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
     if ($payloadVersion -cnotmatch $canonicalSemver) {
         throw "signed manifest version '$payloadVersion' is not canonical X.Y.Z - refusing to install"
     }

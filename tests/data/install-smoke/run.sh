@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh smoke harness — twenty-two scenarios (plan-20260821 A1-05).
+# install.sh smoke harness — twenty-four scenarios (plan-20260821 A1-05).
 #
 #   bash tests/data/install-smoke/run.sh
 #
@@ -240,23 +240,30 @@ run_scenario pretty-envelope manifest-pretty-envelope.json ok yes "stable manife
 
 # 18. Served artifact one byte larger than the signed size → the bounded
 #     download refuses instead of accepting extra bytes.
-run_scenario undersized manifest-undersized.json fail no "download failed"
+run_scenario undersized manifest-undersized.json fail no "downloaded file is empty"
 
-# 19. Manifest 404 (chain not enabled) without opt-in → explicit stop.
+# 19. SIGNED multi-line payload (canonical first line + trailing artifact
+#     row on line two) → the printable-ASCII single-line gate refuses.
+run_scenario multiline-payload manifest-multiline-payload.json fail no "canonical serialization"
+
+# 20. SemVer component wider than the bounded nine-digit grammar.
+run_scenario huge-semver manifest-huge-semver.json fail no "not canonical X.Y.Z"
+
+# 21. Manifest 404 (chain not enabled) without opt-in → explicit stop.
 run_scenario transition-404 -none- fail no "signature chain is not enabled yet"
 
-# 20. Manifest 404 + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED legacy install.
+# 22. Manifest 404 + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED legacy install.
 run_scenario transition-404-fallback -none- ok yes "proceeding UNVERIFIED" \
     LIBRA_ALLOW_FALLBACK=1
 cmp -s "$WORK/home-transition-404-fallback/.libra/bin/libra" \
     "$FIXTURES/tree/libra/releases/v9.9.8/libra-$HOST_PLATFORM" \
     || fail "transition-404-fallback: legacy binary content mismatch"
 
-# 21. Verifier unavailable without opt-in → explicit stop (third state).
+# 23. Verifier unavailable without opt-in → explicit stop (third state).
 SMOKE_PATH="$WORK/no-openssl:$PATH"
 run_scenario verifier-unavailable manifest-valid.json fail no "signature verifier unavailable"
 
-# 22. Verifier unavailable + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED install.
+# 24. Verifier unavailable + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED install.
 run_scenario verifier-unavailable-fallback manifest-valid.json ok yes "proceeding UNVERIFIED" \
     LIBRA_ALLOW_FALLBACK=1
 SMOKE_PATH=""
@@ -265,5 +272,5 @@ SMOKE_PATH=""
 cmp -s "$INSTALLER" "$WORK/install.sh.orig" \
     || fail "the production install.sh was modified by the harness"
 
-[ "$SCENARIOS_RUN" -eq 22 ] || fail "expected 22 scenarios, ran $SCENARIOS_RUN"
+[ "$SCENARIOS_RUN" -eq 24 ] || fail "expected 24 scenarios, ran $SCENARIOS_RUN"
 echo "install-smoke: all $SCENARIOS_RUN scenarios passed"

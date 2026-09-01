@@ -1,4 +1,4 @@
-# install.ps1 smoke harness — twenty scenarios (plan-20260821 A1-05).
+# install.ps1 smoke harness — twenty-two scenarios (plan-20260821 A1-05).
 #
 #   pwsh -NoProfile -File tests/data/install-smoke/run.ps1
 #
@@ -151,6 +151,8 @@ httpd.serve_forever()
     Run-Scenario "trailing-artifact" "manifest-trailing-artifact.json" "fail" "no" "canonical serialization"
     Run-Scenario "pretty-envelope" "manifest-pretty-envelope.json" "ok" "yes" "Signed stable manifest verified"
     Run-Scenario "undersized" "manifest-undersized.json" "fail" "no" "does not match the signed size"
+    Run-Scenario "multiline-payload" "manifest-multiline-payload.json" "fail" "no" "canonical serialization"
+    Run-Scenario "huge-semver" "manifest-huge-semver.json" "fail" "no" "not canonical X.Y.Z"
     Run-Scenario "transition-404" "-none-" "fail" "no" "signature chain is not enabled yet"
     Run-Scenario "transition-404-fallback" "-none-" "ok" "yes" "proceeding UNVERIFIED" @{ LIBRA_ALLOW_FALLBACK = "1" }
 
@@ -159,7 +161,7 @@ httpd.serve_forever()
     if (-not [System.Linq.Enumerable]::SequenceEqual($OriginalBytes, $after)) {
         Fail "the production install.ps1 was modified by the harness"
     }
-    if ($ScenariosRun -ne 20) { Fail "expected 20 scenarios, ran $ScenariosRun" }
+    if ($ScenariosRun -ne 22) { Fail "expected 22 scenarios, ran $ScenariosRun" }
     Write-Host "install.ps1 smoke: all $ScenariosRun scenarios passed"
 } finally {
     Cleanup
