@@ -144,20 +144,38 @@ fn verify_envelope_for_persisted_floor(
     match verify_envelope_bytes(envelope_bytes, &eligible_trust) {
         Ok(manifest) => Ok(manifest),
         Err(ManifestError::NoTrustedSignature) => {
-            let manifest = verify_envelope_bytes(envelope_bytes, ctx.trust)?;
-            let signer = ctx
-                .trust
-                .iter()
-                .find(|key| key.key_id == manifest.signer_key_id)
-                .ok_or_else(|| FlowError::VerifiedSignerMissing {
-                    key_id: manifest.signer_key_id.clone(),
-                })?;
-            Err(StateRejection::SignerGenerationBelowFloor {
-                key_id: signer.key_id.to_string(),
-                offered: signer.generation,
-                floor: ctx.state.generation_floor,
+            match verify_envelope_bytes(envelope_bytes, ctx.trust) {
+                Ok(manifest) => {
+                    let signer = ctx
+                        .trust
+                        .iter()
+                        .find(|key| key.key_id == manifest.signer_key_id)
+                        .ok_or_else(|| FlowError::VerifiedSignerMissing {
+                            key_id: manifest.signer_key_id.clone(),
+                        })?;
+                    Err(StateRejection::SignerGenerationBelowFloor {
+                        key_id: signer.key_id.to_string(),
+                        offered: signer.generation,
+                        floor: ctx.state.generation_floor,
+                    }
+                    .into())
+                }
+                // The full table rejected on the signed/compile-time floor
+                // while the persisted floor is stricter still: report the
+                // EFFECTIVE (three-source max) floor, not the weaker one the
+                // pure verifier knows about.
+                Err(ManifestError::KeyGenerationBelowFloor {
+                    floor,
+                    manifest_min,
+                }) if ctx.state.generation_floor > floor => {
+                    Err(ManifestError::KeyGenerationBelowFloor {
+                        floor: ctx.state.generation_floor,
+                        manifest_min,
+                    }
+                    .into())
+                }
+                Err(error) => Err(error.into()),
             }
-            .into())
         }
         Err(error) => Err(error.into()),
     }

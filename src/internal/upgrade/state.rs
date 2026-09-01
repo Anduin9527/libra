@@ -312,6 +312,42 @@ pub fn local_clock_permits_cached_install(state: &UpgradeState, local_now: i64) 
     local_now >= state.trusted_time_floor - TIME_SLACK_SECONDS
 }
 
+/// Merge every monotone, verification-derived anti-rollback advance from an
+/// `accepted` snapshot onto `current`, without touching cooldown/backoff.
+///
+/// Used when the install of a cryptographically ACCEPTED manifest fails
+/// (pre-probe failure, post-probe rollback, aborted fresh install): the
+/// manifest was verified even though its artifact never became the target,
+/// so the generation floor, trusted time floor, control-revision ceiling and
+/// max-seen identity must survive the failure — otherwise a later manifest
+/// signed by a leaked lower-generation key would be accepted again.
+pub fn merge_acceptance_floors(current: &UpgradeState, accepted: &UpgradeState) -> UpgradeState {
+    let mut state = current.clone();
+    state.schema_version = 1;
+    state.generation_floor = state.generation_floor.max(accepted.generation_floor);
+    state.trusted_time_floor = state.trusted_time_floor.max(accepted.trusted_time_floor);
+    if accepted.max_control_revision > state.max_control_revision {
+        state.max_control_revision = accepted.max_control_revision;
+        state.control_envelope_digest = accepted.control_envelope_digest.clone();
+    }
+    let current_max = state.max_seen.as_deref().and_then(ReleaseVersion::parse);
+    let accepted_max = accepted.max_seen.as_deref().and_then(ReleaseVersion::parse);
+    let advances_max_seen = match (current_max, accepted_max) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(current), Some(accepted)) => accepted > current,
+    };
+    if advances_max_seen {
+        state.max_seen = accepted.max_seen.clone();
+        for (platform, identity) in &accepted.artifact_identity {
+            state
+                .artifact_identity
+                .insert(platform.clone(), identity.clone());
+        }
+    }
+    state
+}
+
 /// Next failure backoff (§A.6: doubling, capped at 1 h, using the same
 /// trusted upper bound for sanity). Returns the state to persist.
 pub fn register_failure_backoff(state: &UpgradeState, local_now: i64) -> UpgradeState {
@@ -517,6 +553,70 @@ mod tests {
                 .unwrap_err(),
             StateRejection::ControlRevisionForked { revision: 0 }
         );
+    }
+
+    #[test]
+    fn merge_acceptance_floors_advances_monotone_fields_only() {
+        let mut current = UpgradeState {
+            generation_floor: 1,
+            trusted_time_floor: 500,
+            max_control_revision: 4,
+            control_envelope_digest: Some("old-digest".into()),
+            max_seen: Some("1.5.0".into()),
+            backoff_not_before: Some(10_000),
+            backoff_seconds: 120,
+            next_success_check_not_before: Some(20_000),
+            ..UpgradeState::default()
+        };
+        current.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "b".repeat(64),
+                size: 1,
+            },
+        );
+        let mut accepted = UpgradeState {
+            generation_floor: 3,
+            trusted_time_floor: 900,
+            max_control_revision: 6,
+            control_envelope_digest: Some("new-digest".into()),
+            max_seen: Some("2.0.0".into()),
+            ..UpgradeState::default()
+        };
+        accepted.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "c".repeat(64),
+                size: 2,
+            },
+        );
+
+        let merged = merge_acceptance_floors(&current, &accepted);
+        assert_eq!(merged.generation_floor, 3);
+        assert_eq!(merged.trusted_time_floor, 900);
+        assert_eq!(merged.max_control_revision, 6);
+        assert_eq!(
+            merged.control_envelope_digest.as_deref(),
+            Some("new-digest")
+        );
+        assert_eq!(merged.max_seen.as_deref(), Some("2.0.0"));
+        assert_eq!(merged.artifact_identity["linux-amd64"].size, 2);
+        // Cooldown/backoff stay exactly as `current` had them.
+        assert_eq!(merged.backoff_not_before, Some(10_000));
+        assert_eq!(merged.backoff_seconds, 120);
+        assert_eq!(merged.next_success_check_not_before, Some(20_000));
+
+        // The reverse direction must not regress anything.
+        let regressed = merge_acceptance_floors(&accepted, &current);
+        assert_eq!(regressed.generation_floor, 3);
+        assert_eq!(regressed.trusted_time_floor, 900);
+        assert_eq!(regressed.max_control_revision, 6);
+        assert_eq!(
+            regressed.control_envelope_digest.as_deref(),
+            Some("new-digest")
+        );
+        assert_eq!(regressed.max_seen.as_deref(), Some("2.0.0"));
+        assert_eq!(regressed.artifact_identity["linux-amd64"].size, 2);
     }
 
     #[test]

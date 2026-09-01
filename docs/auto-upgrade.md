@@ -5,11 +5,12 @@ Libra can keep an official script install up to date automatically. This is
 cryptographically verified, anti-rollback protected, crash-safe, and isolated
 so it can never break or change the outcome of your normal commands.
 
-> **Status.** The currently released `0.22.0` remains inert because it does
-> not carry the production signing trust root. The planned `0.22.1` carries
-> that public root, but auto-upgrade still installs nothing until a valid,
-> signed stable manifest is published; a missing or invalid manifest fails
-> closed.
+> **Status.** Releases since `v0.22.1` carry the production signing trust
+> root (releases up to `v0.22.0` remain inert without it), but auto-upgrade
+> still installs nothing until a valid, signed stable manifest is published;
+> a missing or invalid manifest fails closed. The persisted monotonic
+> key-generation floor described below ships with `0.22.3` — released
+> clients up to `v0.22.2` enforce only the manifest and compiled floors.
 
 ## Enabling it
 

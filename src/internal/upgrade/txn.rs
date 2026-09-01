@@ -22,7 +22,7 @@ use sha2::Digest as _;
 use super::{
     lock::{EntryKind, InstallDir, InstallDirError},
     marker::{InstallMarker, MARKER_FILE_NAME, TARGET_BINARY_NAME, write_marker},
-    state::{UpgradeState, write_state},
+    state::{StateStoreError, UpgradeState, merge_acceptance_floors, read_state, write_state},
 };
 
 /// Transaction journal file name (fd-relative, `0600`).
@@ -178,6 +178,24 @@ fn finish_commit(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
     Ok(TxnOutcome::Installed)
 }
 
+/// Persist the accepted manifest's monotone anti-rollback floors even though
+/// the install is being undone: the manifest itself WAS verified, so a later
+/// manifest signed below its `min_key_generation` must stay rejected. Runs
+/// under the caller-held §A.5 lock in both the live and recovery paths.
+fn persist_acceptance_floors_on_failure(dir: &InstallDir, txn: &Txn) -> Result<(), TxnError> {
+    let current = match read_state(dir) {
+        Ok(state) => state,
+        // A corrupt state file cannot be allowed to drop the accepted floors:
+        // rebuild from the transaction's validated snapshot (floors only ever
+        // advance from the default). Unreadable (I/O) state stays an error —
+        // overwriting a state we could not read might lose a higher floor.
+        Err(StateStoreError::Corrupt { .. }) => UpgradeState::default(),
+        Err(e) => return Err(TxnError::State(e.to_string())),
+    };
+    write_state(dir, &merge_acceptance_floors(&current, &txn.new_state))
+        .map_err(|e| TxnError::State(e.to_string()))
+}
+
 /// Roll back an upgrade: restore the backup over the target, then clean up
 /// (§A.7 RollbackIntent).
 fn finish_rollback(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
@@ -191,6 +209,7 @@ fn finish_rollback(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> 
             detail: "rollback intent on a fresh (Absent) install".into(),
         });
     };
+    persist_acceptance_floors_on_failure(dir, txn)?;
     let layout = observe(dir)?;
     // Restore backup → target unless the old target is already in place.
     if layout.target.as_deref() != Some(hash.as_str()) {
@@ -227,6 +246,7 @@ fn finish_rollback(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> 
 /// Abort a fresh install: remove the new target if present, then clean up
 /// (§A.7 AbortAbsentIntent).
 fn finish_abort_absent(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
+    persist_acceptance_floors_on_failure(dir, txn)?;
     let layout = observe(dir)?;
     if layout.target.as_deref() == Some(txn.new_hash.as_str()) {
         dir.remove_file(TARGET_BINARY_NAME)?;
@@ -618,6 +638,93 @@ mod tests {
             marker: marker_for("2.0.0", b"NEW"),
             new_state: UpgradeState::default(),
         }
+    }
+
+    #[test]
+    fn rollback_and_abort_preserve_accepted_floors() {
+        use crate::internal::upgrade::state::{STATE_FILE_NAME, read_state};
+
+        // Post-probe failure → rollback: the manifest's verified floors must
+        // survive even though the install is undone.
+        let (_g, d) = dir();
+        write_state(
+            &d,
+            &UpgradeState {
+                generation_floor: 1,
+                ..UpgradeState::default()
+            },
+        )
+        .expect("test fixture operation should succeed");
+        d.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn = base_txn(
+            TxnState::CandidateInstalled,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+        );
+        txn.new_state.generation_floor = 3;
+        txn.new_state.max_control_revision = 9;
+        txn.new_state.control_envelope_digest = Some("digest-9".into());
+        journal(&d, &txn);
+        assert_eq!(
+            recover(&d, &fail()).expect("test fixture operation should succeed"),
+            TxnOutcome::RolledBack
+        );
+        let state = read_state(&d).expect("test fixture operation should succeed");
+        assert_eq!(state.generation_floor, 3);
+        assert_eq!(state.max_control_revision, 9);
+        assert_eq!(state.control_envelope_digest.as_deref(), Some("digest-9"));
+
+        // Fresh-install abort: same preservation.
+        let (_g2, d2) = dir();
+        d2.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn2 = base_txn(TxnState::CandidateInstalled, OldTarget::Absent);
+        txn2.new_state.generation_floor = 2;
+        journal(&d2, &txn2);
+        assert_eq!(
+            recover(&d2, &fail()).expect("test fixture operation should succeed"),
+            TxnOutcome::AbortedAbsent
+        );
+        assert_eq!(
+            read_state(&d2)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            2
+        );
+
+        // Corrupt state must not drop the accepted floors: it is rebuilt from
+        // the transaction's validated snapshot.
+        let (_g3, d3) = dir();
+        d3.write_file_atomic(STATE_FILE_NAME, b"{corrupt", 0o600)
+            .expect("test fixture operation should succeed");
+        d3.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        d3.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn3 = base_txn(
+            TxnState::CandidateInstalled,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+        );
+        txn3.new_state.generation_floor = 4;
+        journal(&d3, &txn3);
+        assert_eq!(
+            recover(&d3, &fail()).expect("test fixture operation should succeed"),
+            TxnOutcome::RolledBack
+        );
+        assert_eq!(
+            read_state(&d3)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            4
+        );
     }
 
     #[test]

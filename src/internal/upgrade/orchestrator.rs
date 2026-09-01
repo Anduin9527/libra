@@ -30,8 +30,8 @@ use super::{
     probe,
     settings::{UpgradeMode, effective_mode_for_upgrade},
     state::{
-        UpgradeState, backoff_defers, cooldown_permits_skip, read_state, register_failure_backoff,
-        write_state,
+        UpgradeState, backoff_defers, cooldown_permits_skip, merge_acceptance_floors, read_state,
+        register_failure_backoff, write_state,
     },
     trusted_keys::active_trust_table,
     txn::{self, CANDIDATE_NAME, OldTarget, TxnError, TxnOutcome},
@@ -375,7 +375,12 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
         if !pre_probe_healthy {
             dir.remove_file(CANDIDATE_NAME)?;
             dir.fsync_dir()?;
-            let backed_off = register_failure_backoff(&current_state, staged.local_now);
+            // The manifest WAS accepted — its floors must survive the failed
+            // install (a later lower-generation manifest must stay rejected).
+            let backed_off = register_failure_backoff(
+                &merge_acceptance_floors(&current_state, &staged.new_state),
+                staged.local_now,
+            );
             write_state(&dir, &backed_off).map_err(|e| TxnError::State(e.to_string()))?;
             return Ok(TxnOutcome::NoOp);
         }

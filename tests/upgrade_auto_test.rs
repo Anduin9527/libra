@@ -259,6 +259,38 @@ fn upgrade_persisted_generation_floor_selects_new_signer_and_rejects_lower_polic
 }
 
 #[test]
+fn upgrade_persisted_floor_reports_effective_floor_when_no_key_qualifies() {
+    // Persisted floor 3, only a generation-1 key in trust, manifest
+    // min_key_generation 2: the eligible-set pass finds no key and the
+    // full-table retry rejects on the weaker signed/compile-time floor (2).
+    // The surfaced error must carry the EFFECTIVE three-source floor (3).
+    let trust = vec![TrustedKey {
+        key_id: "old-key",
+        ed25519_pubkey: pubkey_for(&SEED),
+        not_before: 0,
+        not_after: 4_102_444_800,
+        generation: 1,
+    }];
+    let state = UpgradeState {
+        generation_floor: 3,
+        ..Default::default()
+    };
+    let env = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 2),
+        &[("old-key", SEED)],
+    );
+    assert!(matches!(
+        decide_from_envelope(&decision_context(&state, &trust), &env),
+        Err(FlowError::Manifest(
+            libra::internal::upgrade::manifest::ManifestError::KeyGenerationBelowFloor {
+                floor: 3,
+                manifest_min: 2,
+            }
+        ))
+    ));
+}
+
+#[test]
 fn upgrade_windows_is_explicitly_unsupported() {
     let trust = install_test_trust();
     let env = envelope(&payload("2.0.0", 5));
