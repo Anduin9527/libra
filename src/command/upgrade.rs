@@ -278,3 +278,311 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
     }
 }
+
+// ─── the visible `libra upgrade` command (manual signed-channel upgrade) ─────
+
+use std::io::{IsTerminal, Write};
+
+use clap::Parser;
+
+use crate::{
+    internal::upgrade::orchestrator::{
+        ManualCheckOutcome, ManualInstallReport, ManualUpgradeError, manual_upgrade_check,
+    },
+    utils::{error::StableErrorCode, output::OutputConfig},
+};
+
+/// Install-script one-liner surfaced whenever this binary cannot upgrade
+/// itself (dev build / unofficial install).
+const INSTALL_SCRIPT_HINT: &str =
+    "install the official build: curl -fsSL https://download.libra.tools/install.sh | sh";
+
+pub const UPGRADE_EXAMPLES: &str = "\
+EXAMPLES:
+  libra upgrade                 Check the signed release channel; ask before installing
+  libra upgrade --check         Only report whether a newer version exists
+  libra upgrade --yes           Install a newer version without the confirmation prompt
+  libra --json upgrade --check  Machine-readable status for scripts
+
+The check and the install both run the fully verified pipeline: the Ed25519-signed
+stable manifest, anti-rollback floors, sha256/size-enforced download, and a locked
+install transaction with a self-check probe and automatic rollback.
+";
+
+#[derive(Parser, Debug)]
+pub struct UpgradeArgs {
+    /// Only check whether a newer signed version exists; never install
+    #[clap(long, conflicts_with = "yes")]
+    pub check: bool,
+    /// Install a newer version without asking for confirmation
+    #[clap(short = 'y', long)]
+    pub yes: bool,
+}
+
+/// `libra upgrade` — check the signed stable channel and (after confirmation)
+/// replace the running binary with the latest release.
+pub async fn execute_safe(args: UpgradeArgs, output: &OutputConfig) -> CliResult<()> {
+    let local_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let outcome = manual_upgrade_check(local_now)
+        .await
+        .map_err(check_error_to_cli)?;
+
+    match outcome {
+        ManualCheckOutcome::NotOfficialInstall => {
+            if args.check {
+                report_status(
+                    output,
+                    "not_official_install",
+                    None,
+                    None,
+                    "this libra binary is not an official signed install, so it cannot report \
+                     or install signed releases for itself",
+                )?;
+                return Ok(());
+            }
+            Err(CliError::failure(
+                "this libra binary is not an official signed install, so it cannot upgrade itself",
+            )
+            .with_stable_code(StableErrorCode::Unsupported)
+            .with_hint(INSTALL_SCRIPT_HINT)
+            .with_hint("for a source checkout, pull and rebuild instead (cargo build --release)"))
+        }
+        ManualCheckOutcome::UnsupportedPlatform => {
+            if args.check {
+                report_status(
+                    output,
+                    "unsupported_platform",
+                    None,
+                    None,
+                    "this platform is outside the signed release matrix; upgrades are not \
+                     published for it",
+                )?;
+                return Ok(());
+            }
+            Err(CliError::failure(
+                "this platform is outside the signed release matrix, so there is nothing to \
+                 install",
+            )
+            .with_stable_code(StableErrorCode::Unsupported)
+            .with_hint("supported platforms: linux-amd64, linux-arm64, darwin-arm64"))
+        }
+        ManualCheckOutcome::UpToDate { installed, latest } => {
+            report_status(
+                output,
+                "up_to_date",
+                Some(installed.to_string()),
+                Some(latest.to_string()),
+                &format!("libra v{installed} is up to date (latest signed release: v{latest})"),
+            )?;
+            Ok(())
+        }
+        ManualCheckOutcome::Paused { installed } => {
+            report_status(
+                output,
+                "paused",
+                Some(installed.to_string()),
+                None,
+                "the publisher has PAUSED releases (emergency stop) — no upgrade is offered \
+                 right now; staying on the current version",
+            )?;
+            Ok(())
+        }
+        ManualCheckOutcome::RevokedLatest { installed, revoked } => {
+            report_status(
+                output,
+                "latest_revoked",
+                Some(installed.to_string()),
+                Some(revoked.to_string()),
+                &format!(
+                    "the latest published version v{revoked} is REVOKED by the publisher — \
+                     staying on v{installed} until a fixed release ships"
+                ),
+            )?;
+            Ok(())
+        }
+        ManualCheckOutcome::Available(upgrade) => run_available(args, output, *upgrade).await,
+    }
+}
+
+async fn run_available(
+    args: UpgradeArgs,
+    output: &OutputConfig,
+    upgrade: crate::internal::upgrade::orchestrator::ManualUpgrade,
+) -> CliResult<()> {
+    let installed = upgrade.installed();
+    let latest = upgrade.latest();
+    let size_mb = upgrade.artifact_size() as f64 / 1_048_576.0;
+
+    if args.check {
+        report_status(
+            output,
+            "available",
+            Some(installed.to_string()),
+            Some(latest.to_string()),
+            &format!(
+                "a newer version is available: v{installed} -> v{latest} ({size_mb:.1} MB, \
+                 signed) — run `libra upgrade` to install"
+            ),
+        )?;
+        upgrade.decline().await;
+        return Ok(());
+    }
+
+    if !output.is_json() && !output.quiet {
+        println!("  installed  v{installed}");
+        println!("  latest     v{latest}  ({size_mb:.1} MB, signed stable channel)");
+        println!();
+    }
+
+    let proceed = if args.yes {
+        true
+    } else if std::io::stdin().is_terminal() {
+        confirm(&format!("Upgrade to v{latest} now?")).map_err(|error| {
+            CliError::failure(format!("could not read the confirmation answer: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+    } else {
+        upgrade.decline().await;
+        return Err(CliError::failure(format!(
+            "a newer version v{latest} is available, but stdin is not a terminal so libra \
+             cannot ask for confirmation"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("re-run with --yes to install non-interactively")
+        .with_hint("or use --check to only report availability"));
+    };
+
+    if !proceed {
+        upgrade.decline().await;
+        report_status(
+            output,
+            "declined",
+            Some(installed.to_string()),
+            Some(latest.to_string()),
+            &format!("upgrade cancelled — staying on v{installed}"),
+        )?;
+        return Ok(());
+    }
+
+    if !output.is_json() && !output.quiet {
+        println!("  downloading v{latest} ({size_mb:.1} MB, sha256-verified) ...");
+    }
+    let report = upgrade.install().await.map_err(install_error_to_cli)?;
+    match report {
+        ManualInstallReport::Installed(version) => {
+            report_status(
+                output,
+                "installed",
+                Some(installed.to_string()),
+                Some(version.to_string()),
+                &format!(
+                    "upgraded to v{version} — the new version takes effect on your next command"
+                ),
+            )?;
+            Ok(())
+        }
+        ManualInstallReport::RolledBack => Err(CliError::failure(
+            "the downloaded version failed its post-install self-check and the previous \
+             binary was RESTORED — nothing changed",
+        )
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint(
+            "try again later; if this repeats, report it at github.com/libra-tools/libra/issues",
+        )),
+        ManualInstallReport::NotApplied => Err(CliError::failure(
+            "the upgrade was not applied: another libra process is upgrading concurrently, \
+             or the candidate failed its pre-install check",
+        )
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint("re-run `libra upgrade` in a moment")),
+    }
+}
+
+/// Emit one status line (human) or one JSON document (machine mode).
+fn report_status(
+    output: &OutputConfig,
+    status: &str,
+    installed: Option<String>,
+    latest: Option<String>,
+    human: &str,
+) -> CliResult<()> {
+    if output.is_json() {
+        return crate::utils::output::emit_json_data(
+            "upgrade",
+            &serde_json::json!({
+                "status": status,
+                "installed": installed,
+                "latest": latest,
+            }),
+            output,
+        );
+    }
+    if !output.quiet {
+        match status {
+            "up_to_date" | "installed" => println!("✓ {human}"),
+            "paused" | "latest_revoked" => println!("! {human}"),
+            _ => println!("{human}"),
+        }
+    }
+    Ok(())
+}
+
+/// `y`/`yes` (any case) accepts; everything else — including EOF — declines.
+fn parse_confirmation(raw: &str) -> bool {
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn confirm(question: &str) -> std::io::Result<bool> {
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(parse_confirmation(&line))
+}
+
+fn check_error_to_cli(error: ManualUpgradeError) -> CliError {
+    let code = match &error {
+        ManualUpgradeError::Fetch(_) => StableErrorCode::NetworkUnavailable,
+        ManualUpgradeError::Verify(_) => StableErrorCode::NetworkProtocol,
+        ManualUpgradeError::State(_) => StableErrorCode::RepoStateInvalid,
+    };
+    let mut cli =
+        CliError::failure(format!("upgrade check failed: {error}")).with_stable_code(code);
+    if matches!(error, ManualUpgradeError::Fetch(_)) {
+        cli = cli.with_hint("check the network connection and retry");
+    }
+    cli
+}
+
+fn install_error_to_cli(error: ManualUpgradeError) -> CliError {
+    CliError::failure(format!("upgrade download failed: {error}"))
+        .with_stable_code(StableErrorCode::NetworkUnavailable)
+        .with_hint("nothing was changed; re-run `libra upgrade` to retry")
+}
+
+#[cfg(test)]
+mod upgrade_cli_tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_accepts_only_yes_forms() {
+        for yes in ["y", "Y", "yes", "YES", " y \n"] {
+            assert!(parse_confirmation(yes), "{yes:?} must accept");
+        }
+        for no in ["", "n", "no", "nope", "yy", "es", "yes!", "\n"] {
+            assert!(!parse_confirmation(no), "{no:?} must decline");
+        }
+    }
+
+    #[test]
+    fn check_and_yes_are_mutually_exclusive() {
+        use clap::Parser as _;
+        assert!(UpgradeArgs::try_parse_from(["upgrade", "--check", "--yes"]).is_err());
+        assert!(UpgradeArgs::try_parse_from(["upgrade", "--check"]).is_ok());
+        assert!(UpgradeArgs::try_parse_from(["upgrade", "-y"]).is_ok());
+    }
+}

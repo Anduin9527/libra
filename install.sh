@@ -18,7 +18,7 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.22.9"
+DEFAULT_VERSION="v0.22.10"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script, never through
@@ -1103,6 +1103,27 @@ screen_install() {
 
     run_step "install to $target" mv "$temp_file" "$target" \
         || error_exit "could not install to $target" "install"
+
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ]; then
+        # Official-install marker (§A.2/§A.4): records the signed provenance
+        # of the target so `libra upgrade` and `upgrade.mode=auto` accept
+        # this install as upgrade-manageable. Written ONLY on the verified
+        # path — an unverified fallback must never claim official provenance.
+        marker_tmp="${INSTALL_DIR}/.libra-official-install.json.tmp.$$"
+        if printf '{"schema_version":1,"installed_at":"%s","install_source":"official_signed_manifest","platform":"%s","version":"%s","sha256":"%s","size":%s,"manifest_key_id":"%s"}' \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${OS}-${ARCH}" "$STABLE_VERSION" \
+            "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_tmp" \
+            && chmod 644 "$marker_tmp" \
+            && mv "$marker_tmp" "${INSTALL_DIR}/.libra-official-install.json"; then
+            fact "provenance" "official-install marker written (enables 'libra upgrade')"
+        else
+            rm -f "$marker_tmp" 2>/dev/null
+            warn_fact "provenance" "could not record the official-install marker — 'libra upgrade' will ask you to re-run this installer"
+        fi
+    else
+        # An unverified install must not sit next to a stale official marker.
+        rm -f "${INSTALL_DIR}/.libra-official-install.json" 2>/dev/null || true
+    fi
 
     INSTALLED_PATH="$target"
     ensure_lba_alias

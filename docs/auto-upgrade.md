@@ -91,6 +91,31 @@ copied next to a different binary, never qualifies.
   auto-downgrade) but surfaces a high-priority warning pointing at the fixed
   release.
 
+## Upgrading on demand: `libra upgrade`
+
+The explicit counterpart to the background check — and the consumer of
+`upgrade.mode=manual` — is the [`libra upgrade`](commands/upgrade.md)
+command:
+
+```bash
+libra upgrade           # check, show current vs latest, ask before installing
+libra upgrade --check   # only report whether a newer signed version exists
+libra upgrade --yes     # install without the prompt (scripts / CI)
+```
+
+It runs exactly the same verified pipeline as `auto` (signed manifest,
+anti-rollback floors, sha256/size-enforced download, locked install
+transaction with self-check and rollback), but on your explicit request and
+regardless of the auto check's cooldown. `upgrade.mode` does not gate it:
+even with `off`, an explicit `libra upgrade` works — the mode only controls
+the background behaviour.
+
+Since v0.22.10 the install script writes the official-install marker itself
+on every verified install, so a fresh `curl … | sh` install is immediately
+upgrade-manageable. Installs made with older script versions carry no
+marker yet: run the install script once more and `libra upgrade` works from
+then on.
+
 ## Turning it off
 
 ```bash

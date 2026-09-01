@@ -545,6 +545,217 @@ fn now_rfc3339(local_now: i64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
+// ─── manual `libra upgrade` (§A.8's explicit half) ──────────────────────────
+//
+// The manual command is the consumer of `upgrade.mode=manual`: it runs the
+// SAME verified pipeline as the auto check (signed manifest → anti-rollback
+// state → decision → bounded download → locked transaction with probe and
+// rollback), but on explicit user request — so it ignores the auto cadence
+// gates (`should_check_now`, backoff) and reports real diagnostics instead
+// of degrading every failure to a silent skip.
+
+/// A manual check/install failure with a user-facing description.
+#[derive(Debug, thiserror::Error)]
+pub enum ManualUpgradeError {
+    /// The manifest or artifact could not be fetched (network/TLS/size).
+    #[error("{0}")]
+    Fetch(#[from] super::http::UpgradeHttpError),
+    /// The manifest failed verification or was rejected by the persisted
+    /// anti-rollback/time state.
+    #[error("{0}")]
+    Verify(#[from] super::flow::FlowError),
+    /// The upgrade state next to the installed binary could not be read.
+    #[error("cannot read the upgrade state next to the installed binary: {0}")]
+    State(String),
+}
+
+/// Outcome of the manual availability check.
+pub enum ManualCheckOutcome {
+    /// This binary is not an official upgrade-manageable install: a dev
+    /// build (`cargo run`), a renamed copy, an install directory that fails
+    /// §A.5 validation, or a target without the official install marker.
+    NotOfficialInstall,
+    /// The running platform is outside the supported upgrade matrix.
+    UnsupportedPlatform,
+    /// Already on the latest signed release.
+    UpToDate {
+        installed: ReleaseVersion,
+        latest: ReleaseVersion,
+    },
+    /// The publisher has paused releases (emergency stop, §A.6).
+    Paused { installed: ReleaseVersion },
+    /// The latest published version revokes itself; nothing to install.
+    RevokedLatest {
+        installed: ReleaseVersion,
+        revoked: ReleaseVersion,
+    },
+    /// A newer signed version is ready to install.
+    Available(Box<ManualUpgrade>),
+}
+
+/// What a confirmed manual install did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualInstallReport {
+    /// The new version is on disk; it takes effect on the next command.
+    Installed(ReleaseVersion),
+    /// The candidate failed its post-install self-check and the previous
+    /// binary was restored.
+    RolledBack,
+    /// Nothing was changed: another process holds the upgrade lock, made
+    /// concurrent progress, or the candidate failed its pre-install probe.
+    NotApplied,
+}
+
+/// A decided, verified, not-yet-downloaded manual upgrade. Consume it with
+/// [`ManualUpgrade::install`] or [`ManualUpgrade::decline`] — either way the
+/// accepted manifest's monotone floors are persisted (declining a newer
+/// version must not forget the control decisions the manifest proved).
+pub struct ManualUpgrade {
+    ctx: InstallContext,
+    expected_state: UpgradeState,
+    plan: Box<super::flow::InstallPlan>,
+    installed: ReleaseVersion,
+    local_now: i64,
+}
+
+impl ManualUpgrade {
+    /// The running binary's version.
+    pub fn installed(&self) -> ReleaseVersion {
+        self.installed
+    }
+
+    /// The verified newer version the manifest offers.
+    pub fn latest(&self) -> ReleaseVersion {
+        self.plan.version
+    }
+
+    /// Signed artifact size in bytes (download + install budget).
+    pub fn artifact_size(&self) -> u64 {
+        self.plan.artifact.size
+    }
+
+    /// Persist the accepted floors without installing.
+    pub async fn decline(self) {
+        merge_acceptance_floors_with_retry(self.ctx.dir_path.clone(), self.plan.new_state.clone())
+            .await;
+    }
+
+    /// Download the artifact (sha256/size enforced, ≤128 MiB) and run the
+    /// locked install transaction with pre/post probes and auto-rollback.
+    pub async fn install(self) -> Result<ManualInstallReport, ManualUpgradeError> {
+        let client = upgrade_http_client()?;
+        let mut candidate: Vec<u8> = Vec::new();
+        if let Err(error) = download_artifact_to(
+            &client,
+            &self.plan.artifact.url,
+            self.plan.artifact.size,
+            &self.plan.artifact.sha256,
+            &mut candidate,
+        )
+        .await
+        {
+            // The manifest WAS accepted; its floors survive a failed download.
+            merge_acceptance_floors_with_retry(
+                self.ctx.dir_path.clone(),
+                self.plan.new_state.clone(),
+            )
+            .await;
+            return Err(error.into());
+        }
+        let staged = StagedInstall {
+            version: self.plan.version,
+            marker: self.plan.marker,
+            new_state: self.plan.new_state,
+            expected_state: self.expected_state,
+            candidate,
+            local_now: self.local_now,
+        };
+        Ok(match phase_b(&self.ctx, staged).await {
+            AutoUpgradeReport::Installed(version) => ManualInstallReport::Installed(version),
+            AutoUpgradeReport::RolledBack => ManualInstallReport::RolledBack,
+            AutoUpgradeReport::Skipped => ManualInstallReport::NotApplied,
+        })
+    }
+}
+
+/// Manual availability check: verify the live signed manifest and decide.
+/// Unlike the auto check this reports every failure to the caller and does
+/// not consult the auto cadence/backoff gates; like the auto check, every
+/// verified control decision (even a skip) durably advances the floors.
+pub async fn manual_upgrade_check(
+    local_now: i64,
+) -> Result<ManualCheckOutcome, ManualUpgradeError> {
+    let trust = active_trust_table();
+    if trust.is_empty() {
+        // A build with no trust table cannot verify anything — treat it like
+        // a non-official install (dev builds hit the same guidance).
+        return Ok(ManualCheckOutcome::NotOfficialInstall);
+    }
+    let Some(ctx) = resolve_install_context() else {
+        return Ok(ManualCheckOutcome::NotOfficialInstall);
+    };
+    if ctx.platform.support() != PlatformSupport::Supported {
+        return Ok(ManualCheckOutcome::UnsupportedPlatform);
+    }
+    if official_marker_for_target(&ctx.dir, ctx.platform.as_str())
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Ok(ManualCheckOutcome::NotOfficialInstall);
+    }
+    let state = read_state(&ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
+
+    let client = upgrade_http_client()?;
+    let fetched = fetch_manifest(&client, MANIFEST_URL).await?;
+    let https_date = fetched
+        .https_date
+        .as_deref()
+        .and_then(parse_http_date_to_unix);
+    let installed = ReleaseVersion::parse(env!("CARGO_PKG_VERSION")).ok_or_else(|| {
+        ManualUpgradeError::State("the running binary's version is not canonical X.Y.Z".to_string())
+    })?;
+    let ctx_dec = DecisionContext {
+        state: &state,
+        https_date,
+        local_now,
+        trust,
+        platform: Some(ctx.platform),
+        installed_version: installed,
+        installed_at_rfc3339: &now_rfc3339(local_now),
+    };
+    let decision = decide_from_envelope(&ctx_dec, &fetched.bytes)?;
+    Ok(match decision {
+        UpgradeDecision::Install(plan) => ManualCheckOutcome::Available(Box::new(ManualUpgrade {
+            expected_state: state,
+            ctx,
+            plan,
+            installed,
+            local_now,
+        })),
+        UpgradeDecision::Skip { reason, new_state } => {
+            persist_accepted_skip_state(&ctx, state.clone(), new_state).await;
+            use super::flow::SkipReason;
+            match reason {
+                SkipReason::NotNewer {
+                    manifest,
+                    installed,
+                } => ManualCheckOutcome::UpToDate {
+                    installed,
+                    latest: manifest,
+                },
+                SkipReason::Paused => ManualCheckOutcome::Paused { installed },
+                SkipReason::RevokedTarget(revoked) => {
+                    ManualCheckOutcome::RevokedLatest { installed, revoked }
+                }
+                SkipReason::UnsupportedPlatform(_) | SkipReason::PlatformNotInMatrix => {
+                    ManualCheckOutcome::UnsupportedPlatform
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
