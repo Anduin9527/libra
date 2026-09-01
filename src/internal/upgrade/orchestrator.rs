@@ -310,21 +310,27 @@ async fn phase_a(
 }
 
 /// Persist a verified policy update that did not lead to an install (for
-/// example, a pause or same-version manifest). The state is written only if
-/// the baseline read before the network request is still current under the
-/// install-directory lock; otherwise another process has made progress and
-/// this invocation safely leaves it alone.
+/// example, a pause or same-version manifest). The full state is written
+/// only if the baseline read before the network request is still current
+/// under the install-directory lock; when another process has made progress
+/// (or holds the lock), the accepted state's monotone floors are still
+/// merged so an accepted high-generation manifest is never forgotten.
 async fn persist_accepted_skip_state(
     ctx: &InstallContext,
     expected_state: UpgradeState,
     accepted_state: UpgradeState,
 ) {
     let dir_path = ctx.dir_path.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let expected = expected_state.clone();
+    let full_state = accepted_state.clone();
+    let cas_applied = tokio::task::spawn_blocking(move || {
         let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
-        persist_if_state_unchanged(&dir, &expected_state, &accepted_state)
+        persist_if_state_unchanged(&dir, &expected, &full_state)
     })
     .await;
+    if !matches!(cas_applied, Ok(Ok(true))) {
+        merge_acceptance_floors_with_retry(ctx.dir_path.clone(), accepted_state).await;
+    }
 }
 
 /// The state to persist for a failed check attempt: failure backoff on top
@@ -343,9 +349,48 @@ fn failure_backoff_state(
     register_failure_backoff(&base, local_now)
 }
 
+/// Merge the monotone acceptance floors onto the CURRENT on-disk state under
+/// the lock, with no baseline requirement: floors only ever advance, so this
+/// is safe over ANY concurrent progress (unlike backoff/cooldown writes,
+/// which stay behind the state CAS). `Ok(false)` = lock busy, try again.
+fn merge_floors_locked(dir: &InstallDir, accepted: &UpgradeState) -> Result<bool, ()> {
+    let Some(_lock) = dir.try_lock().map_err(|_| ())? else {
+        return Ok(false);
+    };
+    let current = read_state(dir).map_err(|_| ())?;
+    let merged = merge_acceptance_floors(&current, accepted);
+    if merged != current {
+        write_state(dir, &merged).map_err(|_| ())?;
+    }
+    Ok(true)
+}
+
+/// Retry [`merge_floors_locked`] briefly while another process holds the
+/// upgrade lock. Lock holders finish quickly (downloads happen outside the
+/// lock), so a short bounded wait recovers nearly every contention window;
+/// I/O errors abort silently (the next accepted manifest re-advances).
+async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accepted: UpgradeState) {
+    const LOCK_RETRIES: u32 = 8;
+    for _ in 0..LOCK_RETRIES {
+        let path = dir_path.clone();
+        let snapshot = accepted.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let dir = InstallDir::open_validated(&path).map_err(|_| ())?;
+            merge_floors_locked(&dir, &snapshot)
+        })
+        .await;
+        match done {
+            Ok(Ok(false)) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            _ => return,
+        }
+    }
+}
+
 /// Persist a failure backoff only when the state observed before Phase A is
 /// still current. This prevents a late network timeout from clobbering a
-/// newer generation/control floor accepted by another process.
+/// newer generation/control floor accepted by another process. When the
+/// baseline HAS moved, the accepted floors are still merged monotonically —
+/// only the backoff itself is dropped as stale.
 async fn persist_failure_backoff(
     ctx: &InstallContext,
     expected_state: UpgradeState,
@@ -354,11 +399,17 @@ async fn persist_failure_backoff(
 ) {
     let accepted_state = failure_backoff_state(&expected_state, accepted.as_ref(), local_now);
     let dir_path = ctx.dir_path.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let expected = expected_state.clone();
+    let cas_applied = tokio::task::spawn_blocking(move || {
         let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
-        persist_if_state_unchanged(&dir, &expected_state, &accepted_state)
+        persist_if_state_unchanged(&dir, &expected, &accepted_state)
     })
     .await;
+    if let Some(accepted) = accepted
+        && !matches!(cas_applied, Ok(Ok(true)))
+    {
+        merge_acceptance_floors_with_retry(ctx.dir_path.clone(), accepted).await;
+    }
 }
 
 /// Lock-protected compare-and-write for accepted non-install decisions.
@@ -386,18 +437,27 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
     let version = staged.version;
     let dir_path = ctx.dir_path.clone();
     let platform = ctx.platform;
+    let accepted_floors = staged.new_state.clone();
     // Re-open a dedicated InstallDir for the blocking transaction task.
+    // `Ok(None)` = the lock was busy; the caller then merges the accepted
+    // floors with retry, because even an install this process cannot perform
+    // must not forget the manifest it verified.
     let outcome = tokio::task::spawn_blocking(move || {
         let dir = InstallDir::open_validated(&dir_path).map_err(TxnError::Dir)?;
         let Some(_lock) = dir.try_lock()? else {
             // Another process holds the lock — skip this round.
-            return Ok(TxnOutcome::NoOp);
+            return Ok(None);
         };
         // Fetch/download occurred outside the lock. Do not apply that plan
-        // over state another process accepted while Phase A was in flight.
+        // over state another process accepted while Phase A was in flight —
+        // but DO merge the monotone floors this attempt proved.
         let current_state = read_state(&dir).map_err(|e| TxnError::State(e.to_string()))?;
         if current_state != staged.expected_state {
-            return Ok(TxnOutcome::NoOp);
+            let merged = merge_acceptance_floors(&current_state, &staged.new_state);
+            if merged != current_state {
+                write_state(&dir, &merged).map_err(|e| TxnError::State(e.to_string()))?;
+            }
+            return Ok(Some(TxnOutcome::NoOp));
         }
         // Durably advance the acceptance floors BEFORE staging or probing:
         // a crash anywhere in the window before the transaction journal
@@ -424,7 +484,7 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
                 staged.local_now,
             );
             write_state(&dir, &backed_off).map_err(|e| TxnError::State(e.to_string()))?;
-            return Ok(TxnOutcome::NoOp);
+            return Ok(Some(TxnOutcome::NoOp));
         }
         let old_target = current_old_target(&dir, platform)?;
         let new_hash = staged.marker.sha256.clone();
@@ -440,12 +500,19 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
             staged.new_state,
             &probe,
         )
+        .map(Some)
     })
     .await;
 
     match outcome {
-        Ok(Ok(TxnOutcome::Installed)) => AutoUpgradeReport::Installed(version),
-        Ok(Ok(TxnOutcome::RolledBack)) => AutoUpgradeReport::RolledBack,
+        Ok(Ok(Some(TxnOutcome::Installed))) => AutoUpgradeReport::Installed(version),
+        Ok(Ok(Some(TxnOutcome::RolledBack))) => AutoUpgradeReport::RolledBack,
+        Ok(Ok(None)) => {
+            // Lock busy: the install is skipped, but the verified floors are
+            // still merged (with a short retry) so they cannot be lost.
+            merge_acceptance_floors_with_retry(ctx.dir_path.clone(), accepted_floors).await;
+            AutoUpgradeReport::Skipped
+        }
         _ => AutoUpgradeReport::Skipped,
     }
 }
@@ -630,6 +697,58 @@ mod tests {
         let current = read_state(&dir).expect("advanced state must remain readable");
         assert_eq!(current.generation_floor, 3);
         assert_eq!(current.backoff_not_before, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn floors_merge_applies_over_a_changed_baseline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("test directory must be created");
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test directory must canonicalize");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test directory permissions must be set");
+        let dir = InstallDir::open_validated(&path).expect("test directory must validate");
+        // The on-disk state has moved past this attempt's baseline: another
+        // process registered a backoff AND advanced the floor to 2.
+        let moved = UpgradeState {
+            generation_floor: 2,
+            backoff_not_before: Some(9_999),
+            backoff_seconds: 120,
+            ..UpgradeState::default()
+        };
+        write_state(&dir, &moved).expect("moved state fixture must persist");
+
+        // Merging an accepted floor-3 snapshot needs no baseline match and
+        // leaves the concurrent backoff untouched.
+        let accepted = UpgradeState {
+            generation_floor: 3,
+            ..UpgradeState::default()
+        };
+        assert!(
+            merge_floors_locked(&dir, &accepted).expect("floor merge must not error"),
+            "an uncontended lock must merge"
+        );
+        let current = read_state(&dir).expect("merged state must be readable");
+        assert_eq!(current.generation_floor, 3);
+        assert_eq!(current.backoff_not_before, Some(9_999));
+        assert_eq!(current.backoff_seconds, 120);
+
+        // A stale lower floor is a no-op.
+        let lower = UpgradeState {
+            generation_floor: 1,
+            ..UpgradeState::default()
+        };
+        assert!(merge_floors_locked(&dir, &lower).expect("floor merge must not error"));
+        assert_eq!(
+            read_state(&dir)
+                .expect("state must stay readable")
+                .generation_floor,
+            3
+        );
     }
 
     #[test]
