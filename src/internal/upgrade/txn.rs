@@ -304,6 +304,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
     match (txn.state, &txn.old_target) {
         (TxnState::Prepared, OldTarget::Absent) => {
             if layout.target.is_none() && layout.candidate.as_deref() == Some(new.as_str()) {
+                persist_acceptance_floors_on_failure(dir, &txn)?;
                 dir.remove_file(CANDIDATE_NAME)?;
                 dir.fsync_dir()?;
                 dir.remove_file(TXN_FILE_NAME)?;
@@ -322,6 +323,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             let target_old = layout.target.as_deref() == Some(hash.as_str());
             let candidate_new = layout.candidate.as_deref() == Some(new.as_str());
             if target_old && candidate_new && layout.backup.is_none() {
+                persist_acceptance_floors_on_failure(dir, &txn)?;
                 dir.remove_file(CANDIDATE_NAME)?;
                 dir.fsync_dir()?;
                 dir.remove_file(TXN_FILE_NAME)?;
@@ -695,6 +697,51 @@ mod tests {
                 .expect("test fixture operation should succeed")
                 .generation_floor,
             2
+        );
+
+        // Prepared-stage cleanup (crash before backup/rename) must also
+        // preserve the floors: Prepared/Absent with only a candidate…
+        let (_gp, dp) = dir();
+        dp.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn_p = base_txn(TxnState::Prepared, OldTarget::Absent);
+        txn_p.new_state.generation_floor = 5;
+        journal(&dp, &txn_p);
+        assert_eq!(
+            recover(&dp, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::AbortedAbsent
+        );
+        assert_eq!(
+            read_state(&dp)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            5
+        );
+
+        // …and Prepared/Present with target+candidate but no backup.
+        let (_gq, dq) = dir();
+        dq.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        dq.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn_q = base_txn(
+            TxnState::Prepared,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+        );
+        txn_q.new_state.generation_floor = 6;
+        journal(&dq, &txn_q);
+        assert_eq!(
+            recover(&dq, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::NoOp
+        );
+        assert_eq!(
+            read_state(&dq)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            6
         );
 
         // Corrupt state must not drop the accepted floors: it is rebuilt from

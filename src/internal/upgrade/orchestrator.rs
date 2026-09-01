@@ -206,15 +206,29 @@ pub async fn run_auto_upgrade_check(local_now: i64) -> AutoUpgradeReport {
 
     // Phase A: fetch + decide + download, under the budget. Candidate staging
     // and probing happen under the lock in Phase B so concurrent checks
-    // cannot exchange candidates or regress the accepted state.
-    match tokio::time::timeout(UPGRADE_BUDGET, phase_a(&ctx, &state, trust, local_now)).await {
+    // cannot exchange candidates or regress the accepted state. The witness
+    // records the accepted new_state the moment verification succeeds, so a
+    // later download failure or budget timeout cannot lose the floors the
+    // manifest already proved.
+    let acceptance_witness = std::sync::Arc::new(std::sync::Mutex::new(None::<UpgradeState>));
+    match tokio::time::timeout(
+        UPGRADE_BUDGET,
+        phase_a(&ctx, &state, trust, local_now, &acceptance_witness),
+    )
+    .await
+    {
         Ok(Ok(Some(plan))) => phase_b(&ctx, plan).await,
         Ok(Ok(None)) => AutoUpgradeReport::Skipped,
         Ok(Err(())) | Err(_) => {
             // Any failure or timeout: compare-and-write a backoff under the
             // upgrade lock. A concurrent accepted manifest must win rather
-            // than being overwritten by this stale failure path.
-            persist_failure_backoff(&ctx, state, local_now).await;
+            // than being overwritten by this stale failure path; an accepted
+            // manifest from THIS attempt still advances the floors.
+            let accepted = acceptance_witness
+                .lock()
+                .map(|mut witness| witness.take())
+                .unwrap_or(None);
+            persist_failure_backoff(&ctx, state, accepted, local_now).await;
             AutoUpgradeReport::Skipped
         }
     }
@@ -232,12 +246,15 @@ struct StagedInstall {
 }
 
 /// Phase A: fetch the manifest, decide, and download+verify the candidate.
-/// `Ok(Some(_))` means "ready to lock, stage and probe".
+/// `Ok(Some(_))` means "ready to lock, stage and probe". The moment a
+/// manifest is ACCEPTED, its new state is recorded in `acceptance_witness`
+/// so every later failure path can still persist the advanced floors.
 async fn phase_a(
     ctx: &InstallContext,
     state: &UpgradeState,
     trust: &[super::trusted_keys::TrustedKey],
     local_now: i64,
+    acceptance_witness: &std::sync::Arc<std::sync::Mutex<Option<UpgradeState>>>,
 ) -> Result<Option<StagedInstall>, ()> {
     let client = upgrade_http_client().map_err(|_| ())?;
     let fetched = fetch_manifest(&client, MANIFEST_URL)
@@ -266,6 +283,9 @@ async fn phase_a(
             return Ok(None);
         }
     };
+    if let Ok(mut witness) = acceptance_witness.lock() {
+        *witness = Some(plan.new_state.clone());
+    }
 
     // Download into memory (SizeGate-bounded to ≤128 MiB). Do not touch the
     // shared candidate filename until the Phase-B lock is held.
@@ -307,15 +327,32 @@ async fn persist_accepted_skip_state(
     .await;
 }
 
+/// The state to persist for a failed check attempt: failure backoff on top
+/// of the pre-attempt baseline, plus — when this attempt DID accept a
+/// manifest before failing (download error, budget timeout) — the accepted
+/// snapshot's monotone floors (§A.6/§A.7 anti-rollback).
+fn failure_backoff_state(
+    expected_state: &UpgradeState,
+    accepted: Option<&UpgradeState>,
+    local_now: i64,
+) -> UpgradeState {
+    let base = match accepted {
+        Some(accepted) => merge_acceptance_floors(expected_state, accepted),
+        None => expected_state.clone(),
+    };
+    register_failure_backoff(&base, local_now)
+}
+
 /// Persist a failure backoff only when the state observed before Phase A is
 /// still current. This prevents a late network timeout from clobbering a
 /// newer generation/control floor accepted by another process.
 async fn persist_failure_backoff(
     ctx: &InstallContext,
     expected_state: UpgradeState,
+    accepted: Option<UpgradeState>,
     local_now: i64,
 ) {
-    let accepted_state = register_failure_backoff(&expected_state, local_now);
+    let accepted_state = failure_backoff_state(&expected_state, accepted.as_ref(), local_now);
     let dir_path = ctx.dir_path.clone();
     let _ = tokio::task::spawn_blocking(move || {
         let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
@@ -362,6 +399,11 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
         if current_state != staged.expected_state {
             return Ok(TxnOutcome::NoOp);
         }
+        // Durably advance the acceptance floors BEFORE staging or probing:
+        // a crash anywhere in the window before the transaction journal
+        // exists must not lose them (recovery would see no txn and NoOp).
+        let floors = merge_acceptance_floors(&current_state, &staged.new_state);
+        write_state(&dir, &floors).map_err(|e| TxnError::State(e.to_string()))?;
         dir.write_file_atomic(CANDIDATE_NAME, &staged.candidate, 0o755)?;
         let candidate_path = dir.path().join(CANDIDATE_NAME);
         let pre_probe_healthy = probe::run_sync_probe(
@@ -588,5 +630,34 @@ mod tests {
         let current = read_state(&dir).expect("advanced state must remain readable");
         assert_eq!(current.generation_floor, 3);
         assert_eq!(current.backoff_not_before, None);
+    }
+
+    #[test]
+    fn failure_backoff_carries_accepted_floors_from_the_failed_attempt() {
+        // A download failure or budget timeout AFTER manifest acceptance must
+        // still advance the floors the manifest proved.
+        let expected = UpgradeState {
+            generation_floor: 1,
+            ..UpgradeState::default()
+        };
+        let accepted = UpgradeState {
+            generation_floor: 2,
+            max_control_revision: 8,
+            control_envelope_digest: Some("digest-8".into()),
+            ..UpgradeState::default()
+        };
+        let with_acceptance = failure_backoff_state(&expected, Some(&accepted), 1_000);
+        assert_eq!(with_acceptance.generation_floor, 2);
+        assert_eq!(with_acceptance.max_control_revision, 8);
+        assert_eq!(
+            with_acceptance.control_envelope_digest.as_deref(),
+            Some("digest-8")
+        );
+        assert!(with_acceptance.backoff_not_before.is_some());
+
+        // Failures BEFORE acceptance keep the plain baseline behavior.
+        let without = failure_backoff_state(&expected, None, 1_000);
+        assert_eq!(without.generation_floor, 1);
+        assert!(without.backoff_not_before.is_some());
     }
 }

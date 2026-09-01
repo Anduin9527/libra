@@ -329,21 +329,46 @@ pub fn merge_acceptance_floors(current: &UpgradeState, accepted: &UpgradeState) 
     if accepted.max_control_revision > state.max_control_revision {
         state.max_control_revision = accepted.max_control_revision;
         state.control_envelope_digest = accepted.control_envelope_digest.clone();
+    } else if accepted.max_control_revision == state.max_control_revision
+        && state.control_envelope_digest.is_none()
+        && accepted.control_envelope_digest.is_some()
+    {
+        // Revision-equal (notably revision 0, which is also the default):
+        // a recorded digest must survive the merge, otherwise a different
+        // same-revision payload would bypass the fork check.
+        state.control_envelope_digest = accepted.control_envelope_digest.clone();
     }
     let current_max = state.max_seen.as_deref().and_then(ReleaseVersion::parse);
     let accepted_max = accepted.max_seen.as_deref().and_then(ReleaseVersion::parse);
-    let advances_max_seen = match (current_max, accepted_max) {
-        (_, None) => false,
-        (None, Some(_)) => true,
-        (Some(current), Some(accepted)) => accepted > current,
-    };
-    if advances_max_seen {
-        state.max_seen = accepted.max_seen.clone();
-        for (platform, identity) in &accepted.artifact_identity {
-            state
-                .artifact_identity
-                .insert(platform.clone(), identity.clone());
+    match (current_max, accepted_max) {
+        (None, Some(_)) => {
+            state.max_seen = accepted.max_seen.clone();
+            for (platform, identity) in &accepted.artifact_identity {
+                state
+                    .artifact_identity
+                    .insert(platform.clone(), identity.clone());
+            }
         }
+        (Some(current_version), Some(accepted_version)) => {
+            if accepted_version > current_version {
+                state.max_seen = accepted.max_seen.clone();
+                for (platform, identity) in &accepted.artifact_identity {
+                    state
+                        .artifact_identity
+                        .insert(platform.clone(), identity.clone());
+                }
+            } else if accepted_version == current_version {
+                // Same version: fill identities the current state is missing,
+                // but never replace ones it already pinned.
+                for (platform, identity) in &accepted.artifact_identity {
+                    state
+                        .artifact_identity
+                        .entry(platform.clone())
+                        .or_insert_with(|| identity.clone());
+                }
+            }
+        }
+        (_, None) => {}
     }
     state
 }
@@ -617,6 +642,70 @@ mod tests {
         );
         assert_eq!(regressed.max_seen.as_deref(), Some("2.0.0"));
         assert_eq!(regressed.artifact_identity["linux-amd64"].size, 2);
+    }
+
+    #[test]
+    fn merge_acceptance_floors_keeps_equal_revision_digest_and_unions_identities() {
+        // Revision 0 (the default) with a recorded digest must survive a merge
+        // onto a digest-less state, or a different revision-0 payload would
+        // bypass the fork check.
+        let accepted = UpgradeState {
+            control_envelope_digest: Some("rev0-digest".into()),
+            ..UpgradeState::default()
+        };
+        let merged = merge_acceptance_floors(&UpgradeState::default(), &accepted);
+        assert_eq!(merged.max_control_revision, 0);
+        assert_eq!(
+            merged.control_envelope_digest.as_deref(),
+            Some("rev0-digest")
+        );
+
+        // An existing digest at the same revision is never replaced.
+        let current = UpgradeState {
+            control_envelope_digest: Some("kept".into()),
+            ..UpgradeState::default()
+        };
+        assert_eq!(
+            merge_acceptance_floors(&current, &accepted)
+                .control_envelope_digest
+                .as_deref(),
+            Some("kept")
+        );
+
+        // Same max_seen version: missing identities are filled, pinned ones
+        // are preserved.
+        let mut current = UpgradeState {
+            max_seen: Some("2.0.0".into()),
+            ..UpgradeState::default()
+        };
+        current.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "b".repeat(64),
+                size: 1,
+            },
+        );
+        let mut accepted = UpgradeState {
+            max_seen: Some("2.0.0".into()),
+            ..UpgradeState::default()
+        };
+        accepted.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "c".repeat(64),
+                size: 9,
+            },
+        );
+        accepted.artifact_identity.insert(
+            "darwin-arm64".into(),
+            ArtifactIdentity {
+                sha256: "d".repeat(64),
+                size: 7,
+            },
+        );
+        let merged = merge_acceptance_floors(&current, &accepted);
+        assert_eq!(merged.artifact_identity["linux-amd64"].size, 1);
+        assert_eq!(merged.artifact_identity["darwin-arm64"].size, 7);
     }
 
     #[test]
