@@ -6,11 +6,11 @@ on:
       - 'v*' # Trigger when pushing tags starting with v, e.g., v1.0.0
 
 env:
-  RCLONE_VERSION: '1.75.0'
-  RCLONE_LINUX_AMD64_SHA256: 'aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa'
-  RCLONE_LINUX_ARM64_SHA256: 'd0ad88ba4c8e285b7c9efa591e0ab643280a91741e13c27f3a9c0957ccfa5203'
-  RCLONE_OSX_ARM64_SHA256: '35e8f2a666ce789b29111db0dd843ddabc0d59c6b609d07bcaae5d1a07cba6f8'
-  RCLONE_WINDOWS_AMD64_SHA256: '203581f0a7baeae873f2347483a798c79e2eaf5c384a4e9d866aa374f1c89ac0'
+  LIBRA_RCLONE_VERSION: '1.75.0'
+  LIBRA_RCLONE_LINUX_AMD64_SHA256: 'aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa'
+  LIBRA_RCLONE_LINUX_ARM64_SHA256: 'd0ad88ba4c8e285b7c9efa591e0ab643280a91741e13c27f3a9c0957ccfa5203'
+  LIBRA_RCLONE_OSX_ARM64_SHA256: '35e8f2a666ce789b29111db0dd843ddabc0d59c6b609d07bcaae5d1a07cba6f8'
+  LIBRA_RCLONE_WINDOWS_AMD64_SHA256: '203581f0a7baeae873f2347483a798c79e2eaf5c384a4e9d866aa374f1c89ac0'
 
 jobs:
   build-and-upload:
@@ -158,19 +158,19 @@ jobs:
           RCLONE_CONFIG_R2_ACL: private
         run: |
           set -euo pipefail
-          rclone_version="$RCLONE_VERSION"
+          rclone_version="$LIBRA_RCLONE_VERSION"
           case "${{ matrix.target.os }}-${{ matrix.target.arch }}" in
             linux-amd64)
               rclone_platform="linux-amd64"
-              rclone_sha256="$RCLONE_LINUX_AMD64_SHA256"
+              rclone_sha256="$LIBRA_RCLONE_LINUX_AMD64_SHA256"
               ;;
             linux-arm64)
               rclone_platform="linux-arm64"
-              rclone_sha256="$RCLONE_LINUX_ARM64_SHA256"
+              rclone_sha256="$LIBRA_RCLONE_LINUX_ARM64_SHA256"
               ;;
             darwin-arm64)
               rclone_platform="osx-arm64"
-              rclone_sha256="$RCLONE_OSX_ARM64_SHA256"
+              rclone_sha256="$LIBRA_RCLONE_OSX_ARM64_SHA256"
               ;;
             *)
               echo "::error::unsupported rclone platform '${{ matrix.target.os }}-${{ matrix.target.arch }}'"
@@ -222,8 +222,8 @@ jobs:
           RCLONE_CONFIG_R2_ACL: private
         run: |
           $ErrorActionPreference = "Stop"
-          $rcloneVersion = $env:RCLONE_VERSION
-          $rcloneSha256 = $env:RCLONE_WINDOWS_AMD64_SHA256
+          $rcloneVersion = $env:LIBRA_RCLONE_VERSION
+          $rcloneSha256 = $env:LIBRA_RCLONE_WINDOWS_AMD64_SHA256
           $rcloneZip = "rclone-v$($rcloneVersion)-windows-amd64.zip"
           Invoke-WebRequest -Uri "https://github.com/rclone/rclone/releases/download/v$($rcloneVersion)/$rcloneZip" -OutFile $rcloneZip -TimeoutSec 120
           $actualSha256 = (Get-FileHash -Algorithm SHA256 $rcloneZip).Hash.ToLowerInvariant()
@@ -325,8 +325,8 @@ jobs:
           RCLONE_CONFIG_R2_ACL: private
         run: |
           set -euo pipefail
-          rclone_version="$RCLONE_VERSION"
-          rclone_sha256="$RCLONE_LINUX_AMD64_SHA256"
+          rclone_version="$LIBRA_RCLONE_VERSION"
+          rclone_sha256="$LIBRA_RCLONE_LINUX_AMD64_SHA256"
           rclone_zip="rclone-v${rclone_version}-linux-amd64.zip"
           curl -fsSL --connect-timeout 10 --max-time 120 -o "$rclone_zip" \
             "https://github.com/rclone/rclone/releases/download/v${rclone_version}/${rclone_zip}"

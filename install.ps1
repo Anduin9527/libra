@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 # One of the release version surfaces. `compat_version_surface_sync` pins it
 # to Cargo.toml: this value is substituted verbatim into the download URL, so
 # a stale value silently installs an old binary when -Version is not given.
-$DefaultVersion = "v0.22.1"
+$DefaultVersion = "v0.22.2"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override; A1-05 consumes it when signed install flow lands.
 $ReleaseManifestKeyId = "libra-release-1"
