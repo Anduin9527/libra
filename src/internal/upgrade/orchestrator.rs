@@ -354,14 +354,14 @@ fn failure_backoff_state(
     register_failure_backoff(&base, local_now)
 }
 
-/// Durably record an accepted manifest's monotone floors through the floors
-/// SIDE FILE (`record_acceptance_floors`), which has its own micro-lock —
-/// the MAIN upgrade lock is never taken here, so a busy or wedged install
-/// lock cannot delay or starve it. Under normal concurrency the write
-/// completes before this returns; only an externally-stalled micro-lock
-/// holder can exhaust the bounded wait, in which case the error is silently
-/// non-fatal to the user's command and the next successful check re-derives
-/// the floors (see `record_acceptance_floors` for the exact contract).
+/// Durably record an accepted manifest's monotone floors via
+/// `record_acceptance_floors` — the two-channel protocol: the floors SIDE
+/// FILE under its micro-lock first, then (if that lock stays wedged past
+/// both bounded waits) a fallback merge into the MAIN state file under a
+/// bounded main-lock try. Only when BOTH locks are wedged does persistence
+/// fail — and then LOUDLY: the auto path warns (or traces, in machine
+/// modes) with the exact retry command, because these floors are the
+/// anti-replay state; the next accepted check also re-derives them.
 /// When set, the auto path's floor-persist failure warning is suppressed
 /// (JSON/machine/quiet modes promise a silent auto hook); the failure is
 /// still traced. Set by the CLI hook before running the auto check.
@@ -463,9 +463,11 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
 /// The locked stage→probe→transact core shared by the auto and manual paths:
 /// re-opens a dedicated InstallDir on a blocking task, takes the §A.5 lock
 /// (`Ok(None)` = busy), CASes the state baseline, durably advances the
-/// floors, stages the candidate, probes it and runs the install transaction.
-/// The auto wrapper degrades every error to a silent skip; the manual path
-/// surfaces them to the user.
+/// floors, stages the candidate, probes it and runs the install transaction
+/// (whose commit fence holds the floors micro-lock only across the policy
+/// read + PostProbePassed journal write — see txn::CommitFence). The auto
+/// wrapper merges floors and degrades every error to a skip; the manual
+/// path surfaces them to the user.
 async fn run_locked_install(
     ctx: &InstallContext,
     staged: StagedInstall,
@@ -519,12 +521,12 @@ async fn run_locked_install(
         }
         // Early policy re-check (cheap, unlocked): a control decision that
         // already landed aborts before the expensive probe work. The
-        // AUTHORITATIVE check is the commit fence below — it re-reads under
-        // the floors micro-lock after the post-install probe and holds that
-        // lock through the whole commit, so a side-floor write can never
-        // slip between the final check and the committed state. The fence
-        // window is only journal + state/marker writes + fsyncs, so the
-        // floors writers' 15 s bounded wait covers it by construction.
+        // AUTHORITATIVE check is the commit fence (txn.rs) — it re-reads
+        // under the floors micro-lock after the post-install probe and
+        // holds that lock through the durable PostProbePassed journal write
+        // ONLY; the commit tail then runs under that journaled state's
+        // recovery contract. The fence window is one read + one journal
+        // fsync, which the floors writers' bounded waits cover easily.
         let latest = read_state(&dir).map_err(|e| TxnError::State(e.to_string()))?;
         if latest.generation_floor > staged.new_state.generation_floor
             || latest.max_control_revision > staged.new_state.max_control_revision
@@ -1121,6 +1123,59 @@ pub mod manual_test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `phase_b` must merge the accepted floors on the TRANSACTION-ERROR
+    /// arm too (not only lock-busy): an early staging failure inside the
+    /// locked task otherwise silently drops the anti-replay state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase_b_merges_floors_when_the_locked_task_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::super::marker::InstallMarker;
+
+        let guard = tempfile::tempdir().expect("tempdir");
+        let root = guard.path().canonicalize().expect("canonicalize");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let dir = InstallDir::open_validated(&root).expect("validated");
+        // Make candidate staging fail deterministically: the candidate name
+        // is occupied by a DIRECTORY, so write_file_atomic's rename errors.
+        std::fs::create_dir(root.join(CANDIDATE_NAME)).expect("occupy candidate name");
+        let ctx = InstallContext {
+            dir,
+            dir_path: root.clone(),
+            platform: Platform::DarwinArm64,
+        };
+        let accepted = UpgradeState {
+            max_control_revision: 11,
+            ..UpgradeState::default()
+        };
+        let staged = StagedInstall {
+            version: ReleaseVersion::parse("9.9.9").expect("version"),
+            marker: InstallMarker {
+                schema_version: 1,
+                installed_at: "2026-09-02T00:00:00Z".into(),
+                install_source: super::super::marker::OFFICIAL_INSTALL_SOURCE.into(),
+                platform: "darwin-arm64".into(),
+                version: "9.9.9".into(),
+                sha256: "a".repeat(64),
+                size: 3,
+                manifest_key_id: "test-key-1".into(),
+            },
+            new_state: accepted.clone(),
+            expected_state: UpgradeState::default(),
+            candidate: b"NEW".to_vec(),
+            local_now: 1_000,
+        };
+        let report = phase_b(&ctx, staged).await;
+        assert_eq!(report, AutoUpgradeReport::Skipped);
+        let dir = InstallDir::open_validated(&root).expect("re-open");
+        let state = read_state(&dir).expect("read state");
+        assert_eq!(
+            state.max_control_revision, 11,
+            "floors must survive a transaction error"
+        );
+    }
 
     #[test]
     fn should_check_gates_on_mode_and_trust() {

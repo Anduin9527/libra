@@ -2384,8 +2384,9 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
         }
         AutoUpgradeReport::RolledBack => {
             utils::error::emit_advisory_warning(
-                "an auto-upgrade attempt was rolled back (self-check failure or a superseding \
-                 publisher control decision); the current version is unchanged",
+                "an auto-upgrade attempt was rolled back (self-check failure, a superseding \
+                 publisher control decision, or policy-lock contention); the current version \
+                 is unchanged",
             );
         }
         AutoUpgradeReport::Skipped => {}
