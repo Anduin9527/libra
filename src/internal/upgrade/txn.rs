@@ -116,8 +116,11 @@ pub type PostProbe<'a> = dyn Fn(&InstallDir) -> Result<bool, TxnError> + 'a;
 /// guard held through the whole commit (the caller uses it to hold the floors
 /// micro-lock, so a concurrent control write cannot land between the final
 /// policy check and the committed state); `Ok(None)` VETOES the commit and the
-/// transaction rolls back exactly like a failed probe. `None` fence (recovery,
-/// tests) commits unconditionally.
+/// transaction rolls back exactly like a failed probe. A `None` fence
+/// (recovery, tests) does NOT commit unconditionally: it goes through
+/// [`default_fence`] — the same bounded floors-lock acquisition and
+/// persisted-floor comparison — so a superseding control decision vetoes
+/// recovery commits too.
 pub type CommitFence<'a> =
     dyn Fn(&InstallDir) -> Result<Option<super::lock::UpgradeLock>, TxnError> + 'a;
 
@@ -323,29 +326,39 @@ fn probe_and_resolve(
         // flight vetoes the commit instead of resurrecting a superseded
         // plan. (Test fixtures start from default state, whose floors never
         // exceed a transaction's own, so they are unaffected.)
-        let vetoed = match commit_fence {
-            Some(fence) => match fence(dir)? {
-                Some(guard) => {
-                    txn.state = TxnState::PostProbePassed;
-                    store_txn(dir, txn)?;
-                    drop(guard);
-                    false
-                }
-                None => true,
-            },
-            // No custom fence (recovery, tests): the DEFAULT check uses the
-            // same bounded floors-lock acquisition so the policy read and
-            // the journal write are atomic against side-floor writers too —
-            // an unobtainable lock vetoes rather than committing blind.
-            None => match default_fence(dir, &txn.new_state)? {
-                Some(guard) => {
-                    txn.state = TxnState::PostProbePassed;
-                    store_txn(dir, txn)?;
-                    drop(guard);
-                    false
-                }
-                None => true,
-            },
+        // Both arms produce the same three-way result; the DEFAULT arm
+        // (recovery, tests) is the bounded-locked policy check — never an
+        // unconditional commit. A fence ERROR (lock/state unreadable) must
+        // not strand the transaction in CandidateInstalled: roll back FIRST
+        // so the previous binary is restored, then surface the error.
+        let fence_result = match commit_fence {
+            Some(fence) => fence(dir),
+            None => default_fence(dir, &txn.new_state),
+        };
+        let vetoed = match fence_result {
+            Ok(Some(guard)) => {
+                txn.state = TxnState::PostProbePassed;
+                store_txn(dir, txn)?;
+                drop(guard);
+                false
+            }
+            Ok(None) => true,
+            Err(error) => {
+                let undo = match txn.old_target {
+                    OldTarget::Absent => {
+                        txn.state = TxnState::AbortAbsentIntent;
+                        store_txn(dir, txn)?;
+                        finish_abort_absent(dir, txn)
+                    }
+                    OldTarget::Present { .. } => {
+                        txn.state = TxnState::RollbackIntent;
+                        store_txn(dir, txn)?;
+                        finish_rollback(dir, txn)
+                    }
+                };
+                undo?;
+                return Err(error);
+            }
         };
         if vetoed {
             // Vetoed: a newer control decision superseded this plan after

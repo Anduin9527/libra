@@ -363,11 +363,26 @@ fn failure_backoff_state(
 /// non-fatal to the user's command and the next successful check re-derives
 /// the floors (see `record_acceptance_floors` for the exact contract).
 async fn merge_acceptance_floors_with_retry(dir_path: std::path::PathBuf, accepted: UpgradeState) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
-        record_acceptance_floors(&dir, &accepted).map_err(|_| ())
+    let outcome = tokio::task::spawn_blocking(move || {
+        let dir =
+            InstallDir::open_validated(&dir_path).map_err(|e| format!("install directory: {e}"))?;
+        record_acceptance_floors(&dir, &accepted).map_err(|e| e.to_string())
     })
     .await;
+    // The floors are ANTI-REPLAY state: a silent drop would let an older
+    // still-valid signed manifest be accepted again. The auto path cannot
+    // fail the user's command, but it must not be silent either.
+    let failure = match outcome {
+        Ok(Ok(())) => None,
+        Ok(Err(detail)) => Some(detail),
+        Err(join) => Some(join.to_string()),
+    };
+    if let Some(detail) = failure {
+        crate::utils::error::emit_advisory_warning(format!(
+            "a verified upgrade control update could not be persisted ({detail}); run \
+             `libra upgrade --check` to retry it"
+        ));
+    }
 }
 
 /// Persist a failure backoff only when the state observed before Phase A is

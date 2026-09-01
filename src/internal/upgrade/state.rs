@@ -561,12 +561,7 @@ pub fn record_acceptance_floors(
     // 15 s + one 15 s second chance: sized against the commit fence
     // (txn.rs), which holds the floors lock only across ONE state read plus
     // ONE journal write + fsync (the commit tail runs unfenced under the
-    // PostProbePassed recovery contract). On a pathological filesystem
-    // stall even this can expire; the failure is then TRANSIENT hardening
-    // loss, not a policy bypass — pause/revocation/version decisions are
-    // re-evaluated from the LIVE manifest on every round, and the very
-    // manifest that proved these floors re-establishes them on the next
-    // accepted check.
+    // PostProbePassed recovery contract).
     let outcome = match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             receiver.recv_timeout(std::time::Duration::from_secs(15))
@@ -575,15 +570,38 @@ pub fn record_acceptance_floors(
     };
     match outcome {
         Ok(result) => result,
-        Err(_) => Err(StateStoreError::WriteFailed {
-            path,
-            source: InstallDirError::Io {
-                name: FLOORS_FILE_NAME.to_string(),
-                detail: "floors micro-lock stayed held past the bounded wait; \
-                         this attempt's floors were not persisted"
-                    .into(),
-            },
-        }),
+        Err(_) => {
+            // INDEPENDENT fallback channel: merge into the MAIN state file
+            // under the MAIN upgrade lock instead. A stalled floors-lock
+            // holder that is not an installer does not hold the main lock,
+            // so this lands the floors anyway. If BOTH locks are wedged the
+            // stall is on this very filesystem — where no durable-write
+            // protocol can promise persistence either (any spill/pending
+            // file needs the same fsync) — and the caller must FAIL LOUDLY
+            // rather than pretend: the floors are anti-replay state, and a
+            // silently dropped floor would let an older still-valid signed
+            // manifest be accepted again.
+            match install_dir.try_lock() {
+                Ok(Some(_main_guard)) => {
+                    let current = read_state(install_dir)?;
+                    let merged = merge_acceptance_floors(&current, accepted);
+                    if merged != current {
+                        write_state(install_dir, &merged)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(StateStoreError::WriteFailed {
+                    path,
+                    source: InstallDirError::Io {
+                        name: FLOORS_FILE_NAME.to_string(),
+                        detail: "floors micro-lock stayed held past the bounded wait and the \
+                                 main-lock fallback was unavailable; this attempt's floors were \
+                                 not persisted"
+                            .into(),
+                    },
+                }),
+            }
+        }
     }
 }
 

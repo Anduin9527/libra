@@ -513,8 +513,9 @@ async fn run_available(
         }
         ManualInstallReport::RolledBack => Err(CliError::failure(
             "the previous binary was RESTORED — the downloaded version failed its \
-             post-install self-check, or a newer publisher control decision superseded it \
-             at the last moment; nothing changed",
+             post-install self-check, a newer publisher control decision superseded it at \
+             the last moment, or the policy fence could not obtain its lock in time; \
+             nothing changed",
         )
         .with_stable_code(StableErrorCode::RepoStateInvalid)
         .with_hint(
