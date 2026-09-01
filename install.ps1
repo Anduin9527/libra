@@ -30,6 +30,12 @@ $ReleaseManifestKeyId = "libra-release-1"
 $ReleaseManifestPublicKeyHex = "68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3"
 # Pinned origin of the signed stable channel (marker for the smoke harness).
 $ReleaseManifestOrigin = "https://download.libra.tools"
+# Key policy pins mirroring src/internal/upgrade/trusted_keys.rs (§7): the
+# pinned key's rotation generation and validity window as canonical UTC. The
+# window is checked against the SIGNED timestamps, like the native verifier.
+$ReleaseManifestKeyGeneration = 1
+$ReleaseManifestKeyNotBefore = "2026-08-31T11:09:55Z"
+$ReleaseManifestKeyNotAfter = "2027-08-31T00:00:00Z"
 $ExeName = "libra.exe"
 $ReleaseAsset = "libra-windows-amd64.exe"
 
@@ -215,9 +221,13 @@ function Resolve-StableChannel {
     }
 
     if ($raw -is [byte[]]) { $raw = [System.Text.Encoding]::UTF8.GetString($raw) }
+    # Envelope byte cap mirroring the native MAX_MANIFEST_BYTES (1 MiB).
+    if ([System.Text.Encoding]::UTF8.GetByteCount([string]$raw) -gt 1048576) {
+        throw "stable manifest exceeds the 1 MiB limit - refusing to install"
+    }
     $envelope = $raw | ConvertFrom-Json
     if ($envelope.schema_version -ne 1) { throw "stable manifest has unsupported schema_version '$($envelope.schema_version)'" }
-    $signatureEntry = @($envelope.signatures) | Where-Object { $_.key_id -eq $ReleaseManifestKeyId } | Select-Object -First 1
+    $signatureEntry = @($envelope.signatures) | Where-Object { [string]$_.key_id -ceq $ReleaseManifestKeyId } | Select-Object -First 1
     if ($null -eq $signatureEntry) { throw "stable manifest carries no signature from key '$ReleaseManifestKeyId'" }
 
     $payloadBytes = [Convert]::FromBase64String([string]$envelope.payload)
@@ -234,56 +244,99 @@ function Resolve-StableChannel {
     }
 
     $payloadText = [System.Text.Encoding]::UTF8.GetString($payloadBytes)
+    # Structural grammar gate: the payload must START with the exact canonical
+    # top-level field sequence. The RAW text is authoritative for the scalar
+    # values (ConvertFrom-Json eagerly converts ISO-8601 strings to [datetime]
+    # and cannot distinguish a nested field from a top-level one for a regex).
+    # String fields cannot contain quotes, so once this anchor matches, every
+    # captured group is pinned to the REAL top-level value.
+    $headPattern = '^\{"channel":"(?<channel>[^"]*)","version":"(?<version>[^"]*)","control_revision":(?:0|[1-9][0-9]*),"published_at":"(?<published>[^"]*)","expires_at":"(?<expires>[^"]*)","min_key_generation":(?<mkg>0|[1-9][0-9]*),"paused":(?:true|false),"revoked_versions":\[[^\]]*\],"artifacts":\['
+    if ($payloadText -cnotmatch $headPattern) {
+        throw "signed manifest payload does not match the canonical serialization - refusing to install"
+    }
+    $payloadVersion = $Matches['version']
+    $publishedRaw = $Matches['published']
+    $expiresRaw = $Matches['expires']
+    $minKeyGeneration = [int]$Matches['mkg']
     $payload = $payloadText | ConvertFrom-Json
-    if ($payload.channel -ne "stable") { throw "signed manifest channel '$($payload.channel)' is not 'stable'" }
+    if ($Matches['channel'] -cne "stable") { throw "signed manifest channel '$($Matches['channel'])' is not 'stable'" }
     # Canonical X.Y.Z only (no leading "v", no leading zeros) — the exact
     # grammar of the native contract, so revocation/floor comparisons can
     # never be format-bypassed.
     $canonicalSemver = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-    if ([string]$payload.version -notmatch $canonicalSemver) {
-        throw "signed manifest version '$($payload.version)' is not canonical X.Y.Z - refusing to install"
+    if ($payloadVersion -cnotmatch $canonicalSemver) {
+        throw "signed manifest version '$payloadVersion' is not canonical X.Y.Z - refusing to install"
     }
     # Stateless anti-replay floor: this installer shipped alongside
     # $DefaultVersion, so a signed manifest older than that baseline can only
     # be a replayed stale manifest.
-    if ([version][string]$payload.version -lt [version]$DefaultVersion.TrimStart("v")) {
-        throw "signed stable manifest carries $($payload.version), older than this installer's baseline $($DefaultVersion.TrimStart('v')) - possible replay of a stale manifest; re-download install.ps1 and retry"
+    if ([version]$payloadVersion -lt [version]$DefaultVersion.TrimStart("v")) {
+        throw "signed stable manifest carries $payloadVersion, older than this installer's baseline $($DefaultVersion.TrimStart('v')) - possible replay of a stale manifest; re-download install.ps1 and retry"
     }
-    # Expiry must be canonical UTC ("Z", optional fractional seconds); an
-    # offset timestamp is rejected rather than silently normalized. The RAW
-    # payload text is consulted because ConvertFrom-Json eagerly converts
-    # ISO-8601 strings to [datetime], destroying the original spelling.
-    $expiresRaw = if ($payloadText -match '"expires_at":"([^"]*)"') { $Matches[1] } else { "" }
-    if ($expiresRaw -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$') {
+    # Key policy (§7, mirroring the native verifier): generation floor first,
+    # then the pinned key's validity window around the SIGNED lifetime.
+    if ($minKeyGeneration -gt $ReleaseManifestKeyGeneration) {
+        throw "signed manifest min_key_generation $minKeyGeneration is above this installer's pinned key generation $ReleaseManifestKeyGeneration - a key rotation has retired this trust anchor; re-download install.ps1"
+    }
+    # Timestamps must be canonical, calendar-valid UTC ("Z"); offsets or
+    # nonsense field values are rejected rather than silently normalized.
+    $canonicalUtc = '^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?Z$'
+    if ($expiresRaw -cnotmatch $canonicalUtc) {
         throw "signed manifest expires_at '$expiresRaw' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ) - refusing to install"
     }
-    if ([datetime]::UtcNow -ge ([datetime]::Parse($expiresRaw, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal))) {
+    if ($publishedRaw -cnotmatch $canonicalUtc) {
+        throw "signed manifest published_at '$publishedRaw' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ) - refusing to install"
+    }
+    $utcStyle = [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    $inv = [cultureinfo]::InvariantCulture
+    $publishedAt = [datetime]::Parse($publishedRaw, $inv, $utcStyle)
+    $expiresAt = [datetime]::Parse($expiresRaw, $inv, $utcStyle)
+    if ($publishedAt -ge $expiresAt) {
+        throw "signed manifest published_at is not before expires_at - refusing to install"
+    }
+    if ([datetime]::UtcNow -ge $expiresAt) {
         throw "signed stable manifest is expired (expires_at $expiresRaw) - the publisher must renew it"
+    }
+    # Pinned-key validity window (inclusive), against the signed lifetime:
+    # not_before <= published_at <= not_after AND expires_at <= not_after.
+    $keyNotBefore = [datetime]::Parse($ReleaseManifestKeyNotBefore, $inv, $utcStyle)
+    $keyNotAfter = [datetime]::Parse($ReleaseManifestKeyNotAfter, $inv, $utcStyle)
+    if ($publishedAt -lt $keyNotBefore -or $publishedAt -gt $keyNotAfter -or $expiresAt -gt $keyNotAfter) {
+        throw "signed manifest lifetime is outside the pinned key's validity window (published_at $publishedRaw, expires_at $expiresRaw) - re-download install.ps1"
     }
     if ($payload.paused -eq $true) {
         throw "releases are PAUSED by the publisher (signed manifest paused=true) - an emergency stop is active"
     }
     foreach ($revoked in @($payload.revoked_versions)) {
-        if ([string]$revoked -notmatch $canonicalSemver) {
+        if ([string]$revoked -cnotmatch $canonicalSemver) {
             throw "signed manifest revoked_versions entry '$revoked' is not canonical X.Y.Z - refusing to install"
         }
-        if ([string]$revoked -eq [string]$payload.version) {
-            throw "signed stable version $($payload.version) is REVOKED - refusing to install"
+        if ([string]$revoked -ceq $payloadVersion) {
+            throw "signed stable version $payloadVersion is REVOKED - refusing to install"
         }
     }
-    $artifact = @($payload.artifacts) | Where-Object { $_.platform -eq "windows-amd64" } | Select-Object -First 1
+    $artifact = @($payload.artifacts) | Where-Object { [string]$_.platform -ceq "windows-amd64" } | Select-Object -First 1
     if ($null -eq $artifact) { throw "signed manifest has no artifact for windows-amd64" }
     # Exact URL binding: origin, layout AND the tag derived from the signed
     # version (the manifest URL grammar carries no .exe suffix).
-    $expectedUrl = "https://download.libra.tools/libra/releases/v$($payload.version)/libra-windows-amd64"
+    $expectedUrl = "https://download.libra.tools/libra/releases/v$payloadVersion/libra-windows-amd64"
     if ([string]$artifact.url -cne $expectedUrl) {
         throw "signed artifact URL does not match the pinned origin/version layout: $($artifact.url)"
     }
+    # Digest must be exactly 64 lowercase hex; size mirrors the native
+    # (0, 128 MiB] bound — a signed zero-byte or oversized row is refused.
+    if ([string]$artifact.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw "signed manifest artifact sha256 is not 64 lowercase hex - refusing to install"
+    }
+    $artifactSize = [long]$artifact.size
+    if ($artifactSize -le 0 -or $artifactSize -gt 134217728) {
+        throw "signed manifest artifact size $artifactSize is outside (0, 128 MiB] - refusing to install"
+    }
     return @{
-        Version = "v$($payload.version)"
+        Version = "v$payloadVersion"
         Url     = $ReleaseManifestOrigin + ([string]$artifact.url).Substring("https://download.libra.tools".Length)
-        Sha256  = ([string]$artifact.sha256).ToLowerInvariant()
-        Size    = [long]$artifact.size
+        Sha256  = [string]$artifact.sha256
+        Size    = $artifactSize
     }
 }
 

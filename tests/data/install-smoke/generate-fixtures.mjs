@@ -56,8 +56,8 @@ function payloadFor(binaryByPlatform, mutate = {}) {
     version,
     control_revision: 3,
     published_at: "2026-01-01T00:00:00.000Z",
-    expires_at: mutate.expires_at ?? "2028-01-01T00:00:00.000Z",
-    min_key_generation: 1,
+    expires_at: mutate.expires_at ?? "2027-12-31T00:00:00.000Z",
+    min_key_generation: mutate.min_key_generation ?? 1,
     paused: mutate.paused ?? false,
     revoked_versions: mutate.revoked_versions ?? [],
     artifacts: PLATFORMS.map((platform) => ({
@@ -133,9 +133,11 @@ writeFixture(
 );
 
 // Policy branches: each properly SIGNED, so only the policy check can refuse.
+// Expired: published < expires, both inside the test key window, but the
+// expiry itself is in the past — only the expiry check can refuse it.
 writeFixture(
   "fixtures/manifest-expired.json",
-  await envelope(payloadFor(binaries, { expires_at: "2020-01-01T00:00:00.000Z" })),
+  await envelope(payloadFor(binaries, { expires_at: "2026-02-01T00:00:00.000Z" })),
 );
 writeFixture(
   "fixtures/manifest-paused.json",
@@ -151,6 +153,43 @@ writeFixture(
   "fixtures/manifest-stale-replay.json",
   await envelope(payloadFor(binaries, { version: "1.0.0" })),
 );
+
+// Round-2 policy branches (all properly signed with the test key):
+// artifact size 0 must be refused at parse time, before any download.
+writeFixture(
+  "fixtures/manifest-zero-size.json",
+  await envelope(payloadFor(binaries, { size: 0 })),
+);
+// min_key_generation above the installer's pinned key generation (1).
+writeFixture(
+  "fixtures/manifest-future-min-key.json",
+  await envelope(payloadFor(binaries, { min_key_generation: 2 })),
+);
+// Signed lifetime beyond the test key's not_after (2028-01-01): the pinned
+// key window check must refuse it even though it is not yet expired.
+writeFixture(
+  "fixtures/manifest-key-window.json",
+  await envelope(payloadFor(binaries, { expires_at: "2029-01-01T00:00:00.000Z" })),
+);
+// Properly signed but NOT the canonical top-level serialization (an unknown
+// field is injected before "artifacts"): the structural grammar gate must
+// refuse it before trusting any extracted scalar.
+{
+  const canonical = payloadFor(binaries);
+  const injected = {
+    channel: canonical.channel,
+    version: canonical.version,
+    control_revision: canonical.control_revision,
+    published_at: canonical.published_at,
+    expires_at: canonical.expires_at,
+    min_key_generation: canonical.min_key_generation,
+    paused: canonical.paused,
+    revoked_versions: canonical.revoked_versions,
+    metadata: { version: "0.0.1" },
+    artifacts: canonical.artifacts,
+  };
+  writeFixture("fixtures/manifest-noncanonical.json", await envelope(injected));
+}
 
 // Valid signature over the ORIGINAL payload, but the payload was swapped
 // afterwards: byte-level tamper distinct from the flipped-signature case.

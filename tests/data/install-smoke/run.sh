@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh smoke harness — thirteen scenarios (plan-20260821 A1-05).
+# install.sh smoke harness — seventeen scenarios (plan-20260821 A1-05).
 #
 #   bash tests/data/install-smoke/run.sh
 #
@@ -107,6 +107,11 @@ replace('LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_HEX="68aa00ea9358d455645010d811d40702
         'LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_HEX="a8a00ded13ddafaad525fabddc13efc717b29ebed50cd6d653196057fa8f8a43"')
 replace('LIBRA_RELEASE_MANIFEST_ORIGIN="https://download.libra.tools"',
         f'LIBRA_RELEASE_MANIFEST_ORIGIN="{base}"')
+# The test keypair's validity window (fixtures are signed inside it).
+replace('LIBRA_RELEASE_MANIFEST_KEY_NOT_BEFORE="2026-08-31T11:09:55Z"',
+        'LIBRA_RELEASE_MANIFEST_KEY_NOT_BEFORE="2026-01-01T00:00:00Z"')
+replace('LIBRA_RELEASE_MANIFEST_KEY_NOT_AFTER="2027-08-31T00:00:00Z"',
+        'LIBRA_RELEASE_MANIFEST_KEY_NOT_AFTER="2028-01-01T00:00:00Z"')
 replace('BASE_URL="${LIBRA_BASE_URL:-https://download.libra.tools/libra/releases}"',
         'BASE_URL="${LIBRA_BASE_URL:-' + base + '/libra/releases}"')
 replace(r'DEFAULT_VERSION="v[0-9][0-9.]*"', 'DEFAULT_VERSION="v9.9.8"', regex=True)
@@ -206,21 +211,34 @@ run_scenario stale-replay manifest-stale-replay.json fail no "older than this in
 #    verification fails before any policy field is trusted.
 run_scenario tampered-payload manifest-tampered-payload.json fail no "SIGNATURE VERIFICATION FAILED"
 
-# 10. Manifest 404 (chain not enabled) without opt-in → explicit stop.
+# 10. Signed artifact row with size 0 → refused at parse time (before any
+#     download; the native contract bounds size to (0, 128 MiB]).
+run_scenario zero-size manifest-zero-size.json fail no "outside (0, 128 MiB]"
+
+# 11. min_key_generation above the installer's pinned key generation.
+run_scenario future-min-key manifest-future-min-key.json fail no "min_key_generation"
+
+# 12. Signed lifetime beyond the pinned key's validity window.
+run_scenario key-window manifest-key-window.json fail no "validity window"
+
+# 13. Properly signed but not the canonical top-level serialization.
+run_scenario noncanonical manifest-noncanonical.json fail no "canonical serialization"
+
+# 14. Manifest 404 (chain not enabled) without opt-in → explicit stop.
 run_scenario transition-404 -none- fail no "signature chain is not enabled yet"
 
-# 11. Manifest 404 + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED legacy install.
+# 15. Manifest 404 + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED legacy install.
 run_scenario transition-404-fallback -none- ok yes "proceeding UNVERIFIED" \
     LIBRA_ALLOW_FALLBACK=1
 cmp -s "$WORK/home-transition-404-fallback/.libra/bin/libra" \
     "$FIXTURES/tree/libra/releases/v9.9.8/libra-$HOST_PLATFORM" \
     || fail "transition-404-fallback: legacy binary content mismatch"
 
-# 12. Verifier unavailable without opt-in → explicit stop (third state).
+# 16. Verifier unavailable without opt-in → explicit stop (third state).
 SMOKE_PATH="$WORK/no-openssl:$PATH"
 run_scenario verifier-unavailable manifest-valid.json fail no "signature verifier unavailable"
 
-# 13. Verifier unavailable + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED install.
+# 17. Verifier unavailable + LIBRA_ALLOW_FALLBACK=1 → explicit UNVERIFIED install.
 run_scenario verifier-unavailable-fallback manifest-valid.json ok yes "proceeding UNVERIFIED" \
     LIBRA_ALLOW_FALLBACK=1
 SMOKE_PATH=""
@@ -229,5 +247,5 @@ SMOKE_PATH=""
 cmp -s "$INSTALLER" "$WORK/install.sh.orig" \
     || fail "the production install.sh was modified by the harness"
 
-[ "$SCENARIOS_RUN" -eq 13 ] || fail "expected 13 scenarios, ran $SCENARIOS_RUN"
+[ "$SCENARIOS_RUN" -eq 17 ] || fail "expected 17 scenarios, ran $SCENARIOS_RUN"
 echo "install-smoke: all $SCENARIOS_RUN scenarios passed"

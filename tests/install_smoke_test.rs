@@ -1,9 +1,11 @@
 //! CI carrier for the installer verification smoke (plan-20260821 A1-05).
 //!
-//! Drives `tests/data/install-smoke/run.sh`: thirteen scenarios covering the
+//! Drives `tests/data/install-smoke/run.sh`: seventeen scenarios covering the
 //! signed stable channel (verified install, tampered signature and tampered
 //! payload, sha256 and size mismatches, expired / paused / revoked policy
-//! branches, the stale-replay anti-downgrade floor, the manifest-404 and
+//! branches, the stale-replay anti-downgrade floor, zero-size and
+//! min_key_generation and key-validity-window policy rejections, the
+//! non-canonical-serialization gate, the manifest-404 and
 //! verifier-unavailable transition states, each with and without
 //! `LIBRA_ALLOW_FALLBACK=1`). The harness
 //! rewrites trust markers only in a COPY of the production installer and
@@ -47,7 +49,7 @@ fn install_sh_smoke_scenarios() {
         "install-smoke harness failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(
-        stdout.contains("all 13 scenarios passed"),
+        stdout.contains("all 17 scenarios passed"),
         "harness did not report full coverage:\n{stdout}"
     );
 }

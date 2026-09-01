@@ -32,6 +32,13 @@ MCowBQYDK2VwAyEAaKoA6pNY1FVkUBDYEdQHArP2fOxL3/UtPU+4EHr67tM=
 # Pinned origin of the signed stable channel (no env override; marker for the
 # smoke harness only). Signed artifact URLs must live under this origin.
 LIBRA_RELEASE_MANIFEST_ORIGIN="https://download.libra.tools"
+# Key policy pins mirroring src/internal/upgrade/trusted_keys.rs (§7): the
+# pinned key's rotation generation and validity window as canonical UTC.
+# The window is checked against the SIGNED timestamps (published_at within,
+# expires_at not beyond), exactly like the native verifier.
+LIBRA_RELEASE_MANIFEST_KEY_GENERATION=1
+LIBRA_RELEASE_MANIFEST_KEY_NOT_BEFORE="2026-08-31T11:09:55Z"
+LIBRA_RELEASE_MANIFEST_KEY_NOT_AFTER="2027-08-31T00:00:00Z"
 
 # ─── theme (Dusk) ────────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${LIBRA_NO_TUI:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
@@ -521,7 +528,7 @@ sha256_of_stdin() {
 fetch_stable_manifest() {
     manifest_url="${LIBRA_RELEASE_MANIFEST_ORIGIN}/libra/releases/stable/manifest-v1.json"
     if [ "$DOWNLOADER" = "curl" ]; then
-        http_code=$(curl -sS --max-redirs 0 --connect-timeout 10 --max-time 60 \
+        http_code=$(curl -sS --max-redirs 0 --max-filesize 1048576 --connect-timeout 10 --max-time 60 \
             -o "$1" -w '%{http_code}' "$manifest_url" 2>/dev/null) || http_code=000
         case "$http_code" in
             200) printf 'ok' ;;
@@ -565,6 +572,14 @@ semver_less() {
     [ "$sl_a3" -lt "$sl_b3" ]
 }
 
+# Canonical, calendar-valid UTC timestamp ("Z", optional fractional seconds).
+# Field ranges are enforced so nonsense like 2099-99-99T99:99:99Z can never
+# reach the lexicographic comparisons.
+is_canonical_utc() {
+    printf '%s' "$1" | grep -qE \
+        '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]+)?Z$'
+}
+
 # Extract the value of a "key":"value" string field from compact JSON in $2.
 json_string_field() {
     sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$2" | head -n1
@@ -575,6 +590,12 @@ json_string_field() {
 # is terminal (fail closed) — callers must NOT fall back to unsigned installs.
 verify_stable_manifest() {
     manifest_file=$1
+    # Envelope byte cap mirroring the native MAX_MANIFEST_BYTES (1 MiB): a
+    # hostile origin cannot force unbounded parsing.
+    manifest_bytes=$(wc -c <"$manifest_file" 2>/dev/null | awk '{print $1}')
+    if [ -z "$manifest_bytes" ] || [ "$manifest_bytes" -gt 1048576 ]; then
+        error_exit "stable manifest exceeds the 1 MiB limit (${manifest_bytes:-?} bytes)" "verify" "refusing to install"
+    fi
     work_dir=$(mktemp -d 2>/dev/null) \
         || error_exit "mktemp failed" "verify" "make sure \$TMPDIR is writable"
 
@@ -608,6 +629,17 @@ verify_stable_manifest() {
     fi
 
     payload_file="$work_dir/payload.bin"
+    # Structural grammar gate: the payload must START with the exact canonical
+    # top-level field sequence (channel, version, control_revision,
+    # published_at, expires_at, min_key_generation, paused, revoked_versions,
+    # artifacts). String fields cannot contain quotes, so once this anchor
+    # matches, every sed extraction below is pinned to the REAL top-level
+    # value — no nested or unknown field can spoof one.
+    if ! grep -qE '^\{"channel":"[^"]*","version":"[^"]*","control_revision":(0|[1-9][0-9]*),"published_at":"[^"]*","expires_at":"[^"]*","min_key_generation":(0|[1-9][0-9]*),"paused":(true|false),"revoked_versions":\[[^]]*\],"artifacts":\[' "$payload_file"; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest payload does not match the canonical serialization" "verify" \
+            "refusing to install — the payload field layout is not the release contract"
+    fi
     # Scalar fields are extracted ONLY from the payload head — everything
     # before the canonical trailing "artifacts" array — so artifact URL
     # contents can never spoof a top-level field for the sed extraction.
@@ -615,7 +647,9 @@ verify_stable_manifest() {
     sed 's/"artifacts":.*//' "$payload_file" > "$head_file"
     channel=$(json_string_field channel "$head_file")
     STABLE_VERSION=$(json_string_field version "$head_file")
+    published_at=$(json_string_field published_at "$head_file")
     expires_at=$(json_string_field expires_at "$head_file")
+    min_key_generation=$(sed -n 's/.*"min_key_generation":\([0-9][0-9]*\).*/\1/p' "$head_file" | head -n1)
     paused=$(sed -n 's/.*"paused":\(true\|false\).*/\1/p' "$head_file" | head -n1)
 
     [ "$channel" = "stable" ] || { rm -rf "$work_dir"; error_exit "signed manifest channel '${channel:-?}' is not 'stable'" "verify" "refusing to install"; }
@@ -625,6 +659,13 @@ verify_stable_manifest() {
         error_exit "signed manifest version '${STABLE_VERSION}' is not canonical X.Y.Z" "verify" \
             "refusing to install — versions must match the release contract exactly"
     fi
+    # Key policy (§7, mirroring the native verifier): generation floor first,
+    # then the pinned key's validity window around the SIGNED lifetime.
+    if [ -z "$min_key_generation" ] || [ "$min_key_generation" -gt "$LIBRA_RELEASE_MANIFEST_KEY_GENERATION" ]; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest min_key_generation ${min_key_generation:-?} is above this installer's pinned key generation ${LIBRA_RELEASE_MANIFEST_KEY_GENERATION}" "verify" \
+            "a key rotation has retired this installer's trust anchor — re-download install.sh"
+    fi
     # Stateless anti-replay floor: this installer was published alongside
     # DEFAULT_VERSION, so a signed manifest older than that baseline can only
     # be a replayed stale manifest — refuse it outright (no fallback).
@@ -633,18 +674,37 @@ verify_stable_manifest() {
         error_exit "signed stable manifest carries ${STABLE_VERSION}, older than this installer's baseline ${DEFAULT_VERSION#v}" "verify" \
             "possible replay of a stale manifest — re-download install.sh and retry"
     fi
-    # Expiry must be canonical UTC ("Z", optional fractional seconds): an
-    # offset timestamp would defeat the lexicographic comparison below.
-    if ! printf '%s' "$expires_at" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$'; then
+    # Timestamps must be canonical, calendar-valid UTC ("Z"): offsets or
+    # nonsense field values would defeat the lexicographic comparisons below.
+    if ! is_canonical_utc "$expires_at"; then
         rm -rf "$work_dir"
         error_exit "signed manifest expires_at '${expires_at:-?}' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ)" "verify" "refusing to install"
     fi
+    if ! is_canonical_utc "$published_at"; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest published_at '${published_at:-?}' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ)" "verify" "refusing to install"
+    fi
     now_utc=$(date -u '+%Y-%m-%dT%H:%M:%S')
     expires_cmp=$(printf '%s' "$expires_at" | cut -c1-19)
+    published_cmp=$(printf '%s' "$published_at" | cut -c1-19)
+    if ! lex_less "$published_cmp" "$expires_cmp"; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest published_at is not before expires_at" "verify" "refusing to install"
+    fi
     if ! lex_less "$now_utc" "$expires_cmp"; then
         rm -rf "$work_dir"
         error_exit "signed stable manifest is expired (expires_at ${expires_at})" "verify" \
             "the publisher must renew the manifest — refusing to install"
+    fi
+    # Pinned-key validity window (inclusive), against the signed lifetime:
+    # not_before <= published_at <= not_after AND expires_at <= not_after.
+    key_nb=$(printf '%s' "$LIBRA_RELEASE_MANIFEST_KEY_NOT_BEFORE" | cut -c1-19)
+    key_na=$(printf '%s' "$LIBRA_RELEASE_MANIFEST_KEY_NOT_AFTER" | cut -c1-19)
+    if lex_less "$published_cmp" "$key_nb" || lex_less "$key_na" "$published_cmp" \
+        || lex_less "$key_na" "$expires_cmp"; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest lifetime is outside the pinned key's validity window (published_at ${published_at}, expires_at ${expires_at})" "verify" \
+            "the signing key window ended or has not begun — re-download install.sh"
     fi
     if [ "$paused" = "true" ]; then
         rm -rf "$work_dir"
@@ -692,8 +752,13 @@ verify_stable_manifest() {
         error_exit "signed artifact URL does not match the pinned origin/version layout: $STABLE_URL" "verify" \
             "refusing to install"
     fi
-    [ -n "$STABLE_SHA256" ] && [ -n "$STABLE_SIZE" ] \
-        || error_exit "signed manifest artifact row is incomplete" "verify" "refusing to install"
+    # Digest must be exactly 64 lowercase hex; size mirrors the native
+    # (0, 128 MiB] bound — a signed zero-byte or oversized row is refused.
+    printf '%s' "$STABLE_SHA256" | grep -qE '^[0-9a-f]{64}$' \
+        || error_exit "signed manifest artifact sha256 is not 64 lowercase hex" "verify" "refusing to install"
+    if [ -z "$STABLE_SIZE" ] || [ "$STABLE_SIZE" -le 0 ] || [ "$STABLE_SIZE" -gt 134217728 ]; then
+        error_exit "signed manifest artifact size ${STABLE_SIZE:-?} is outside (0, 128 MiB]" "verify" "refusing to install"
+    fi
 }
 
 # Explicit-confirm gate for the two transition states (manifest 404 and

@@ -1,4 +1,4 @@
-# install.ps1 smoke harness — eleven scenarios (plan-20260821 A1-05).
+# install.ps1 smoke harness — fifteen scenarios (plan-20260821 A1-05).
 #
 #   pwsh -NoProfile -File tests/data/install-smoke/run.ps1
 #
@@ -66,6 +66,9 @@ httpd.serve_forever()
     Rewrite '$ReleaseManifestKeyId = "libra-release-1"' '$ReleaseManifestKeyId = "libra-release-test-1"'
     Rewrite '$ReleaseManifestPublicKeyHex = "68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3"' '$ReleaseManifestPublicKeyHex = "a8a00ded13ddafaad525fabddc13efc717b29ebed50cd6d653196057fa8f8a43"'
     Rewrite '$ReleaseManifestOrigin = "https://download.libra.tools"' ('$ReleaseManifestOrigin = "' + $Base + '"')
+    # The test keypair's validity window (fixtures are signed inside it).
+    Rewrite '$ReleaseManifestKeyNotBefore = "2026-08-31T11:09:55Z"' '$ReleaseManifestKeyNotBefore = "2026-01-01T00:00:00Z"'
+    Rewrite '$ReleaseManifestKeyNotAfter = "2027-08-31T00:00:00Z"' '$ReleaseManifestKeyNotAfter = "2028-01-01T00:00:00Z"'
     Rewrite '[string]$DownloadBaseUrl = "https://download.libra.tools",' ('[string]$DownloadBaseUrl = "' + $Base + '",')
     $copy = $copy -replace '\$DefaultVersion = "v[0-9][0-9.]*"', '$DefaultVersion = "v9.9.8"'
     $CopyPath = Join-Path $Work "install-copy.ps1"
@@ -139,6 +142,10 @@ httpd.serve_forever()
     Run-Scenario "revoked" "manifest-revoked.json" "fail" "no" "REVOKED"
     Run-Scenario "stale-replay" "manifest-stale-replay.json" "fail" "no" "older than this installer's baseline"
     Run-Scenario "tampered-payload" "manifest-tampered-payload.json" "fail" "no" "SIGNATURE VERIFICATION FAILED"
+    Run-Scenario "zero-size" "manifest-zero-size.json" "fail" "no" "outside (0, 128 MiB]"
+    Run-Scenario "future-min-key" "manifest-future-min-key.json" "fail" "no" "min_key_generation"
+    Run-Scenario "key-window" "manifest-key-window.json" "fail" "no" "validity window"
+    Run-Scenario "noncanonical" "manifest-noncanonical.json" "fail" "no" "canonical serialization"
     Run-Scenario "transition-404" "-none-" "fail" "no" "signature chain is not enabled yet"
     Run-Scenario "transition-404-fallback" "-none-" "ok" "yes" "proceeding UNVERIFIED" @{ LIBRA_ALLOW_FALLBACK = "1" }
 
@@ -147,7 +154,7 @@ httpd.serve_forever()
     if (-not [System.Linq.Enumerable]::SequenceEqual($OriginalBytes, $after)) {
         Fail "the production install.ps1 was modified by the harness"
     }
-    if ($ScenariosRun -ne 11) { Fail "expected 11 scenarios, ran $ScenariosRun" }
+    if ($ScenariosRun -ne 15) { Fail "expected 15 scenarios, ran $ScenariosRun" }
     Write-Host "install.ps1 smoke: all $ScenariosRun scenarios passed"
 } finally {
     Cleanup
