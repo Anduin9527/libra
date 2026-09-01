@@ -518,35 +518,24 @@ pub fn record_acceptance_floors(
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-    // Timed out behind a stalled holder: fall back to an UNLOCKED monotone
-    // merge-write with re-read verification. Renames are atomic, so readers
-    // never see torn bytes; the verify loop folds our floors back in if a
-    // concurrent (resumed) writer overwrote them from a stale read. The
-    // residual loss window — a holder stalled mid-write that resumes and
-    // clobbers AFTER our last verification, with no later check in this
-    // process — is accepted and re-derived by the next successful manifest
-    // check (a locally SIGSTOP-wielding actor already controls the account).
-    for _ in 0..3 {
-        let current = read_floors_file(install_dir)?.unwrap_or_default();
-        let merged = merge_acceptance_floors(&current, accepted);
-        if merged == current {
-            return Ok(());
-        }
-        write_floors_file(install_dir, &merged)?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let current = read_floors_file(install_dir)?.unwrap_or_default();
-    if merge_acceptance_floors(&current, accepted) == current {
-        Ok(())
-    } else {
-        Err(StateStoreError::WriteFailed {
-            path,
-            source: InstallDirError::Io {
-                name: FLOORS_FILE_NAME.to_string(),
-                detail: "floors write kept being overwritten by a stalled concurrent writer".into(),
-            },
-        })
-    }
+    // Timed out behind a stalled holder. Deliberately do NOT write without
+    // the lock: an unlocked write is last-writer-wins and a stale fallback
+    // writer could overwrite a higher floor another writer just persisted
+    // (a real regression). Every write stays lock-serialized RMW, so the
+    // PERSISTED floors can never regress; the cost is that THIS attempt's
+    // floors stay unpersisted behind an externally-stalled holder (SIGSTOP
+    // mid-write — an actor with that power already owns the account). The
+    // caller treats this as non-fatal and the next successful manifest
+    // check re-derives the floors.
+    Err(StateStoreError::WriteFailed {
+        path,
+        source: InstallDirError::Io {
+            name: FLOORS_FILE_NAME.to_string(),
+            detail: "floors micro-lock stayed held past the bounded wait; \
+                     refusing an unserialized write"
+                .into(),
+        },
+    })
 }
 
 fn write_floors_file(
@@ -827,6 +816,47 @@ mod tests {
         let merged = merge_acceptance_floors(&current, &accepted);
         assert_eq!(merged.artifact_identity["linux-amd64"].size, 1);
         assert_eq!(merged.artifact_identity["darwin-arm64"].size, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_floor_recorders_serialize_and_never_regress() {
+        let temp = tempfile::tempdir().expect("test directory must be created");
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test directory must canonicalize");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test directory permissions must be set");
+
+        // Many writers racing with mixed floors: every write is a
+        // lock-serialized read-merge-write, so the final persisted floor is
+        // exactly the maximum ever accepted — no lost update, no regression.
+        let mut handles = Vec::new();
+        for floor in [5u32, 7, 3, 6, 2, 7, 4, 1] {
+            let dir_path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let dir = InstallDir::open_validated(&dir_path).expect("thread dir must validate");
+                let accepted = UpgradeState {
+                    generation_floor: floor,
+                    ..UpgradeState::default()
+                };
+                record_acceptance_floors(&dir, &accepted)
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("recorder thread must not panic")
+                .expect("uncontended-scale recording must succeed");
+        }
+        let dir = InstallDir::open_validated(&path).expect("dir must validate");
+        assert_eq!(
+            read_state(&dir)
+                .expect("state must be readable")
+                .generation_floor,
+            7
+        );
     }
 
     #[test]
