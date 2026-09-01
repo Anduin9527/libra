@@ -472,7 +472,11 @@ jobs:
             while [[ "$attempt" -le 16 ]]; do
               body="$(curl -fsSL --connect-timeout 10 --max-time 30 \
                 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url")" || true
-              if printf '%s\n' "$body" | grep -Fq "$needle"; then
+              # Herestring, NOT a pipeline: under pipefail, `printf | grep -q`
+              # dies of printf's SIGPIPE (grep exits at first match) once the
+              # body outgrows the pipe buffer, failing the check forever even
+              # though the needle is present.
+              if grep -Fq -- "$needle" <<<"$body"; then
                 echo "CDN $url matches $GITHUB_REF_NAME"
                 return 0
               fi
