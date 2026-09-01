@@ -501,19 +501,15 @@ async fn run_available(
         }
         ManualInstallReport::ControlChanged { detail } => {
             // The publisher's decision changed while the prompt was open;
-            // refusing to install the stale plan is the CORRECT outcome, so
-            // this is informational (exit 0), stated plainly.
-            report_status(
-                output,
-                "control_changed",
-                Some(installed.to_string()),
-                Some(latest.to_string()),
-                &format!(
-                    "nothing was installed: {detail} — run `libra upgrade` again to see the \
-                     current state"
-                ),
-            )?;
-            Ok(())
+            // refusing the stale plan is CORRECT — but an install was
+            // REQUESTED and did not happen, so the exit is non-zero (a CI
+            // `upgrade --yes` must not sail on as if it upgraded).
+            Err(CliError::failure(format!(
+                "nothing was installed — the publisher's control decision changed while \
+                 confirming: {detail}"
+            ))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("run `libra upgrade` again to see the current state"))
         }
         ManualInstallReport::RolledBack => Err(CliError::failure(
             "the downloaded version failed its post-install self-check and the previous \
@@ -586,10 +582,19 @@ fn confirm(question: &str) -> std::io::Result<bool> {
 /// upgrade subsystem's established state code), floor-write failures the IO
 /// write code.
 fn manual_error_to_cli(prefix: &str, error: ManualUpgradeError) -> CliError {
+    use crate::internal::upgrade::http::UpgradeHttpError;
     let code = match &error {
-        ManualUpgradeError::Fetch(_) | ManualUpgradeError::Timeout(_) => {
-            StableErrorCode::NetworkUnavailable
-        }
+        // Transport-level trouble (unreachable, TLS, HTTP status, stall).
+        ManualUpgradeError::Fetch(
+            UpgradeHttpError::Request { .. }
+            | UpgradeHttpError::ClientBuild(_)
+            | UpgradeHttpError::Status { .. }
+            | UpgradeHttpError::Sink(_),
+        )
+        | ManualUpgradeError::Timeout(_) => StableErrorCode::NetworkUnavailable,
+        // The peer violated the channel's contract (redirects, wrong URL,
+        // size bounds, digest mismatch, non-https) — protocol, not weather.
+        ManualUpgradeError::Fetch(_) => StableErrorCode::NetworkProtocol,
         ManualUpgradeError::Verify(FlowError::State(_)) => StableErrorCode::RepoStateInvalid,
         ManualUpgradeError::Verify(_) => StableErrorCode::NetworkProtocol,
         ManualUpgradeError::State(_) | ManualUpgradeError::Txn(_) => {
@@ -652,6 +657,18 @@ mod upgrade_cli_tests {
         assert_eq!(
             manual_error_to_cli("x", timeout).stable_code(),
             StableErrorCode::NetworkUnavailable
+        );
+        // Digest mismatches are the peer violating the contract (NET-002),
+        // not transport weather (NET-001).
+        let digest = ManualUpgradeError::Fetch(
+            crate::internal::upgrade::http::UpgradeHttpError::DigestMismatch {
+                expected: "a".repeat(64),
+                actual: "b".repeat(64),
+            },
+        );
+        assert_eq!(
+            manual_error_to_cli("x", digest).stable_code(),
+            StableErrorCode::NetworkProtocol
         );
     }
 }

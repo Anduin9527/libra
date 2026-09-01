@@ -75,7 +75,8 @@ Homebrew, from-source builds, manual copies, and third-party package managers
 are never marked official and never auto-upgrade — an official-install marker
 is written only after a verified signed-manifest install, and it must match the
 actual binary's platform, size, and sha256 (its version field is
-informational; the install's own self-check probes pin version↔digest). A
+informational; version and digest come out of the same verified signed
+manifest row, which is what binds them). A
 binary hashing itself, or a marker copied next to a different binary, never
 qualifies.
 

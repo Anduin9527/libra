@@ -61,8 +61,7 @@ envelope; the payload lives under `data`:
 ```
 
 `data.status` is one of `up_to_date`, `available`, `installed`, `declined`,
-`control_changed`, `paused`, `latest_revoked`, `not_official_install`,
-`unsupported_platform`. Machine modes (`--json`/`--machine`) and `--quiet`
+`paused`, `latest_revoked`, `not_official_install`, `unsupported_platform`. Machine modes (`--json`/`--machine`) and `--quiet`
 never prompt: an available upgrade without `--yes` or `--check` is refused
 with the exact flags to use, so stdout always stays a clean machine
 document.
@@ -72,8 +71,10 @@ document.
 - **Re-verification after confirmation**: the prompt can stay open for any
   amount of time, so after you confirm, the manifest is fetched and verified
   AGAIN before anything is downloaded. A pause, a revocation, or a different
-  version published while you were deciding wins — the command reports
-  `control_changed`, installs nothing, and asks you to re-run.
+  version published while you were deciding wins — the command installs
+  nothing and exits non-zero (`LBR-CONFLICT-002`) with what changed and a
+  hint to re-run, so a scripted `--yes` can never sail on as if it
+  upgraded.
 - **Durable floors at check time**: the moment a manifest is accepted (offer
   or skip), its anti-rollback floors are persisted; a floor-persist failure
   is an error, never silently ignored. Declining an offer needs no extra

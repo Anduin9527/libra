@@ -492,9 +492,14 @@ async fn run_locked_install(
         }
         // A newer control decision may have landed in the floors side file
         // while we staged and probed (its writer does not take the main
-        // lock): re-check right before the transaction so a mid-flight floor
-        // or control-revision raise aborts this candidate instead of
-        // installing under superseded policy.
+        // lock): re-check right before the transaction, and HOLD the floors
+        // micro-lock from this read through the transaction itself, so a
+        // side-floor write cannot slip between the policy check and the
+        // commit. Writers block for up to 15 s (state.rs), which outlives
+        // the probe+journal window this lock covers.
+        let _floors_gate = dir
+            .lock_floors_blocking()
+            .map_err(|e| TxnError::State(format!("floors lock: {e}")))?;
         let latest = read_state(&dir).map_err(|e| TxnError::State(e.to_string()))?;
         if latest.generation_floor > staged.new_state.generation_floor
             || latest.max_control_revision > staged.new_state.max_control_revision
@@ -740,6 +745,12 @@ impl ManualUpgrade {
         };
         // Durable floors before any download/staging (crash windows included).
         persist_floors_strict(self.ctx.dir_path.clone(), plan.new_state.clone()).await?;
+        // Re-read AFTER the floor write: the effective state now folds the
+        // floors we just persisted (and possibly a trusted-time advance from
+        // this very round), so phase-b's CAS must baseline on it — otherwise
+        // our own write would fail the CAS and report a phantom race.
+        let expected_state =
+            read_state(&self.ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
 
         let mut candidate: Vec<u8> = Vec::new();
         tokio::time::timeout(
@@ -755,21 +766,35 @@ impl ManualUpgrade {
         .await
         .map_err(|_| ManualUpgradeError::Timeout("artifact download"))??;
 
-        let staged = StagedInstall {
-            version: plan.version,
-            marker: plan.marker,
-            new_state: plan.new_state,
-            expected_state: state,
-            candidate,
-            local_now,
-        };
-        match run_locked_install(&self.ctx, staged).await {
-            Ok(Ok(Some(TxnOutcome::Installed))) => Ok(ManualInstallReport::Installed(plan.version)),
-            Ok(Ok(Some(TxnOutcome::RolledBack))) => Ok(ManualInstallReport::RolledBack),
-            Ok(Ok(Some(_))) | Ok(Ok(None)) => Ok(ManualInstallReport::NotApplied),
-            Ok(Err(error)) => Err(ManualUpgradeError::Txn(error.to_string())),
-            Err(join) => Err(ManualUpgradeError::Txn(join.to_string())),
-        }
+        finish_manual_install(&self.ctx, plan, expected_state, candidate, local_now).await
+    }
+}
+
+/// The shared post-download tail of a manual install: stage the candidate
+/// against the post-floor baseline and run the locked transaction. Used by
+/// the production path and (with an injected candidate) the test hooks, so
+/// both exercise the same mapping.
+async fn finish_manual_install(
+    ctx: &InstallContext,
+    plan: Box<super::flow::InstallPlan>,
+    expected_state: UpgradeState,
+    candidate: Vec<u8>,
+    local_now: i64,
+) -> Result<ManualInstallReport, ManualUpgradeError> {
+    let staged = StagedInstall {
+        version: plan.version,
+        marker: plan.marker,
+        new_state: plan.new_state,
+        expected_state,
+        candidate,
+        local_now,
+    };
+    match run_locked_install(ctx, staged).await {
+        Ok(Ok(Some(TxnOutcome::Installed))) => Ok(ManualInstallReport::Installed(plan.version)),
+        Ok(Ok(Some(TxnOutcome::RolledBack))) => Ok(ManualInstallReport::RolledBack),
+        Ok(Ok(Some(_))) | Ok(Ok(None)) => Ok(ManualInstallReport::NotApplied),
+        Ok(Err(error)) => Err(ManualUpgradeError::Txn(error.to_string())),
+        Err(join) => Err(ManualUpgradeError::Txn(join.to_string())),
     }
 }
 
@@ -854,16 +879,9 @@ pub async fn manual_upgrade_check(
     let Some(ctx) = resolve_install_context() else {
         return Ok(ManualCheckOutcome::NotOfficialInstall);
     };
-    if ctx.platform.support() != PlatformSupport::Supported {
-        return Ok(ManualCheckOutcome::UnsupportedPlatform);
-    }
-    if official_marker_for_target(&ctx.dir, ctx.platform.as_str())
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return Ok(ManualCheckOutcome::NotOfficialInstall);
-    }
+    // The platform/marker gates live in manual_check_with_envelope (single
+    // source, exercised by the test hooks too); duplicating the MARKER gate
+    // here would only save one manifest fetch on pre-marker installs.
     let client = upgrade_http_client()?;
     let fetched = tokio::time::timeout(MANUAL_CHECK_BUDGET, fetch_manifest(&client, MANIFEST_URL))
         .await
@@ -884,6 +902,18 @@ async fn manual_check_with_envelope(
     local_now: i64,
     trust: &[super::trusted_keys::TrustedKey],
 ) -> Result<ManualCheckOutcome, ManualUpgradeError> {
+    // §A.2 gates, shared with the test hooks: only a supported platform
+    // with a validating official-install marker is upgrade-manageable.
+    if ctx.platform.support() != PlatformSupport::Supported {
+        return Ok(ManualCheckOutcome::UnsupportedPlatform);
+    }
+    if official_marker_for_target(&ctx.dir, ctx.platform.as_str())
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Ok(ManualCheckOutcome::NotOfficialInstall);
+    }
     let state = read_state(&ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
     let installed = ReleaseVersion::parse(env!("CARGO_PKG_VERSION")).ok_or_else(|| {
         ManualUpgradeError::State("the running binary's version is not canonical X.Y.Z".to_string())
@@ -913,9 +943,13 @@ async fn manual_check_with_envelope(
         UpgradeDecision::Skip { reason, new_state } => {
             // Same acceptance semantics for a skip: floors first (fallibly),
             // then the auto path's best-effort full-state persist for the
-            // shared cooldown bookkeeping.
+            // shared cooldown bookkeeping — baselined on a POST-floor
+            // re-read, or the floor write we just made would fail its CAS
+            // and silently drop the success cooldown.
             persist_floors_strict(ctx.dir_path.clone(), new_state.clone()).await?;
-            persist_accepted_skip_state(&ctx, state.clone(), new_state).await;
+            let rebased =
+                read_state(&ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
+            persist_accepted_skip_state(&ctx, rebased, new_state).await;
             use super::flow::SkipReason;
             match reason {
                 SkipReason::NotNewer {
@@ -1005,21 +1039,11 @@ pub mod manual_test_hooks {
             }
         };
         persist_floors_strict(upgrade.ctx.dir_path.clone(), plan.new_state.clone()).await?;
-        let staged = StagedInstall {
-            version: plan.version,
-            marker: plan.marker,
-            new_state: plan.new_state,
-            expected_state: state,
-            candidate,
-            local_now,
-        };
-        match run_locked_install(&upgrade.ctx, staged).await {
-            Ok(Ok(Some(TxnOutcome::Installed))) => Ok(ManualInstallReport::Installed(plan.version)),
-            Ok(Ok(Some(TxnOutcome::RolledBack))) => Ok(ManualInstallReport::RolledBack),
-            Ok(Ok(Some(_))) | Ok(Ok(None)) => Ok(ManualInstallReport::NotApplied),
-            Ok(Err(error)) => Err(ManualUpgradeError::Txn(error.to_string())),
-            Err(join) => Err(ManualUpgradeError::Txn(join.to_string())),
-        }
+        let expected_state =
+            read_state(&upgrade.ctx.dir).map_err(|e| ManualUpgradeError::State(e.to_string()))?;
+        let _ = state;
+        // Same tail as the production path (mapping included).
+        finish_manual_install(&upgrade.ctx, plan, expected_state, candidate, local_now).await
     }
 }
 

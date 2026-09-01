@@ -558,7 +558,11 @@ pub fn record_acceptance_floors(
             },
         });
     }
-    match receiver.recv_timeout(std::time::Duration::from_secs(3)) {
+    // 15 s: long enough to outlive a concurrent manual install transaction
+    // holding the floors lock across its pre-commit policy window (probe +
+    // journal, typically seconds) — a shorter wait made a concurrent
+    // process drop verified floors exactly when they mattered most.
+    match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
         Ok(result) => result,
         Err(_) => Err(StateStoreError::WriteFailed {
             path,

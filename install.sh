@@ -439,24 +439,39 @@ download_file_pinned() {
 # Official-install marker (§A.2/§A.4): records the signed provenance of the
 # target so `libra upgrade` and `upgrade.mode=auto` accept this install as
 # upgrade-manageable. Called ONLY on the verified path — an unverified
-# fallback must never claim official provenance. mktemp creates the staging
-# file exclusively (O_EXCL), so a pre-created symlink can never redirect the
-# write to another file.
+# fallback must never claim official provenance.
+#
+# Write discipline (§A.5-lite): the install dir must be OWNED by the current
+# user and not world-writable, and the marker is composed inside a fresh
+# 0700 staging DIRECTORY created atomically by mktemp -d — no other user can
+# reach the staged file, and the unpredictable name plus private mode close
+# the pre-created/replaced-symlink redirection races a bare temp file has.
+# MARKER_WRITTEN feeds the final summary so a failure is never silent.
+MARKER_WRITTEN=0
 write_official_marker() {
-    marker_tmp=$(mktemp "${INSTALL_DIR}/.libra-official-install.json.XXXXXX" 2>/dev/null) || {
+    if [ ! -O "$INSTALL_DIR" ] 2>/dev/null; then
+        warn_fact "provenance" "install dir is not owned by you — official-install marker skipped; 'libra upgrade' will not manage this install"
+        return 0
+    fi
+    if [ -n "$(find "$INSTALL_DIR" -maxdepth 0 -perm -0002 2>/dev/null)" ]; then
+        warn_fact "provenance" "install dir is world-writable — official-install marker skipped; run: chmod o-w '$INSTALL_DIR'"
+        return 0
+    fi
+    marker_dir=$(mktemp -d "${INSTALL_DIR}/.libra-marker.XXXXXX" 2>/dev/null) || {
         warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
         return 0
     }
     if printf '{"schema_version":1,"installed_at":"%s","install_source":"official_signed_manifest","platform":"%s","version":"%s","sha256":"%s","size":%s,"manifest_key_id":"%s"}' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${OS}-${ARCH}" "$STABLE_VERSION" \
-        "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_tmp" \
-        && chmod 644 "$marker_tmp" \
-        && mv "$marker_tmp" "${INSTALL_DIR}/.libra-official-install.json"; then
+        "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_dir/marker.json" \
+        && chmod 644 "$marker_dir/marker.json" \
+        && mv "$marker_dir/marker.json" "${INSTALL_DIR}/.libra-official-install.json"; then
+        MARKER_WRITTEN=1
         fact "provenance" "official-install marker written (enables 'libra upgrade')"
     else
-        rm -f "$marker_tmp" 2>/dev/null
         warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
     fi
+    rm -rf "$marker_dir" 2>/dev/null
 }
 
 # Print sha256 hex of "$1", or empty string if no hashing tool is available.
@@ -1292,6 +1307,11 @@ screen_success() {
         agent_say "Installed in about 30 seconds. You're all set — use libra normally, or the new lba shorthand."
     else
         agent_say "Installed in about 30 seconds. You're all set — here's what to try first:"
+    fi
+    # A verified install whose provenance marker could not be recorded is
+    # working but NOT upgrade-manageable — say so where it cannot be missed.
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ] && [ "${MARKER_WRITTEN:-0}" != "1" ]; then
+        warn_fact "provenance" "upgrade management NOT enabled (the official-install marker was not written) — 'libra upgrade' will ask you to re-run this installer"
     fi
 
     pad="                                       "
