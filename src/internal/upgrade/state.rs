@@ -10,24 +10,26 @@
 //!   revision — a lower revision is always rejected, an equal revision is
 //!   accepted only byte-identical (digest match), so a pre-revocation
 //!   envelope cannot be replayed after a revocation was seen;
+//! - `generation_floor`: highest accepted manifest `min_key_generation` — a
+//!   later manifest can neither lower that policy floor nor use a signer
+//!   generation below it;
 //! - `trusted_time_floor`: monotone time floor advanced ONLY in the same
 //!   atomic write as a fully validated acceptance (§A.6: invalid envelopes
 //!   or bogus future `Date` headers must never poison time state);
 //! - success cooldown and failure backoff for online-check throttling.
 //!
 //! All decision logic here is PURE (explicit clock inputs); the durable
-//! read/write is a small serialization layer using the same atomic-write +
-//! `0600` discipline as the settings file. Locked, directory-fd-relative
-//! access arrives with the install-lock slice (§A.5).
+//! read/write is a small serialization layer using the validated install
+//! directory's fd-relative atomic-write + `0600` operations (§A.5).
 
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::manifest::{ReleaseVersion, VerifiedManifest};
+use super::{
+    lock::{InstallDir, InstallDirError},
+    manifest::{ReleaseVersion, VerifiedManifest},
+};
 
 /// State file name inside the install directory (regular file, `0600`,
 /// no-follow discipline enforced by the locked accessors of §A.5).
@@ -61,7 +63,7 @@ pub struct ArtifactIdentity {
 }
 
 /// Durable anti-rollback / control / throttle state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeState {
     #[serde(default)]
     pub schema_version: u32,
@@ -77,6 +79,11 @@ pub struct UpgradeState {
     /// Hex sha256 of the payload accepted at `max_control_revision`.
     #[serde(default)]
     pub control_envelope_digest: Option<String>,
+    /// Highest accepted manifest `min_key_generation`. This is monotone and
+    /// defaults to zero when reading a state file written before this field
+    /// existed, preserving the prior fail-closed key-policy baseline.
+    #[serde(default)]
+    pub generation_floor: u32,
     /// Monotone trusted time floor (unix seconds).
     #[serde(default)]
     pub trusted_time_floor: i64,
@@ -102,6 +109,18 @@ pub enum StateRejection {
          different payload (digest mismatch)"
     )]
     ControlRevisionForked { revision: u64 },
+    #[error(
+        "manifest min_key_generation {offered} is below the persisted generation floor {floor}"
+    )]
+    GenerationFloorRollback { offered: u32, floor: u32 },
+    #[error(
+        "manifest signer key '{key_id}' generation {offered} is below the persisted generation floor {floor}"
+    )]
+    SignerGenerationBelowFloor {
+        key_id: String,
+        offered: u32,
+        floor: u32,
+    },
     #[error("manifest version {offered} is below the accepted {accepted}")]
     VersionRollback {
         offered: ReleaseVersion,
@@ -162,11 +181,22 @@ pub fn evaluate_manifest(
         });
     }
     if manifest.control_revision == state.max_control_revision
-        && state.max_control_revision > 0
+        && state.control_envelope_digest.is_some()
         && state.control_envelope_digest.as_deref() != Some(digest_hex.as_str())
     {
         return Err(StateRejection::ControlRevisionForked {
             revision: manifest.control_revision,
+        });
+    }
+
+    // A signed manifest can raise the key-generation policy, but can never
+    // lower the policy that a previous accepted manifest established. The
+    // flow filters candidate signing keys against this same persisted floor
+    // before calling this function.
+    if manifest.min_key_generation < state.generation_floor {
+        return Err(StateRejection::GenerationFloorRollback {
+            offered: manifest.min_key_generation,
+            floor: state.generation_floor,
         });
     }
 
@@ -216,6 +246,7 @@ pub fn evaluate_manifest(
     // advance in ONE durable write (performed by the caller under the lock).
     let mut new_state = state.clone();
     new_state.schema_version = 1;
+    new_state.generation_floor = state.generation_floor.max(manifest.min_key_generation);
     new_state.trusted_time_floor = state
         .trusted_time_floor
         .max(manifest.published_at)
@@ -313,7 +344,7 @@ pub enum StateStoreError {
     Unreadable {
         path: PathBuf,
         #[source]
-        source: io::Error,
+        source: InstallDirError,
     },
     /// Corrupt anti-rollback state is FATAL for the upgrade cycle: silently
     /// resetting it would erase the rollback/replay protections, so the
@@ -327,18 +358,23 @@ pub enum StateStoreError {
     WriteFailed {
         path: PathBuf,
         #[source]
-        source: io::Error,
+        source: InstallDirError,
     },
 }
 
 /// Read the state file inside `install_dir`. Missing file → default state.
 /// Corrupt file → error (fail closed; see [`StateStoreError::Corrupt`]).
-pub fn read_state(install_dir: &Path) -> Result<UpgradeState, StateStoreError> {
-    let path = install_dir.join(STATE_FILE_NAME);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(UpgradeState::default()),
-        Err(err) => return Err(StateStoreError::Unreadable { path, source: err }),
+pub fn read_state(install_dir: &InstallDir) -> Result<UpgradeState, StateStoreError> {
+    let path = install_dir.path().join(STATE_FILE_NAME);
+    let Some(bytes) =
+        install_dir
+            .read_file(STATE_FILE_NAME)
+            .map_err(|source| StateStoreError::Unreadable {
+                path: path.clone(),
+                source,
+            })?
+    else {
+        return Ok(UpgradeState::default());
     };
     serde_json::from_slice(&bytes).map_err(|err| StateStoreError::Corrupt {
         path,
@@ -348,30 +384,41 @@ pub fn read_state(install_dir: &Path) -> Result<UpgradeState, StateStoreError> {
 
 /// Atomically persist `state` inside `install_dir` (`0600` on Unix). The
 /// §A.5 lock and directory-fd discipline wrap this call.
-pub fn write_state(install_dir: &Path, state: &UpgradeState) -> Result<(), StateStoreError> {
-    let path = install_dir.join(STATE_FILE_NAME);
-    let write_failed = |err: io::Error| StateStoreError::WriteFailed {
+pub fn write_state(install_dir: &InstallDir, state: &UpgradeState) -> Result<(), StateStoreError> {
+    let path = install_dir.path().join(STATE_FILE_NAME);
+    let write_failed = |source: InstallDirError| StateStoreError::WriteFailed {
         path: path.clone(),
-        source: err,
+        source,
     };
     let mut bytes = serde_json::to_vec_pretty(state).map_err(|err| StateStoreError::Corrupt {
         path: path.clone(),
         detail: format!("cannot serialize state: {err}"),
     })?;
     bytes.push(b'\n');
-    crate::utils::atomic_write::write_atomic(&path, &bytes, true).map_err(write_failed)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(write_failed)?;
-    }
+    install_dir
+        .write_file_atomic(STATE_FILE_NAME, &bytes, 0o600)
+        .map_err(write_failed)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use crate::internal::upgrade::{manifest::VerifiedArtifact, platform::Platform};
+
+    #[cfg(unix)]
+    fn validated_dir(temp: &tempfile::TempDir) -> InstallDir {
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test fixture operation should succeed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test fixture operation should succeed");
+        InstallDir::open_validated(&path).expect("test fixture operation should succeed")
+    }
 
     fn manifest(version: &str, control: u64, digest_byte: u8) -> VerifiedManifest {
         let published_at = 1_000_000;
@@ -411,6 +458,7 @@ mod tests {
         let s = &accepted.new_state;
         assert_eq!(s.max_seen.as_deref(), Some("1.2.3"));
         assert_eq!(s.max_control_revision, 5);
+        assert_eq!(s.generation_floor, 1);
         assert_eq!(
             s.control_envelope_digest.as_deref(),
             Some(hex::encode([7u8; 32]).as_str())
@@ -455,6 +503,42 @@ mod tests {
         // Same revision, identical payload → idempotent acceptance.
         assert!(
             evaluate_manifest(&state, &manifest("1.2.3", 5, 7), Some(GOOD_DATE), GOOD_DATE).is_ok()
+        );
+    }
+
+    #[test]
+    fn revision_zero_with_an_accepted_digest_still_rejects_a_fork() {
+        let state = UpgradeState {
+            control_envelope_digest: Some(hex::encode([7u8; 32])),
+            ..UpgradeState::default()
+        };
+        assert_eq!(
+            evaluate_manifest(&state, &manifest("1.2.3", 0, 9), Some(GOOD_DATE), GOOD_DATE)
+                .unwrap_err(),
+            StateRejection::ControlRevisionForked { revision: 0 }
+        );
+    }
+
+    #[test]
+    fn generation_floor_is_monotone_and_legacy_state_defaults_to_zero() {
+        let legacy: UpgradeState = serde_json::from_str(r#"{"schema_version":1}"#)
+            .expect("legacy state fixture must deserialize");
+        assert_eq!(legacy.generation_floor, 0);
+
+        let mut raised = manifest("1.2.3", 5, 7);
+        raised.min_key_generation = 2;
+        let state = evaluate_manifest(&legacy, &raised, Some(GOOD_DATE), GOOD_DATE)
+            .expect("raised generation fixture must be accepted")
+            .new_state;
+        assert_eq!(state.generation_floor, 2);
+
+        let lower = manifest("1.2.4", 6, 8);
+        assert_eq!(
+            evaluate_manifest(&state, &lower, Some(GOOD_DATE), GOOD_DATE).unwrap_err(),
+            StateRejection::GenerationFloorRollback {
+                offered: 1,
+                floor: 2,
+            }
         );
     }
 
@@ -595,37 +679,51 @@ mod tests {
         assert!(!backoff_defers(&damaged, 1_000));
     }
 
+    #[cfg(unix)]
     #[test]
     fn state_store_roundtrip_missing_and_corrupt() {
-        let dir = tempfile::tempdir().expect("test fixture operation should succeed");
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
         // Missing → default.
-        let state = read_state(dir.path()).expect("test fixture operation should succeed");
+        let state = read_state(&dir).expect("test fixture operation should succeed");
         assert_eq!(state.max_control_revision, 0);
+        assert_eq!(state.generation_floor, 0);
         // Roundtrip.
         let m = manifest("1.2.3", 5, 7);
         let accepted = evaluate_manifest(&state, &m, Some(GOOD_DATE), GOOD_DATE)
             .expect("test fixture operation should succeed");
-        write_state(dir.path(), &accepted.new_state)
-            .expect("test fixture operation should succeed");
-        let reread = read_state(dir.path()).expect("test fixture operation should succeed");
+        write_state(&dir, &accepted.new_state).expect("test fixture operation should succeed");
+        let reread = read_state(&dir).expect("test fixture operation should succeed");
         assert_eq!(reread.max_control_revision, 5);
+        assert_eq!(reread.generation_floor, 1);
         assert_eq!(reread.max_seen.as_deref(), Some("1.2.3"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir.path().join(STATE_FILE_NAME))
-                .expect("test fixture operation should succeed")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        assert!(matches!(
+            dir.stat_entry(STATE_FILE_NAME),
+            Ok(Some(super::super::lock::EntryKind::Regular {
+                mode: 0o600,
+                ..
+            }))
+        ));
         // Corrupt → hard error, never a silent reset.
-        fs::write(dir.path().join(STATE_FILE_NAME), b"{ nope")
+        dir.write_file_atomic(STATE_FILE_NAME, b"{ nope", 0o600)
             .expect("test fixture operation should succeed");
         assert!(matches!(
-            read_state(dir.path()),
+            read_state(&dir),
             Err(StateStoreError::Corrupt { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_refuses_a_symlinked_state_file() {
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
+        std::os::unix::fs::symlink("/etc/passwd", temp.path().join(STATE_FILE_NAME))
+            .expect("test fixture operation should succeed");
+
+        assert!(matches!(
+            read_state(&dir),
+            Err(StateStoreError::Unreadable { .. })
         ));
     }
 

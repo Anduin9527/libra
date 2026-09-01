@@ -10,14 +10,13 @@
 //!   before any user command runs; a clean recovery or the (overwhelmingly
 //!   common) no-transaction case returns quietly.
 //! - [`run_auto_upgrade_check`] — the `upgrade.mode=auto` check that fetches
-//!   the signed manifest, decides, downloads + probes a candidate and
+//!   the signed manifest, decides, downloads a candidate and probes +
 //!   installs it under the §A.5 lock. Every failure is isolated so it can
 //!   never break the user's actual command (§A.8).
 //!
 //! Both short-circuit to a no-op before any network or filesystem work when
-//! the compiled trust table is empty — which it is in production until the
-//! release-key ceremony (§A.6). The auto-upgrade path is therefore inert by
-//! construction until keys are provisioned.
+//! the compiled trust table is empty. A build carrying the ceremony public
+//! key still fails closed until a valid signed manifest is available.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -113,14 +112,14 @@ pub async fn startup_recovery_gate() -> CliResult<()> {
     let Some(ctx) = resolve_install_context() else {
         return Ok(());
     };
-    // A corrupt state file is fatal for the upgrade subsystem (§A.7): refuse
-    // to proceed rather than silently discard anti-rollback history.
-    if let Err(err) = read_state(&ctx.dir_path) {
-        return Err(CliError::fatal(err.to_string())
-            .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid));
-    }
     let version = env!("CARGO_PKG_VERSION").to_string();
     let outcome = tokio::task::spawn_blocking(move || {
+        // Recovery serializes with every state/transaction writer. Keep the
+        // lock until the recovery path's final fsync.
+        let _lock = ctx.dir.lock_blocking()?;
+        // A corrupt state file is fatal for the upgrade subsystem (§A.7):
+        // refuse to proceed rather than silently discard rollback history.
+        read_state(&ctx.dir).map_err(|e| TxnError::State(e.to_string()))?;
         let probe =
             move |dir: &InstallDir| sync_post_install_probe(dir, &version, RECOVERY_PROBE_TIMEOUT);
         txn::recover(&ctx.dir, &probe)
@@ -138,6 +137,10 @@ pub async fn startup_recovery_gate() -> CliResult<()> {
         Ok(_) => Ok(()),
         Err(TxnError::FatalRecovery { detail, .. }) => Err(CliError::fatal(format!(
             "auto-upgrade is in an unrecoverable state and must be repaired manually: {detail}"
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)),
+        Err(TxnError::State(detail)) => Err(CliError::fatal(format!(
+            "auto-upgrade anti-rollback state is invalid and must be repaired manually: {detail}"
         ))
         .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)),
         Err(other) => {
@@ -194,37 +197,42 @@ pub async fn run_auto_upgrade_check(local_now: i64) -> AutoUpgradeReport {
     {
         return AutoUpgradeReport::Skipped;
     }
-    let Ok(state) = read_state(&ctx.dir_path) else {
+    let Ok(state) = read_state(&ctx.dir) else {
         return AutoUpgradeReport::Skipped;
     };
     if !should_check_now(UpgradeMode::Auto, false, &state, local_now) {
         return AutoUpgradeReport::Skipped;
     }
 
-    // Phase A: fetch + decide + download + candidate probe, under the budget.
+    // Phase A: fetch + decide + download, under the budget. Candidate staging
+    // and probing happen under the lock in Phase B so concurrent checks
+    // cannot exchange candidates or regress the accepted state.
     match tokio::time::timeout(UPGRADE_BUDGET, phase_a(&ctx, &state, trust, local_now)).await {
         Ok(Ok(Some(plan))) => phase_b(&ctx, plan).await,
         Ok(Ok(None)) => AutoUpgradeReport::Skipped,
         Ok(Err(())) | Err(_) => {
-            // Any failure or timeout: record a backoff and skip. Errors in
-            // persisting the backoff are themselves swallowed.
-            let backed_off = register_failure_backoff(&state, local_now);
-            let _ = write_state(&ctx.dir_path, &backed_off);
+            // Any failure or timeout: compare-and-write a backoff under the
+            // upgrade lock. A concurrent accepted manifest must win rather
+            // than being overwritten by this stale failure path.
+            persist_failure_backoff(&ctx, state, local_now).await;
             AutoUpgradeReport::Skipped
         }
     }
 }
 
-/// The install plan plus the verified candidate already staged on disk.
+/// The install plan plus a verified in-memory candidate. It is staged only
+/// after Phase B obtains the upgrade lock.
 struct StagedInstall {
     version: ReleaseVersion,
     marker: super::marker::InstallMarker,
     new_state: UpgradeState,
-    old_target: OldTarget,
+    expected_state: UpgradeState,
+    candidate: Vec<u8>,
+    local_now: i64,
 }
 
-/// Phase A: fetch the manifest, decide, download+verify the candidate, run
-/// the candidate self-check. `Ok(Some(_))` means "ready to install".
+/// Phase A: fetch the manifest, decide, and download+verify the candidate.
+/// `Ok(Some(_))` means "ready to lock, stage and probe".
 async fn phase_a(
     ctx: &InstallContext,
     state: &UpgradeState,
@@ -253,11 +261,14 @@ async fn phase_a(
     let decision = decide_from_envelope(&ctx_dec, &fetched.bytes).map_err(|_| ())?;
     let plan = match decision {
         UpgradeDecision::Install(plan) => plan,
-        UpgradeDecision::Skip(_) => return Ok(None),
+        UpgradeDecision::Skip { new_state, .. } => {
+            persist_accepted_skip_state(ctx, state.clone(), new_state).await;
+            return Ok(None);
+        }
     };
 
-    // Download the artifact into memory (SizeGate-bounded to ≤128 MiB), then
-    // stage it as the candidate file via the fd-relative writer.
+    // Download into memory (SizeGate-bounded to ≤128 MiB). Do not touch the
+    // shared candidate filename until the Phase-B lock is held.
     let mut buf: Vec<u8> = Vec::new();
     download_artifact_to(
         &client,
@@ -268,38 +279,76 @@ async fn phase_a(
     )
     .await
     .map_err(|_| ())?;
-    ctx.dir
-        .write_file_atomic(CANDIDATE_NAME, &buf, 0o755)
-        .map_err(|_| ())?;
-
-    // Candidate self-check before we trust it (§A.7 Phase A probe).
-    let candidate_path = ctx.dir.path().join(CANDIDATE_NAME);
-    let outcome = probe::run_phase_a_probe(
-        &candidate_path,
-        probe::ProbeKind::PreInstall,
-        &plan.version.to_string(),
-        RECOVERY_PROBE_TIMEOUT,
-    )
-    .await;
-    if !outcome.is_healthy() {
-        let _ = ctx.dir.remove_file(CANDIDATE_NAME);
-        return Err(());
-    }
-
-    let old_target = current_old_target(ctx).map_err(|_| ())?;
     Ok(Some(StagedInstall {
         version: plan.version,
         marker: plan.marker,
         new_state: plan.new_state,
-        old_target,
+        expected_state: state.clone(),
+        candidate: buf,
+        local_now,
     }))
 }
 
-/// Phase B: install the staged candidate under the §A.5 lock via the
-/// transaction, running the post-install self-check.
+/// Persist a verified policy update that did not lead to an install (for
+/// example, a pause or same-version manifest). The state is written only if
+/// the baseline read before the network request is still current under the
+/// install-directory lock; otherwise another process has made progress and
+/// this invocation safely leaves it alone.
+async fn persist_accepted_skip_state(
+    ctx: &InstallContext,
+    expected_state: UpgradeState,
+    accepted_state: UpgradeState,
+) {
+    let dir_path = ctx.dir_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
+        persist_if_state_unchanged(&dir, &expected_state, &accepted_state)
+    })
+    .await;
+}
+
+/// Persist a failure backoff only when the state observed before Phase A is
+/// still current. This prevents a late network timeout from clobbering a
+/// newer generation/control floor accepted by another process.
+async fn persist_failure_backoff(
+    ctx: &InstallContext,
+    expected_state: UpgradeState,
+    local_now: i64,
+) {
+    let accepted_state = register_failure_backoff(&expected_state, local_now);
+    let dir_path = ctx.dir_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = InstallDir::open_validated(&dir_path).map_err(|_| ())?;
+        persist_if_state_unchanged(&dir, &expected_state, &accepted_state)
+    })
+    .await;
+}
+
+/// Lock-protected compare-and-write for accepted non-install decisions.
+/// `false` means another process advanced the state or holds the lock; both
+/// are safe skips. Errors are deliberately non-fatal to the caller's command.
+fn persist_if_state_unchanged(
+    dir: &InstallDir,
+    expected_state: &UpgradeState,
+    accepted_state: &UpgradeState,
+) -> Result<bool, ()> {
+    let Some(_lock) = dir.try_lock().map_err(|_| ())? else {
+        return Ok(false);
+    };
+    let current = read_state(dir).map_err(|_| ())?;
+    if &current != expected_state {
+        return Ok(false);
+    }
+    write_state(dir, accepted_state).map_err(|_| ())?;
+    Ok(true)
+}
+
+/// Phase B: compare the state baseline, stage+pre-probe the candidate, then
+/// install it under the single §A.5 lock via the transaction.
 async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeReport {
     let version = staged.version;
     let dir_path = ctx.dir_path.clone();
+    let platform = ctx.platform;
     // Re-open a dedicated InstallDir for the blocking transaction task.
     let outcome = tokio::task::spawn_blocking(move || {
         let dir = InstallDir::open_validated(&dir_path).map_err(TxnError::Dir)?;
@@ -307,13 +356,37 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
             // Another process holds the lock — skip this round.
             return Ok(TxnOutcome::NoOp);
         };
+        // Fetch/download occurred outside the lock. Do not apply that plan
+        // over state another process accepted while Phase A was in flight.
+        let current_state = read_state(&dir).map_err(|e| TxnError::State(e.to_string()))?;
+        if current_state != staged.expected_state {
+            return Ok(TxnOutcome::NoOp);
+        }
+        dir.write_file_atomic(CANDIDATE_NAME, &staged.candidate, 0o755)?;
+        let candidate_path = dir.path().join(CANDIDATE_NAME);
+        let pre_probe_healthy = probe::run_sync_probe(
+            &candidate_path,
+            "pre-install",
+            &version.to_string(),
+            RECOVERY_PROBE_TIMEOUT,
+        )
+        .map(|outcome| outcome.is_healthy())
+        .unwrap_or(false);
+        if !pre_probe_healthy {
+            dir.remove_file(CANDIDATE_NAME)?;
+            dir.fsync_dir()?;
+            let backed_off = register_failure_backoff(&current_state, staged.local_now);
+            write_state(&dir, &backed_off).map_err(|e| TxnError::State(e.to_string()))?;
+            return Ok(TxnOutcome::NoOp);
+        }
+        let old_target = current_old_target(&dir, platform)?;
         let new_hash = staged.marker.sha256.clone();
         let expected = version.to_string();
         let probe =
             move |d: &InstallDir| sync_post_install_probe(d, &expected, RECOVERY_PROBE_TIMEOUT);
         txn::run_install(
             &dir,
-            staged.old_target,
+            old_target,
             &version.to_string(),
             &new_hash,
             staged.marker,
@@ -331,14 +404,14 @@ async fn phase_b(ctx: &InstallContext, staged: StagedInstall) -> AutoUpgradeRepo
 }
 
 /// Snapshot the current target as the transaction's `old_target`.
-fn current_old_target(ctx: &InstallContext) -> Result<OldTarget, TxnError> {
+fn current_old_target(dir: &InstallDir, platform: Platform) -> Result<OldTarget, TxnError> {
     use super::lock::EntryKind;
-    match ctx.dir.stat_entry(TARGET_BINARY_NAME)? {
+    match dir.stat_entry(TARGET_BINARY_NAME)? {
         Some(EntryKind::Regular { .. }) => {
-            let bytes = ctx.dir.read_file(TARGET_BINARY_NAME)?.unwrap_or_default();
+            let bytes = dir.read_file(TARGET_BINARY_NAME)?.unwrap_or_default();
             use sha2::Digest as _;
             let hash = hex::encode(sha2::Sha256::digest(&bytes));
-            let marker_snapshot = official_marker_for_target(&ctx.dir, ctx.platform.as_str())
+            let marker_snapshot = official_marker_for_target(dir, platform.as_str())
                 .ok()
                 .flatten();
             Ok(OldTarget::Present {
@@ -416,8 +489,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn auto_check_is_inert_with_empty_trust_table() {
-        // Production trust table is empty ⇒ the check does no I/O and skips.
+    async fn auto_check_skips_when_the_test_binary_has_no_install_context() {
+        // The test binary is not an installed `libra` target, so this reaches
+        // the no-install-context gate without making a network request.
         assert_eq!(
             run_auto_upgrade_check(1_000).await,
             AutoUpgradeReport::Skipped
@@ -426,7 +500,88 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn recovery_gate_is_inert_with_empty_trust_table() {
+    async fn recovery_gate_skips_when_the_test_binary_has_no_install_context() {
         assert!(startup_recovery_gate().await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_skip_state_is_atomically_persisted_only_from_matching_baseline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("test directory must be created");
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test directory must canonicalize");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test directory permissions must be set");
+        let dir = InstallDir::open_validated(&path).expect("test directory must validate");
+        let baseline = UpgradeState::default();
+        let accepted = UpgradeState {
+            generation_floor: 2,
+            ..UpgradeState::default()
+        };
+
+        assert!(
+            persist_if_state_unchanged(&dir, &baseline, &accepted)
+                .expect("matching baseline must persist")
+        );
+        assert_eq!(
+            read_state(&dir)
+                .expect("persisted state must be readable")
+                .generation_floor,
+            2
+        );
+
+        let concurrent = UpgradeState {
+            generation_floor: 3,
+            ..UpgradeState::default()
+        };
+        write_state(&dir, &concurrent).expect("concurrent state fixture must persist");
+        let stale_update = UpgradeState {
+            generation_floor: 4,
+            ..UpgradeState::default()
+        };
+        assert!(
+            !persist_if_state_unchanged(&dir, &accepted, &stale_update)
+                .expect("stale baseline must safely skip")
+        );
+        assert_eq!(
+            read_state(&dir)
+                .expect("concurrent state must remain readable")
+                .generation_floor,
+            3
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_failure_backoff_cannot_clobber_an_advanced_generation_floor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("test directory must be created");
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test directory must canonicalize");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test directory permissions must be set");
+        let dir = InstallDir::open_validated(&path).expect("test directory must validate");
+        let baseline = UpgradeState::default();
+        let advanced = UpgradeState {
+            generation_floor: 3,
+            ..UpgradeState::default()
+        };
+        write_state(&dir, &advanced).expect("advanced state fixture must persist");
+
+        let stale_backoff = register_failure_backoff(&baseline, 1_000);
+        assert!(
+            !persist_if_state_unchanged(&dir, &baseline, &stale_backoff)
+                .expect("stale failure backoff must safely skip")
+        );
+        let current = read_state(&dir).expect("advanced state must remain readable");
+        assert_eq!(current.generation_floor, 3);
+        assert_eq!(current.backoff_not_before, None);
     }
 }

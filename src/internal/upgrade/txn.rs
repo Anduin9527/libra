@@ -158,7 +158,9 @@ fn observe(dir: &InstallDir) -> Result<Layout, TxnError> {
 /// Commit: persist marker + anti-rollback state, verify identity, remove
 /// backup/candidate, fsync, then delete the txn LAST (§A.7).
 fn finish_commit(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
-    write_state(dir.path(), &txn.new_state).map_err(|e| TxnError::State(e.to_string()))?;
+    // Callers hold the upgrade lock through commit/recovery, so this state
+    // write cannot overwrite a newer accepted anti-rollback floor.
+    write_state(dir, &txn.new_state).map_err(|e| TxnError::State(e.to_string()))?;
     write_marker(dir, &txn.marker).map_err(|e| TxnError::Marker(e.to_string()))?;
     // Identity re-check: the committed target must be the new hash.
     let layout = observe(dir)?;
