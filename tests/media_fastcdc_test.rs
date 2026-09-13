@@ -351,6 +351,139 @@ fn ready_file_rejects_malformed_payloads() {
     assert!(ok.lfs_url.as_str().contains("/info/lfs"));
 }
 
+// FC-15 seeds this credential for a distinct user on its disposable server.
+const OTHER_USER_AUTHORIZATION: &str = "Bearer other-user-not-in-ready-file";
+
+/// Verify authentication and both read routes directly: discovery intentionally
+/// treats 401 as fallback, so it cannot prove authenticated scope isolation.
+async fn verify_other_user_scope(
+    client: &reqwest::Client,
+    base: &url::Url,
+    oid: &str,
+    chunk_hash: &str,
+) -> anyhow::Result<()> {
+    use reqwest::StatusCode;
+
+    for (path, expected, label) in [
+        ("capabilities".to_owned(), StatusCode::OK, "authentication"),
+        (
+            format!("manifests/by-media/{oid}"),
+            StatusCode::NOT_FOUND,
+            "manifest isolation",
+        ),
+        (
+            format!("manifests/by-media/{oid}/chunks/{chunk_hash}"),
+            StatusCode::NOT_FOUND,
+            "chunk isolation",
+        ),
+    ] {
+        let status = client
+            .get(base.join(&path)?)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?
+            .status();
+        anyhow::ensure!(
+            status == expected,
+            "second-user {label}: expected HTTP {expected}, got {status}; seed a distinct authenticated user in the live harness"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn other_user_scope_requires_authentication_and_denies_both_read_routes() {
+    use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+    // Exercise the live guard against missing credentials and either leaked
+    // read route, including chunk leakage behind a correctly hidden manifest.
+    for (capabilities, manifest, chunk, error) in [
+        (
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            None,
+        ),
+        (
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            Some("authentication"),
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            Some("authentication"),
+        ),
+        (
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            Some("manifest isolation"),
+        ),
+        (
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::OK,
+            Some("chunk isolation"),
+        ),
+        (
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            Some("manifest isolation"),
+        ),
+    ] {
+        let app = Router::new()
+            .route("/capabilities", get(move || async move { capabilities }))
+            .route(
+                "/manifests/by-media/oid",
+                get(move || async move { manifest }),
+            )
+            .route(
+                "/manifests/by-media/oid/chunks/hash",
+                get(move || async move { chunk }),
+            )
+            .layer(axum::middleware::from_fn(
+                |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    if request.headers().get(AUTHORIZATION)
+                        != Some(&HeaderValue::from_static(OTHER_USER_AUTHORIZATION))
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    next.run(request).await
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .default_headers(HeaderMap::from_iter([(
+                AUTHORIZATION,
+                HeaderValue::from_static(OTHER_USER_AUTHORIZATION),
+            )]))
+            .build()
+            .unwrap();
+        let result = verify_other_user_scope(&client, &base, "oid", "hash").await;
+        let anonymous = reqwest::Client::builder().no_proxy().build().unwrap();
+        let anonymous_result = verify_other_user_scope(&anonymous, &base, "oid", "hash").await;
+        server.abort();
+        assert!(
+            anonymous_result
+                .unwrap_err()
+                .to_string()
+                .contains("authentication")
+        );
+        match error {
+            Some(label) => assert!(result.unwrap_err().to_string().contains(label)),
+            None => result.unwrap(),
+        }
+    }
+}
+
 /// Run against a real FastCDC Media server (monoengine) using a ready-file.
 /// FC-15 writes `MONOENGINE_FASTCDC_READY_FILE` with `{lfs_url, token}` only.
 #[tokio::test]
@@ -502,34 +635,51 @@ async fn monoengine_fastcdc_http_interop() {
         .await
         .unwrap();
     assert_eq!(fs::read(&output).unwrap(), data);
+    // FC-15 seeds this token for a distinct user; it is not an invalid-token fixture.
     let other = reqwest::Client::builder()
         .no_proxy()
         .default_headers(HeaderMap::from_iter([(
             AUTHORIZATION,
-            HeaderValue::from_static("Bearer other-user-not-in-ready-file"),
+            HeaderValue::from_static(OTHER_USER_AUTHORIZATION),
         )]))
         .build()
         .unwrap();
     let mut other_lfs = LFSClient::from_remote_url(&remote).unwrap();
     other_lfs.client = other.clone();
-    match MediaClient::discover(other, &lfs_url, false).await.unwrap() {
-        None => {}
-        Some(other_media) => {
-            assert!(
-                !other_media
-                    .download(&manifest.media_oid, manifest.media_size, &output, &store)
-                    .await
-                    .unwrap(),
-                "other users must not read scoped Media chunks"
-            );
-        }
-    }
+    verify_other_user_scope(&other, &base, &manifest.media_oid, &chunk.chunk_hash)
+        .await
+        .unwrap();
+    let other_media = MediaClient::discover(other, &lfs_url, false)
+        .await
+        .unwrap()
+        .expect("second authenticated user must negotiate FastCDC");
+    let other_store = MediaChunkStore::at(dir.path().join("other-user-chunks"));
+    let other_output = dir.path().join("other-user-download.bin");
+    fs::write(&other_output, b"second-user destination").unwrap();
+    assert!(
+        !other_media
+            .download(
+                &manifest.media_oid,
+                manifest.media_size,
+                &other_output,
+                &other_store
+            )
+            .await
+            .unwrap(),
+        "other users must not read scoped Media chunks"
+    );
+    assert_eq!(fs::read(&other_output).unwrap(), b"second-user destination");
     other_lfs
-        .download_object(&manifest.media_oid, manifest.media_size, &output, None)
+        .download_object(
+            &manifest.media_oid,
+            manifest.media_size,
+            &other_output,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
-        fs::read(&output).unwrap(),
+        fs::read(&other_output).unwrap(),
         data,
         "other users retain complete standard LFS access"
     );

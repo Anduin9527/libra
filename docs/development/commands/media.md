@@ -66,6 +66,14 @@ monoengine 新端点要求 Mono access token，并保留 URI 改写前的仓库�
 guard 不依赖该文件。测试结果以本次实际运行记录为准；不把编译失败或
 skipped/ignored 计为通过。这不是标准 Git FastCDC 互通。
 
+FC-15 的隔离服务还须为与 ready-file token 不同的用户播种有效测试 token
+`other-user-not-in-ready-file`；该固定值只用于一次性测试服务。测试必须验证
+第二用户的 capabilities 返回 200、第一用户的 manifest 与 chunk 读取路由
+均返回 404，不能把认证失败或 discovery fallback 计为跨用户隔离通过。
+Media 拒绝读取后独立目标文件须保持原内容，随后标准 LFS 下载仍须成功。
+非 ignored 的 scope-guard 回归用例覆盖认证失败、manifest 泄漏和 chunk
+泄漏；本地路由回归不替代真实 monoengine 互通证据。
+
 ## 未完成项
 
 本次交付传输链路，不宣称完成 Lore §6 的全部生产门禁。

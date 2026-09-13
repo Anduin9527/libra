@@ -110,6 +110,16 @@ cargo test --features fastcdc --test media_fastcdc_test -- --ignored --exact mon
 tokens. The default `cargo test` feature-gate guard still passes without this
 file; the live test is executed by the monoengine FC-15 harness.
 
+The isolated FC-15 server must also seed `other-user-not-in-ready-file` as a
+valid token for a **different user** from the ready-file token. This fixed token
+is a test fixture and must only be used on the disposable test server. The test
+requires HTTP 200 for that user's capabilities and HTTP 404 for the first
+user's manifest and chunk read routes; authentication failure cannot count as
+scope isolation. It also checks that a denied Media download preserves a fresh
+destination and that the second user can still download the standard LFS object.
+The non-ignored scope-guard regression test covers authentication failures and
+leaked manifest/chunk responses without a live server.
+
 ## Deferred
 
 Shared repository ACLs, automatic orphan GC, quota accounting, server fsck/heal,
