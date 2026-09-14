@@ -1,7 +1,7 @@
 # generated — do not edit
-# regenerate: sh tests/NEXTEST_GROUPS.sh  (source of truth: tests/SERIAL_REGISTRY.tsv)
+# regenerate: sh tests/NEXTEST_GROUPS.sh (groups: tests/SERIAL_REGISTRY.tsv; timeouts: generator)
 # plan-20260827 NP-01 / ADR-NP-01: union external-resource mutual-exclusion group.
-# plan-20260827 NP-02: profiles carry runner behavior only (groups/threads/junit);
+# plan-20260827 NP-02: profiles carry runner behavior only (groups/threads/junit/timeouts);
 # Cargo features and env always travel with the command line.
 
 [test-groups.external]
@@ -18,6 +18,13 @@ path = "junit.xml"
 [profile.test-provider]
 test-threads = 1
 junit = { path = "junit.xml" }
+
+# MIG-R03: these two cases embed cargo build and may wait for its lock.
+# Warn every 120s; terminate after 20 minutes, with 10s shutdown grace.
+# Timeout-only: external-resource group membership remains registry-derived.
+[[profile.default.overrides]]
+filter = 'binary(=e2e_mcp_flow) & (test(=test_e2e_mcp_flow) | test(=test_web_only_sigterm_releases_ports))'
+slow-timeout = { period = "120s", terminate-after = 10, grace-period = "10s" }
 
 [[profile.default.overrides]]
 filter = 'binary(=code_ui_remote_approval_matrix)'
