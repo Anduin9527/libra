@@ -1,4 +1,7 @@
 test_fn	lane	reason
+config_cascade_uses_explicit_role	lane:cwd+env	uses isolated global/system configuration paths and cwd to prove read-only role routing
+global_config_create_uses_global_role	lane:env	uses the shared configuration fixture and validates global writer cache isolation
+system_config_create_uses_system_role	lane:env	uses the shared configuration fixture and validates system writer cache isolation
 configuration_ledger_has_independent_version_namespace	lane:env	uses the shared config database fixture to isolate process configuration paths
 global_and_system_bootstrap_create_no_repository_shape	lane:env	uses the shared config database fixture to isolate process configuration paths
 repository_only_upgrade_preserves_config_receipt_and_values	lane:env	uses isolated global/system paths to prove repository upgrades preserve ambient configuration

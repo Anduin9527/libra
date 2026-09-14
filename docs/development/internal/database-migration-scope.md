@@ -70,6 +70,38 @@ database, run DDL, add a receipt, or use a generic repository connection as a
 fallback. Configuration writes and `libra config --global/--system` creation
 must select `GlobalConfig` or `SystemConfig` respectively.
 
+### MIG-03 routing transition
+
+The role-only APIs delivered by MIG-02 retain the manifest rules above.
+Configuration command writers use `schema::{create_configuration_database,
+open_configuration_database,ensure_configuration_schema_is_current}` and
+revalidate cached handles on every acquisition. Until MIG-04 ships the legacy
+reader barrier and its recognition policy together, these configuration-only
+wrappers additionally reject a future Repository ledger, as the previous
+configuration paths did. This transitional fence is composed from the existing
+role classifiers, both before DDL and under the configuration migration write
+lock. It never grants permission to execute Repository DDL or rewrite legacy
+receipts. Validation is on acquisition, not a lifetime guarantee for a handle
+already held by a caller.
+
+Strict global/system cascade and storage-credential readers open through
+`schema::open_readonly_connection_for_role`, then validate through
+`schema::check_configuration_schema`. The connection uses an absolute literal
+SQLite filename, read-only mode and no-create; URI metacharacters cannot
+redirect it. Non-UTF-8 filenames are rejected with contextual errors. Missing
+stores remain absent; legacy-only pre-ledger stores remain readable without
+bootstrap. A malformed modern table, or a receipted configuration store missing
+its required modern table, remains an error rather than a fallback value.
+Local repository readers keep their existing Repository behavior.
+
+The fresh best-effort reader uses the same read-only opener but deliberately
+retains its existing query-based compatibility and failure-isolation policy:
+only proven absence falls through; unreadable or encrypted local state cannot
+be replaced by a global value. The opener itself does not impose strict policy.
+Error context may now identify the configuration role; this routing step does
+not change the remote/cloud `LBR-CONFIG-001` classifier or JSON contract.
+MIG-04 owns that externally documented policy transition.
+
 ## Fixture isolation
 
 Tests that can reach global or system configuration must route every ambient

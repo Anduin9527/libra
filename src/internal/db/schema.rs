@@ -7,7 +7,8 @@
 use std::{fmt, io, path::Path, sync::OnceLock, time::Duration};
 
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, Statement, TransactionTrait,
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbErr,
+    Statement, TransactionTrait,
 };
 
 use super::{SchemaCompatibility, SchemaUpgradeReport, migration::Migration};
@@ -239,7 +240,7 @@ pub fn latest_schema_version_for_role(role: DatabaseRole) -> io::Result<Option<i
         .map_err(|error| io::Error::other(error.clone()))
 }
 
-/// Two indexed metadata queries, with no DDL and no configuration-value reads.
+/// Metadata lookup and indexed MAX, with no DDL or configuration-value reads.
 pub async fn current_schema_version_for_role<C: ConnectionTrait>(
     conn: &C,
     role: DatabaseRole,
@@ -273,8 +274,8 @@ pub async fn current_schema_version_for_role<C: ConnectionTrait>(
         .map_err(|error| io::Error::other(format!("invalid {role} schema version: {error}")))
 }
 
-pub async fn inspect_schema_for_connection(
-    conn: &DatabaseConnection,
+pub async fn inspect_schema_for_connection<C: ConnectionTrait>(
+    conn: &C,
     role: DatabaseRole,
 ) -> io::Result<SchemaCompatibility> {
     let current = current_schema_version_for_role(conn, role).await?;
@@ -311,6 +312,184 @@ fn reject_future(role: DatabaseRole, compatibility: &SchemaCompatibility) -> io:
         )));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SchemaPolicy {
+    RoleOnly,
+    LegacyConfiguration,
+}
+
+fn require_configuration_role(role: DatabaseRole) -> io::Result<()> {
+    match role {
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{role} is not a configuration scope; use its role-specific database API"),
+        )),
+    }
+}
+
+async fn inspect_supported_schema<C: ConnectionTrait>(
+    conn: &C,
+    role: DatabaseRole,
+    policy: SchemaPolicy,
+) -> io::Result<SchemaCompatibility> {
+    if matches!(policy, SchemaPolicy::LegacyConfiguration) {
+        require_configuration_role(role)?;
+        // Preserve the pre-routing legacy fence until the configuration
+        // barrier and its recognition policy land together. This policy does
+        // not change the role-only APIs or authorize Repository DDL.
+        reject_future(
+            DatabaseRole::Repository,
+            &inspect_schema_for_connection(conn, DatabaseRole::Repository).await?,
+        )?;
+    }
+    let compatibility = inspect_schema_for_connection(conn, role).await?;
+    reject_future(role, &compatibility)?;
+    Ok(compatibility)
+}
+
+/// Validate configuration compatibility without migrating or reading values.
+pub(crate) async fn check_configuration_schema<C: ConnectionTrait>(
+    conn: &C,
+    role: DatabaseRole,
+) -> io::Result<()> {
+    inspect_supported_schema(conn, role, SchemaPolicy::LegacyConfiguration)
+        .await
+        .map(|_| ())
+}
+
+/// A pre-ledger configuration file may contain only the legacy table. Do not
+/// bootstrap it during a read. A receipted file missing config_kv is corrupt,
+/// not an absent setting; views are queried normally so query errors surface.
+pub(crate) async fn configuration_has_kv(
+    conn: &DatabaseConnection,
+    role: DatabaseRole,
+) -> io::Result<bool> {
+    require_configuration_role(role)?;
+    let inspect_error = |error| {
+        io::Error::other(format!(
+            "failed to inspect {role} config_kv schema: {error}"
+        ))
+    };
+    if super::sqlite_schema_contains(conn, "table", "config_kv")
+        .await
+        .map_err(inspect_error)?
+        || super::sqlite_schema_contains(conn, "view", "config_kv")
+            .await
+            .map_err(inspect_error)?
+    {
+        return Ok(true);
+    }
+    if current_schema_version_for_role(conn, role).await?.is_some() {
+        return Err(io::Error::other(format!(
+            "{role} database is missing its required config_kv table; restore a verified backup"
+        )));
+    }
+    Ok(false)
+}
+
+/// Revalidate cached configuration handles as well as newly opened writers.
+pub(crate) async fn ensure_configuration_schema_is_current(
+    conn: &DatabaseConnection,
+    role: DatabaseRole,
+) -> io::Result<()> {
+    let compatibility =
+        inspect_supported_schema(conn, role, SchemaPolicy::LegacyConfiguration).await?;
+    if matches!(compatibility, SchemaCompatibility::UpgradeRequired { .. }) {
+        upgrade_connection_with_policy(conn, role, SchemaPolicy::LegacyConfiguration).await?;
+    }
+    Ok(())
+}
+
+/// Open an existing literal filename without creation, DDL or compatibility
+/// policy. Strict readers must call `check_configuration_schema`; best-effort
+/// readers retain their query-based failure-isolation contract.
+pub(crate) async fn open_readonly_connection_for_role(
+    db_path: &Path,
+    busy_timeout: Duration,
+    role: DatabaseRole,
+) -> io::Result<DatabaseConnection> {
+    open_literal_connection(db_path, busy_timeout, role, true).await
+}
+
+async fn open_literal_connection(
+    db_path: &Path,
+    busy_timeout: Duration,
+    role: DatabaseRole,
+    read_only: bool,
+) -> io::Result<DatabaseConnection> {
+    ledger_for_role(role)?;
+    // Absolute paths also prevent a relative filename starting with `file:`
+    // from being interpreted as a SQLite URI (SQLITE_OPEN_URI is enabled).
+    let filename = std::path::absolute(db_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot resolve {role} database path '{}': {error}",
+                db_path.display()
+            ),
+        )
+    })?;
+    if filename.to_str().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{role} database path '{}' is not valid UTF-8; use a UTF-8 path",
+                db_path.display()
+            ),
+        ));
+    }
+    // The URL is fixed: SQLite URI metacharacters in the caller's path must
+    // not become query options or redirect the connection to another file.
+    let mut options = ConnectOptions::new("sqlite://role-owned-database");
+    options.sqlx_logging(false);
+    options.map_sqlx_sqlite_pool_opts(super::sqlite_pool_options);
+    options.map_sqlx_sqlite_opts(move |opts| {
+        opts.filename(&filename)
+            .read_only(read_only)
+            .create_if_missing(false)
+            .busy_timeout(busy_timeout)
+            .synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Full)
+    });
+    Database::connect(options).await.map_err(|error| {
+        io::Error::other(format!(
+            "failed to open {role} database '{}': {error}; check the file and its permissions",
+            db_path.display()
+        ))
+    })
+}
+
+pub(crate) async fn open_configuration_database(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> io::Result<DatabaseConnection> {
+    require_configuration_role(role)?;
+    let conn = open_literal_connection(db_path, Duration::from_secs(30), role, false).await?;
+    ensure_configuration_schema_is_current(&conn, role).await?;
+    Ok(conn)
+}
+
+pub(crate) async fn create_configuration_database(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> io::Result<DatabaseConnection> {
+    require_configuration_role(role)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(db_path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot create {role} database '{}': {error}",
+                    db_path.display()
+                ),
+            )
+        })?;
+    open_configuration_database(db_path, role).await
 }
 
 pub async fn establish_connection_for_role(
@@ -365,8 +544,16 @@ pub async fn upgrade_connection_for_role(
     conn: &DatabaseConnection,
     role: DatabaseRole,
 ) -> io::Result<SchemaUpgradeReport> {
+    upgrade_connection_with_policy(conn, role, SchemaPolicy::RoleOnly).await
+}
+
+async fn upgrade_connection_with_policy(
+    conn: &DatabaseConnection,
+    role: DatabaseRole,
+    policy: SchemaPolicy,
+) -> io::Result<SchemaUpgradeReport> {
     let ledger = ledger_for_role(role)?;
-    reject_future(role, &inspect_schema_for_connection(conn, role).await?)?;
+    inspect_supported_schema(conn, role, policy).await?;
     if ledger == SchemaLedger::Repository {
         return super::apply_database_schema_upgrades(conn).await;
     }
@@ -378,7 +565,7 @@ pub async fn upgrade_connection_for_role(
     // or advance a receipt without its corresponding schema.
     conn.transaction::<_, _, DbErr>(|txn| {
         Box::pin(upgrade_configuration_transaction(
-            txn, role, migrations, latest,
+            txn, role, migrations, latest, policy,
         ))
     })
     .await
@@ -394,18 +581,27 @@ async fn upgrade_configuration_transaction(
     role: DatabaseRole,
     migrations: Vec<Migration>,
     latest: Option<i64>,
+    policy: SchemaPolicy,
 ) -> Result<SchemaUpgradeReport, DbErr> {
     txn.execute_unprepared(CONFIGURATION_LEDGER_SQL).await?;
     txn.execute_unprepared("UPDATE configuration_schema_versions SET version = version WHERE 0")
         .await?;
-    let previous = current_schema_version_for_role(txn, role)
+    let compatibility = inspect_supported_schema(txn, role, policy)
         .await
         .map_err(|error| DbErr::Custom(error.to_string()))?;
-    if previous.is_some_and(|current| latest.is_none_or(|latest| current > latest)) {
-        return Err(DbErr::Custom(format!(
-            "{role} schema advanced concurrently; install a newer Libra binary"
-        )));
-    }
+    let previous = match compatibility {
+        SchemaCompatibility::Compatible {
+            current_version, ..
+        }
+        | SchemaCompatibility::UpgradeRequired {
+            current_version, ..
+        } => current_version,
+        SchemaCompatibility::UnsupportedFuture { .. } => {
+            return Err(DbErr::Custom(format!(
+                "{role} schema advanced concurrently; install a newer Libra binary"
+            )));
+        }
+    };
     let mut applied = Vec::new();
     if previous != latest {
         for bootstrap in bootstraps_for_role(role) {

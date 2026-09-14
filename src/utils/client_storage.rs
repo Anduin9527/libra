@@ -57,7 +57,7 @@ use crate::{
         branch::Branch,
         config::{ConfigKv, decrypt_value},
         db,
-        db::establish_connection_with_busy_timeout,
+        db::{DatabaseRole, establish_connection_with_busy_timeout, schema},
         head::Head,
         model::object_index,
     },
@@ -2347,9 +2347,14 @@ async fn resolve_env_for_storage_init_typed(
         if let Some(future) = inspect_global_config_schema_future_at_path(&global_db_path).await {
             return Err(StorageConfigResolutionError::GlobalSchemaFuture(future));
         }
-        match read_config_env_value(name, &vault_key, &global_db_path, "global")
-            .await
-            .map_err(StorageConfigResolutionError::Other)
+        match read_config_env_value(
+            name,
+            &vault_key,
+            &global_db_path,
+            DatabaseRole::GlobalConfig,
+        )
+        .await
+        .map_err(StorageConfigResolutionError::Other)
         {
             Ok(Some(value)) => return Ok(Some(value)),
             Ok(None) => {}
@@ -2372,9 +2377,10 @@ async fn resolve_env_for_storage_init_without_global(
     if let Ok(storage_path) = try_get_storage_path(None) {
         let local_db_path = storage_path.join(DATABASE);
         if local_db_path.exists()
-            && let Some(value) = read_config_env_value(name, &vault_key, &local_db_path, "local")
-                .await
-                .map_err(StorageConfigResolutionError::Other)?
+            && let Some(value) =
+                read_config_env_value(name, &vault_key, &local_db_path, DatabaseRole::Repository)
+                    .await
+                    .map_err(StorageConfigResolutionError::Other)?
         {
             return Ok(Some(value));
         }
@@ -2419,36 +2425,68 @@ pub(crate) async fn inspect_global_config_schema_future_at_path(
 ///   or global key).
 ///
 /// Boundary conditions:
-/// - Returns `Err` when the database path is not valid UTF-8 (sea-orm needs a
-///   string-typed URL).
+/// - Global configuration opens a literal filename read-only with no creation
+///   or migration. Local repository reads retain their existing upgrade path.
 /// - Returns `Err` when decryption fails — the user sees the raw vault error, not a
 ///   silent fall-back to plaintext.
 async fn read_config_env_value(
     env_name: &str,
     vault_key: &str,
     db_path: &Path,
-    scope: &str,
+    role: DatabaseRole,
 ) -> Result<Option<String>, String> {
-    let db_path_str = db_path.to_str().ok_or_else(|| {
-        format!(
-            "database path is not valid UTF-8 for {scope} config: {}",
-            db_path.display()
-        )
-    })?;
-    let conn = establish_connection_with_busy_timeout(db_path_str, Duration::from_millis(200))
-        .await
-        .map_err(|err| match scope {
-            "global" => format!(
-                "failed to connect to global config '{}': {}",
-                db_path.display(),
-                err
-            ),
-            _ => format!(
-                "failed to connect to local config '{}': {}",
-                db_path.display(),
-                err
-            ),
-        })?;
+    let (conn, scope) = match role {
+        DatabaseRole::GlobalConfig => {
+            let conn = schema::open_readonly_connection_for_role(
+                db_path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to connect to global config '{}': {error}",
+                    db_path.display()
+                )
+            })?;
+            schema::check_configuration_schema(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !schema::configuration_has_kv(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(None);
+            }
+            (conn, "global")
+        }
+        DatabaseRole::Repository => {
+            let path = db_path.to_str().ok_or_else(|| {
+                format!(
+                    "database path is not valid UTF-8 for local config: {}",
+                    db_path.display()
+                )
+            })?;
+            let conn = schema::establish_connection_with_busy_timeout_for_role(
+                path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to connect to local config '{}': {error}",
+                    db_path.display()
+                )
+            })?;
+            (conn, "local")
+        }
+        DatabaseRole::SystemConfig | DatabaseRole::Derived => {
+            return Err(format!(
+                "{role} cannot supply storage credentials; use local or global configuration"
+            ));
+        }
+    };
 
     let entry = ConfigKv::get_with_conn(&conn, vault_key)
         .await
