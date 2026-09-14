@@ -3855,6 +3855,7 @@ dependencies = [
  "dirs",
  "fastrand",
  "flate2",
+ "fs_extra",
  "futures",
  "futures-core",
  "futures-util",
