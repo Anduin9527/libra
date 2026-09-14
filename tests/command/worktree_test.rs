@@ -21,6 +21,27 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn test_worktree_move_cross_device_error_is_portable() {
+    let source = include_str!("../../src/command/worktree.rs");
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains("error.kind()!=io::ErrorKind::CrossesDevices"));
+    assert!(!source.contains("libc::EXDEV"));
+    #[cfg(unix)]
+    let raw_error = libc::EXDEV;
+    #[cfg(windows)]
+    let raw_error = 17; // Windows ERROR_NOT_SAME_DEVICE.
+    #[cfg(any(unix, windows))]
+    assert_eq!(
+        std::io::Error::from_raw_os_error(raw_error).kind(),
+        std::io::ErrorKind::CrossesDevices
+    );
+    assert_ne!(
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied).kind(),
+        std::io::ErrorKind::CrossesDevices
+    );
+}
+
+#[test]
 fn test_worktree_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["worktree", "list"], temp.path());

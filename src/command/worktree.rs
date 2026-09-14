@@ -5253,7 +5253,7 @@ async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMove
     }
 
     let move_result = fs::rename(&src_path, &dest_path).or_else(|error| {
-        if error.raw_os_error() != Some(libc::EXDEV) {
+        if error.kind() != io::ErrorKind::CrossesDevices {
             return Err(error);
         }
 

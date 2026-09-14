@@ -13,6 +13,121 @@ use super::*;
 
 mod git_import;
 
+async fn assert_configuration_role_writer(scope: config::ConfigScope, flag: &str) {
+    use libra::internal::{
+        config::ConfigKv,
+        db::{DatabaseRole, schema::latest_schema_version_for_role},
+    };
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let fixture = ConfigDbFixture::new().expect("isolate configuration paths");
+    let role = scope.database_role();
+    assert_eq!(
+        role,
+        if scope == config::ConfigScope::Global {
+            DatabaseRole::GlobalConfig
+        } else {
+            DatabaseRole::SystemConfig
+        }
+    );
+    let path = scope.get_config_path().expect("scoped path");
+    assert!(fixture.contains(&path));
+    assert!(!path.exists());
+    exec_config(vec!["config", "set", flag, "test.role", "preserved"])
+        .await
+        .expect("create through actual scoped command");
+    scope
+        .ensure_config_exists()
+        .await
+        .expect("idempotent ensure");
+    let conn = config::ScopedConfig::get_connection(scope)
+        .await
+        .expect("cached writer");
+    let tables: Vec<String> = conn.query_all_raw(Statement::from_string(conn.get_database_backend(),
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"))
+        .await.expect("inspect table names").into_iter().map(|row| row.try_get_by_index(0).expect("table name")).collect();
+    assert_eq!(
+        tables,
+        [
+            "config",
+            "config_kv",
+            "configuration_schema_versions",
+            "schema_versions"
+        ]
+    );
+    config::ScopedConfig::set(scope, "test.cached", "yes", false)
+        .await
+        .expect("cached write");
+    let configuration_future = latest_schema_version_for_role(role)
+        .expect("config manifest")
+        .expect("config latest")
+        + 1;
+    let repository_future = latest_schema_version_for_role(DatabaseRole::Repository)
+        .expect("repo manifest")
+        .expect("repo latest")
+        + 1;
+    for (table, future) in [
+        ("configuration_schema_versions", configuration_future),
+        ("schema_versions", repository_future),
+    ] {
+        if table == "schema_versions" {
+            conn.execute_unprepared("CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)")
+                .await.expect("legacy ledger fixture");
+        }
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            format!("INSERT INTO {table} VALUES (?, 'future', 'fixture')"),
+            [future.into()],
+        ))
+        .await
+        .expect("inject future receipt");
+        let before = std::fs::read(&path).expect("snapshot before rejection");
+        let error = config::ScopedConfig::set(scope, "test.role", "must-not-write", false)
+            .await
+            .expect_err("cache hits must revalidate both future fences");
+        assert!(
+            error.contains(if table == "schema_versions" {
+                "unsupported"
+            } else {
+                "newer"
+            }),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("snapshot after rejection"),
+            before
+        );
+        assert_eq!(
+            ConfigKv::get_with_conn(&conn, "test.role")
+                .await
+                .expect("read fixture value")
+                .expect("preserved row")
+                .value,
+            "preserved"
+        );
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            format!("DELETE FROM {table} WHERE version = ?"),
+            [future.into()],
+        ))
+        .await
+        .expect("restore fixture receipt");
+    }
+    conn.close().await.expect("close fixture writer");
+}
+
+#[tokio::test]
+#[serial(env)]
+async fn global_config_create_uses_global_role() {
+    assert_configuration_role_writer(config::ConfigScope::Global, "--global").await;
+}
+
+#[tokio::test]
+#[serial(env)]
+async fn system_config_create_uses_system_role() {
+    assert_configuration_role_writer(config::ConfigScope::System, "--system").await;
+}
+
 /// Guard for temporarily setting an environment variable during a test and restoring it on drop.
 ///
 /// # Safety
@@ -783,7 +898,7 @@ async fn test_config_get_cascaded_global_read_failure_returns_error() {
 
     let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
     let bad_global_db = config_fixture.global_db();
-    std::fs::write(&bad_global_db, "definitely-not-a-sqlite-database").unwrap();
+    std::fs::write(bad_global_db, "definitely-not-a-sqlite-database").unwrap();
 
     let result = exec_config(vec!["config", "get", "user.missing"]).await;
     let err = result.expect_err("broken cascaded scope should not be ignored");
@@ -938,7 +1053,7 @@ async fn test_config_set_read_failure_does_not_silently_skip_existing_state_chec
 
     let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
     let bad_global_db = config_fixture.global_db();
-    std::fs::write(&bad_global_db, "definitely-not-a-sqlite-database").unwrap();
+    std::fs::write(bad_global_db, "definitely-not-a-sqlite-database").unwrap();
 
     let result = exec_config(vec![
         "config",
@@ -1490,7 +1605,7 @@ async fn resolve_user_identity_sources_tolerates_corrupt_global_db() {
     let global_db_path = config_fixture.global_db();
     // A non-SQLite payload: opening this file as a sea-orm SQLite connection
     // (or running the schema-compat check on it) is guaranteed to fail.
-    std::fs::write(&global_db_path, b"this is not a sqlite database").unwrap();
+    std::fs::write(global_db_path, b"this is not a sqlite database").unwrap();
 
     // Ensure env-var fallbacks are empty so we can attribute the result to
     // config-read tolerance, not env shadowing.
