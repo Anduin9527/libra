@@ -70,19 +70,28 @@ database, run DDL, add a receipt, or use a generic repository connection as a
 fallback. Configuration writes and `libra config --global/--system` creation
 must select `GlobalConfig` or `SystemConfig` respectively.
 
-### MIG-03 routing transition
+### MIG-03 routing and MIG-04 compatibility policy
 
 The role-only APIs delivered by MIG-02 retain the manifest rules above.
 Configuration command writers use `schema::{create_configuration_database,
 open_configuration_database,ensure_configuration_schema_is_current}` and
-revalidate cached handles on every acquisition. Until MIG-04 ships the legacy
-reader barrier and its recognition policy together, these configuration-only
-wrappers additionally reject a future Repository ledger, as the previous
-configuration paths did. This transitional fence is composed from the existing
-role classifiers, both before DDL and under the configuration migration write
-lock. It never grants permission to execute Repository DDL or rewrite legacy
-receipts. Validation is on acquisition, not a lifetime guarantee for a handle
-already held by a caller.
+revalidate cached handles on every acquisition. The central
+`inspect_configuration_schema` composes the own-role classifier with bounded
+version/name allowlists for both ledgers. Unknown, duplicate, mismatched and
+unpaired receipts fail closed, including unknown entries below the maximum.
+Known Repository receipts (including 0801) are accepted without granting
+permission to execute Repository DDL or repair legacy state. Validation occurs
+before DDL and again under the migration writer lock.
+
+The manifest separately registers an explicit-mutation-only barrier at
+`i64::MAX`, named `configuration_legacy_reader_barrier`. It is accepted only
+alongside the exact configuration base receipt, never as an automatic
+migration. `db::write_configuration_barrier` is the sole writer: its first SQL
+acquires the shared SQLite writer lock, then rechecks metadata and appends the
+marker to the legacy ledger without deleting existing receipts. Scoped
+set/add/unset/import and section edits share a caller-owned transaction with
+the marker; a failure rolls back both. Repeated writes are idempotent. Cached
+handles are revalidated, with another locked check before each mutation.
 
 Strict global/system cascade and storage-credential readers open through
 `schema::open_readonly_connection_for_role`, then validate through
@@ -98,9 +107,12 @@ The fresh best-effort reader uses the same read-only opener but deliberately
 retains its existing query-based compatibility and failure-isolation policy:
 only proven absence falls through; unreadable or encrypted local state cannot
 be replaced by a global value. The opener itself does not impose strict policy.
-Error context may now identify the configuration role; this routing step does
-not change the remote/cloud `LBR-CONFIG-001` classifier or JSON contract.
-MIG-04 owns that externally documented policy transition.
+Remote/cloud preflight inspects Global and System independently before any
+Global credential bypass. True Config future and unsupported legacy receipts
+retain `LBR-CONFIG-001`; complete Global env/local credentials cannot bypass
+System defaults. JSON retains its existing fields and adds scope/ledger/reason,
+without untrusted receipt names or values. All preflight and cascade reads
+remain physically read-only and never append the barrier.
 
 ## Fixture isolation
 

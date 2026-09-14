@@ -111,12 +111,24 @@ async fn config_db_fixture_creates_sqlite_only_beneath_its_root() {
 
 #[path = "db_migration/branch_convergence.rs"]
 mod branch_convergence;
+#[path = "db_migration/configuration_barrier.rs"]
+mod configuration_barrier;
 #[path = "db_migration/branch_convergence/historical_bootstrap.rs"]
 mod historical_bootstrap;
 #[path = "db_migration/legacy_config.rs"]
 mod legacy_config;
 #[path = "db_migration/role_scope.rs"]
 mod role_scope;
+
+#[tokio::test]
+async fn configuration_barrier_is_idempotent_and_atomic() {
+    configuration_barrier::atomic_barrier().await;
+}
+
+#[test]
+fn configuration_barrier_has_single_writer_callsite() {
+    configuration_barrier::sole_writer();
+}
 
 /// Path helper. Returns `(tempdir, sqlite-url)`. The TempDir is held by the
 /// caller for the lifetime of the test.

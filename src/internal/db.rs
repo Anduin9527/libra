@@ -366,6 +366,61 @@ pub async fn begin_write_transaction<
     Ok(txn)
 }
 
+/// The sole writer of the configuration-owned legacy reader barrier. The
+/// caller owns commit/rollback so its setting mutation and the marker are one
+/// atomic unit. Even callers using a deferred transaction acquire the writer
+/// lock here before inspecting any receipts.
+pub async fn write_configuration_barrier(
+    txn: &sea_orm::DatabaseTransaction,
+    role: DatabaseRole,
+) -> io::Result<()> {
+    let barrier = schema::schema_manifest().configuration_barrier;
+    if !barrier.roles.contains(&role) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot write a configuration compatibility barrier for {role}"),
+        ));
+    }
+    txn.execute_unprepared(ACQUIRE_WRITE_LOCK_SQL)
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "failed to lock {role} before updating configuration: {error}"
+            ))
+        })?;
+    let inspection = schema::inspect_configuration_schema(txn, role).await?;
+    if let Some(issue) = inspection.issue {
+        return Err(io::Error::other(issue.to_string()));
+    }
+    if !inspection.base_receipt_present {
+        return Err(io::Error::other(format!(
+            "{role} is missing its configuration base receipt; reopen it with a compatible Libra binary before writing"
+        )));
+    }
+    if inspection.barrier_present {
+        return Ok(());
+    }
+    txn.execute_unprepared(barrier.legacy_ledger_sql)
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "failed to prepare the {role} compatibility ledger: {error}"
+            ))
+        })?;
+    txn.execute_raw(Statement::from_sql_and_values(
+        txn.get_database_backend(),
+        "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        [barrier.version.into(), barrier.name.into()],
+    ))
+    .await
+    .map_err(|error| {
+        io::Error::other(format!(
+            "failed to protect {role} from older Libra writers: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 /// `ConnectionTrait::transaction` with the write lock taken up front.
 ///
 /// Same shape and same `TransactionError` mapping as sea-orm's own, so a call

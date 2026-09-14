@@ -7,7 +7,7 @@ use std::{io::IsTerminal, path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 use once_cell::sync::Lazy;
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use sea_orm::{DatabaseConnection, DatabaseTransaction};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -15,11 +15,12 @@ use crate::{
     internal::{
         config::{ConfigKv, ConfigKvEntry, is_sensitive_key, is_vault_internal_key},
         db::{
-            DatabaseRole, get_db_conn_instance,
+            DatabaseRole, begin_write_transaction, get_db_conn_instance,
             schema::{
                 create_configuration_database, ensure_configuration_schema_is_current,
                 open_configuration_database,
             },
+            write_configuration_barrier,
         },
         upgrade::settings::{
             UPGRADE_MODE_KEY, UpgradeMode, UpgradeSettingsError, read_mode as read_upgrade_mode,
@@ -214,6 +215,27 @@ impl ScopedConfig {
 
     // ── ConfigKv wrappers with scope ─────────────────────────────────
 
+    async fn begin_mutation(scope: ConfigScope) -> Result<DatabaseTransaction, String> {
+        let conn = Self::get_connection(scope).await?;
+        let txn = begin_write_transaction(&conn).await.map_err(|error| {
+            format!(
+                "failed to start {} config transaction: {error}",
+                scope_name(scope)
+            )
+        })?;
+        if scope != ConfigScope::Local {
+            write_configuration_barrier(&txn, scope.database_role())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to protect {} config before writing: {error}",
+                        scope_name(scope)
+                    )
+                })?;
+        }
+        Ok(txn)
+    }
+
     pub async fn get(scope: ConfigScope, key: &str) -> Result<Option<ConfigKvEntry>, String> {
         let conn = Self::get_connection(scope).await?;
         ConfigKv::get_with_conn(&conn, key)
@@ -234,10 +256,13 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::set_with_conn(&conn, key, value, encrypted)
+        let txn = Self::begin_mutation(scope).await?;
+        ConfigKv::set_with_conn(&txn, key, value, encrypted)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to set config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn add(
@@ -246,24 +271,35 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::add_with_conn(&conn, key, value, encrypted)
+        let txn = Self::begin_mutation(scope).await?;
+        ConfigKv::add_with_conn(&txn, key, value, encrypted)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to add config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn unset(scope: ConfigScope, key: &str) -> Result<usize, String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::unset_with_conn(&conn, key)
+        let txn = Self::begin_mutation(scope).await?;
+        let removed = ConfigKv::unset_with_conn(&txn, key)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(removed)
     }
 
     pub async fn unset_all(scope: ConfigScope, key: &str) -> Result<usize, String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::unset_all_with_conn(&conn, key)
+        let txn = Self::begin_mutation(scope).await?;
+        let removed = ConfigKv::unset_all_with_conn(&txn, key)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(removed)
     }
 
     pub async fn list_all(scope: ConfigScope) -> Result<Vec<ConfigKvEntry>, String> {
@@ -2550,12 +2586,8 @@ async fn handle_remove_section(
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    let conn = ScopedConfig::get_connection(scope)
-        .await
-        .map_err(config_read_cli_error)?;
-    // Begin first so the existence check and the deletes are one atomic unit.
-    let txn = conn
-        .begin()
+    // Lock before reading; the compatibility marker rolls back with deletes.
+    let txn = ScopedConfig::begin_mutation(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
 
@@ -2613,11 +2645,7 @@ async fn handle_rename_section(
         .with_exit_code(2));
     }
 
-    let conn = ScopedConfig::get_connection(scope)
-        .await
-        .map_err(config_read_cli_error)?;
-    let txn = conn
-        .begin()
+    let txn = ScopedConfig::begin_mutation(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
 

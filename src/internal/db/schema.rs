@@ -4,7 +4,13 @@
 //! from a filename. Configuration migration receipts have their own namespace;
 //! legacy repository receipts are retained for the later confirmed repair path.
 
-use std::{fmt, io, path::Path, sync::OnceLock, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt, io,
+    path::Path,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbErr,
@@ -73,6 +79,80 @@ CREATE TABLE IF NOT EXISTS configuration_schema_versions (
     applied_at TEXT NOT NULL
 );
 "#;
+
+const CONFIGURATION_BASE_VERSION: i64 = 2026090601;
+const CONFIGURATION_BASE_NAME: &str = "configuration_base";
+
+/// An explicit-mutation-only compatibility migration, deliberately excluded
+/// from automatic migrations and bootstraps. The legacy namespace must remain
+/// future to every older Repository-only reader.
+pub struct ConfigurationBarrier {
+    pub roles: &'static [DatabaseRole],
+    pub version: i64,
+    pub name: &'static str,
+    pub required_base_version: i64,
+    pub required_base_name: &'static str,
+    pub legacy_ledger_sql: &'static str,
+}
+
+const CONFIGURATION_BARRIER: ConfigurationBarrier = ConfigurationBarrier {
+    roles: CONFIGURATION,
+    version: i64::MAX,
+    name: "configuration_legacy_reader_barrier",
+    required_base_version: CONFIGURATION_BASE_VERSION,
+    required_base_name: CONFIGURATION_BASE_NAME,
+    legacy_ledger_sql: "CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)",
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationSchemaIssueKind {
+    Future,
+    UnregisteredReceipt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationSchemaIssue {
+    pub role: DatabaseRole,
+    pub ledger: SchemaLedger,
+    pub current_version: i64,
+    pub latest_version: Option<i64>,
+    pub kind: ConfigurationSchemaIssueKind,
+}
+
+impl ConfigurationSchemaIssue {
+    pub fn reason(&self) -> &'static str {
+        match self.kind {
+            ConfigurationSchemaIssueKind::Future => {
+                "schema is newer than this Libra binary supports"
+            }
+            ConfigurationSchemaIssueKind::UnregisteredReceipt => {
+                "schema contains an unsupported migration receipt"
+            }
+        }
+    }
+}
+
+impl fmt::Display for ConfigurationSchemaIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} database {} (ledger: {}, version: {}, latest supported: {}); install a compatible newer Libra binary; do not edit migration receipts manually",
+            self.role,
+            self.reason(),
+            self.ledger.table_name(),
+            self.current_version,
+            super::format_schema_version(self.latest_version)
+        )
+    }
+}
+
+pub struct ConfigurationSchemaInspection {
+    pub compatibility: SchemaCompatibility,
+    pub issue: Option<ConfigurationSchemaIssue>,
+    /// Positively established metadata; unsupported inspections may stop early.
+    pub base_receipt_present: bool,
+    pub barrier_present: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct ScopedMigration {
@@ -148,6 +228,7 @@ pub struct SchemaManifest {
     pub migrations: Vec<ScopedMigration>,
     pub bootstraps: &'static [BootstrapDefinition],
     pub top_ups: &'static [TopUpDefinition],
+    pub configuration_barrier: &'static ConfigurationBarrier,
 }
 
 pub fn schema_manifest() -> &'static SchemaManifest {
@@ -169,8 +250,8 @@ fn build_schema_manifest() -> SchemaManifest {
     migrations.push(ScopedMigration {
         roles: CONFIGURATION,
         migration: Migration {
-            version: 2026090601,
-            name: "configuration_base",
+            version: CONFIGURATION_BASE_VERSION,
+            name: CONFIGURATION_BASE_NAME,
             up: LEGACY_CONFIG_SQL,
             down: None,
         },
@@ -179,6 +260,7 @@ fn build_schema_manifest() -> SchemaManifest {
         migrations,
         bootstraps: BOOTSTRAPS,
         top_ups: TOP_UPS,
+        configuration_barrier: &CONFIGURATION_BARRIER,
     }
 }
 
@@ -317,7 +399,7 @@ fn reject_future(role: DatabaseRole, compatibility: &SchemaCompatibility) -> io:
 #[derive(Clone, Copy)]
 enum SchemaPolicy {
     RoleOnly,
-    LegacyConfiguration,
+    Configuration,
 }
 
 fn require_configuration_role(role: DatabaseRole) -> io::Result<()> {
@@ -330,20 +412,175 @@ fn require_configuration_role(role: DatabaseRole) -> io::Result<()> {
     }
 }
 
+fn registered_receipts(ledger: SchemaLedger) -> &'static BTreeMap<i64, &'static str> {
+    static REPOSITORY_RECEIPTS: OnceLock<BTreeMap<i64, &'static str>> = OnceLock::new();
+    static CONFIGURATION_RECEIPTS: OnceLock<BTreeMap<i64, &'static str>> = OnceLock::new();
+    let (cache, role) = match ledger {
+        SchemaLedger::Repository => (&REPOSITORY_RECEIPTS, DatabaseRole::Repository),
+        SchemaLedger::Configuration => (&CONFIGURATION_RECEIPTS, DatabaseRole::GlobalConfig),
+    };
+    cache.get_or_init(|| {
+        migrations_for_role(role)
+            .into_iter()
+            .map(|migration| (migration.version, migration.name))
+            .collect()
+    })
+}
+
+/// Read only bounded metadata. An extra row beyond the manifest plus its one
+/// reserved barrier necessarily contains an unknown or duplicate receipt.
+async fn configuration_receipts<C: ConnectionTrait>(
+    conn: &C,
+    ledger: SchemaLedger,
+) -> io::Result<Vec<(i64, String)>> {
+    let table = ledger.table_name();
+    let exists = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT type FROM sqlite_master WHERE name = ? LIMIT 1",
+            [table.into()],
+        ))
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "failed to inspect configuration ledger {table}: {error}"
+            ))
+        })?;
+    let Some(metadata) = exists else {
+        return Ok(Vec::new());
+    };
+    let kind: String = metadata.try_get_by_index(0).map_err(|_| {
+        io::Error::other(format!("invalid metadata for configuration ledger {table}"))
+    })?;
+    if kind != "table" {
+        return Err(io::Error::other(format!(
+            "configuration ledger {table} is not a table; restore a verified backup"
+        )));
+    }
+    let limit = registered_receipts(ledger).len() + 2;
+    // The identifier and limit come only from the closed manifest. Truncating
+    // names also bounds hostile metadata allocation; no registered name is
+    // this long, so a truncated name can never be accepted accidentally.
+    conn.query_all_raw(Statement::from_string(
+        conn.get_database_backend(),
+        format!(
+            "SELECT version, CASE WHEN typeof(name) = 'text' THEN substr(name, 1, 256) ELSE '' END FROM {table} ORDER BY version DESC LIMIT {limit}"
+        ),
+    ))
+    .await
+    .map_err(|error| {
+        io::Error::other(format!(
+            "failed to read configuration ledger {table}: {error}"
+        ))
+    })?
+    .into_iter()
+    .map(|row| {
+        Ok((
+            row.try_get_by_index(0).map_err(|_| {
+                io::Error::other(format!("invalid version in configuration ledger {table}"))
+            })?,
+            row.try_get_by_index(1).map_err(|_| {
+                io::Error::other(format!(
+                    "invalid receipt name in configuration ledger {table}"
+                ))
+            })?,
+        ))
+    })
+    .collect()
+}
+
+/// Configuration policy composes its own manifest with a strict legacy receipt
+/// allowlist. It never mistakes a known Repository receipt for Config future,
+/// and never treats support as permission to repair legacy metadata.
+pub async fn inspect_configuration_schema<C: ConnectionTrait>(
+    conn: &C,
+    role: DatabaseRole,
+) -> io::Result<ConfigurationSchemaInspection> {
+    require_configuration_role(role)?;
+    let compatibility = inspect_schema_for_connection(conn, role).await?;
+    // Once the own-role maximum proves future, unrelated malformed legacy
+    // metadata must not demote it to an ignorable System I/O error.
+    if let SchemaCompatibility::UnsupportedFuture {
+        current_version,
+        latest_version,
+    } = compatibility
+    {
+        return Ok(ConfigurationSchemaInspection {
+            compatibility: compatibility.clone(),
+            issue: Some(ConfigurationSchemaIssue {
+                role,
+                ledger: SchemaLedger::Configuration,
+                current_version,
+                latest_version,
+                kind: ConfigurationSchemaIssueKind::Future,
+            }),
+            base_receipt_present: false,
+            barrier_present: false,
+        });
+    }
+    let own = configuration_receipts(conn, SchemaLedger::Configuration).await?;
+    let barrier = schema_manifest().configuration_barrier;
+    let base_receipt_present = own.iter().any(|(version, name)| {
+        *version == barrier.required_base_version && name == barrier.required_base_name
+    });
+    let mut issue = None;
+    let mut barrier_present = false;
+    for (ledger, preloaded) in [
+        (SchemaLedger::Configuration, Some(own)),
+        (SchemaLedger::Repository, None),
+    ] {
+        if issue.is_some() {
+            break;
+        }
+        let receipts = match preloaded {
+            Some(receipts) => receipts,
+            None => configuration_receipts(conn, ledger).await?,
+        };
+        let registered = registered_receipts(ledger);
+        let mut seen = BTreeSet::new();
+        for (version, name) in receipts {
+            let is_barrier = ledger == SchemaLedger::Repository
+                && version == barrier.version
+                && name == barrier.name
+                && base_receipt_present;
+            let supported = (is_barrier
+                || registered
+                    .get(&version)
+                    .is_some_and(|expected| *expected == name))
+                && seen.insert(version);
+            if supported && is_barrier {
+                barrier_present = true;
+            }
+            if !supported && issue.is_none() {
+                issue = Some(ConfigurationSchemaIssue {
+                    role,
+                    ledger,
+                    current_version: version,
+                    latest_version: registered.last_key_value().map(|(version, _)| *version),
+                    kind: ConfigurationSchemaIssueKind::UnregisteredReceipt,
+                });
+            }
+        }
+    }
+    Ok(ConfigurationSchemaInspection {
+        compatibility,
+        issue,
+        base_receipt_present,
+        barrier_present,
+    })
+}
+
 async fn inspect_supported_schema<C: ConnectionTrait>(
     conn: &C,
     role: DatabaseRole,
     policy: SchemaPolicy,
 ) -> io::Result<SchemaCompatibility> {
-    if matches!(policy, SchemaPolicy::LegacyConfiguration) {
-        require_configuration_role(role)?;
-        // Preserve the pre-routing legacy fence until the configuration
-        // barrier and its recognition policy land together. This policy does
-        // not change the role-only APIs or authorize Repository DDL.
-        reject_future(
-            DatabaseRole::Repository,
-            &inspect_schema_for_connection(conn, DatabaseRole::Repository).await?,
-        )?;
+    if matches!(policy, SchemaPolicy::Configuration) {
+        let inspection = inspect_configuration_schema(conn, role).await?;
+        if let Some(issue) = inspection.issue {
+            return Err(io::Error::other(issue.to_string()));
+        }
+        return Ok(inspection.compatibility);
     }
     let compatibility = inspect_schema_for_connection(conn, role).await?;
     reject_future(role, &compatibility)?;
@@ -355,7 +592,7 @@ pub(crate) async fn check_configuration_schema<C: ConnectionTrait>(
     conn: &C,
     role: DatabaseRole,
 ) -> io::Result<()> {
-    inspect_supported_schema(conn, role, SchemaPolicy::LegacyConfiguration)
+    inspect_supported_schema(conn, role, SchemaPolicy::Configuration)
         .await
         .map(|_| ())
 }
@@ -395,10 +632,9 @@ pub(crate) async fn ensure_configuration_schema_is_current(
     conn: &DatabaseConnection,
     role: DatabaseRole,
 ) -> io::Result<()> {
-    let compatibility =
-        inspect_supported_schema(conn, role, SchemaPolicy::LegacyConfiguration).await?;
+    let compatibility = inspect_supported_schema(conn, role, SchemaPolicy::Configuration).await?;
     if matches!(compatibility, SchemaCompatibility::UpgradeRequired { .. }) {
-        upgrade_connection_with_policy(conn, role, SchemaPolicy::LegacyConfiguration).await?;
+        upgrade_connection_with_policy(conn, role, SchemaPolicy::Configuration).await?;
     }
     Ok(())
 }

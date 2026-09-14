@@ -1,4 +1,4 @@
-//! Global config schema-newer guards for plan-20260708 P0-12.
+//! Configuration-role compatibility policy and read-only dispatch guards.
 
 use std::{
     fs,
@@ -14,6 +14,450 @@ const ENV_SECRET_VALUE: &str = "ENV_STORAGE_SECRET_SHOULD_NOT_LEAK";
 const INSTALL_COMMAND: &str =
     "curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh";
 
+fn fixture_sql(path: &Path, sql: &str) {
+    tokio::runtime::Runtime::new()
+        .expect("fixture runtime")
+        .block_on(async {
+            let conn = raw_config_fixture(path).await;
+            conn.execute_unprepared(sql).await.expect("fixture SQL");
+            conn.close().await.expect("close fixture writer");
+        });
+}
+
+fn known_repository_receipts(path: &Path) {
+    use libra::internal::db::{DatabaseRole, schema};
+    tokio::runtime::Runtime::new()
+        .expect("fixture runtime")
+        .block_on(async {
+            let conn = raw_config_fixture(path).await;
+            conn.execute_unprepared(
+                schema::schema_manifest()
+                    .configuration_barrier
+                    .legacy_ledger_sql,
+            )
+            .await
+            .unwrap();
+            for migration in schema::migrations_for_role(DatabaseRole::Repository) {
+                conn.execute_raw(Statement::from_sql_and_values(
+                    conn.get_database_backend(),
+                    "INSERT INTO schema_versions VALUES (?, ?, 'fixture')",
+                    [migration.version.into(), migration.name.into()],
+                ))
+                .await
+                .unwrap();
+            }
+            libra::internal::config::ConfigKv::set_with_conn(
+                &conn,
+                "test.receipt",
+                "preserved-value",
+                false,
+            )
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+        });
+}
+
+fn configuration_base_fixture(path: &Path, role: libra::internal::db::DatabaseRole) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let conn = libra::internal::db::create_database_for_role(path.to_str().unwrap(), role)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    });
+}
+
+fn assert_preflight_allowed(fixture: &CliFixture) {
+    let missing = fixture.root.join("absent-source");
+    for args in [
+        vec!["pull"],
+        vec!["push"],
+        vec!["fetch"],
+        vec!["cloud", "status"],
+        vec!["clone", missing.to_str().unwrap(), "absent-destination"],
+    ] {
+        let output = fixture.run(&fixture.repo, &args);
+        let stderr = stderr_text(&output);
+        assert!(!stderr.contains("LBR-CONFIG-001"), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("unsupported migration receipt"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn repository_only_receipt_does_not_block_remote_commands() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    for (path, role) in [
+        (
+            &fixture.global_db,
+            libra::internal::db::DatabaseRole::GlobalConfig,
+        ),
+        (
+            &fixture.system_db,
+            libra::internal::db::DatabaseRole::SystemConfig,
+        ),
+    ] {
+        configuration_base_fixture(path, role);
+        known_repository_receipts(path);
+    }
+    let snapshots = [
+        fs::read(&fixture.global_db).unwrap(),
+        fs::read(&fixture.system_db).unwrap(),
+    ];
+    assert_preflight_allowed(&fixture);
+    assert_eq!(
+        snapshots,
+        [
+            fs::read(&fixture.global_db).unwrap(),
+            fs::read(&fixture.system_db).unwrap()
+        ]
+    );
+}
+
+#[test]
+fn global_and_system_future_schema_fail_closed() {
+    for system in [false, true] {
+        let fixture = CliFixture::new();
+        fixture.init_repo();
+        fixture.write_future_global_config();
+        if system {
+            fs::create_dir_all(fixture.system_db.parent().unwrap()).unwrap();
+            fs::copy(&fixture.global_db, &fixture.system_db).unwrap();
+        }
+        let path = if system {
+            &fixture.system_db
+        } else {
+            &fixture.global_db
+        };
+        let before = fs::read(path).unwrap();
+        for args in [
+            vec!["pull"],
+            vec!["push"],
+            vec!["fetch"],
+            vec!["cloud", "status"],
+            vec!["clone", "https://example.invalid/never-contacted", "copy"],
+        ] {
+            let output = if system {
+                // Global is also future, but its credentials are satisfied.
+                // It must not hide the second, System issue.
+                fixture.run_envs(
+                    &fixture.repo,
+                    &args,
+                    &[
+                        ("LIBRA_STORAGE_TYPE", "local"),
+                        ("LIBRA_D1_ACCOUNT_ID", "fixture-account"),
+                        ("LIBRA_D1_API_TOKEN", ENV_SECRET_VALUE),
+                        ("LIBRA_D1_DATABASE_ID", "fixture-database"),
+                    ],
+                )
+            } else {
+                fixture.run(&fixture.repo, &args)
+            };
+            let stderr = stderr_text(&output);
+            assert!(
+                !output.status.success() && stderr.contains("LBR-CONFIG-001"),
+                "{args:?}: {stderr}"
+            );
+            assert!(!stderr.contains(ENV_SECRET_VALUE));
+            if system {
+                assert!(
+                    stderr.contains("system config database schema is newer"),
+                    "{stderr}"
+                );
+            }
+        }
+        assert_eq!(before, fs::read(path).unwrap());
+        // Even malformed unrelated metadata cannot hide a proven own-role
+        // future behind the System unreadable-store carve-out.
+        fixture_sql(path, "CREATE TABLE schema_versions (unexpected TEXT)");
+        let output = fixture.run_env(
+            &fixture.repo,
+            &["pull"],
+            "LIBRA_STORAGE_TYPE",
+            if system { "local" } else { "r2" },
+        );
+        assert!(stderr_text(&output).contains("LBR-CONFIG-001"));
+    }
+}
+
+#[test]
+fn config_future_diagnostics_are_redacted() {
+    for system in [false, true] {
+        let fixture = CliFixture::new();
+        fixture.init_repo();
+        fixture.write_future_global_config();
+        if system {
+            fs::create_dir_all(fixture.system_db.parent().unwrap()).unwrap();
+            fs::rename(&fixture.global_db, &fixture.system_db).unwrap();
+        }
+        let path = if system {
+            &fixture.system_db
+        } else {
+            &fixture.global_db
+        };
+        fixture_sql(
+            path,
+            "UPDATE configuration_schema_versions SET name = 'SECRET_RECEIPT_NAME';",
+        );
+        for args in [vec!["pull"], vec!["--json", "pull"]] {
+            let output = fixture.run(&fixture.repo, &args);
+            let stderr = stderr_text(&output);
+            assert!(stderr.contains("LBR-CONFIG-001"), "{stderr}");
+            for secret in [SECRET_VALUE, ENV_SECRET_VALUE, "SECRET_RECEIPT_NAME"] {
+                assert!(
+                    !stderr.contains(secret)
+                        && !String::from_utf8_lossy(&output.stdout).contains(secret)
+                );
+            }
+            if args[0] == "--json" {
+                let payload: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+                assert_eq!(
+                    payload["details"]["config_scope"],
+                    if system { "system" } else { "global" }
+                );
+                assert_eq!(
+                    payload["details"]["schema_ledger"],
+                    "configuration_schema_versions"
+                );
+                assert!(
+                    payload["details"]["schema_reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("newer")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn offline_and_local_storage_semantics_are_preserved() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.write_complete_local_storage_config();
+    fixture.write_future_global_config();
+    for output in [
+        fixture.run(&fixture.repo, &["--offline", "pull"]),
+        fixture.run(&fixture.repo, &["pull"]),
+        fixture.run_with_complete_storage_env(&fixture.repo, &["pull"]),
+    ] {
+        assert!(!stderr_text(&output).contains("LBR-CONFIG-001"));
+    }
+    fs::create_dir_all(fixture.system_db.parent().unwrap()).unwrap();
+    fs::copy(&fixture.global_db, &fixture.system_db).unwrap();
+    let offline = fixture.run(&fixture.repo, &["--offline", "pull"]);
+    assert!(!stderr_text(&offline).contains("LBR-CONFIG-001"));
+    let online = fixture.run(&fixture.repo, &["pull"]);
+    assert!(stderr_text(&online).contains("LBR-CONFIG-001"));
+}
+
+#[test]
+fn unregistered_legacy_receipt_fails_closed() {
+    use libra::internal::db::{DatabaseRole, schema};
+    let barrier = schema::schema_manifest().configuration_barrier;
+    for system in [false, true] {
+        for variant in [
+            "lower",
+            "wrong-name",
+            "null-name",
+            "duplicate",
+            "fake-barrier",
+            "unpaired-barrier",
+            "own-lower",
+        ] {
+            let fixture = CliFixture::new();
+            fixture.init_repo();
+            let (path, role) = if system {
+                (&fixture.system_db, DatabaseRole::SystemConfig)
+            } else {
+                (&fixture.global_db, DatabaseRole::GlobalConfig)
+            };
+            configuration_base_fixture(path, role);
+            fixture_sql(
+                path,
+                "CREATE TABLE schema_versions (version INTEGER, name TEXT, applied_at TEXT)",
+            );
+            let known = schema::migrations_for_role(DatabaseRole::Repository)
+                .pop()
+                .unwrap();
+            let sql = match variant {
+                "lower" => format!("INSERT INTO schema_versions VALUES ({}, '{}', 'fixture'), (1, 'SECRET_RECEIPT_NAME', 'fixture')", known.version, known.name),
+                "wrong-name" => format!("INSERT INTO schema_versions VALUES ({}, 'SECRET_RECEIPT_NAME', 'fixture')", known.version),
+                "null-name" => format!("INSERT INTO schema_versions VALUES ({}, NULL, 'fixture')", known.version),
+                "duplicate" => format!("INSERT INTO schema_versions VALUES ({0}, '{1}', 'fixture'), ({0}, '{1}', 'fixture')", known.version, known.name),
+                "fake-barrier" => format!("INSERT INTO schema_versions VALUES ({}, 'SECRET_RECEIPT_NAME', 'fixture')", barrier.version),
+                "unpaired-barrier" => format!("DELETE FROM configuration_schema_versions; INSERT INTO schema_versions VALUES ({}, '{}', 'fixture')", barrier.version, barrier.name),
+                _ => "INSERT INTO configuration_schema_versions VALUES (1, 'SECRET_RECEIPT_NAME', 'fixture')".into(),
+            };
+            fixture_sql(path, &sql);
+            let before = fs::read(path).unwrap();
+            let output = fixture.run(&fixture.repo, &["--json", "pull"]);
+            let stderr = stderr_text(&output);
+            assert!(
+                stderr.contains("LBR-CONFIG-001")
+                    && stderr.contains("unsupported migration receipt"),
+                "{variant}: {stderr}"
+            );
+            assert!(!stderr.contains("SECRET_RECEIPT_NAME"));
+            let rejected = fixture.run(
+                &fixture.repo,
+                &[
+                    "config",
+                    "set",
+                    if system { "--system" } else { "--global" },
+                    "test.no",
+                    "forbidden",
+                ],
+            );
+            assert!(!rejected.status.success());
+            assert_eq!(before, fs::read(path).unwrap(), "{variant}");
+        }
+    }
+}
+
+#[test]
+fn configuration_barrier_does_not_block_same_build() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    for (flag, path, role) in [
+        (
+            "--global",
+            &fixture.global_db,
+            libra::internal::db::DatabaseRole::GlobalConfig,
+        ),
+        (
+            "--system",
+            &fixture.system_db,
+            libra::internal::db::DatabaseRole::SystemConfig,
+        ),
+    ] {
+        configuration_base_fixture(path, role);
+        fixture_sql(
+            path,
+            "CREATE TRIGGER reject_config BEFORE INSERT ON config_kv BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+        );
+        let before = fs::read(path).unwrap();
+        let failed = fixture.run(
+            &fixture.repo,
+            &["config", "set", flag, "test.barrier", "forbidden"],
+        );
+        assert!(!failed.status.success());
+        let stderr = stderr_text(&failed);
+        assert!(
+            stderr.contains("failed to set config 'test.barrier'") && stderr.contains("config_kv"),
+            "{stderr}"
+        );
+        assert_eq!(
+            before,
+            fs::read(path).unwrap(),
+            "failed explicit mutation must roll back the marker too"
+        );
+        fixture_sql(path, "DROP TRIGGER reject_config");
+        let before = fs::read(path).unwrap();
+        let missing = fixture.run(
+            &fixture.repo,
+            &["config", "--remove-section", flag, "absent"],
+        );
+        assert!(!missing.status.success() && stderr_text(&missing).contains("No such section"));
+        assert_eq!(
+            before,
+            fs::read(path).unwrap(),
+            "section validation failure must roll back its marker"
+        );
+        fixture.success(
+            &fixture.repo,
+            &["config", "set", flag, "test.barrier", "first"],
+        );
+        fixture.success(
+            &fixture.repo,
+            &["config", "set", flag, "test.barrier", "second"],
+        );
+        let output = fixture.success(&fixture.repo, &["config", "get", flag, "test.barrier"]);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("second"));
+    }
+    assert_preflight_allowed(&fixture);
+}
+
+#[test]
+fn repository_receipt_keeps_global_config_values_readable() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    known_repository_receipts(&fixture.global_db);
+    let before = fs::read(&fixture.global_db).unwrap();
+    for args in [
+        vec!["config", "get", "test.receipt"],
+        vec!["config", "get", "--global", "test.receipt"],
+    ] {
+        let output = fixture.success(&fixture.repo, &args);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("preserved-value"));
+    }
+    assert_eq!(before, fs::read(&fixture.global_db).unwrap());
+}
+
+#[test]
+fn read_paths_never_write_configuration_barrier() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    for (path, role, flag) in [
+        (
+            &fixture.global_db,
+            libra::internal::db::DatabaseRole::GlobalConfig,
+            "--global",
+        ),
+        (
+            &fixture.system_db,
+            libra::internal::db::DatabaseRole::SystemConfig,
+            "--system",
+        ),
+    ] {
+        configuration_base_fixture(path, role);
+        fixture_sql(
+            path,
+            "INSERT INTO config_kv (key, value, encrypted) VALUES ('test.read', 'read-only', 0)",
+        );
+        let before = fs::read(path).unwrap();
+        fixture.success(&fixture.repo, &["config", "get", flag, "test.read"]);
+        fixture.success(&fixture.repo, &["config", "list", flag]);
+        fixture.success(&fixture.repo, &["config", "get", "test.read"]);
+        fixture.success(&fixture.repo, &["status"]);
+        assert_preflight_allowed(&fixture);
+        assert_eq!(before, fs::read(path).unwrap());
+        let tables = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(configuration_tables(path));
+        assert!(!tables.iter().any(|name| name == "schema_versions"));
+    }
+}
+
+#[test]
+fn config_policy_docs_are_synchronized() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for language in ["", "zh-CN/"] {
+        for command in ["config", "pull", "push", "fetch", "clone", "cloud"] {
+            let path = root.join(format!("docs/commands/{language}{command}.md"));
+            let text = fs::read_to_string(&path).unwrap();
+            for anchor in ["LBR-CONFIG-001", "2026090801", "barrier"] {
+                assert!(text.contains(anchor), "{} missing {anchor}", path.display());
+            }
+        }
+    }
+    for path in ["COMPATIBILITY.md", "docs/error-codes.md"] {
+        let text = fs::read_to_string(root.join(path)).unwrap();
+        assert!(
+            text.contains("LBR-CONFIG-001") && text.contains("configuration_schema_versions"),
+            "{path}"
+        );
+    }
+}
+
 async fn raw_config_fixture(path: &Path) -> sea_orm::DatabaseConnection {
     fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
     if !path.exists() {
@@ -23,6 +467,7 @@ async fn raw_config_fixture(path: &Path) -> sea_orm::DatabaseConnection {
     let mut options = sea_orm::ConnectOptions::new("sqlite://fixture");
     options
         .sqlx_logging(false)
+        .map_sqlx_sqlite_pool_opts(|pool| pool.idle_timeout(None).max_lifetime(None))
         .map_sqlx_sqlite_opts(move |opts| opts.filename(&filename).create_if_missing(false));
     sea_orm::Database::connect(options)
         .await
@@ -194,11 +639,12 @@ async fn config_cascade_uses_explicit_role() {
     .await
     .expect("future config fixture");
     let before = fs::read(fixture.global_db()).expect("future snapshot");
-    assert!(
+    assert_eq!(
         read_cascaded_config_value_strict(none, "test.role")
             .await
-            .is_err(),
-        "true config future must not return a credential/default"
+            .expect("local cascade skips unsupported Global defaults"),
+        Some("system".into()),
+        "true Global future must not return its value; supported System fallback remains available to local commands"
     );
     assert_eq!(
         read_cascaded_config_value_fresh_conn("test.role").await,
@@ -283,7 +729,12 @@ fn config_role_bootstrap_writes_configuration_state_only() {
         let runtime = tokio::runtime::Runtime::new().expect("fixture runtime");
         assert_eq!(
             runtime.block_on(configuration_tables(path)),
-            ["config", "config_kv", "configuration_schema_versions"]
+            [
+                "config",
+                "config_kv",
+                "configuration_schema_versions",
+                "schema_versions"
+            ]
         );
     }
     assert_eq!(
@@ -328,7 +779,7 @@ fn config_role_bootstrap_writes_configuration_state_only() {
         before
     );
 
-    // The existing legacy-future policy remains intact until MIG-04.
+    // A true configuration-owned future still rejects a scoped writer.
     fixture.write_future_global_config();
     let before = fs::read(&fixture.global_db).expect("legacy future snapshot");
     let rejected = fixture.run(
@@ -479,9 +930,11 @@ impl CliFixture {
         let global_db = home.join(".libra").join("config.db");
         let system_db = root.join("system").join("config.db");
         fs::create_dir_all(&home).expect("create isolated home");
-        let latest_schema_version = libra::internal::db::migration::latest_builtin_schema_version()
-            .expect("read latest schema version")
-            .expect("built-in migrations should have a latest schema version");
+        let latest_schema_version = libra::internal::db::schema::latest_schema_version_for_role(
+            libra::internal::db::DatabaseRole::GlobalConfig,
+        )
+        .expect("read latest schema version")
+        .expect("built-in migrations should have a latest schema version");
         Self {
             _temp: temp,
             root,
@@ -603,20 +1056,20 @@ impl CliFixture {
         let db_path = self.global_db.to_str().expect("utf8 global db");
         let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
         runtime.block_on(async {
-            let conn = libra::internal::db::create_database(db_path)
+            let conn = libra::internal::db::create_database_for_role(db_path, libra::internal::db::DatabaseRole::GlobalConfig)
                 .await
                 .expect("create global config db");
             let backend = conn.get_database_backend();
             conn.execute_raw(Statement::from_sql_and_values(
                 backend,
-                "DELETE FROM schema_versions",
+                "DELETE FROM configuration_schema_versions",
                 [],
             ))
             .await
             .expect("clear schema versions");
             conn.execute_raw(Statement::from_sql_and_values(
                 backend,
-                "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+                "INSERT INTO configuration_schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
                 [
                     self.future_schema_version.into(),
                     "future_schema_for_test".into(),

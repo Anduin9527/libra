@@ -48,7 +48,12 @@ async fn assert_configuration_role_writer(scope: config::ConfigScope, flag: &str
         .await.expect("inspect table names").into_iter().map(|row| row.try_get_by_index(0).expect("table name")).collect();
     assert_eq!(
         tables,
-        ["config", "config_kv", "configuration_schema_versions"]
+        [
+            "config",
+            "config_kv",
+            "configuration_schema_versions",
+            "schema_versions"
+        ]
     );
     config::ScopedConfig::set(scope, "test.cached", "yes", false)
         .await
@@ -66,7 +71,7 @@ async fn assert_configuration_role_writer(scope: config::ConfigScope, flag: &str
         ("schema_versions", repository_future),
     ] {
         if table == "schema_versions" {
-            conn.execute_unprepared("CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)")
+            conn.execute_unprepared("CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)")
                 .await.expect("legacy ledger fixture");
         }
         conn.execute_raw(Statement::from_sql_and_values(
@@ -80,7 +85,14 @@ async fn assert_configuration_role_writer(scope: config::ConfigScope, flag: &str
         let error = config::ScopedConfig::set(scope, "test.role", "must-not-write", false)
             .await
             .expect_err("cache hits must revalidate both future fences");
-        assert!(error.contains("newer"), "{error}");
+        assert!(
+            error.contains(if table == "schema_versions" {
+                "unsupported"
+            } else {
+                "newer"
+            }),
+            "{error}"
+        );
         assert_eq!(
             std::fs::read(&path).expect("snapshot after rejection"),
             before

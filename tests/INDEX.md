@@ -389,6 +389,10 @@ workdir on exit.
 
 ## Wave 1F — Feature-gated deterministic (compile-time feature, no secrets)
 
+The ignored Linux old-reader oracle additionally requires the attested v0.22.16
+binary path in `LIBRA_TEST_OLD_BINARY`, its pinned digest in
+`LIBRA_TEST_OLD_BINARY_SHA256`, and `LIBRA_ENABLE_OLD_READER_ORACLE=1`.
+
 Deterministic L1 targets excluded from a bare `cargo test --all` only because
 they require a compile-time feature (not a runtime secret). CI runs them in
 dedicated feature-on steps.
@@ -396,6 +400,7 @@ dedicated feature-on steps.
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `upgrade_auto_test` | 1 | plan-20260714 §A.11 auto-upgrade end-to-end: signature+decision chain, anti-rollback/revocation replay, real-binary `__upgrade-probe` self-check, install/rollback transaction (`--features test-upgrade`) | `src/internal/upgrade/`, `src/command/upgrade.rs` |
+| `old_reader_oracle_test` | 1 | Opt-in hash-pinned Linux v0.22.16 refuses Global/System compatibility barriers before writes; same-build read/write succeeds (`--features test-upgrade`, ignored) | `src/internal/db.rs`, `src/internal/db/schema.rs`, `src/command/config.rs` |
 | `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations; plan-20260821 A1-06 Backend B1-02 transition contract vectors (cross-implementation verify, anti-vv placeholder) (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs`, `tests/data/up01-transition-vectors-v1.json` |
 | `install_smoke_test` | 2 | plan-20260821 A1-05 installer verification smoke: twenty-four `install.sh` scenarios (signed install, tampered signature/payload, sha/size mismatch, expired/paused/revoked, stale-replay floor, zero-size, min_key_generation + bounded-numeric grammar, key validity window, non-canonical/trailing-artifact serialization, calendar-invalid dates, pretty-printed envelope acceptance, oversized-response cutoff, multi-line payload smuggling, oversized SemVer components, manifest-404 and verifier-unavailable transitions ± `LIBRA_ALLOW_FALLBACK`) plus twenty-two `install.ps1` scenarios when `pwsh` exists; needs bash+python3+openssl, otherwise prints skipped | `install.sh`, `install.ps1`, `tests/data/install-smoke/` |
 
