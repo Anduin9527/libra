@@ -783,7 +783,7 @@ async fn test_config_get_cascaded_global_read_failure_returns_error() {
 
     let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
     let bad_global_db = config_fixture.global_db();
-    std::fs::write(&bad_global_db, "definitely-not-a-sqlite-database").unwrap();
+    std::fs::write(bad_global_db, "definitely-not-a-sqlite-database").unwrap();
 
     let result = exec_config(vec!["config", "get", "user.missing"]).await;
     let err = result.expect_err("broken cascaded scope should not be ignored");
@@ -938,7 +938,7 @@ async fn test_config_set_read_failure_does_not_silently_skip_existing_state_chec
 
     let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
     let bad_global_db = config_fixture.global_db();
-    std::fs::write(&bad_global_db, "definitely-not-a-sqlite-database").unwrap();
+    std::fs::write(bad_global_db, "definitely-not-a-sqlite-database").unwrap();
 
     let result = exec_config(vec![
         "config",
@@ -1490,7 +1490,7 @@ async fn resolve_user_identity_sources_tolerates_corrupt_global_db() {
     let global_db_path = config_fixture.global_db();
     // A non-SQLite payload: opening this file as a sea-orm SQLite connection
     // (or running the schema-compat check on it) is guaranteed to fail.
-    std::fs::write(&global_db_path, b"this is not a sqlite database").unwrap();
+    std::fs::write(global_db_path, b"this is not a sqlite database").unwrap();
 
     // Ensure env-var fallbacks are empty so we can attribute the result to
     // config-read tolerance, not env shadowing.
