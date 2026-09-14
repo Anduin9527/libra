@@ -2968,7 +2968,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn locate_env_reports_the_hit_layer_and_resolver_delegates() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::{ConfigDbFixture, ScopedEnvVar};
 
         let name = "LIBRA_PS06_LOCATE_TEST_KEY";
         let _process_probe = ScopedEnvVar::set(name, "layer-probe");
@@ -2987,8 +2987,8 @@ mod tests {
         let _missing_probe = ScopedEnvVar::unset(name);
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = tmp.path().join("isolated-global.db");
-        let _global_db = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &db);
+        let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        let db = config_fixture.global_db().to_path_buf();
         let missing = locate_env_for_target(name, LocalIdentityTarget::None)
             .await
             .expect("miss path");
@@ -3051,15 +3051,12 @@ mod tests {
     #[test]
     #[serial_test::serial(env)]
     fn resolve_env_sync_for_dir_reads_the_target_repos_vault() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::{ConfigDbFixture, ScopedEnvVar};
 
         let name = "LIBRA_PS06_AB_FACTORY_KEY";
         let _probe = ScopedEnvVar::unset(name);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _global_db = ScopedEnvVar::set(
-            "LIBRA_CONFIG_GLOBAL_DB",
-            tmp.path().join("isolated-global.db"),
-        );
+        let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         for (repo, value) in [("a", "from-repo-a"), ("b", "from-repo-b")] {
             let storage = tmp.path().join(repo).join(".libra");
@@ -3275,21 +3272,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn strict_subsection_snapshot_cascades_each_case_sensitive_name() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::ConfigDbFixture;
 
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let local_db = temp.path().join("local.db");
-        let global_db = temp.path().join("global.db");
-        let system_db = temp.path().join("system.db");
+        let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        let local_db = config_fixture.root().join("local.db");
+        let global_db = config_fixture.global_db().to_path_buf();
+        let system_db = config_fixture.system_db().to_path_buf();
         write_config_db(&local_db, "Merge.Shared.Driver", "local-shared", false).await;
         append_plain_config(&local_db, "merge.Local.driver", "local-only").await;
         write_config_db(&global_db, "merge.Shared.driver", "global-shadowed", false).await;
         append_plain_config(&global_db, "MERGE.Global.DRIVER", "global-only").await;
         append_plain_config(&global_db, "merge.local.driver", "lowercase-subsection").await;
         write_config_db(&system_db, "merge.System.driver", "system-only", false).await;
-        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global_db);
-        let _system = ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &system_db);
-
         let values = read_cascaded_subsection_values_strict(
             LocalIdentityTarget::ExplicitDb(&local_db),
             "merge",
@@ -3313,12 +3307,12 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn strict_prefix_key_snapshot_includes_all_scopes_and_legacy_rows() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::ConfigDbFixture;
 
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let local_db = temp.path().join("local.db");
-        let global_db = temp.path().join("global.db");
-        let system_db = temp.path().join("system.db");
+        let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        let local_db = config_fixture.root().join("local.db");
+        let global_db = config_fixture.global_db().to_path_buf();
+        let system_db = config_fixture.system_db().to_path_buf();
         write_config_db(&local_db, "MERGETOOL.local.cmd", "local-tool", false).await;
         write_config_db(
             &global_db,
@@ -3343,9 +3337,6 @@ mod tests {
             .expect("insert legacy mergetool key");
             conn.close().await.expect("close system db");
         }
-        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global_db);
-        let _system = ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &system_db);
-
         let keys = read_cascaded_config_keys_by_prefix_strict(
             LocalIdentityTarget::ExplicitDb(&local_db),
             "mergetool.",

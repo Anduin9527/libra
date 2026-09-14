@@ -20,6 +20,7 @@ struct CliFixture {
     home: PathBuf,
     repo: PathBuf,
     global_db: PathBuf,
+    system_db: PathBuf,
     future_schema_version: i64,
     latest_schema_version: i64,
 }
@@ -31,6 +32,7 @@ impl CliFixture {
         let home = root.join("home");
         let repo = root.join("repo");
         let global_db = home.join(".libra").join("config.db");
+        let system_db = root.join("system").join("config.db");
         fs::create_dir_all(&home).expect("create isolated home");
         let latest_schema_version = libra::internal::db::migration::latest_builtin_schema_version()
             .expect("read latest schema version")
@@ -41,6 +43,7 @@ impl CliFixture {
             home,
             repo,
             global_db,
+            system_db,
             future_schema_version: latest_schema_version + 1,
             latest_schema_version,
         }
@@ -51,6 +54,8 @@ impl CliFixture {
         fs::create_dir_all(&config_home).expect("create isolated config dir");
         fs::create_dir_all(self.global_db.parent().expect("global db parent"))
             .expect("create global config dir");
+        fs::create_dir_all(self.system_db.parent().expect("system db parent"))
+            .expect("create system config dir");
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
         command
@@ -62,6 +67,7 @@ impl CliFixture {
             .env("USERPROFILE", &self.home)
             .env("XDG_CONFIG_HOME", &config_home)
             .env("LIBRA_CONFIG_GLOBAL_DB", &self.global_db)
+            .env("LIBRA_CONFIG_SYSTEM_DB", &self.system_db)
             .env("LIBRA_TEST", "1")
             .env("LANG", "C")
             .env("LC_ALL", "C");
