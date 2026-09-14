@@ -1,4 +1,9 @@
 test_fn	lane	reason
+configuration_ledger_has_independent_version_namespace	lane:env	uses the shared config database fixture to isolate process configuration paths
+global_and_system_bootstrap_create_no_repository_shape	lane:env	uses the shared config database fixture to isolate process configuration paths
+repository_only_upgrade_preserves_config_receipt_and_values	lane:env	uses isolated global/system paths to prove repository upgrades preserve ambient configuration
+role_schema_up_fault_rolls_back_ledger	lane:env	injects schema failures only in databases owned by the shared config fixture
+role_scoped_schema_writer_keeps_ledgers_disjoint	lane:env	uses the shared config database fixture for the absent/old/current/future role matrix
 <site:tests/code_ui_remote_approval_matrix.rs:macro:approval_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 <site:tests/code_ui_remote_generation_matrix.rs:macro:generation_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 <site:tests/code_ui_remote_lease_matrix.rs:macro:lease_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed

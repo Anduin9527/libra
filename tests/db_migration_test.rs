@@ -115,6 +115,8 @@ mod branch_convergence;
 mod historical_bootstrap;
 #[path = "db_migration/legacy_config.rs"]
 mod legacy_config;
+#[path = "db_migration/role_scope.rs"]
+mod role_scope;
 
 /// Path helper. Returns `(tempdir, sqlite-url)`. The TempDir is held by the
 /// caller for the lifetime of the test.
