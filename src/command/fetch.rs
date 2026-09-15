@@ -12,6 +12,7 @@ use std::{
 };
 
 use clap::Parser;
+use futures_util::FutureExt;
 use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash, get_hash_kind},
@@ -22,7 +23,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionError,
 };
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -34,8 +35,9 @@ use crate::{
         },
     },
     git_protocol::{
-        PKT_LINE_PROTOCOL_ERROR_PREFIX,
+        PKT_LINE_PROTOCOL_ERROR_PREFIX, PktLineError,
         ServiceType::{self, UploadPack},
+        pkt_frame_payload_len,
     },
     internal::{
         branch::Branch,
@@ -2344,6 +2346,7 @@ async fn read_fetch_stream(
     let mut reader = StreamReader::new(result_stream);
     let mut data_out = FetchStreamData::default();
     let mut pack_completion = PackCompletionTracker::default();
+    let mut ready_tail_bytes = None;
     let mut reach_pack = false;
     let mut saw_shallow_response = false;
     let render_progress = matches!(output.progress, ProgressMode::Text);
@@ -2354,6 +2357,17 @@ async fn read_fetch_stream(
     let time = Instant::now();
 
     loop {
+        if pack_completion.complete && ready_tail_bytes.is_none() {
+            // A completed pack must not wait for an idle transport. Validate the
+            // buffered (or first immediately available) chunk, finishing any
+            // frame begun there, without draining an unbounded stream of trailers.
+            // At this boundary EOF, Pending and transport errors retain the old
+            // complete-pack success behavior; errors within a frame still fail.
+            match reader.fill_buf().now_or_never() {
+                Some(Ok(bytes)) if !bytes.is_empty() => ready_tail_bytes = Some(bytes.len()),
+                _ => break,
+            }
+        }
         let (len, data) = match read_pkt_line(&mut reader).await {
             Ok(packet) => packet,
             Err(source) if source.kind() == io::ErrorKind::UnexpectedEof && reach_pack => break,
@@ -2365,6 +2379,15 @@ async fn read_fetch_stream(
                 continue;
             }
             break;
+        }
+        if let Some(remaining) = &mut ready_tail_bytes {
+            *remaining = remaining.saturating_sub(len);
+            if *remaining == 0 {
+                break;
+            }
+            // Trailers were previously ignored after a complete pack. Validate
+            // their framing without appending unchecked bytes to that pack.
+            continue;
         }
         if !reach_pack {
             if let Some(oid) = parse_shallow_packet(&data, b"shallow ") {
@@ -2383,9 +2406,7 @@ async fn read_fetch_stream(
                 if let Some(progress) = &progress {
                     progress.tick(data_out.pack_data.len() as u64);
                 }
-                if pack_completion.observe(&data_out.pack_data) {
-                    break;
-                }
+                let _ = pack_completion.observe(&data_out.pack_data);
                 continue;
             }
         }
@@ -2409,9 +2430,7 @@ async fn read_fetch_stream(
                         if let Some(progress) = &progress {
                             progress.tick(data_out.pack_data.len() as u64);
                         }
-                        if pack_completion.observe(&data_out.pack_data) {
-                            break;
-                        }
+                        let _ = pack_completion.observe(&data_out.pack_data);
                     }
                     2 => handle_remote_progress(
                         payload,
@@ -3657,33 +3676,42 @@ async fn current_have_safe() -> Result<Vec<String>, FetchError> {
 /// Read 4 bytes hex number
 async fn read_hex_4(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<u32> {
     let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf).await?;
+    // Only EOF before the first byte is a normal frame boundary.
+    reader.read_exact(&mut buf[..1]).await?;
+    reader.read_exact(&mut buf[1..]).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::InvalidData, PktLineError::TruncatedHeader)
+        } else {
+            error
+        }
+    })?;
     let hex_str = std::str::from_utf8(&buf).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "invalid packet line header '{}'",
-                String::from_utf8_lossy(&buf)
-            ),
+            PktLineError::InvalidHeaderEncoding,
         )
     })?;
-    u32::from_str_radix(hex_str, 16).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid packet line header '{hex_str}'"),
-        )
-    })
+    u32::from_str_radix(hex_str, 16)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, PktLineError::InvalidHexHeader))
 }
 
 /// async version of `read_pkt_line`
 /// - return (raw length, data)
 async fn read_pkt_line(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<(usize, Vec<u8>)> {
     let len = read_hex_4(reader).await?;
+    let payload_len = pkt_frame_payload_len(len)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if len == 0 {
         return Ok((0, Vec::new()));
     }
-    let mut data = vec![0u8; (len - 4) as usize];
-    reader.read_exact(&mut data).await?;
+    let mut data = vec![0u8; payload_len];
+    reader.read_exact(&mut data).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::InvalidData, PktLineError::TruncatedPayload)
+        } else {
+            error
+        }
+    })?;
     Ok((len as usize, data))
 }
 
@@ -4269,6 +4297,364 @@ mod tests {
         pack
     }
 
+    fn assert_async_pkt_protocol_error(source: std::io::Error) {
+        use crate::{
+            git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            source
+                .to_string()
+                .starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX)
+        );
+        let error = CliError::from(FetchError::PacketRead { source });
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+        assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+        assert!(
+            error.hints().is_empty(),
+            "pkt-line errors have no additional CLI hint"
+        );
+        for text in [
+            error.to_string(),
+            error.render_for_stderr(),
+            error.render_json(),
+        ] {
+            assert!(!text.contains("SECRET"));
+            assert!(!text.contains("SECR"));
+            assert!(!text.contains('�'));
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_rejects_len_below_four() {
+        use crate::git_protocol::PktFrameError;
+
+        for frame in [b"0001".as_slice(), b"0002", b"0003"] {
+            let source = super::read_pkt_line(&mut &frame[..]).await.unwrap_err();
+            assert_eq!(
+                source
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<PktFrameError>()),
+                Some(&PktFrameError::LengthBelowHeader),
+            );
+            assert_async_pkt_protocol_error(source);
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_flush_regression() {
+        let mut input = b"00000004".as_slice();
+        assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (0, vec![]));
+        assert_eq!(input, b"0004");
+        assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (4, vec![]));
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_len4_regression() {
+        let mut input = b"00040005x".as_slice();
+        assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (4, vec![]));
+        assert_eq!(input, b"0005x");
+        assert_eq!(
+            super::read_pkt_line(&mut input).await.unwrap(),
+            (5, b"x".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_upper_bound_regression() {
+        let payload = vec![0xa5; 65_531];
+        let mut frame = b"ffff".to_vec();
+        frame.extend_from_slice(&payload);
+        let mut input = frame.as_slice();
+        assert_eq!(
+            super::read_pkt_line(&mut input).await.unwrap(),
+            (65_535, payload)
+        );
+        assert!(input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_helper_single_source() {
+        use crate::git_protocol::{PktFrameError, pkt_frame_payload_len};
+
+        // Compare the reader's wire contract with the shared public validator,
+        // including empty frames and the allocation bounds on either side.
+        for len in [0, 1, 2, 3, 4, 5, 16, 255, 65_535] {
+            let expected = pkt_frame_payload_len(len);
+            let mut frame = format!("{len:04x}").into_bytes();
+            if let Ok(payload_len) = expected {
+                frame.extend(vec![0x61; payload_len]);
+            }
+            let actual = super::read_pkt_line(&mut frame.as_slice()).await;
+            match expected {
+                Ok(payload_len) => {
+                    let (raw_len, data) = actual.unwrap();
+                    assert_eq!(raw_len, len as usize);
+                    assert_eq!(data, vec![0x61; payload_len]);
+                }
+                Err(expected) => {
+                    let source = actual.unwrap_err();
+                    assert_eq!(
+                        source
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<PktFrameError>()),
+                        Some(&expected),
+                    );
+                    assert_async_pkt_protocol_error(source);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_reach_pack_truncated_eof() {
+        use std::{
+            io,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+
+        use crate::git_protocol::PktLineError;
+
+        let output = OutputConfig::default();
+        let pack = empty_pack_bytes();
+        let malformed = [
+            (b"S".as_slice(), PktLineError::TruncatedHeader),
+            (b"SE".as_slice(), PktLineError::TruncatedHeader),
+            (b"SEC".as_slice(), PktLineError::TruncatedHeader),
+            (b"0040SECRET\xff".as_slice(), PktLineError::TruncatedPayload),
+            (b"SECR".as_slice(), PktLineError::InvalidHexHeader),
+            (
+                b"\xff\xff\xff\xff".as_slice(),
+                PktLineError::InvalidHeaderEncoding,
+            ),
+        ];
+        for sideband in [false, true] {
+            let mut response = BytesMut::new();
+            let mut payload = if sideband { vec![1] } else { vec![] };
+            payload.extend_from_slice(&pack);
+            append_pkt_line(&mut response, &payload);
+            for (tail, expected) in malformed {
+                for split_chunks in 0..3 {
+                    let chunks = if split_chunks == 2 {
+                        std::iter::once(response.clone().freeze())
+                            .chain(tail.iter().map(|byte| Bytes::copy_from_slice(&[*byte])))
+                            .collect()
+                    } else if split_chunks == 1 {
+                        vec![response.clone().freeze(), Bytes::copy_from_slice(tail)]
+                    } else {
+                        let mut combined = response.clone();
+                        // Also exercise multiple valid trailers before truncation.
+                        append_pkt_line(&mut combined, b"\x02progress\n");
+                        append_pkt_line(&mut combined, b"\x01ignored trailer");
+                        combined.extend_from_slice(tail);
+                        vec![combined.freeze()]
+                    };
+                    let mut stream: FetchStream = stream::iter(chunks.into_iter().map(Ok)).boxed();
+                    let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+                        .await
+                        .err()
+                        .expect("an observed truncated frame must fail after a complete pack");
+                    let FetchError::PacketRead { source } = error else {
+                        panic!("expected packet read failure")
+                    };
+                    assert_eq!(
+                        source
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<PktLineError>()),
+                        Some(&expected)
+                    );
+                    assert_async_pkt_protocol_error(source);
+                }
+            }
+
+            // A reached pack with a missing checksum must not turn a partial
+            // pkt-line into either boundary EOF or the later IncompletePack error.
+            let mut incomplete_payload = if sideband { vec![1] } else { vec![] };
+            incomplete_payload.extend_from_slice(&pack[..pack.len() - 5]);
+            for (tail, expected) in malformed {
+                let mut incomplete_response = BytesMut::new();
+                append_pkt_line(&mut incomplete_response, &incomplete_payload);
+                incomplete_response.extend_from_slice(tail);
+                let mut stream: FetchStream =
+                    stream::iter([Ok(incomplete_response.freeze())]).boxed();
+                let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+                    .await
+                    .err()
+                    .expect("truncated framing must take precedence over incomplete pack");
+                let FetchError::PacketRead { source } = error else {
+                    panic!("expected packet read failure")
+                };
+                assert_eq!(
+                    source
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<PktLineError>()),
+                    Some(&expected)
+                );
+                assert_async_pkt_protocol_error(source);
+            }
+
+            // A valid frame begun in the observed chunk may finish in later
+            // chunks. Cover both split headers and split payloads, then an idle
+            // connection: completion must preserve the original checked pack.
+            let frame = Bytes::from_static(b"000b\x02hello\n");
+            for split in [1, 2, 3, 4, 6, frame.len() - 1] {
+                let mut remainder = BytesMut::from(&frame[split..]);
+                // A later chunk can contain bytes beyond the completed frame.
+                // They lie outside the observed chunk and its final frame.
+                remainder.extend_from_slice(b"SECR");
+                let mut stream: FetchStream = stream::iter([
+                    Ok(response.clone().freeze()),
+                    Ok(frame.slice(..split)),
+                    Ok(remainder.freeze()),
+                ])
+                .chain(stream::pending())
+                .boxed();
+                let data = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    read_fetch_stream(&mut stream, &output, "fetch origin"),
+                )
+                .await
+                .expect("finish a fragmented valid trailer without waiting for EOF")
+                .unwrap();
+                assert_eq!(data.pack_data, pack);
+            }
+
+            let mut valid_tail = BytesMut::new();
+            append_pkt_line(&mut valid_tail, b"\x02progress\n");
+            append_pkt_line(&mut valid_tail, b"\x01ignored trailer");
+            append_pkt_line(&mut valid_tail, b"");
+            let mut stream: FetchStream =
+                stream::iter([Ok(response.clone().freeze()), Ok(valid_tail.freeze())])
+                    .chain(stream::pending())
+                    .boxed();
+            let data = tokio::time::timeout(
+                Duration::from_millis(250),
+                read_fetch_stream(&mut stream, &output, "fetch origin"),
+            )
+            .await
+            .expect("valid ready trailers must not wait for EOF")
+            .unwrap();
+            assert_eq!(
+                data.pack_data, pack,
+                "trailers must not corrupt the completed pack"
+            );
+
+            let mut flushed = response.clone();
+            flushed.extend_from_slice(b"0000SECR");
+            let mut stream: FetchStream = stream::iter([Ok(flushed.freeze())])
+                .chain(stream::pending())
+                .boxed();
+            let data = tokio::time::timeout(
+                Duration::from_millis(250),
+                read_fetch_stream(&mut stream, &output, "fetch origin"),
+            )
+            .await
+            .expect("flush must finish without reading subsequent bytes")
+            .unwrap();
+            assert_eq!(data.pack_data, pack);
+
+            // A peer can keep producing ready valid packets forever. Validate the
+            // observed chunk only, rather than delaying completion indefinitely.
+            let polls = Arc::new(AtomicUsize::new(0));
+            let tail_polls = polls.clone();
+            let tail = stream::repeat_with(move || {
+                let polled = tail_polls.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    polled < 3,
+                    "completed fetch must not drain an unbounded tail"
+                );
+                Ok(Bytes::from_static(b"0004"))
+            });
+            let mut stream: FetchStream = stream::iter([Ok(response.clone().freeze())])
+                .chain(tail)
+                .boxed();
+            let data = read_fetch_stream(&mut stream, &output, "fetch origin")
+                .await
+                .unwrap();
+            assert_eq!(data.pack_data, pack);
+            assert_eq!(polls.load(Ordering::Relaxed), 1);
+
+            let mut stream: FetchStream = stream::iter([
+                Ok(response.clone().freeze()),
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "transport reset",
+                )),
+            ])
+            .boxed();
+            let data = read_fetch_stream(&mut stream, &output, "fetch origin")
+                .await
+                .unwrap();
+            assert_eq!(
+                data.pack_data, pack,
+                "preserve a reset after a complete pack at a frame boundary"
+            );
+
+            for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::TimedOut] {
+                let mut stream: FetchStream = stream::iter([
+                    Ok(response.clone().freeze()),
+                    Ok(Bytes::from_static(b"0")),
+                    Err(io::Error::new(kind, "transport failure")),
+                ])
+                .boxed();
+                let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(
+                    matches!(&error, FetchError::PacketRead { source } if source.kind() == kind)
+                );
+                if kind == io::ErrorKind::TimedOut {
+                    let cli = crate::utils::error::CliError::from(error);
+                    assert_eq!(
+                        cli.stable_code(),
+                        crate::utils::error::StableErrorCode::NetworkUnavailable
+                    );
+                    assert_eq!(
+                        cli.hints()
+                            .iter()
+                            .map(|hint| hint.as_str())
+                            .collect::<Vec<_>>(),
+                        ["check network connectivity and retry"]
+                    );
+                }
+            }
+        }
+
+        // Partial reads before any pack have the same typed carrier. A clean
+        // boundary EOF remains distinguishable from either truncation reason.
+        for (frame, expected) in malformed {
+            let source = super::read_pkt_line(&mut &frame[..]).await.unwrap_err();
+            assert_eq!(
+                source
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<PktLineError>()),
+                Some(&expected)
+            );
+            assert_async_pkt_protocol_error(source);
+        }
+        let source = super::read_pkt_line(&mut b"".as_slice()).await.unwrap_err();
+        assert_eq!(source.kind(), io::ErrorKind::UnexpectedEof);
+        for partial in [b"".as_slice(), b"0", b"0008a"] {
+            let mut source = stream::iter([
+                Ok(Bytes::copy_from_slice(partial)),
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "transport reset",
+                )),
+            ]);
+            let mut reader = tokio_util::io::StreamReader::new(&mut source);
+            let error = super::read_pkt_line(&mut reader).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        }
+    }
+
     #[tokio::test]
     async fn read_fetch_stream_accepts_eof_after_complete_pack_without_flush() {
         let pack = empty_pack_bytes();
@@ -4308,14 +4694,24 @@ mod tests {
             stream::iter(vec![Ok::<Bytes, std::io::Error>(response.freeze())]).boxed();
         let output = OutputConfig::default();
 
-        let result = read_fetch_stream(&mut stream, &output, "fetch origin").await;
-        let is_incomplete = matches!(&result, Err(super::FetchError::IncompletePack { .. }));
+        let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+            .await
+            .err()
+            .expect("an incomplete pack must fail at a clean frame boundary");
         assert!(
-            is_incomplete,
-            "a truncated pack must surface as IncompletePack, got: {}",
-            result
-                .err()
-                .map_or_else(|| "Ok(..)".to_string(), |e| e.to_string())
+            matches!(&error, FetchError::IncompletePack { received } if *received == pack.len())
+        );
+        let cli = crate::utils::error::CliError::from(error);
+        assert_eq!(
+            cli.stable_code(),
+            crate::utils::error::StableErrorCode::NetworkProtocol
+        );
+        assert_eq!(
+            cli.hints()
+                .iter()
+                .map(|hint| hint.as_str())
+                .collect::<Vec<_>>(),
+            ["the connection dropped mid-transfer — retry the fetch"]
         );
     }
 

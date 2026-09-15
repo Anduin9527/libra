@@ -297,6 +297,23 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 | 无法写入 pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
 | 本地状态损坏 | `LBR-REPO-002` | 128 | "inspect repository state and object integrity" |
 
+## Fetch 期间的封包截断
+
+收到的 pkt-line 标头或 payload 在帧中途遇到 EOF 截断时，fetch 返回 `LBR-NET-002`。
+截断错误只包含固定原因，不回显远端字节。长度一至三在分配 payload 前被拒绝；
+flush（`0000`）、空数据帧（`0004`）及最大长度帧（`ffff`）仍然有效。
+标头解码错误也只包含固定原因，不回显收到的字节。
+
+如果 pack 尚未完整而传输在封包中途结束，错误报告封包截断，不含已接收
+字节数或额外 CLI 提示。如果传输在封包边界结束而 pack 仍不完整，错误仍报告
+字节数，并附带 "the connection dropped mid-transfer — retry the fetch" 提示。
+
+完整且校验通过的 pack 仍可在没有 flush、连接尚未关闭时完成。Fetch 也会检查
+完成时已可读取的尾部封包字节；这些字节中的不完整帧会返回错误。
+请检查连接或代理是否截断了响应，然后重试 fetch。
+对网络远端，如果尾部帧已经开始但随后停止传输，仍适用现有空闲超时；超时会使 fetch
+以 `LBR-NET-001` 失败。
+
 ## 畸形 HTTP(S) discovery 响应
 
 在 HTTP(S) 引用发现（discovery）期间，Libra 会拒绝零字节广告和畸形

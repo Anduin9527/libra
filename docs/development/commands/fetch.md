@@ -76,6 +76,38 @@ flowchart TD
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
+## Async pkt-line lengths and EOF
+
+Fetch's async reader uses `pkt_frame_payload_len` before allocating a payload.
+Lengths one through three carry `PktFrameError` through `io::ErrorKind::InvalidData`;
+flush, length-four and `ffff` frames retain their wire semantics. An EOF after any
+header byte or within a payload carries the existing `PktLineError::TruncatedHeader`
+or `TruncatedPayload`, with its leading marker and fixed reason, to `LBR-NET-002`.
+Only EOF before the first header byte remains a normal frame-boundary EOF. Other
+I/O errors preserve their original kind; ordinary `PacketRead` classification is
+still assigned to PKT-10. UTF8/hex-header decoding errors also carry the existing
+fixed `PktLineError` reasons: the new post-pack reader must not expose remote bytes.
+PKT-13 still owns shared strict ASCII-hex validation across all async readers.
+
+A malformed or truncated frame takes precedence over `IncompletePack`, even after
+some pack bytes arrive. It reports the precise pkt-line reason without a byte
+count or additional CLI hint. `IncompletePack` and its retry hint remain for an
+unfinished pack ending at a clean frame boundary; both paths are `LBR-NET-002`.
+
+Once the pack checksum is verified, `read_fetch_stream` makes one nonblocking
+observation of the buffered or first immediately available transport chunk. It
+validates every frame beginning in that chunk, including any remainder spanning
+later chunks, without appending trailer payloads to the completed pack. It then
+returns; it does not drain a continually ready stream of new chunks. No available
+frame bytes (Pending, boundary EOF or a boundary transport error) retains the
+previous completed-pack success behavior. A read error after observing a frame
+byte still propagates. This bounds trailing work to the observed chunk plus at
+most one frame, while preserving completion without an idle connection closing.
+Flush still terminates the packet sequence, so bytes after it are not parsed.
+An observed partial frame must still complete or fail. Existing network idle
+timeouts can fail this read with `LBR-NET-001`; no new timeout is introduced and
+the partial frame is not silently accepted merely because the pack was complete.
+
 ## Malformed HTTP(S) discovery responses
 
 During HTTP(S) reference discovery, Libra rejects a zero-byte advertisement and

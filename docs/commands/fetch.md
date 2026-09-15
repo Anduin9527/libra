@@ -404,6 +404,26 @@ by default for maximum script friendliness.
 | Failed to write pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
 | Local state corruption | `LBR-REPO-002` | 128 | "inspect repository state and object integrity" |
 
+## Truncated packets during fetch
+
+Fetch reports `LBR-NET-002` for truncation of a received pkt-line header or payload
+midway through the frame. These errors contain a fixed reason without the
+remote bytes. Lengths from one to three are rejected before allocating a payload;
+flush (`0000`), empty data (`0004`) and maximum-length (`ffff`) frames remain valid.
+Header decoding errors also use fixed reasons without echoing the received bytes.
+
+If a transfer stops inside a packet before the pack is complete, the error
+reports packet truncation without a received-byte count or an extra CLI hint.
+Ending between packets with an incomplete pack still reports the byte count and
+adds the hint "the connection dropped mid-transfer — retry the fetch".
+
+A complete, checksum-verified pack can still finish without a flush or connection
+close. Fetch also checks trailing packet bytes already available at completion;
+a partial frame in those bytes is an error. Check whether the connection or a
+proxy truncated the response, then retry the fetch.
+For network remotes, if a trailing frame starts but then stalls, the existing
+transport idle timeout applies; timing out fails the fetch with `LBR-NET-001`.
+
 ## Malformed HTTP(S) discovery responses
 
 During HTTP(S) reference discovery, Libra rejects a zero-byte advertisement and
