@@ -290,8 +290,9 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 | 无效远程 spec（缺少 repo、URL 格式错误、不支持的 scheme） | `LBR-CLI-003` 或 `LBR-REPO-001` | 129 / 128 | 因原因而异 |
 | 发现期间认证失败 | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | 网络超时 / 传输失败 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
-| discovery 期间 pkt-line 畸形 / 广告为空 | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
-| Packet / sideband / checksum / pack 协议失败 | `LBR-NET-002` | 128 | 无额外提示；不完整的 pack 除外："the connection dropped mid-transfer — retry the fetch" |
+| pkt-line discovery / 传输建立错误 / 广告为空 | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| 封包读取连接重置 / 非协议 IO 错误 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
+| pkt-line 截断 / sideband / checksum / pack 协议失败 | `LBR-NET-002` | 128 | 无额外提示；不完整的 pack 除外："the connection dropped mid-transfer — retry the fetch" |
 | 对象格式不匹配 | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | 无法创建 pack 目录 | `LBR-IO-002` | 128 | "check filesystem permissions" |
 | 无法写入 pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
@@ -326,3 +327,19 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 fetch discovery 对空广告或畸形 pkt-line 响应返回 `LBR-NET-002`，不回显标头或
 payload 字节。普通网络故障仍返回 `LBR-NET-001`；遇到协议错误时，请先检查 Git
 服务及代理返回的响应，再重试。
+
+## pkt-line 错误归类
+
+检测到的 pkt-line 帧格式错误返回 `LBR-NET-002`（退出码128），包括空的 HTTP(S)
+discovery 广告。普通连接失败、连接重置和超时返回 `LBR-NET-001`（退出码128）。
+协议错误发生时请核对 Git 服务及代理响应。discovery 帧错误的提示为
+`check that the remote serves Git data and that a proxy has not altered the response`。
+
+对象传输建立阶段检测到的 pkt-line 错误使用相同协议提示。读取 fetch 流时的标头或
+payload 截断保留 `LBR-NET-002`，不附加 CLI 提示。在完整帧边界结束但 pack 尚未完整时，
+仍保留字节数及 `the connection dropped mid-transfer — retry the fetch` 提示。
+读取封包时的普通连接重置返回 `LBR-NET-001`。
+
+在 pack 数据开始前，upload-pack 流于帧边界遇到 EOF（包括零字节 POST 响应）
+返回 `LBR-NET-001`，提示为 `check network connectivity and retry`。
+空的 discovery 广告仍返回 `LBR-NET-002`。

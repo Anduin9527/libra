@@ -65,6 +65,15 @@ notes: |
   requires explicit opt-in and hash-pinned v0.22.16/v0.22.19 binaries. The
   integration-test-plan matrix and plan-20260910.md record exact isolated gates;
   these are not new cli.* runner scenarios and never repair ambient user DBs.
+  PKT-10's 25 pkt-line command-boundary cases remain Cargo library tests in
+  command::ls_remote::pkt_line_boundary_tests, run with
+  cargo test --lib command::ls_remote::pkt_line_boundary_tests.
+  The empty-advertisement fixture reaches actual fetch/clone/ls-remote/pull
+  handlers; the clone fetch-phase fixture verifies two discovery GETs and the
+  wanted-object POST. Both use bounded local HTTP through HttpsClient, not TLS
+  or live remotes. URL carrier matrices do not replace later raw Git/SSH reader
+  coverage. No new cli.* scenario is registered; the integration plan matrix
+  and plan-20260901.md PKT-10 hold scope and actual execution evidence.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

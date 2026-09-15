@@ -90,3 +90,12 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 不支持的 object-format capability 使用固定错误消息
 `Unsupported object format capability`，不回显远端提供的值。
 请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。
+
+## pkt-line 错误归类
+
+检测到的 pkt-line 帧格式错误返回 `LBR-NET-002`（退出码128），包括空的 HTTP(S)
+discovery 广告。普通连接失败、连接重置和超时返回 `LBR-NET-001`（退出码128）。
+协议错误发生时请核对 Git 服务及代理响应。discovery 帧错误的提示为
+`check that the remote serves Git data and that a proxy has not altered the response`。
+
+此归类用于引用 discovery；认证失败与本地配置读取错误保持原有错误码。

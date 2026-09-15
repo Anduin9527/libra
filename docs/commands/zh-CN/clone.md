@@ -388,7 +388,8 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | URL 格式错误或 scheme 不支持 | `LBR-CLI-003` | 129 | "check the clone URL or scheme" |
 | 认证 / 权限拒绝 | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | 网络不可达 | `LBR-NET-001` | 128 | "check the remote host, DNS, VPN/proxy, and network connectivity" |
-| 协议 / discovery 错误 | `LBR-NET-002` | 128 | "the remote did not complete discovery successfully" |
+| pkt-line discovery / 传输帧错误 | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| 其他 discovery 协议错误 | `LBR-NET-002` | 128 | "the remote did not complete discovery successfully; retry and inspect server/protocol settings" |
 | 找不到远程分支 | `LBR-REPO-003` | 128 | "use `-b <branch>` to specify an existing branch" |
 | 对象格式不匹配 | `LBR-REPO-003` | 128 | "the remote and local repository use different object formats" |
 | 检出解析失败 | `LBR-REPO-003` | 128 | "working tree checkout target could not be resolved" |
@@ -429,3 +430,16 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 不支持的 object-format capability 使用固定错误消息
 `Unsupported object format capability`，不回显远端提供的值。
 请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。
+
+## pkt-line 错误归类
+
+检测到的 pkt-line 帧格式错误返回 `LBR-NET-002`（退出码128），包括空的 HTTP(S)
+discovery 广告。普通连接失败、连接重置和超时返回 `LBR-NET-001`（退出码128）。
+协议错误发生时请核对 Git 服务及代理响应。discovery 帧错误的提示为
+`check that the remote serves Git data and that a proxy has not altered the response`。
+
+对象传输阶段检测到的 pkt-line 错误（包括标头或 payload 截断）使用相同协议错误码及
+提示。discovery 中的普通 IO 错误仍为 `LBR-IO-001`；认证与 host-key 指引保持原有处理。
+
+pack 完整性与 pkt-line 帧格式是不同错误：在完整帧边界结束但 pack 未完整时，clone
+仍使用既有 `LBR-NET-001` 传输错误与网络重试提示；fetch/pull 对此使用 `LBR-NET-002`。

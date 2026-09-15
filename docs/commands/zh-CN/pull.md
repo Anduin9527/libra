@@ -258,8 +258,10 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 | 不支持的 `pull.rebase=merges|interactive` 模式 | `LBR-CLI-002` | 129 | 使用布尔 rebase 或显式的受支持 pull 标志 |
 | `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` / `merge.renormalize` 配置值无效（继承自 `libra merge`） | `LBR-REPO-003` | 128 | 把对应 merge 配置设为支持值或删除 |
 | Fetch：网络不可达 / 超时 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
+| Fetch：封包读取连接重置 / 非协议 IO 故障 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch：认证失败 | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
-| Fetch：协议错误 | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
+| Fetch：pkt-line discovery / 传输建立错误 | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Fetch：pkt-line 截断 / sideband / checksum / pack 协议错误 | `LBR-NET-002` | 128 | 无额外提示；不完整 pack 除外："the connection dropped mid-transfer — retry the pull" |
 | Merge：非 squash 冲突、脏工作树或未跟踪覆盖 | `LBR-CONFLICT-002` | 128 | "resolve conflicts, then run 'libra merge --continue'" |
 | Merge：无 merge 状态的未解决索引，或新发生的 squash 冲突 | `LBR-CONFLICT-002` | 128 | "resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'" |
 | Merge：`--ff-only` 拒绝非快进 | `LBR-CONFLICT-002` | 128 | "run 'libra pull' without --ff-only to allow a merge commit" |
@@ -285,3 +287,19 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 不支持的 object-format capability 使用固定错误消息
 `Unsupported object format capability`，不回显远端提供的值。
 请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。
+
+## pkt-line 错误归类
+
+检测到的 pkt-line 帧格式错误返回 `LBR-NET-002`（退出码128），包括空的 HTTP(S)
+discovery 广告。普通连接失败、连接重置和超时返回 `LBR-NET-001`（退出码128）。
+协议错误发生时请核对 Git 服务及代理响应。discovery 帧错误的提示为
+`check that the remote serves Git data and that a proxy has not altered the response`。
+
+fetch 阶段的 discovery 与对象传输建立使用此归类。读取流时的标头或 payload 截断返回
+`LBR-NET-002`，无额外 CLI 提示；在完整帧边界结束但 pack 尚未完整时，保留字节数及
+`the connection dropped mid-transfer — retry the pull` 提示。封包读取中的普通连接重置
+返回 `LBR-NET-001`。这些错误的 JSON 仍保留 `details.phase = "fetch"`。
+
+在 pack 数据开始前，upload-pack 流于帧边界遇到 EOF（包括零字节 POST 响应）
+返回 `LBR-NET-001`，提示为 `check network connectivity and retry`。
+空的 discovery 广告仍返回 `LBR-NET-002`。

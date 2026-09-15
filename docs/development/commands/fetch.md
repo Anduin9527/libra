@@ -124,8 +124,8 @@ details with the shared leading marker. Empty discovery responses use the same
 marker. `map_fetch_discovery_error` matches the raw detail with `starts_with`
 and maps these pkt-line discovery errors to `LBR-NET-002`; it does not search the
 formatted outer error. Non-marker network errors remain `LBR-NET-001`, including
-the fixed unsupported-object-format capability diagnostic. Other commands and
-streaming transport readers retain their independent error boundaries.
+the fixed unsupported-object-format capability diagnostic. The other command adapters now follow the same raw-marker classification;
+streaming header grammar remains a separate transport concern.
 
 The marker branch attaches the fixed hint
 `check that the remote serves Git data and that a proxy has not altered the response`.
@@ -133,3 +133,45 @@ Other non-marker discovery parse errors also remain `LBR-NET-001`; fully typing
 those errors is deferred under DEFER-04. The raw-marker mapping applies whenever
 an existing transport supplies that marker; asynchronous header readers are
 covered separately by PKT-13.
+
+## pkt-line boundary classification
+
+The `fetch` boundary maps detected pkt-line errors to `LBR-NET-002`, including
+empty HTTP(S) discovery advertisements. Match `GitError::NetworkError(detail)`
+using the shared `PKT_LINE_PROTOCOL_ERROR_PREFIX` on the raw detail, before
+timeout or host-key heuristics. Object-transfer IO carriers, plus the
+clone/ls-remote/pull discovery IO carriers, use `fetch::is_pkt_line_io_error`,
+which compares a bounded Display prefix without allocating a second complete
+message. Marker matching itself is O(prefix length); normal user-message
+formatting still costs O(message length). Never classify using a formatted outer
+error, a remote URL, case folding, trimming, or a substring search.
+
+Object-transfer setup reports detected pkt-line errors with the same protocol
+hint. A truncated header or payload while reading the fetch stream retains
+`LBR-NET-002` with no extra CLI hint. An incomplete pack ending at a clean frame
+boundary retains its byte count and `the connection dropped mid-transfer — retry
+the fetch` hint. A transport reset while reading a packet is `LBR-NET-001`.
+
+An upload-pack EOF at a frame boundary before pack data begins, including a
+zero-byte POST response, returns `LBR-NET-001` with
+`check network connectivity and retry`. An empty discovery advertisement remains
+`LBR-NET-002`.
+
+Marker discovery/transfer-setup errors use the exact `check that the remote serves Git data and that a proxy has not altered the response`
+hint. Non-marker network failures retain `LBR-NET-001`; clone discovery's ordinary
+IO errors retain `LBR-IO-001`. Authentication, local metadata errors and existing
+non-marker host-key handling are unchanged. Other untyped discovery parsing
+errors retain existing classification (DEFER-04); this change does not complete
+strict async header validation or the later Git/SSH reader work.
+
+The default tests exercise all command conversions with raw carriers and parser
+errors, preserve the fetch PacketRead no-hint contract, and prove empty
+advertisements reach all four actual command handlers. The clone transfer case
+checks both discovery requests and a POST containing the advertised wanted OID.
+Its local HTTP fixture runs the production HttpsClient path; it does not exercise
+TLS negotiation or certificate validation.
+
+The prefix sink avoids allocating a full Display output itself; the Display
+implementation (including OS-error formatting) or earlier diagnostic redaction
+may still allocate. The two HTTP fixtures use a two-worker Tokio runtime so
+synchronous configuration lookup does not stop the cached pool and server.

@@ -515,3 +515,17 @@ and omitting both inherits `rerere.autoUpdate`. An explicit choice is persisted
 for an interrupted operation: merge state, rebase auxiliary state, and the
 SQLite cherry-pick sequencer state respectively, so `--continue` preserves the
 decision. Both flags are no-ops while `rerere.enabled` is false.
+
+## pkt-line error classification
+
+Detected pkt-line framing errors return `LBR-NET-002` (legacy exit 128) at the
+fetch, clone, ls-remote and pull boundaries, including an empty HTTP(S)
+discovery advertisement. Ordinary network failures, timeouts and packet-read
+connection resets use `LBR-NET-001` (exit 128); clone discovery retains
+`LBR-IO-001` for non-protocol IO failures. No new error code, command option or
+JSON field is introduced. This classification applies when the transport/parser
+reports a pkt-line failure; remaining async header validation is separate.
+
+Pack completeness is a separate existing contract: clone reports an incomplete
+pack ending at a clean frame boundary as `LBR-NET-001`, while fetch/pull use
+`LBR-NET-002`. This card preserves that distinction.

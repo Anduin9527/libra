@@ -884,6 +884,11 @@ impl From<FetchError> for CliError {
             FetchError::Discovery { source, .. } => {
                 map_fetch_discovery_error(error.to_string(), source)
             }
+            FetchError::FetchObjects { source, .. } if is_pkt_line_io_error(source) => {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+            }
             FetchError::FetchObjects { source, .. } => map_fetch_io_error(
                 error.to_string(),
                 source,
@@ -891,13 +896,13 @@ impl From<FetchError> for CliError {
             )
             .with_hint("check network connectivity and retry"),
             FetchError::PacketRead { source } => {
-                if is_timeout_io_error(source) {
+                if is_pkt_line_io_error(source) {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::NetworkProtocol)
+                } else {
                     CliError::fatal(error.to_string())
                         .with_stable_code(StableErrorCode::NetworkUnavailable)
                         .with_hint("check network connectivity and retry")
-                } else {
-                    CliError::fatal(error.to_string())
-                        .with_stable_code(StableErrorCode::NetworkProtocol)
                 }
             }
             FetchError::RemoteBranchNotFound { .. } => CliError::command_usage(error.to_string())
@@ -964,6 +969,45 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
         }
         _ => CliError::fatal(message).with_stable_code(StableErrorCode::NetworkProtocol),
     }
+}
+
+/// Inspect the inner IO diagnostic without allocating its complete formatted message.
+/// Only the marker prefix is compared; formatting stops as soon as it matches or differs.
+pub(crate) fn is_pkt_line_io_error(error: &std::io::Error) -> bool {
+    struct PrefixMatcher<'a> {
+        remaining: &'a [u8],
+        matched: bool,
+        rejected: bool,
+    }
+
+    impl std::fmt::Write for PrefixMatcher<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if self.matched || self.rejected {
+                return Err(std::fmt::Error);
+            }
+            let count = self.remaining.len().min(text.len());
+            if self.remaining[..count] != text.as_bytes()[..count] {
+                self.rejected = true;
+                return Err(std::fmt::Error);
+            }
+            self.remaining = &self.remaining[count..];
+            if self.remaining.is_empty() {
+                self.matched = true;
+                // Deliberately stop Display before it formats any suffix.
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let mut matcher = PrefixMatcher {
+        remaining: PKT_LINE_PROTOCOL_ERROR_PREFIX.as_bytes(),
+        matched: false,
+        rejected: false,
+    };
+    let _ = std::fmt::write(&mut matcher, format_args!("{error}"));
+    matcher.matched
 }
 
 fn map_fetch_io_error(

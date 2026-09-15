@@ -573,7 +573,8 @@ Every `CloneError` variant maps to an explicit `StableErrorCode` -- no message s
 | Malformed URL or unsupported scheme | `LBR-CLI-003` | 129 | "check the clone URL or scheme" |
 | Authentication / permission denied | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | Network unreachable | `LBR-NET-001` | 128 | "check the remote host, DNS, VPN/proxy, and network connectivity" |
-| Protocol / discovery error | `LBR-NET-002` | 128 | "the remote did not complete discovery successfully" |
+| pkt-line discovery / transfer framing error | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Other discovery protocol error | `LBR-NET-002` | 128 | "the remote did not complete discovery successfully; retry and inspect server/protocol settings" |
 | Remote branch not found | `LBR-REPO-003` | 128 | "use `-b <branch>` to specify an existing branch" |
 | Object format mismatch | `LBR-REPO-003` | 128 | "the remote and local repository use different object formats" |
 | Checkout resolve failure | `LBR-REPO-003` | 128 | "working tree checkout target could not be resolved" |
@@ -619,3 +620,20 @@ An unsupported object-format capability reports the fixed message
 `Unsupported object format capability` without echoing its remote value.
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
+
+## pkt-line error classification
+
+Detected pkt-line framing errors return `LBR-NET-002` (exit 128), including an
+empty HTTP(S) discovery advertisement. Ordinary connection failures, resets and
+timeouts return `LBR-NET-001` (exit 128). Verify the Git service and any proxy
+response when a protocol error occurs. Discovery framing errors use the hint
+`check that the remote serves Git data and that a proxy has not altered the response`.
+
+The same protocol classification and hint apply during object transfer, including
+a truncated pkt-line header or payload. An ordinary IO failure without a pkt-line marker during discovery
+remains `LBR-IO-001`; authentication and host-key diagnostics retain their existing
+handling.
+
+Pack completeness is separate from pkt-line framing: an incomplete pack ending
+at a clean frame boundary keeps clone's existing `LBR-NET-001` transfer error and
+network retry hint. Fetch and pull report that completeness failure as `LBR-NET-002`.

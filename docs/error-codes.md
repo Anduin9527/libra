@@ -103,7 +103,7 @@ structured report is always present.
 | `128` | `LBR-OBLITERATE-002` | `repo` | Object exists only inside a packfile; v1 cannot rewrite packs | `file obliterate` on a packed-only object (lore.md 2.5) |
 | `128` | `LBR-OBLITERATE-003` | `conflict` | Obliteration not confirmed; it is irreversible and requires --yes | `file obliterate` without `--yes` (lore.md 2.5) |
 | `128` | `LBR-NET-001` | `network` | Remote unreachable or transport unavailable | DNS, timeout, TLS, connection refused |
-| `128` | `LBR-NET-002` | `network` | Protocol, negotiation, or pack failure | packet-line, sideband, unpack/ref update protocol errors |
+| `128` | `LBR-NET-002` | `network` | Protocol, negotiation, or pack failure | detected packet-line framing / empty discovery response, sideband, unpack/ref update protocol errors |
 | `128` | `LBR-AUTH-001` | `auth` | Missing identity, token, or credentials | missing commit identity, missing API key, missing SSH material |
 | `128` | `LBR-AUTH-002` | `auth` | Credential present but permission denied | forbidden push, insufficient scope |
 | `128` | `LBR-IO-001` | `io` | Read/open/load failure | failed to open pack, failed to read index |

@@ -112,3 +112,14 @@ An unsupported object-format capability reports the fixed message
 `Unsupported object format capability` without echoing its remote value.
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
+
+## pkt-line error classification
+
+Detected pkt-line framing errors return `LBR-NET-002` (exit 128), including an
+empty HTTP(S) discovery advertisement. Ordinary connection failures, resets and
+timeouts return `LBR-NET-001` (exit 128). Verify the Git service and any proxy
+response when a protocol error occurs. Discovery framing errors use the hint
+`check that the remote serves Git data and that a proxy has not altered the response`.
+
+This classification applies to reference discovery. Authentication failures and
+local configuration read errors keep their existing error codes.

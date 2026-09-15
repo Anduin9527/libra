@@ -397,8 +397,9 @@ by default for maximum script friendliness.
 | Invalid remote spec (missing repo, malformed URL, unsupported scheme) | `LBR-CLI-003` or `LBR-REPO-001` | 129 / 128 | Varies by cause |
 | Authentication failure during discovery | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | Network timeout / transport failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
-| Malformed pkt-line / empty advertisement during discovery | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
-| Packet / sideband / checksum / pack protocol failure | `LBR-NET-002` | 128 | No additional hint, except for an incomplete pack: "the connection dropped mid-transfer — retry the fetch" |
+| pkt-line discovery / transfer setup error / empty advertisement | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Packet-read connection reset / non-protocol IO failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
+| pkt-line truncation / sideband / checksum / pack protocol failure | `LBR-NET-002` | 128 | No additional hint, except for an incomplete pack: "the connection dropped mid-transfer — retry the fetch" |
 | Object format mismatch | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | Failed to create pack directory | `LBR-IO-002` | 128 | "check filesystem permissions" |
 | Failed to write pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
@@ -439,3 +440,22 @@ Fetch discovery reports `LBR-NET-002` for an empty advertisement or malformed
 pkt-line response, without echoing its header or payload bytes. Ordinary network
 failures retain `LBR-NET-001`; verify the Git service and any proxy response
 before retrying a protocol failure.
+
+## pkt-line error classification
+
+Detected pkt-line framing errors return `LBR-NET-002` (exit 128), including an
+empty HTTP(S) discovery advertisement. Ordinary connection failures, resets and
+timeouts return `LBR-NET-001` (exit 128). Verify the Git service and any proxy
+response when a protocol error occurs. Discovery framing errors use the hint
+`check that the remote serves Git data and that a proxy has not altered the response`.
+
+Object-transfer setup reports detected pkt-line errors with the same protocol
+hint. A truncated header or payload while reading the fetch stream retains
+`LBR-NET-002` with no extra CLI hint. An incomplete pack ending at a clean frame
+boundary retains its byte count and `the connection dropped mid-transfer — retry
+the fetch` hint. A transport reset while reading a packet is `LBR-NET-001`.
+
+An upload-pack EOF at a frame boundary before pack data begins, including a
+zero-byte POST response, returns `LBR-NET-001` with
+`check network connectivity and retry`. An empty discovery advertisement remains
+`LBR-NET-002`.

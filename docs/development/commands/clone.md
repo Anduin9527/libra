@@ -78,3 +78,43 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## pkt-line boundary classification
+
+The `clone` boundary maps detected pkt-line errors to `LBR-NET-002`, including
+empty HTTP(S) discovery advertisements. Match `GitError::NetworkError(detail)`
+using the shared `PKT_LINE_PROTOCOL_ERROR_PREFIX` on the raw detail, before
+timeout or host-key heuristics. Object-transfer IO carriers, plus the
+clone/ls-remote/pull discovery IO carriers, use `fetch::is_pkt_line_io_error`,
+which compares a bounded Display prefix without allocating a second complete
+message. Marker matching itself is O(prefix length); normal user-message
+formatting still costs O(message length). Never classify using a formatted outer
+error, a remote URL, case folding, trimming, or a substring search.
+
+The same protocol classification and hint apply during object transfer, including
+a truncated pkt-line header or payload. An ordinary IO failure without a pkt-line marker during discovery
+remains `LBR-IO-001`; authentication and host-key diagnostics retain their existing
+handling.
+
+Marker discovery/transfer-setup errors use the exact `check that the remote serves Git data and that a proxy has not altered the response`
+hint. Non-marker network failures retain `LBR-NET-001`; clone discovery's ordinary
+IO errors retain `LBR-IO-001`. Authentication, local metadata errors and existing
+non-marker host-key handling are unchanged. Other untyped discovery parsing
+errors retain existing classification (DEFER-04); this change does not complete
+strict async header validation or the later Git/SSH reader work.
+
+The default tests exercise all command conversions with raw carriers and parser
+errors, preserve the fetch PacketRead no-hint contract, and prove empty
+advertisements reach all four actual command handlers. The clone transfer case
+checks both discovery requests and a POST containing the advertised wanted OID.
+Its local HTTP fixture runs the production HttpsClient path; it does not exercise
+TLS negotiation or certificate validation.
+
+Pack completeness is separate from pkt-line framing: an incomplete pack ending
+at a clean frame boundary keeps clone's existing `LBR-NET-001` transfer error and
+network retry hint. Fetch and pull report that completeness failure as `LBR-NET-002`.
+
+The prefix sink avoids allocating a full Display output itself; the Display
+implementation (including OS-error formatting) or earlier diagnostic redaction
+may still allocate. The two HTTP fixtures use a two-worker Tokio runtime so
+synchronous configuration lookup does not stop the cached pool and server.

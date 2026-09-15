@@ -31,6 +31,7 @@ use crate::{
         init::InitError,
         restore::{RestoreArgs, RestoreError},
     },
+    git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
     internal::{
         ai::history::HistoryManager,
         branch::{self, Branch},
@@ -1017,6 +1018,16 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                     .with_stable_code(StableErrorCode::AuthPermissionDenied)
                     .with_hint("check SSH key / HTTP credentials and repository access rights")
             }
+            GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+                CliError::fatal(format!("remote discovery failed: {source}"))
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+            }
+            GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
+                CliError::fatal(format!("remote discovery failed: {source}"))
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+            }
             GitError::NetworkError(_) => {
                 let message = source.to_string();
                 let error = CliError::fatal(format!("remote discovery failed: {message}"))
@@ -1056,6 +1067,14 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
         fetch::FetchError::ObjectFormatMismatch { .. } => CliError::fatal(source.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("the remote and local repository use different object formats"),
+        fetch::FetchError::FetchObjects { source: error, .. }
+        | fetch::FetchError::PacketRead { source: error }
+            if fetch::is_pkt_line_io_error(error) =>
+        {
+            CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         fetch::FetchError::FetchObjects { .. } | fetch::FetchError::PacketRead { .. } => {
             CliError::fatal(source.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)

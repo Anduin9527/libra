@@ -100,10 +100,31 @@ cargo test --test ai_agent_test -- --test-threads=1
 | 文件级命令与 LFS 本地能力 | `clean`、`rm`、`mv`、`lfs track/untrack/ls-files`、本地 lock 负向路径 | 1 | 已实现 | `cli.clean-rm-mv-lfs-basic` |
 | 其他 CLI 外壳能力 | `open`、root `--json/-J`、`--machine`、`--quiet`、颜色/progress/exit-code-on-warning | 1 | 已实现 | `cli.open-smoke`, `cli.cross-cutting-flags` |
 | 安装器短别名 | IX-01 默认相对 `lba -> libra`、same-version 缺失修复/幂等、`--no-alias`/`LIBRA_NO_ALIAS=1`、既有 regular/foreign symlink 保护、无 symlink 能力回退 | 1 | 已实现（Cargo 驱动 POSIX 完整 installer smoke） | Cargo: `compat_install_alias` |
+| pkt-line 命令错误边界 | fetch/clone/ls-remote/pull 的 marker 协议错误与普通 IO/网络错误归类；真实空 HTTP advertisement 四命令路径和 clone discovery→fetch POST | 1 | Cargo library 场景已实现；执行证据见 plan-20260901.md PKT-10 | Cargo library: `command::ls_remote::pkt_line_boundary_tests`（25 项；非 cli.* runner scenario） |
 | Schema 与本地协议 | schema 建链自动升级、local clone/remote/ls-remote/fetch/pull（含 refspec 精确映射、remotes.default、rename namespace、symref、pull-rebase hook/JSON child 隔离）、shallow fetch、拒绝 file remote push | 2 | 已实现 | Runner: `cli.schema-upgrade-observable`, `cli.clone-fetch-pull-local`, `cli.fetch-depth-local`, `cli.push-local-file-remote-rejected`; Cargo: `command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history` |
 | 对象读取与树遍历 | `rev-parse`、`show-ref` / `show-ref --branches` / `show-ref --no-branches` / `show-ref --no-tags` / `show-ref --hash[=<n>]` / `show-ref --no-hash` / `show-ref --abbrev[=<n>]` / `show-ref --no-abbrev` / `show-ref --dereference` / `show-ref --no-dereference` / `show-ref --verify` / `show-ref --no-verify` / `show-ref --exists` / `show-ref --no-exists` / `show-ref --head` / `show-ref --no-head` / `show-ref --exclude-existing[=<pattern>]`、`for-each-ref --points-at`、`cat-file`、`hash-object --stdin` / `--path` / `--no-filters`、`show`、`rev-list` / multi revision / `A..B` / `^A` / `A...B` / `rev-list --count` / `rev-list -n` / `rev-list --skip` / `rev-list --since` / `rev-list --after` / `rev-list --until` / `rev-list --before` / `rev-list --merges` / `rev-list --no-merges` / `rev-list --min-parents` / `rev-list --max-parents` / `rev-list --no-min-parents` / `rev-list --no-max-parents` / `rev-list --first-parent` / `rev-list --author` / `rev-list --committer` / `rev-list --grep` / `rev-list -- <path>` / `rev-list --left-right` / `rev-list --left-only` / `rev-list --right-only` / `rev-list --cherry-pick` / `rev-list --cherry-mark` / `rev-list --cherry` / `rev-list --parents` / `rev-list --children` / `rev-list --timestamp`、`fsck`、sha256 object format；`ls-tree` 默认/递归/子目录/`--full-name`/`--full-tree` 路径场景 | 2 | 已实现 | `cli.object-readback`, `cli.show-ref-exclude-existing`, `cli.ls-tree-smoke`, `cli.sha256-object-readback` |
 | 维护命令 | `gc`、`prune`、`archive`（tar/zip、`--prefix`、`--output`、`--list`、`TREEISH <path>...` pathspec）、`verify-pack <idx>...` / `verify-pack --pack` / `verify-pack -v` / `verify-pack -s`、内部 `index-pack --stdin` / `--keep` / `--progress` / `--no-progress` fixture | 2 | 已实现 | `cli.gc-smoke`, `cli.archive-smoke`, `cli.verify-pack-smoke` |
 | GitHub live remote | `gh` 创建/清理私有临时 repo、`push` refspec/tag/delete/force/mirror、真实 clone/fetch/pull | 3 | 已实现，需显式 live gate | `live.github-create-push-clone-fetch` |
+
+
+PKT-10 的 pkt-line 边界场景使用默认 Cargo library 测试：
+`cargo test --lib command::ls_remote::pkt_line_boundary_tests`。
+模块包含 25 个具名门；其中
+`pkt_line_discovery_empty_response_regression_fetch_clone_lsremote_pull`
+通过各命令实际 `execute_safe` 路径核对空 advertisement 的 GET、`LBR-NET-002`、
+exit 128、提示及 pull 的 fetch phase；
+`pkt_line_matrix_parametrized_https_marker_maps_net_002`
+核对 clone 两次 discovery GET 和带 wanted OID 的 fetch POST。
+本地 HTTP fixture 运行生产 HttpsClient，不宣称覆盖 TLS 握手或证书验证；
+git/ssh/https URL carrier 矩阵只验证 mapper。原始 Git/SSH framing 与严格异步
+header grammar 属于 PKT-08/13。fixture 使用临时仓库、env/cwd/hash_kind 锁、
+有界请求/等待与 server shutdown；无新增 feature gate 或 live remote。
+这些库测试不是 integration-runner 的新 cli.* 场景，完整运行及发布证据保存在
+`plan-20260901.md` 对应任务卡；文档映射检查为
+
+```bash
+cargo test --test compat_matrix_alignment
+```
 
 **剩余覆盖缺口**：默认本地 wave 已覆盖当前 runner 注册的 `cli.*` 场景；需要真实 GitHub 远端的 `live.*` 场景不进入默认阻断门，只能在具备 `gh` 登录态和仓库创建/删除权限时运行。新增或修改 Git 兼容命令时，必须把对应场景加入本表、YAML、场景文档和 runner registry；如果当前 runner 尚未实现，必须在 YAML 和文档中保留明确的未实现状态，而不能只在本表声明覆盖。
 

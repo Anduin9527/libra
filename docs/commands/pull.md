@@ -299,8 +299,10 @@ Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, a
 | Unsupported `pull.rebase=merges|interactive` mode | `LBR-CLI-002` | 129 | Use boolean rebase or an explicit supported pull flag |
 | Invalid `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` / `merge.renormalize` (inherited from `libra merge`) | `LBR-REPO-003` | 128 | Set the named merge key to a supported value or remove it |
 | Fetch: network unreachable / timeout | `LBR-NET-001` | 128 | "check network connectivity and retry" |
+| Fetch: packet-read connection reset / non-protocol IO failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch: authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
-| Fetch: protocol error | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
+| Fetch: pkt-line discovery / transfer setup error | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Fetch: pkt-line truncation / sideband / checksum / pack protocol error | `LBR-NET-002` | 128 | No additional hint, except for an incomplete pack: "the connection dropped mid-transfer — retry the pull" |
 | Merge: non-squash conflicts, dirty worktree, or untracked overwrite | `LBR-CONFLICT-002` | 128 | "resolve conflicts, then run 'libra merge --continue'" |
 | Merge: unresolved index without merge state, or a new squash conflict | `LBR-CONFLICT-002` | 128 | "resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'" |
 | Merge: non-fast-forward rejected by `--ff-only` | `LBR-CONFLICT-002` | 128 | "run 'libra pull' without --ff-only to allow a merge commit" |
@@ -328,3 +330,23 @@ An unsupported object-format capability reports the fixed message
 `Unsupported object format capability` without echoing its remote value.
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
+
+## pkt-line error classification
+
+Detected pkt-line framing errors return `LBR-NET-002` (exit 128), including an
+empty HTTP(S) discovery advertisement. Ordinary connection failures, resets and
+timeouts return `LBR-NET-001` (exit 128). Verify the Git service and any proxy
+response when a protocol error occurs. Discovery framing errors use the hint
+`check that the remote serves Git data and that a proxy has not altered the response`.
+
+The fetch phase uses this classification for discovery and object-transfer
+setup. A truncated header or payload while reading the fetch stream returns
+`LBR-NET-002` with no extra CLI hint; an incomplete pack at a clean frame boundary
+retains its byte count and `the connection dropped mid-transfer — retry the pull`
+hint. A packet-read connection reset is `LBR-NET-001`. These errors keep
+`details.phase = "fetch"` in JSON output.
+
+An upload-pack EOF at a frame boundary before pack data begins, including a
+zero-byte POST response, returns `LBR-NET-001` with
+`check network connectivity and retry`. An empty discovery advertisement remains
+`LBR-NET-002`.
