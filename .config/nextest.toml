@@ -63,6 +63,22 @@ filter = 'test(/(^|::)agent_push_after_prune_requires_force_rewrite_and_lease_pr
 test-group = 'external'
 
 [[profile.default.overrides]]
+filter = 'test(/(^|::)agent_push_seed_readiness_accepts_missing_or_empty_marker_dir$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_push_seed_readiness_rejects_marker_path_io_error$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_push_seed_readiness_rejects_terminal_marker$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_push_seed_waits_for_durable_index_retirement$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
 filter = 'test(/(^|::)agent_push_writes_private_agent_traces_ref$/)'
 test-group = 'external'
 
