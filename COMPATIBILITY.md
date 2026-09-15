@@ -547,8 +547,25 @@ Git/SSH pkt-line reader errors have typed `LBR-NET-002` classification for lengt
 clone and pull as `LBR-NET-002`, including zero-byte advertisements, with
 `check that the remote serves Git data and that a proxy has not altered the response`.
 Truncated advertisements previously returned `LBR-NET-001` with a network/transfer
-hint; lengths 1–3 could panic. Git/SSH discovery and SSH object-fetch/push wrappers
-may still return `LBR-NET-001`. Complete CLI propagation and bounded SSH cleanup
-remain unfinished. Flush, empty payload and maximum-size
+hint; lengths 1–3 could panic. Git discovery may still return `LBR-NET-001`; SSH advertisement propagation and
+cleanup are described below. ASCII-hex header classification remains unfinished. Flush, empty payload and maximum-size
 frame behavior is preserved, as are ordinary IO/idle classifications. HTTP(S)
 command-boundary behavior is unchanged.
+
+### SSH advertisement error propagation
+
+SSH discovery/object-fetch/push advertisement errors for lengths 1–3 and truncated
+headers/payloads return `LBR-NET-002`, with no captured child stdout/stderr appended.
+This includes missing advertisements caused by SSH connection, host-trust,
+authentication or repository-access failure. When the local non-zero exit status
+is available, the fixed protocol reason is followed by `SSH exited with status N`
+and fixed SSH/host-key/ssh-agent/access guidance; raw stderr is excluded.
+Required-header EOF allows up to 100ms to observe SSH's own status before killing
+it; other read errors request termination immediately. The observation and
+cleanup share a two-second total budget, and the primary protocol reason survives
+cleanup failure. Ordinary IO/timeouts keep their transport classification, but
+termination can change the reported status/available diagnostics; local cleanup
+warnings supplement the collected result. Interactive stderr inheritance and
+other process-output diagnostics remain unchanged. Arbitrary descendant cleanup
+is not claimed. Specific host-key guidance, Git discovery propagation and strict
+async ASCII-hex validation remain later work.

@@ -625,3 +625,31 @@ CI 在 Wave 0 调用此脚本，失败即阻断 PR。
 3. 未实现能力必须用 `BASELINE_GAP-*` 标记，不允许写成默认可执行步骤。
 4. 若引入新的 live gate 环境变量，必须同步更新 `.env.test.example`、本计划 Wave 说明、`compat_matrix_alignment` 的 env 规则（如需）。
 5. 修改 §3.3 Path → Wave 映射，须同步更新 `tools/integration-runner/config/path-wave-map.toml`（如已落地）。
+
+### PKT-12 SSH advertisement error gates (Cargo-only)
+
+The eleven `pkt_line_client_` PKT-12 library gates cover shared inner/outer error
+formatting, native non-zero SSH exits with fixed status/guidance, successful/failed
+output collection, preservation of collected output when cleanup fails, and real
+ordinary-error child reaping. The real-command gate uses non-terminal stdin;
+run it under nextest or redirect stdin from `/dev/null`, otherwise it fails
+explicitly rather than letting inherited stderr make the no-echo assertion empty.
+Unix child gates include fifty malformed-frame command cases and five native
+exit-255/empty-advertisement cases across ls-remote/fetch/clone/pull/push. The
+existing `transport_timeout_uses_push_idle_timeout` gate covers push classifier
+priority and ordinary errors. These are Cargo-only cases, not new cli.* runner
+scenarios. Actual run evidence belongs in plan-20260901.md; Unix process tests do
+not claim Windows execution coverage.
+
+### PKT-12 existing SSH host-key CLI cases
+
+`command_test::command::fetch_test::test_fetch_ssh_host_key_failure_is_reported`
+and `command_test::command::push_test::test_push_ssh_host_key_failure_is_reported`
+retain their names and serial lanes. Each runs the real CLI in human, JSON and
+machine modes, pins exit 128 / `LBR-NET-002`, the incomplete-header reason, local
+SSH exit 255 and fixed SSH guidance, and rejects raw host-key stderr in both
+output streams. Full hint vectors are command-specific: fetch checks that the
+remote serves Git data and a proxy has not altered the response; push checks the
+remote Git service or proxy response. Push also verifies no remote ref was created.
+Actual results, including the rejected wrong-hint assertion and its corrected
+rerun, are recorded in plan-20260901.md; these are local fake-SSH CLI tests.

@@ -2581,10 +2581,16 @@ fn porcelain_ref_fields(update: &PushRefUpdate) -> (char, String) {
 
 /// Classify a transport-layer I/O error into a typed `PushError`.
 ///
-/// Transport errors that mention "timed out" (from SSH idle timeout or reqwest
-/// read_timeout) are mapped to `PushError::Timeout` with the originating phase.
-/// All other errors become `PushError::Network`.
+/// A pkt-line protocol carrier takes precedence over timeout text and keeps its
+/// fixed protocol diagnostic. Other transport errors mentioning "timed out"
+/// (from SSH idle timeout or reqwest read_timeout) become `PushError::Timeout`;
+/// remaining errors become `PushError::Network`.
 fn classify_transport_error(phase: &str, e: std::io::Error) -> PushError {
+    if crate::command::fetch::is_pkt_line_io_error(&e) {
+        return PushError::Protocol {
+            detail: e.to_string(),
+        };
+    }
     let detail = e.to_string();
     let lower = detail.to_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
@@ -5019,6 +5025,23 @@ old1 new1 refs/heads/main\n"
             err,
             PushError::Timeout { phase, seconds }
                 if phase == "send-pack" && seconds == PUSH_IDLE_TIMEOUT.as_secs()
+        ));
+        let marker = crate::git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX;
+        let protocol_detail = format!("{marker}timed out fixture");
+        assert!(matches!(
+            classify_transport_error("send-pack", std::io::Error::other(protocol_detail.clone())),
+            PushError::Protocol { detail } if detail == protocol_detail
+        ));
+        assert!(matches!(
+            classify_transport_error(
+                "send-pack",
+                std::io::Error::other(format!("context: {marker}ordinary failure"))
+            ),
+            PushError::Network(_)
+        ));
+        assert!(matches!(
+            classify_transport_error("send-pack", std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")),
+            PushError::Network(detail) if detail == "send-pack failed: connection reset"
         ));
     }
 

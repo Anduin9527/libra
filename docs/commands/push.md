@@ -533,3 +533,37 @@ branch-protection hints; valid `ng` reasons remain visible. Local remote-trackin
 refs are updated only after successful status validation. A failed response
 does not prove the server rolled back its refs: inspect the remote state before
 retrying an update.
+
+## SSH advertisement error handling
+
+SSH advertisement frames with lengths `0001` through `0003`, incomplete headers
+(including zero-byte EOF), or truncated payloads return `LBR-NET-002`. The fixed
+protocol reason and its marker are retained; captured SSH stdout/stderr is never
+inserted into that protocol error.
+
+A missing advertisement can also mean SSH failed before Git negotiation, for
+example because of connectivity, host trust, authentication or repository access.
+This release still reports that incomplete advertisement as `LBR-NET-002`. When
+SSH's local non-zero exit status is available, the message adds only
+`SSH exited with status N` and fixed guidance to check SSH connectivity, trusted
+host keys, ssh-agent authentication and remote repository access. The original
+SSH stderr is not shown in this protocol diagnostic; specific host-key guidance
+is not yet provided by this path.
+
+After an incomplete required header, Libra allows up to 100 milliseconds for SSH
+to report its exit status, then requests termination if it is still running.
+Other advertisement read errors request termination immediately. The status
+window and direct-child cleanup share a two-second total budget. Cleanup failure
+does not replace the primary protocol reason. This does not promise cleanup of
+arbitrary descendant processes.
+
+Ordinary IO and timeout errors keep their transport classification. Cleanup can
+terminate a running child, so its reported exit status and the amount of
+available diagnostics can change; a local cleanup warning is appended to any
+collected process result. Interactive stderr inheritance and other SSH
+process-error diagnostics retain their existing behavior, so this change does
+not suppress every SSH terminal message.
+
+The `git://` object-fetch path already reports these frame errors as `LBR-NET-002`.
+Git discovery can still report them as `LBR-NET-001`. Non-ASCII/non-hex headers
+retain their existing classification. HTTP(S) behavior is unchanged.

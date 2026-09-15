@@ -88,6 +88,17 @@ notes: |
   inputs plus actual local TCP Git object-fetch advertisements and public
   fetch/clone/pull error conversions. They do not prove complete command
   execution or SSH process cleanup. No cli.* runner scenario is added.
+  PKT-12 has eleven Cargo library gates for shared SSH advertisement error
+  wrappers, native exit status without captured output echo, bounded direct-child
+  cleanup and real ordinary-IO cleanup. Fifty malformed-frame and five native
+  exit-255/empty-advertisement command cases require non-terminal stdin and Unix;
+  the existing push timeout gate also covers classifier priority and ordinary IO.
+  Actual run evidence is recorded in plan-20260901.md. No cli.* scenario is added.
+  Two existing command_test cases, test_fetch_ssh_host_key_failure_is_reported
+  and test_push_ssh_host_key_failure_is_reported, also run human/JSON/machine CLI
+  modes and pin exit128/NET002/headerEOF/SSH255, fixed SSH guidance, each command's
+  complete protocol-hint vector, no raw stderr in either stream, and push ref safety.
+  Their names and serial lanes are retained; rejected runs are not acceptance.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

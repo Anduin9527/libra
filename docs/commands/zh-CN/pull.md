@@ -315,9 +315,32 @@ Git/SSH pkt-line 广告读取器拒绝声明长度 `0001` 至 `0003`、不完整
 报告为 `LBR-NET-002`，包括零字节广告；提示为
 `check that the remote serves Git data and that a proxy has not altered the response`。
 长度 1–3 之前可能触发 panic；截断广告之前返回 `LBR-NET-001` 与网络/传输提示。
-Git/SSH discovery、SSH 取对象及 push 广告的外层包装仍可能返回 `LBR-NET-001`；
-SSH 错误收集仍沿用既有子程序等待行为，这些路径由后续改动处理。
+Git discovery 包装仍可能返回 `LBR-NET-001`；SSH 广告透传与有界清理见下节。
+完整的 ASCII-hex 标头校验仍由后续改动处理。
 
 该广告阶段不同于协商后的 upload-pack 响应：HTTP(S) 帧分类和空 upload-pack 响应
 分类不变。测试已覆盖真实本机 TCP 取对象广告读取及公开 fetch/clone/pull 错误转换，
 不代表完整命令执行或有界 SSH 清理。畸形帧应检查远端 Git 服务或代理。
+
+## SSH 广告错误处理
+
+SSH advertisement 长度 `0001` 至 `0003`、不完整标头（包括零字节 EOF）或截断
+payload 均作为 pkt-line 协议错误返回 `LBR-NET-002`。固定协议原因与 marker 保留，
+该协议错误不会插入捕获到的 SSH stdout/stderr。
+
+未收到完整广告也可能是 SSH 在 Git 协商前因连接、主机信任、认证或仓库访问失败。
+本版本仍将这类不完整广告报告为 `LBR-NET-002`；当能观察到本地 SSH 非零退出状态时，
+消息仅追加 `SSH exited with status N` 与固定指引，提示检查 SSH 连接、可信主机键、
+ssh-agent 认证及远端仓库权限。协议诊断不展示原始 SSH stderr；这条路径目前尚未
+提供针对具体 host-key 故障的分类指引。
+
+必需标头不完整时，Libra 先给 SSH 最多100毫秒回报退出状态，再请求终止仍在运行的
+子程序；其它广告读取错误立即请求终止。状态观察与直接子程序清理共用两秒总预算。
+清理失败不会替换主要协议原因；这不承诺回收任意后代程序。
+
+普通 IO 与超时保留传输错误分类。清理可能终止仍在运行的子程序，因此报告的退出
+状态与可用诊断长度可能改变；本地清理警告会附在已收集的程序结果之后。交互 stderr
+继承及其它 SSH 子程序诊断保留既有行为，本改动不代表抑制全部 SSH 终端消息。
+
+`git://` 取对象阶段已经将这些帧归类为 `LBR-NET-002`，Git discovery 仍可能返回
+`LBR-NET-001`。非 ASCII/非 hex 标头保留既有分类，HTTP(S) 行为不变。

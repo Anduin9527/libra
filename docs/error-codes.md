@@ -483,3 +483,17 @@ They parse the final JSON stderr line and assert both:
 - machine-readable fields are stable
 
 Shared helpers live in [`tests/command/mod.rs`](../tests/command/mod.rs).
+
+### SSH advertisement framing
+
+`LBR-NET-002` covers SSH advertisement lengths 1–3 and header/payload EOF through
+discovery, object-fetch and push. An empty advertisement caused by SSH connection,
+host-trust, authentication or repository-access failure currently also uses this
+code. The fixed protocol diagnostic includes `SSH exited with status N` and fixed
+SSH/host-key/ssh-agent/access guidance when a local non-zero exit is observed;
+captured stderr is never inserted. Required-header EOF permits a 100ms status
+window within the two-second total cleanup budget; other read failures request
+termination immediately. Cleanup failure preserves the primary protocol reason.
+Ordinary IO/timeouts remain `LBR-NET-001`, although termination can change the
+reported status/available diagnostics. Specific host-key guidance and async
+non-hex header classification remain separate work.
