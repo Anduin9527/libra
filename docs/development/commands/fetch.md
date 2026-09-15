@@ -89,5 +89,15 @@ truncated or replaced the response; then retry.
 
 The buffered parser preserves typed pkt-line failures as raw `GitError::NetworkError`
 details with the shared leading marker. Empty discovery responses use the same
-marker. Command error mapping and streaming transport readers are separate
-boundaries; this change does not alter their classification by itself.
+marker. `map_fetch_discovery_error` matches the raw detail with `starts_with`
+and maps these pkt-line discovery errors to `LBR-NET-002`; it does not search the
+formatted outer error. Non-marker network errors remain `LBR-NET-001`, including
+the fixed unsupported-object-format capability diagnostic. Other commands and
+streaming transport readers retain their independent error boundaries.
+
+The marker branch attaches the fixed hint
+`check that the remote serves Git data and that a proxy has not altered the response`.
+Other non-marker discovery parse errors also remain `LBR-NET-001`; fully typing
+those errors is deferred under DEFER-04. The raw-marker mapping applies whenever
+an existing transport supplies that marker; asynchronous header readers are
+covered separately by PKT-13.

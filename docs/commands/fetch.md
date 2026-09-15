@@ -397,7 +397,8 @@ by default for maximum script friendliness.
 | Invalid remote spec (missing repo, malformed URL, unsupported scheme) | `LBR-CLI-003` or `LBR-REPO-001` | 129 / 128 | Varies by cause |
 | Authentication failure during discovery | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | Network timeout / transport failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
-| Packet / sideband / checksum / pack protocol failure | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
+| Malformed pkt-line / empty advertisement during discovery | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Packet / sideband / checksum / pack protocol failure | `LBR-NET-002` | 128 | No additional hint, except for an incomplete pack: "the connection dropped mid-transfer — retry the fetch" |
 | Object format mismatch | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | Failed to create pack directory | `LBR-IO-002` | 128 | "check filesystem permissions" |
 | Failed to write pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
@@ -413,3 +414,8 @@ An unsupported object-format capability reports the fixed message
 `Unsupported object format capability` without echoing its remote value.
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
+
+Fetch discovery reports `LBR-NET-002` for an empty advertisement or malformed
+pkt-line response, without echoing its header or payload bytes. Ordinary network
+failures retain `LBR-NET-001`; verify the Git service and any proxy response
+before retrying a protocol failure.

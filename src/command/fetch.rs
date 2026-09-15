@@ -33,7 +33,10 @@ use crate::{
             RemotePruneEntry, classify_stale_tracking_branches, remote_advertised_branch_names,
         },
     },
-    git_protocol::ServiceType::{self, UploadPack},
+    git_protocol::{
+        PKT_LINE_PROTOCOL_ERROR_PREFIX,
+        ServiceType::{self, UploadPack},
+    },
     internal::{
         branch::Branch,
         config::{ConfigKv, ConfigKvEntry, RemoteConfig},
@@ -945,6 +948,11 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
         GitError::UnAuthorized(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::AuthPermissionDenied)
             .with_hint("check SSH key / HTTP credentials and repository access rights"),
+        GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         GitError::NetworkError(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::NetworkUnavailable)
             .with_hint("check network connectivity and retry"),
@@ -3750,6 +3758,162 @@ mod tests {
             test::ScopedEnvVar,
         },
     };
+
+    #[test]
+    fn pkt_line_fetch_marker_maps_to_lbr_net_002() {
+        use git_internal::errors::GitError;
+
+        use crate::{
+            git_protocol::{PKT_LINE_PROTOCOL_ERROR_PREFIX, ServiceType::UploadPack},
+            internal::protocol::parse_discovered_references,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        for response in [
+            b"".as_slice(),
+            b"0",
+            b"00",
+            b"000",
+            b"\xff000",
+            b"zzzz",
+            b"+004",
+            b"0001",
+            b"0002",
+            b"0003",
+            b"0008abc",
+        ] {
+            let source = parse_discovered_references(Bytes::copy_from_slice(response), UploadPack)
+                .expect_err("malformed discovery must fail");
+            assert!(
+                matches!(&source, GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+            );
+            let error = CliError::from(FetchError::Discovery {
+                remote: "https://example.invalid/repo".to_string(),
+                source,
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+            assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "check that the remote serves Git data and that a proxy has not altered the response"
+                ]
+            );
+        }
+        let source = GitError::NetworkError(format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}timeout"));
+        let error = CliError::from(FetchError::Discovery {
+            remote: "origin".to_string(),
+            source,
+        });
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+    }
+
+    #[test]
+    fn pkt_line_fetch_non_marker_stays_net_001() {
+        use git_internal::errors::GitError;
+
+        use crate::{
+            git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        for detail in [
+            "connection refused".to_string(),
+            "operation timed out".to_string(),
+            "Unsupported object format capability".to_string(),
+            format!("wrapper: {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+            format!(" {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+            "PKT-LINE protocol error: malformed".to_string(),
+        ] {
+            let error = CliError::from(FetchError::Discovery {
+                remote: "origin".to_string(),
+                source: GitError::NetworkError(detail),
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+            assert_eq!(error.stable_code().as_str(), "LBR-NET-001");
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                ["check network connectivity and retry"]
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let error = CliError::from(FetchError::Discovery {
+                remote: "origin".to_string(),
+                source: GitError::IOError(std::io::Error::new(kind, "transport failure")),
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+        }
+        let error = CliError::from(FetchError::Discovery {
+            remote: "origin".to_string(),
+            source: GitError::UnAuthorized("permission denied".to_string()),
+        });
+        assert_eq!(error.stable_code(), StableErrorCode::AuthPermissionDenied);
+    }
+
+    #[test]
+    fn pkt_line_fetch_zero_echo_sentinel() {
+        use crate::{
+            git_protocol::ServiceType::UploadPack,
+            internal::protocol::parse_discovered_references,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        let sentinel = "REMOTE_FETCH_SECRET_7b1c";
+        for header in [b"zzzz".as_slice(), b"\xff000", b"0001", b"ffff"] {
+            let mut response = header.to_vec();
+            response.extend_from_slice(sentinel.as_bytes());
+            let source = parse_discovered_references(Bytes::from(response), UploadPack)
+                .expect_err("invalid header or truncated payload must fail");
+            assert!(!source.to_string().contains(sentinel));
+            let error = CliError::from(FetchError::Discovery {
+                remote: "https://example.invalid/repo".to_string(),
+                source,
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            for rendered in [
+                error.to_string(),
+                error.render_for_stderr(),
+                error.render_json(),
+            ] {
+                assert!(!rendered.contains(sentinel));
+                assert!(!rendered.contains('�'));
+            }
+        }
+    }
+
+    /// Cross-module fallback anchor; fetch discovery itself sets an explicit code.
+    #[test]
+    fn pkt_line_fetch_classifier_fallback_anchored() {
+        use crate::{
+            git_protocol::{PktFrameError, PktLineError},
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        for source in [
+            PktLineError::TruncatedHeader,
+            PktLineError::InvalidHeaderEncoding,
+            PktLineError::InvalidHexHeader,
+            PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            PktLineError::InvalidFrameLength(PktFrameError::LengthAboveMaximum),
+            PktLineError::TruncatedPayload,
+        ] {
+            let error = CliError::fatal(source.to_string());
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+        }
+    }
 
     /// `--no-progress` forces progress reporting off while leaving progress on
     /// when the flag is absent (and short-circuits when it is already off).

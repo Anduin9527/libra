@@ -290,7 +290,8 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 | 无效远程 spec（缺少 repo、URL 格式错误、不支持的 scheme） | `LBR-CLI-003` 或 `LBR-REPO-001` | 129 / 128 | 因原因而异 |
 | 发现期间认证失败 | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | 网络超时 / 传输失败 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
-| Packet / sideband / checksum / pack 协议失败 | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
+| discovery 期间 pkt-line 畸形 / 广告为空 | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Packet / sideband / checksum / pack 协议失败 | `LBR-NET-002` | 128 | 无额外提示；不完整的 pack 除外："the connection dropped mid-transfer — retry the fetch" |
 | 对象格式不匹配 | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | 无法创建 pack 目录 | `LBR-IO-002` | 128 | "check filesystem permissions" |
 | 无法写入 pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
@@ -304,3 +305,7 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 不支持的 object-format capability 使用固定错误消息
 `Unsupported object format capability`，不回显远端提供的值。
 请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。
+
+fetch discovery 对空广告或畸形 pkt-line 响应返回 `LBR-NET-002`，不回显标头或
+payload 字节。普通网络故障仍返回 `LBR-NET-001`；遇到协议错误时，请先检查 Git
+服务及代理返回的响应，再重试。
