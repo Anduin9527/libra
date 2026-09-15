@@ -9,7 +9,7 @@
 use core::fmt;
 use std::str::FromStr;
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use git_internal::errors::GitError;
 
 /// Identifies the direction of a smart-protocol exchange.
@@ -107,7 +107,50 @@ pub fn pkt_frame_payload_len(declared_len: u32) -> Result<usize, PktFrameError> 
     }
 }
 
-use bytes::Bytes;
+/// A malformed or incomplete buffered pkt-line frame.
+///
+/// Error messages contain fixed reasons, never remote header or payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PktLineError {
+    /// Nonempty input ends before the complete four-byte header.
+    TruncatedHeader,
+    /// The four-byte header is not valid UTF-8.
+    InvalidHeaderEncoding,
+    /// The header contains a character other than an ASCII hexadecimal digit.
+    InvalidHexHeader,
+    /// The declared length cannot represent a supported pkt-line frame.
+    InvalidFrameLength(PktFrameError),
+    /// The buffer ends before the complete declared payload.
+    TruncatedPayload,
+}
+
+impl fmt::Display for PktLineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::TruncatedHeader => "incomplete four-byte header",
+            Self::InvalidHeaderEncoding => "header is not valid UTF-8",
+            Self::InvalidHexHeader => "header must contain four ASCII hexadecimal digits",
+            Self::InvalidFrameLength(error) => return error.fmt(f),
+            Self::TruncatedPayload => "payload is shorter than the declared frame length",
+        };
+        write!(f, "{PKT_LINE_PROTOCOL_ERROR_PREFIX}{reason}")
+    }
+}
+
+impl std::error::Error for PktLineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidFrameLength(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<PktFrameError> for PktLineError {
+    fn from(error: PktFrameError) -> Self {
+        Self::InvalidFrameLength(error)
+    }
+}
 
 /// Consume a single pkt-line frame from the front of `bytes` and return its
 /// `(declared_length, payload)`.
@@ -119,38 +162,37 @@ use bytes::Bytes;
 ///   the consumed frame.
 ///
 /// Boundary conditions:
-/// - Returns `(0, Bytes::new())` when `bytes` is empty so callers can use a
+/// - Returns `Ok((0, Bytes::new()))` when `bytes` is empty so callers can use a
 ///   zero-length response as a stop condition.
-/// - Returns `(0, Bytes::new())` when the decoded length is zero (the flush marker
+/// - Returns `Ok((0, Bytes::new()))` when the decoded length is zero (the flush marker
 ///   `0000`); the leading 4 header bytes are still consumed.
-/// - **Panics** when the 4-byte header is not valid UTF-8 hex. Callers must therefore
-///   validate or trust the source — typically only network code that rejects malformed
-///   frames upstream invokes this helper.
-pub fn read_pkt_line(bytes: &mut Bytes) -> (usize, Bytes) {
+/// - A `0004` header produces an empty payload with declared length four.
+///
+/// # Errors
+///
+/// Returns [`PktLineError`] for incomplete headers or payloads, non-ASCII-hex
+/// headers, or invalid frame lengths. On error, the input buffer is unchanged.
+/// Callers that require a response must reject empty input at their own boundary.
+pub fn read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), PktLineError> {
     if bytes.is_empty() {
-        return (0, Bytes::new());
+        return Ok((0, Bytes::new()));
     }
-    let pkt_length_bytes = bytes.copy_to_bytes(4);
-    // INVARIANT: the function's doc comment explicitly documents that
-    // callers must validate the 4-byte header as UTF-8 hex. Network code
-    // upstream rejects malformed frames before they reach this helper.
-    let header_str = core::str::from_utf8(&pkt_length_bytes)
-        .expect("pkt-line header must be 4 bytes of ASCII hex (caller contract)");
-    let pkt_length = usize::from_str_radix(header_str, 16).unwrap_or_else(|_| {
-        panic!("pkt-line header {pkt_length_bytes:?} is not valid hex (caller contract)")
-    });
-    if pkt_length == 0 {
-        return (0, Bytes::new());
+    let header = bytes.get(..4).ok_or(PktLineError::TruncatedHeader)?;
+    let header_str =
+        core::str::from_utf8(header).map_err(|_| PktLineError::InvalidHeaderEncoding)?;
+    if !header.iter().all(u8::is_ascii_hexdigit) {
+        return Err(PktLineError::InvalidHexHeader);
     }
-    // Advance the buffer past the payload — the caller receives the payload slice and
-    // any subsequent read continues from the next frame.
-    let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
-    tracing::debug!("pkt line: {:?}", pkt_line);
-
-    (pkt_length, pkt_line)
+    let declared_len =
+        u32::from_str_radix(header_str, 16).map_err(|_| PktLineError::InvalidHexHeader)?;
+    let payload_len = pkt_frame_payload_len(declared_len)?;
+    if bytes.len() - 4 < payload_len {
+        return Err(PktLineError::TruncatedPayload);
+    }
+    // Validate the entire frame before consuming either header or payload.
+    bytes.advance(4);
+    Ok((declared_len as usize, bytes.copy_to_bytes(payload_len)))
 }
-
-use bytes::BytesMut;
 
 /// Append a UTF-8 string as a pkt-line to `pkt_line_stream`.
 ///
@@ -173,7 +215,135 @@ pub fn add_pkt_line_string(pkt_line_stream: &mut BytesMut, buf_str: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PKT_LINE_PROTOCOL_ERROR_PREFIX, PktFrameError, pkt_frame_payload_len};
+    use super::{
+        Bytes, PKT_LINE_PROTOCOL_ERROR_PREFIX, PktFrameError, PktLineError, pkt_frame_payload_len,
+        read_pkt_line,
+    };
+    use crate::utils::error::{CliError, StableErrorCode};
+
+    fn assert_rejected(input: &[u8], expected: PktLineError) {
+        let mut bytes = Bytes::copy_from_slice(input);
+        let original = bytes.clone();
+        assert_eq!(read_pkt_line(&mut bytes), Err(expected));
+        assert_eq!(bytes, original, "failed parsing must not consume input");
+        assert!(
+            expected
+                .to_string()
+                .starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX)
+        );
+    }
+
+    #[test]
+    fn read_pkt_line_rejects_short_header() {
+        for input in [b"0".as_slice(), b"00", b"000"] {
+            assert_rejected(input, PktLineError::TruncatedHeader);
+        }
+    }
+
+    #[test]
+    fn read_pkt_line_rejects_non_utf8_header() {
+        assert_rejected(b"\xff000", PktLineError::InvalidHeaderEncoding);
+    }
+
+    #[test]
+    fn read_pkt_line_rejects_non_hex_header() {
+        for input in [b"zzzz", b"+004", b"-004", b" 004", b"0x04", b"000\n"] {
+            assert_rejected(input, PktLineError::InvalidHexHeader);
+        }
+    }
+
+    #[test]
+    fn read_pkt_line_rejects_len_below_four() {
+        for input in [b"0001", b"0002", b"0003"] {
+            assert_rejected(input, PktFrameError::LengthBelowHeader.into());
+        }
+    }
+
+    #[test]
+    fn read_pkt_line_rejects_truncated_frame() {
+        for input in [b"0005".as_slice(), b"0008abc", b"ffffremote-sentinel"] {
+            assert_rejected(input, PktLineError::TruncatedPayload);
+        }
+    }
+
+    #[test]
+    fn read_pkt_line_preserves_empty_buffer() {
+        let mut bytes = Bytes::new();
+        assert_eq!(read_pkt_line(&mut bytes), Ok((0, Bytes::new())));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn read_pkt_line_preserves_flush() {
+        let mut bytes = Bytes::from_static(b"00000005x");
+        assert_eq!(read_pkt_line(&mut bytes), Ok((0, Bytes::new())));
+        assert_eq!(bytes, b"0005x".as_slice());
+    }
+
+    #[test]
+    fn read_pkt_line_preserves_len_4_empty_payload() {
+        let mut bytes = Bytes::from_static(b"00040000");
+        assert_eq!(read_pkt_line(&mut bytes), Ok((4, Bytes::new())));
+        assert_eq!(bytes, b"0000".as_slice());
+    }
+
+    #[test]
+    fn read_pkt_line_preserves_payload_and_following_frames() {
+        let mut bytes = Bytes::from_static(b"000Ahello\n0005x0000");
+        assert_eq!(
+            read_pkt_line(&mut bytes),
+            Ok((10, Bytes::from_static(b"hello\n")))
+        );
+        assert_eq!(read_pkt_line(&mut bytes), Ok((5, Bytes::from_static(b"x"))));
+        assert_eq!(read_pkt_line(&mut bytes), Ok((0, Bytes::new())));
+        assert!(bytes.is_empty());
+        let payload = vec![0xff; 0xffff - 4];
+        for header in [b"ffff", b"FFFF"] {
+            let mut frame = header.to_vec();
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(b"0000");
+            let mut bytes = Bytes::from(frame);
+            assert_eq!(
+                read_pkt_line(&mut bytes),
+                Ok((0xffff, Bytes::copy_from_slice(&payload)))
+            );
+            assert_eq!(bytes, b"0000".as_slice());
+        }
+    }
+
+    #[test]
+    fn pkt_line_error_text_matches_protocol_classifier() {
+        for (error, reason) in [
+            (PktLineError::TruncatedHeader, "incomplete four-byte header"),
+            (
+                PktLineError::InvalidHeaderEncoding,
+                "header is not valid UTF-8",
+            ),
+            (
+                PktLineError::InvalidHexHeader,
+                "header must contain four ASCII hexadecimal digits",
+            ),
+            (
+                PktFrameError::LengthBelowHeader.into(),
+                "frame length is smaller than the four-byte header",
+            ),
+            (
+                PktFrameError::LengthAboveMaximum.into(),
+                "frame length exceeds the four-digit header limit",
+            ),
+            (
+                PktLineError::TruncatedPayload,
+                "payload is shorter than the declared frame length",
+            ),
+        ] {
+            let message = error.to_string();
+            assert_eq!(message, format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}{reason}"));
+            assert_eq!(
+                CliError::fatal(message).stable_code(),
+                StableErrorCode::NetworkProtocol
+            );
+        }
+    }
 
     #[test]
     fn pkt_frame_payload_len_ok_flush_zero() {
