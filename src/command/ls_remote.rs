@@ -877,14 +877,15 @@ mod pkt_line_boundary_tests {
         EmptyAdvertisement,
         MalformedFetch,
     }
+    type Transcript = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
     #[derive(Clone)]
     struct ServerState {
         mode: ResponseMode,
-        transcript: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
+        transcript: Transcript,
     }
     struct TestServer {
         url: String,
-        transcript: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
+        transcript: Transcript,
         task: JoinHandle<()>,
         shutdown: Option<oneshot::Sender<()>>,
     }
