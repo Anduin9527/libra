@@ -529,3 +529,13 @@ reports a pkt-line failure; remaining async header validation is separate.
 Pack completeness is a separate existing contract: clone reports an incomplete
 pack ending at a clean frame boundary as `LBR-NET-001`, while fetch/pull use
 `LBR-NET-002`. This card preserves that distinction.
+
+### Push receive-pack status reports
+
+Unexpected receive-pack status lines in push reports fail with `LBR-NET-002`.
+A missing final flush uses the same code, including empty responses and
+truncated unpack/`ng` rejections. Diagnostics use fixed reasons
+without echoing unexpected status bytes. Ordinary transport failures remain
+`LBR-NET-001`, while completely framed server unpack/`ng` rejections keep their existing protocol
+code and hints. Validation failure does not advance local tracking refs and does
+not establish whether the remote already applied an update.

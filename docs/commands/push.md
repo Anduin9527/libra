@@ -495,6 +495,7 @@ trigger a fuzzy match suggestion via edit distance.
 | Pack encoding failed | `LBR-INTERNAL-001` | 128 | Issues URL |
 | Remote unpack failed | `LBR-NET-002` | 128 | "retry or check server logs" |
 | Remote ref update rejected | `LBR-NET-002` | 128 | "check branch protection rules" |
+| Unexpected receive-pack status line / missing status-report flush | `LBR-NET-002` | 128 | "check the remote Git service or proxy response and retry" |
 | Network error | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | LFS upload failed | `LBR-NET-001` | 128 | "check LFS endpoint configuration" |
 | Tracking ref update failed | `LBR-IO-002` | 128 | -- |
@@ -515,3 +516,20 @@ and do not include the malformed header or payload. Check the remote Git service
 and any proxy that may truncate or replace its response, then retry. Other
 discovery connectivity failures and transport configuration errors retain
 `LBR-NET-001`; authentication and timeout handling retain their existing behavior.
+
+## Receive-pack status reports
+
+An unexpected receive-pack status line returns `LBR-NET-002` (exit 128), with
+`pkt-line protocol error: unexpected receive-pack status line`. The diagnostic
+does not echo that status line. Every report must reach an explicit `0000`
+flush before its unpack/ref statuses are interpreted. An empty response or EOF
+before that flush returns `LBR-NET-002` with the fixed reason
+`missing receive-pack status flush`, including truncated unpack/`ng` rejections.
+Both cases use `check the remote Git service or proxy response and retry`.
+
+Ordinary transport failures retain `LBR-NET-001`. Completely framed server-declared unpack failures
+and `ng` ref rejections retain `LBR-NET-002` with their existing server-log or
+branch-protection hints; valid `ng` reasons remain visible. Local remote-tracking
+refs are updated only after successful status validation. A failed response
+does not prove the server rolled back its refs: inspect the remote state before
+retrying an update.

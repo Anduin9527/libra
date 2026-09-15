@@ -367,6 +367,7 @@ Git LFS 需要单独的二进制（`git-lfs`）和 post-push hook 来上传大�
 | Pack 编码失败 | `LBR-INTERNAL-001` | 128 | Issues URL |
 | 远程 unpack 失败 | `LBR-NET-002` | 128 | "retry or check server logs" |
 | 远程 ref 更新被拒绝 | `LBR-NET-002` | 128 | "check branch protection rules" |
+| 未识别receive-pack状态行 / 状态报告缺少flush | `LBR-NET-002` | 128 | "check the remote Git service or proxy response and retry" |
 | 网络错误 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | LFS 上传失败 | `LBR-NET-001` | 128 | "check LFS endpoint configuration" |
 | 跟踪 ref 更新失败 | `LBR-IO-002` | 128 | -- |
@@ -385,3 +386,17 @@ receive-pack 状态响应中的畸形帧，均返回 `LBR-NET-002`；未收到 H
 错误使用固定的 `pkt-line protocol error: ` 原因，不包含畸形标头或 payload。
 请检查远端 Git 服务及可能截断或替换响应的代理，然后重试。其他 discovery
 连接故障及传输配置错误仍返回 `LBR-NET-001`；认证和超时处理保持既有行为。
+
+## Receive-pack 状态报告
+
+未识别的 receive-pack 状态行返回 `LBR-NET-002`（退出码128），消息为
+`pkt-line protocol error: unexpected receive-pack status line`，不回显该状态行。
+所有状态报告都必须先读到显式 `0000` flush，才解释 unpack/引用状态。空响应或在
+flush 前遇到 EOF 时，返回 `LBR-NET-002`，固定原因为
+`missing receive-pack status flush`；这也涵盖被截断的 unpack/`ng` 拒绝。两类错误均提示
+`check the remote Git service or proxy response and retry`。
+
+普通传输故障仍返回 `LBR-NET-001`。帧结构完整的服务器 unpack 失败和 `ng` 引用拒绝
+仍返回 `LBR-NET-002`，并保留检查服务端日志或分支保护规则的提示；合法 `ng`
+原因仍可见。只有状态验证成功后才更新本地远程跟踪引用。响应失败不能证明服务器
+已回滚引用；重试更新前应先核对远程状态。

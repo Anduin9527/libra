@@ -74,6 +74,14 @@ notes: |
   or live remotes. URL carrier matrices do not replace later raw Git/SSH reader
   coverage. No new cli.* scenario is registered; the integration plan matrix
   and plan-20260901.md PKT-10 hold scope and actual execution evidence.
+  PKT-09 adds four named push receive-pack status gates to the existing Cargo
+  library tests (cargo test --lib pkt_line_push_); existing
+  validate_receive_pack_response cases remain regression coverage. A bounded
+  local HTTP fixture drives actual receive-pack discovery and a delete-only
+  POST, verifies malformed/truncated/status/flush errors and unchanged local
+  tracking refs. It does not claim TLS/SSH or remote rollback proof. This is
+  Cargo-only coverage, not a new cli.* runner scenario; actual evidence belongs
+  to plan-20260901.md PKT-09.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

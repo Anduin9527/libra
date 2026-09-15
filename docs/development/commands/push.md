@@ -77,3 +77,39 @@ and do not include the malformed header or payload. Check the remote Git service
 and any proxy that may truncate or replace its response, then retry. Other
 discovery connectivity failures and transport configuration errors retain
 `LBR-NET-001`; authentication and timeout handling retain their existing behavior.
+
+## Receive-pack status reports
+
+An unexpected receive-pack status line returns `LBR-NET-002` (exit 128), with
+`pkt-line protocol error: unexpected receive-pack status line`. The diagnostic
+does not echo that status line. Every report must reach an explicit `0000`
+flush before its unpack/ref statuses are interpreted. An empty response or EOF
+before that flush returns `LBR-NET-002` with the fixed reason
+`missing receive-pack status flush`, including truncated unpack/`ng` rejections.
+Both cases use `check the remote Git service or proxy response and retry`.
+
+Ordinary transport failures retain `LBR-NET-001`. Completely framed server-declared unpack failures
+and `ng` ref rejections retain `LBR-NET-002` with their existing server-log or
+branch-protection hints; valid `ng` reasons remain visible. Local remote-tracking
+refs are updated only after successful status validation. A failed response
+does not prove the server rolled back its refs: inspect the remote state before
+retrying an update.
+
+The status parser first checks framing through the first explicit flush, using
+the shared pkt-line reader over a zero-copy Bytes clone. It rejects exhaustion
+before that flush even when an unpack/`ng` status would otherwise return early.
+The standalone reader empty-buffer behavior and trailing-byte handling after
+the first flush remain unchanged. The extra scan takes O(frame count) work
+without copying payloads or collecting another response buffer; existing
+semantic parsing still scales with response size. The unexpected-line diagnostic
+uses the shared marker and a fixed reason; existing `ng` parsing/rendering rules
+belong to PKT-14.
+
+Four named PKT-09 library gates cover the error variant, the updated locked
+expectation, status-code consistency, omitted flush and zero-echo rendering.
+The local HTTP receive-pack fixture exercises actual push discovery and POST
+through HttpsClient, submits a delete-only transaction, checks its old/zero OIDs
+and ref name, and verifies malformed responses leave the local tracking ref
+unchanged. It uses a temporary repo, a two-worker Tokio runtime, scoped local
+storage selection, a bounded request body, command timeout and server shutdown.
+It is not a TLS or real SSH integration test.

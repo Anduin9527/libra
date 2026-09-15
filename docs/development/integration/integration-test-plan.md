@@ -101,6 +101,7 @@ cargo test --test ai_agent_test -- --test-threads=1
 | 其他 CLI 外壳能力 | `open`、root `--json/-J`、`--machine`、`--quiet`、颜色/progress/exit-code-on-warning | 1 | 已实现 | `cli.open-smoke`, `cli.cross-cutting-flags` |
 | 安装器短别名 | IX-01 默认相对 `lba -> libra`、same-version 缺失修复/幂等、`--no-alias`/`LIBRA_NO_ALIAS=1`、既有 regular/foreign symlink 保护、无 symlink 能力回退 | 1 | 已实现（Cargo 驱动 POSIX 完整 installer smoke） | Cargo: `compat_install_alias` |
 | pkt-line 命令错误边界 | fetch/clone/ls-remote/pull 的 marker 协议错误与普通 IO/网络错误归类；真实空 HTTP advertisement 四命令路径和 clone discovery→fetch POST | 1 | Cargo library 场景已实现；执行证据见 plan-20260901.md PKT-10 | Cargo library: `command::ls_remote::pkt_line_boundary_tests`（25 项；非 cli.* runner scenario） |
+| push receive-pack 状态报告 | 未识别状态行、畸形/截断帧、状态报告缺flush（含空响应及unpack/ng拒绝）、固定诊断及本地tracking引用保持 | 1 | Cargo library场景；实际验收见plan-20260901.md PKT-09 | Cargo library: `command::push::test` 中4个PKT-09具名门（非cli.* runner scenario） |
 | Schema 与本地协议 | schema 建链自动升级、local clone/remote/ls-remote/fetch/pull（含 refspec 精确映射、remotes.default、rename namespace、symref、pull-rebase hook/JSON child 隔离）、shallow fetch、拒绝 file remote push | 2 | 已实现 | Runner: `cli.schema-upgrade-observable`, `cli.clone-fetch-pull-local`, `cli.fetch-depth-local`, `cli.push-local-file-remote-rejected`; Cargo: `command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history` |
 | 对象读取与树遍历 | `rev-parse`、`show-ref` / `show-ref --branches` / `show-ref --no-branches` / `show-ref --no-tags` / `show-ref --hash[=<n>]` / `show-ref --no-hash` / `show-ref --abbrev[=<n>]` / `show-ref --no-abbrev` / `show-ref --dereference` / `show-ref --no-dereference` / `show-ref --verify` / `show-ref --no-verify` / `show-ref --exists` / `show-ref --no-exists` / `show-ref --head` / `show-ref --no-head` / `show-ref --exclude-existing[=<pattern>]`、`for-each-ref --points-at`、`cat-file`、`hash-object --stdin` / `--path` / `--no-filters`、`show`、`rev-list` / multi revision / `A..B` / `^A` / `A...B` / `rev-list --count` / `rev-list -n` / `rev-list --skip` / `rev-list --since` / `rev-list --after` / `rev-list --until` / `rev-list --before` / `rev-list --merges` / `rev-list --no-merges` / `rev-list --min-parents` / `rev-list --max-parents` / `rev-list --no-min-parents` / `rev-list --no-max-parents` / `rev-list --first-parent` / `rev-list --author` / `rev-list --committer` / `rev-list --grep` / `rev-list -- <path>` / `rev-list --left-right` / `rev-list --left-only` / `rev-list --right-only` / `rev-list --cherry-pick` / `rev-list --cherry-mark` / `rev-list --cherry` / `rev-list --parents` / `rev-list --children` / `rev-list --timestamp`、`fsck`、sha256 object format；`ls-tree` 默认/递归/子目录/`--full-name`/`--full-tree` 路径场景 | 2 | 已实现 | `cli.object-readback`, `cli.show-ref-exclude-existing`, `cli.ls-tree-smoke`, `cli.sha256-object-readback` |
 | 维护命令 | `gc`、`prune`、`archive`（tar/zip、`--prefix`、`--output`、`--list`、`TREEISH <path>...` pathspec）、`verify-pack <idx>...` / `verify-pack --pack` / `verify-pack -v` / `verify-pack -s`、内部 `index-pack --stdin` / `--keep` / `--progress` / `--no-progress` fixture | 2 | 已实现 | `cli.gc-smoke`, `cli.archive-smoke`, `cli.verify-pack-smoke` |
@@ -125,6 +126,18 @@ header grammar 属于 PKT-08/13。fixture 使用临时仓库、env/cwd/hash_kind
 ```bash
 cargo test --test compat_matrix_alignment
 ```
+
+PKT-09 的状态报告回归使用既有 Cargo library 入口：
+
+```bash
+cargo test --lib pkt_line_push_
+cargo test --lib validate_receive_pack_response
+```
+
+其中4个新增具名门登记于 plan-20260901.md PKT-09；真实push fixture经本地HTTP
+完成receive-pack discovery和delete-only POST，核对畸形/截断响应返回LBR-NET-002
+及本地tracking ref不变。测试不宣称TLS、SSH或真实远端回滚覆盖；YAML notes同步
+Cargo-only范围，没有新增cli.* runner场景。
 
 **剩余覆盖缺口**：默认本地 wave 已覆盖当前 runner 注册的 `cli.*` 场景；需要真实 GitHub 远端的 `live.*` 场景不进入默认阻断门，只能在具备 `gh` 登录态和仓库创建/删除权限时运行。新增或修改 Git 兼容命令时，必须把对应场景加入本表、YAML、场景文档和 runner registry；如果当前 runner 尚未实现，必须在 YAML 和文档中保留明确的未实现状态，而不能只在本表声明覆盖。
 
