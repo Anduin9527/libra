@@ -505,3 +505,13 @@ trigger a fuzzy match suggestion via edit distance.
 - Discovery / connection: 60s connection timeout
 - Upload / receive-pack: 600s idle timeout (no data progress triggers timeout)
 - Timeouts are mapped to `NetworkUnavailable` with `phase` detail
+
+## pkt-line protocol errors
+
+Malformed pkt-line frames in HTTP(S) reference discovery, or in receive-pack
+status responses over HTTP(S) or SSH, fail with `LBR-NET-002`. An absent HTTP(S) discovery advertisement also
+uses `LBR-NET-002`. These errors have a fixed `pkt-line protocol error: ` reason
+and do not include the malformed header or payload. Check the remote Git service
+and any proxy that may truncate or replace its response, then retry. Other
+discovery connectivity failures and transport configuration errors retain
+`LBR-NET-001`; authentication and timeout handling retain their existing behavior.

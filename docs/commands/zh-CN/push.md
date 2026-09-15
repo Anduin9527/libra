@@ -377,3 +377,11 @@ Git LFS 需要单独的二进制（`git-lfs`）和 post-push hook 来上传大�
 - Discovery / 连接：60s 连接超时
 - 上传 / receive-pack：600s idle 超时（无数据进度会触发超时）
 - 超时会映射为带 `phase` 细节的 `NetworkUnavailable`
+
+## pkt-line 协议错误
+
+HTTP(S) 引用发现（discovery）中的畸形 pkt-line 帧，或 HTTP(S)/SSH
+receive-pack 状态响应中的畸形帧，均返回 `LBR-NET-002`；未收到 HTTP(S) discovery 广告时也返回 `LBR-NET-002`。
+错误使用固定的 `pkt-line protocol error: ` 原因，不包含畸形标头或 payload。
+请检查远端 Git 服务及可能截断或替换响应的代理，然后重试。其他 discovery
+连接故障及传输配置错误仍返回 `LBR-NET-001`；认证和超时处理保持既有行为。

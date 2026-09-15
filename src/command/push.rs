@@ -33,7 +33,10 @@ use url::Url;
 
 use crate::{
     command::{branch, fetch::RemoteClient, lfs_schema::LfsUploadSummary},
-    git_protocol::{ServiceType::ReceivePack, add_pkt_line_string, read_pkt_line},
+    git_protocol::{
+        PKT_LINE_PROTOCOL_ERROR_PREFIX, PktLineError, ServiceType::ReceivePack,
+        add_pkt_line_string, read_pkt_line,
+    },
     info_println,
     internal::{
         ai::automation::{VCS_EVENT_POST_PUSH, dispatch_current_repo_vcs_event_to_history},
@@ -307,6 +310,10 @@ pub enum PushError {
     #[error("remote rejected ref update for '{refname}': {reason}")]
     RemoteRefUpdateFailed { refname: String, reason: String },
 
+    /// A pkt-line failure whose detail starts with the shared protocol marker.
+    #[error("{detail}")]
+    Protocol { detail: String },
+
     #[error("network error: {0}")]
     Network(String),
 
@@ -337,6 +344,43 @@ pub enum PushError {
 
     #[error("failed to create push certificate signature: {0}")]
     PushSignFailed(String),
+}
+
+impl From<PktLineError> for PushError {
+    fn from(error: PktLineError) -> Self {
+        Self::Protocol {
+            detail: error.to_string(),
+        }
+    }
+}
+
+fn map_push_discovery_error(repo_url: &str, error: GitError) -> PushError {
+    match error {
+        GitError::UnAuthorized(_) => PushError::AuthenticationFailed {
+            url: repo_url.to_string(),
+        },
+        GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+            PushError::Protocol { detail }
+        }
+        GitError::NetworkError(detail) => {
+            let lower = detail.to_lowercase();
+            if lower.contains("timeout") || lower.contains("timed out") {
+                PushError::Timeout {
+                    phase: "discovery".to_string(),
+                    seconds: PUSH_CONNECT_TIMEOUT.as_secs(),
+                }
+            } else {
+                PushError::DiscoveryFailed {
+                    url: repo_url.to_string(),
+                    detail,
+                }
+            }
+        }
+        other => PushError::DiscoveryFailed {
+            url: repo_url.to_string(),
+            detail: other.to_string(),
+        },
+    }
 }
 
 impl From<PushError> for CliError {
@@ -415,6 +459,9 @@ impl From<PushError> for CliError {
             PushError::RemoteRefUpdateFailed { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("the remote rejected the update; check branch protection rules"),
+            PushError::Protocol { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check the remote Git service or proxy response and retry"),
             PushError::Network(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
                 .with_hint("check network connectivity and retry"),
@@ -892,29 +939,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         phase: "discovery".to_string(),
         seconds: PUSH_CONNECT_TIMEOUT.as_secs(),
     })?
-    .map_err(|e| match e {
-        GitError::UnAuthorized(_) => PushError::AuthenticationFailed {
-            url: repo_url.clone(),
-        },
-        GitError::NetworkError(detail) => {
-            let lower = detail.to_lowercase();
-            if lower.contains("timeout") || lower.contains("timed out") {
-                PushError::Timeout {
-                    phase: "discovery".to_string(),
-                    seconds: PUSH_CONNECT_TIMEOUT.as_secs(),
-                }
-            } else {
-                PushError::DiscoveryFailed {
-                    url: repo_url.clone(),
-                    detail,
-                }
-            }
-        }
-        other => PushError::DiscoveryFailed {
-            url: repo_url.clone(),
-            detail: other.to_string(),
-        },
-    })?;
+    .map_err(|error| map_push_discovery_error(&repo_url, error))?;
 
     let local_kind = get_hash_kind();
     if discovery.hash_kind != local_kind {
@@ -2250,7 +2275,7 @@ fn validate_receive_pack_response(
     mut response_data: Bytes,
     plans: &[RefUpdatePlan],
 ) -> Result<(), PushError> {
-    let (_, pkt_line) = read_pkt_line(&mut response_data);
+    let (_, pkt_line) = read_pkt_line(&mut response_data)?;
     if pkt_line != "unpack ok\n" {
         return Err(PushError::RemoteUnpackFailed);
     }
@@ -2261,7 +2286,7 @@ fn validate_receive_pack_response(
         .collect();
     let mut seen_refs = HashSet::new();
     loop {
-        let (len, pkt_line) = read_pkt_line(&mut response_data);
+        let (len, pkt_line) = read_pkt_line(&mut response_data)?;
         if len == 0 {
             break;
         }
@@ -3102,6 +3127,121 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn pkt_line_push_protocol_variant_exists() {
+        let error = PushError::from(PktLineError::TruncatedHeader);
+        assert!(
+            matches!(&error, PushError::Protocol { detail } if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+        );
+        assert_eq!(
+            error.to_string(),
+            "pkt-line protocol error: incomplete four-byte header"
+        );
+    }
+
+    #[test]
+    fn pkt_line_push_discovery_marker_maps_to_protocol() {
+        // Feed the real discovery parser result through the production mapper.
+        for response in [b"".as_slice(), b"0001", b"0008abc"] {
+            let error = crate::internal::protocol::parse_discovered_references(
+                Bytes::copy_from_slice(response),
+                ReceivePack,
+            )
+            .expect_err("malformed discovery");
+            let error = map_push_discovery_error("https://example.invalid/repo", error);
+            assert!(
+                matches!(&error, PushError::Protocol { detail } if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+            );
+            assert_eq!(
+                CliError::from(error).stable_code(),
+                StableErrorCode::NetworkProtocol
+            );
+        }
+        let detail = format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}timeout in malformed frame");
+        assert!(matches!(
+            map_push_discovery_error("remote", GitError::NetworkError(detail)),
+            PushError::Protocol { .. }
+        ));
+    }
+
+    #[test]
+    fn pkt_line_push_cli_maps_protocol_to_lbr_net_002() {
+        let error = CliError::from(PushError::from(PktLineError::TruncatedPayload));
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+    }
+
+    #[test]
+    fn pkt_line_push_malformed_response_unit() {
+        let plans = vec![test_ref_update_plan("refs/heads/main")];
+        for malformed in [
+            b"0".as_slice(),
+            b"00",
+            b"000",
+            b"\xff000",
+            b"zzzz",
+            b"+004",
+            b"0001",
+            b"0002",
+            b"0003",
+            b"0008abc",
+        ] {
+            for later_frame in [false, true] {
+                let mut response = BytesMut::new();
+                if later_frame {
+                    add_pkt_line_string(&mut response, "unpack ok\n".to_string());
+                }
+                response.extend_from_slice(malformed);
+                let error = validate_receive_pack_response(response.freeze(), &plans)
+                    .expect_err("malformed frame must fail");
+                assert!(
+                    matches!(&error, PushError::Protocol { detail } if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+                );
+                assert_eq!(
+                    CliError::from(error).stable_code(),
+                    StableErrorCode::NetworkProtocol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pkt_line_push_discovery_failed_regression_stays_net_001() {
+        for detail in [
+            "connection refused".to_string(),
+            format!("wrapper: {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+            format!(" {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+        ] {
+            let error = map_push_discovery_error("remote", GitError::NetworkError(detail));
+            assert!(matches!(&error, PushError::DiscoveryFailed { .. }));
+            assert_eq!(
+                CliError::from(error).stable_code(),
+                StableErrorCode::NetworkUnavailable
+            );
+        }
+        let timeout = map_push_discovery_error(
+            "remote",
+            GitError::NetworkError("operation timed out".to_string()),
+        );
+        assert!(matches!(&timeout, PushError::Timeout { .. }));
+        assert_eq!(
+            CliError::from(timeout).stable_code(),
+            StableErrorCode::NetworkUnavailable
+        );
+        assert!(matches!(
+            map_push_discovery_error("remote", GitError::UnAuthorized("denied".to_string())),
+            PushError::AuthenticationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn pkt_line_push_network_variant_regression_stays_net_001() {
+        let error = CliError::from(PushError::Network(
+            "failed to configure remote transport".to_string(),
+        ));
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+    }
 
     fn save_test_blob(content: &str) -> Blob {
         let blob = Blob::from_content(content);
