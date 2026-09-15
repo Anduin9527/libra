@@ -343,3 +343,21 @@ payload 截断保留 `LBR-NET-002`，不附加 CLI 提示。在完整帧边界�
 在 pack 数据开始前，upload-pack 流于帧边界遇到 EOF（包括零字节 POST 响应）
 返回 `LBR-NET-001`，提示为 `check network connectivity and retry`。
 空的 discovery 广告仍返回 `LBR-NET-002`。
+
+## Git 与 SSH 广告帧边界
+
+Git/SSH pkt-line 广告读取器拒绝声明长度 `0001` 至 `0003`、不完整的四字节标头，
+以及声明 payload 内的截断 EOF。flush `0000`、空 payload `0004` 和最大 `ffff`
+帧保持既有行为。读取边界的 typed pkt-line 错误经分类得到 `LBR-NET-002`；
+普通传输 IO 和 idle 超时经分类仍为 `LBR-NET-001`。
+
+在 `git://` 取对象前的 advertisement 阶段，fetch、clone 和 pull 已将这些错误
+报告为 `LBR-NET-002`，包括零字节广告；提示为
+`check that the remote serves Git data and that a proxy has not altered the response`。
+长度 1–3 之前可能触发 panic；截断广告之前返回 `LBR-NET-001` 与网络/传输提示。
+Git/SSH discovery、SSH 取对象及 push 广告的外层包装仍可能返回 `LBR-NET-001`；
+SSH 错误收集仍沿用既有子程序等待行为，这些路径由后续改动处理。
+
+该广告阶段不同于协商后的 upload-pack 响应：HTTP(S) 帧分类和空 upload-pack 响应
+分类不变。测试已覆盖真实本机 TCP 取对象广告读取及公开 fetch/clone/pull 错误转换，
+不代表完整命令执行或有界 SSH 清理。畸形帧应检查远端 Git 服务或代理。

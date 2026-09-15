@@ -107,12 +107,12 @@ pub fn pkt_frame_payload_len(declared_len: u32) -> Result<usize, PktFrameError> 
     }
 }
 
-/// A malformed or incomplete buffered pkt-line frame.
+/// A malformed or incomplete pkt-line frame.
 ///
 /// Error messages contain fixed reasons, never remote header or payload bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PktLineError {
-    /// Nonempty input ends before the complete four-byte header.
+    /// A required header ends before all four bytes arrive.
     TruncatedHeader,
     /// The four-byte header is not valid UTF-8.
     InvalidHeaderEncoding,
@@ -192,6 +192,22 @@ pub fn read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), PktLineError> 
     // Validate the entire frame before consuming either header or payload.
     bytes.advance(4);
     Ok((declared_len as usize, bytes.copy_to_bytes(payload_len)))
+}
+
+/// Preserve ordinary transport errors and classify an incomplete frame read.
+///
+/// `truncated_frame` identifies the header or payload being read. The returned
+/// InvalidData error retains a downcastable PktLineError with a fixed protocol
+/// reason; other IO errors keep their original kind, reason and source.
+pub(crate) fn pkt_line_read_error(
+    error: std::io::Error,
+    truncated_frame: PktLineError,
+) -> std::io::Error {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, truncated_frame)
+    } else {
+        error
+    }
 }
 
 /// Append a UTF-8 string as a pkt-line to `pkt_line_stream`.

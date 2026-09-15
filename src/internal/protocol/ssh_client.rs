@@ -12,13 +12,13 @@ use bytes::{Bytes, BytesMut};
 use futures_util::stream::StreamExt;
 use git_internal::errors::GitError;
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     DiscoveryResult, FetchStream, generate_upload_pack_content, parse_discovered_references,
 };
-use crate::git_protocol::ServiceType;
+use crate::git_protocol::{PktLineError, ServiceType, pkt_frame_payload_len, pkt_line_read_error};
 
 const DEFAULT_SSH_PORT: u16 = 22;
 
@@ -215,9 +215,9 @@ impl SshClient {
     /// Each individual `read_exact` call is wrapped with the configured idle
     /// timeout so a stalled remote triggers a timely error instead of blocking
     /// forever.
-    async fn read_advertisement(
+    async fn read_advertisement<R: AsyncRead + Unpin>(
         &self,
-        stdout: &mut tokio::process::ChildStdout,
+        stdout: &mut R,
     ) -> Result<Bytes, IoError> {
         let mut buf = BytesMut::new();
         loop {
@@ -231,7 +231,13 @@ impl SshClient {
                         timeout.as_secs()
                     ))
                 })?
-                .map_err(|e| IoError::other(format!("SSH read failed: {e}")))?;
+                .map_err(|error| {
+                    if error.kind() == ErrorKind::UnexpectedEof {
+                        pkt_line_read_error(error, PktLineError::TruncatedHeader)
+                    } else {
+                        IoError::other(format!("SSH read failed: {error}"))
+                    }
+                })?;
             let len_str = std::str::from_utf8(&len_buf)
                 .map_err(|e| IoError::other(format!("invalid pkt-line length: {e}")))?;
             let len = usize::from_str_radix(len_str, 16)
@@ -240,7 +246,9 @@ impl SshClient {
             if len == 0 {
                 break;
             }
-            let mut data = vec![0u8; len - 4];
+            let payload_len = pkt_frame_payload_len(len as u32)
+                .map_err(|error| IoError::new(ErrorKind::InvalidData, PktLineError::from(error)))?;
+            let mut data = vec![0u8; payload_len];
             let timeout = self.idle_timeout;
             tokio::time::timeout(timeout, stdout.read_exact(&mut data))
                 .await
@@ -250,7 +258,13 @@ impl SshClient {
                         timeout.as_secs()
                     ))
                 })?
-                .map_err(|e| IoError::other(format!("SSH read failed: {e}")))?;
+                .map_err(|error| {
+                    if error.kind() == ErrorKind::UnexpectedEof {
+                        pkt_line_read_error(error, PktLineError::TruncatedPayload)
+                    } else {
+                        IoError::other(format!("SSH read failed: {error}"))
+                    }
+                })?;
             buf.extend_from_slice(&data);
         }
         Ok(buf.freeze())
@@ -600,8 +614,58 @@ pub fn is_ssh_spec(spec: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) async fn read_test_stream<R: AsyncRead + Unpin>(
+        stream: &mut R,
+        idle: Duration,
+    ) -> Result<Bytes, IoError> {
+        let client = SshClient::from_ssh_spec("git@fixture.invalid:repo")
+            .unwrap()
+            .with_idle_timeout(idle);
+        client.read_advertisement(stream).await
+    }
+
+    pub(crate) async fn read_frame_fixture(mut input: &[u8]) -> Result<Bytes, IoError> {
+        read_test_stream(&mut input, Duration::from_secs(1)).await
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_ssh_rejects_len_below_four() {
+        for input in [b"0001", b"0002", b"0003"] {
+            crate::internal::protocol::git_client::tests::assert_typed_frame_error(
+                read_frame_fixture(input).await.unwrap_err(),
+                PktLineError::InvalidFrameLength(
+                    crate::git_protocol::PktFrameError::LengthBelowHeader,
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_ssh_flush_regression() {
+        assert_eq!(
+            read_frame_fixture(b"0000zzzz").await.unwrap(),
+            b"0000".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_ssh_len4_regression() {
+        let input = b"00040005x0000";
+        assert_eq!(read_frame_fixture(input).await.unwrap(), input.as_slice());
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_ssh_upper_bound_regression() {
+        for header in [b"ffff", b"FFFF"] {
+            let mut input = header.to_vec();
+            input.extend_from_slice(&vec![0xff; 0xffff - 4]);
+            input.extend_from_slice(b"0000");
+            assert_eq!(read_frame_fixture(&input).await.unwrap(), input.as_slice());
+        }
+    }
 
     #[test]
     fn test_is_ssh_spec() {

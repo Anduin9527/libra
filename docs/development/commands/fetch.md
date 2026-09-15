@@ -175,3 +175,45 @@ The prefix sink avoids allocating a full Display output itself; the Display
 implementation (including OS-error formatting) or earlier diagnostic redaction
 may still allocate. The two HTTP fixtures use a two-worker Tokio runtime so
 synchronous configuration lookup does not stop the cached pool and server.
+
+## Git and SSH advertisement frame boundaries
+
+The Git/SSH pkt-line advertisement readers reject declared lengths `0001` through
+`0003`, incomplete four-byte headers, and EOF inside a declared payload. Flush
+`0000`, empty-payload `0004` and maximum-size `ffff` frames retain their behavior.
+Their typed pkt-line errors classify as `LBR-NET-002` at the reader boundary;
+ordinary transport IO and idle timeouts remain `LBR-NET-001` when classified.
+
+During the `git://` object-fetch advertisement, fetch, clone and pull already
+report these failures as `LBR-NET-002`, including a zero-byte advertisement. The
+hint is `check that the remote serves Git data and that a proxy has not altered the response`.
+Lengths 1–3 previously could panic; truncated advertisements previously returned
+`LBR-NET-001` with a network/transfer hint. Git/SSH discovery and SSH object-fetch
+or push advertisement wrappers can still report `LBR-NET-001`; SSH error collection
+retains its existing process-wait behavior. These remaining paths need later work.
+
+This advertisement is distinct from an upload-pack response after negotiation:
+HTTP(S) framing and empty upload-pack response classifications are unchanged.
+Tests exercise real local TCP object-fetch advertisement reads and the public
+fetch/clone/pull error conversions, without claiming full command execution or
+bounded SSH cleanup. Check the remote Git service or proxy for malformed frames.
+
+The shared `pkt_frame_payload_len` is called before allocating a non-flush payload.
+`pkt_line_read_error` maps `UnexpectedEof` at the exact header/payload read into
+`InvalidData` with a downcastable `PktLineError`; ordinary IO keeps its cause.
+SSH retains its existing ordinary-read context. No duplicate frame-reason enum is
+introduced. The private loops accept `AsyncRead + Unpin`; concrete TCP/child-stdout
+callers remain unchanged. Only cfg(test) module helpers expose the reader to the
+cross-client tests. No production visibility is broadened for tests.
+
+The ten named PKT-08 gates cover both clients' invalid lower bounds, flush, empty
+payload and upper bound plus paired payload/header EOF cases. The latter also pin
+ordinary reset/idle-timeout classification. They execute the actual reader loop
+with deterministic AsyncRead inputs, including a pending duplex stream for idle
+timeout, and inspect the typed source before the public CliError conversion.
+The invalid-length and two EOF gates also run actual local TCP GitClient::fetch_objects
+advertisement reads, verify the service request and typed source, and convert each
+result through public fetch/clone/pull errors. These are transport-plus-conversion
+tests, not complete command or SSH-process tests. Header ASCII-hex checks and the
+remaining discovery/SSH wrapper propagation are separate later work. The new per-frame
+checks are O(1); existing advertisement collection still scales with input size.

@@ -539,3 +539,16 @@ without echoing unexpected status bytes. Ordinary transport failures remain
 `LBR-NET-001`, while completely framed server unpack/`ng` rejections keep their existing protocol
 code and hints. Validation failure does not advance local tracking refs and does
 not establish whether the remote already applied an update.
+
+### Git/SSH advertisement reader stage
+
+Git/SSH pkt-line reader errors have typed `LBR-NET-002` classification for lengths
+1–3 and incomplete headers/payloads. `git://` object-fetch advertisements already surface these errors through fetch,
+clone and pull as `LBR-NET-002`, including zero-byte advertisements, with
+`check that the remote serves Git data and that a proxy has not altered the response`.
+Truncated advertisements previously returned `LBR-NET-001` with a network/transfer
+hint; lengths 1–3 could panic. Git/SSH discovery and SSH object-fetch/push wrappers
+may still return `LBR-NET-001`. Complete CLI propagation and bounded SSH cleanup
+remain unfinished. Flush, empty payload and maximum-size
+frame behavior is preserved, as are ordinary IO/idle classifications. HTTP(S)
+command-boundary behavior is unchanged.

@@ -82,6 +82,12 @@ notes: |
   tracking refs. It does not claim TLS/SSH or remote rollback proof. This is
   Cargo-only coverage, not a new cli.* runner scenario; actual evidence belongs
   to plan-20260901.md PKT-09.
+  PKT-08 adds ten named pkt_line_client_ Cargo library gates over the actual
+  Git/SSH advertisement reader loops: bounds, flush, empty/max payload, typed
+  partial-header/payload EOF, ordinary IO and idle timeouts. Tests use AsyncRead
+  inputs plus actual local TCP Git object-fetch advertisements and public
+  fetch/clone/pull error conversions. They do not prove complete command
+  execution or SSH process cleanup. No cli.* runner scenario is added.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

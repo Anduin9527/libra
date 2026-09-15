@@ -637,3 +637,25 @@ handling.
 Pack completeness is separate from pkt-line framing: an incomplete pack ending
 at a clean frame boundary keeps clone's existing `LBR-NET-001` transfer error and
 network retry hint. Fetch and pull report that completeness failure as `LBR-NET-002`.
+
+## Git and SSH advertisement frame boundaries
+
+The Git/SSH pkt-line advertisement readers reject declared lengths `0001` through
+`0003`, incomplete four-byte headers, and EOF inside a declared payload. Flush
+`0000`, empty-payload `0004` and maximum-size `ffff` frames retain their behavior.
+Their typed pkt-line errors classify as `LBR-NET-002` at the reader boundary;
+ordinary transport IO and idle timeouts remain `LBR-NET-001` when classified.
+
+During the `git://` object-fetch advertisement, fetch, clone and pull already
+report these failures as `LBR-NET-002`, including a zero-byte advertisement. The
+hint is `check that the remote serves Git data and that a proxy has not altered the response`.
+Lengths 1–3 previously could panic; truncated advertisements previously returned
+`LBR-NET-001` with a network/transfer hint. Git/SSH discovery and SSH object-fetch
+or push advertisement wrappers can still report `LBR-NET-001`; SSH error collection
+retains its existing process-wait behavior. These remaining paths need later work.
+
+This advertisement is distinct from an upload-pack response after negotiation:
+HTTP(S) framing and empty upload-pack response classifications are unchanged.
+Tests exercise real local TCP object-fetch advertisement reads and the public
+fetch/clone/pull error conversions, without claiming full command execution or
+bounded SSH cleanup. Check the remote Git service or proxy for malformed frames.
