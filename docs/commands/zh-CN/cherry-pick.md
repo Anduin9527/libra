@@ -31,6 +31,8 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 新的 cherry-pick 在索引存在未合并条目时拒绝开始：在解析任何目标、写入索引、工作树、引用或序列状态之前，以 exit 128 与 `LBR-CONFLICT-001` 退出，并列出最多 10 条未合并路径（Git 同样拒绝）。逐条解决后 `libra add`，或用 `libra reset --hard` 放弃冲突，然后重新执行 cherry-pick；该拒绝不产生序列，`--continue`、`--skip`、`--abort`、`--quit` 对它不适用。发生冲突的 `-n`/`--no-commit` pick 同样不产生可继续的序列：解决后 `libra add`（或 `libra rm`）并执行 `libra commit`，或用 `libra reset --hard` 放弃已暂存的 pick。会覆盖未跟踪工作树文件的 pick 在该提交写入任何内容之前被拒绝：移走或删除提示中的文件后重新执行命令；若逐提交序列中之前的提交已落地，则改为执行 `libra cherry-pick --continue`（会重新尝试停住的提交，Git 则会丢弃它）；若 `--no-commit` 运行中之前的 pick 已暂存，则没有序列，用 `-n` 重新 pick 剩余提交，或用 `libra reset --hard` 放弃全部。
 
+逐提交模式的多提交 pick 在应用第一个提交之前就记录序列，并随每个应用的提交推进（普通提交与分支更新在同一数据库事务里完成；`--ff` 快进则在重置前先写入恢复标记），因此运行被中断、或在之前的提交落地后遇到非冲突错误而停止时，序列保持进行中：用 `libra cherry-pick --continue`、`--skip` 或 `--abort` 收尾。`--ff` 会沿用到 `--continue` 与 `--skip` 应用的提交。`--skip` 与 `--abort` 在重置之前先记录自身；若被中断，重跑同一命令即可完成，完成前 `--continue` 以 `LBR-REPO-003` 拒绝。
+
 该内容合并与 `libra merge` 完全共用路径上的 `merge` gitattribute 及
 `merge.default` 回退：内建 `text`、`binary`、`union`，未知名称回退
 `text`。因此 union driver 可把重叠 pick 解析为 current 内容后接 picked
@@ -293,7 +295,7 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 | 代码 | 条件 | 提示 |
 |------|-----------|------|
 | `LBR-REPO-001` | 不在 libra 仓库内 | 使用 `libra init` 初始化或进入仓库 |
-| `LBR-REPO-003` | HEAD detached、`--continue`/`--skip`/`--abort`/`--quit` 时没有进行中的 cherry-pick，或 `--continue` 在错误的分支上 | 切换到分支 / 先发起 cherry-pick / 切回序列所在分支 |
+| `LBR-REPO-003` | HEAD detached、`--continue`/`--skip`/`--abort`/`--quit` 时没有进行中的 cherry-pick、`--continue` 在错误的分支上，或被中断的 `--skip`/`--abort` 尚未完成（完成前 `--continue` 拒绝） | 切换到分支 / 先发起 cherry-pick / 切回序列所在分支 / 重跑被中断的 `--skip` 或 `--abort`（或用 `--quit` 放弃序列） |
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
 | `LBR-CLI-002` | merge commit 未带 `-m`、`-m` 越界、非法 `--cleanup`/`--empty` mode、空提交未带 `--allow-empty`、冗余提交未带 `--keep-redundant-commits`/`--empty=drop`/`--empty=keep`，或空消息未带 `--allow-empty-message` | 使用提示中指明的标志 |
 | `LBR-UNSUPPORTED-001` | 传入了不支持的自定义 `--strategy`，**或** pick 序列的输入中存在需要裁决的 `160000` gitlink（submodule） | 去掉 `--strategy`；gitlink 情形请在 Libra 之外解决 submodule 指针，或从相关提交中移除该条目——拒绝发生在任何索引/工作树/状态写入之前 |

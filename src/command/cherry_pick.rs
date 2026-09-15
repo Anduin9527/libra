@@ -159,6 +159,11 @@ enum CherryPickError {
         stop: UntrackedStop,
     },
 
+    /// #477 HF-31: an interrupted `--skip`/`--abort` left its phase marker;
+    /// the same verb must finish before the sequence can continue.
+    #[error("an interrupted 'libra cherry-pick --{0}' has not finished")]
+    ControlPending(ControlPhase),
+
     #[error("a cherry-pick is already in progress")]
     InProgress,
 
@@ -211,6 +216,7 @@ impl CherryPickError {
             | Self::UntrackedOverwrite { .. } => StableErrorCode::ConflictUnresolved,
             Self::InProgress => StableErrorCode::ConflictOperationBlocked,
             Self::NoCherryPickInProgress => StableErrorCode::RepoStateInvalid,
+            Self::ControlPending(_) => StableErrorCode::RepoStateInvalid,
             Self::WrongBranch { .. } => StableErrorCode::RepoStateInvalid,
             Self::LoadObject(_) => StableErrorCode::IoReadFailed,
             Self::SaveFailed(_) => StableErrorCode::IoWriteFailed,
@@ -302,6 +308,10 @@ impl From<CherryPickError> for CliError {
             CherryPickError::NoCherryPickInProgress => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint("there is no cherry-pick to --continue/--skip/--abort/--quit"),
+            CherryPickError::ControlPending(phase) => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint(format!("run 'libra cherry-pick --{phase}' again to finish it"))
+                .with_hint("or forget the sequence with 'libra cherry-pick --quit'"),
             CherryPickError::WrongBranch { expected, .. } => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint(format!("switch back to '{expected}' before continuing")),
@@ -410,6 +420,25 @@ struct CherryPickOpts {
     /// on every resume, absent (= false) in rows from older binaries.
     #[serde(default)]
     stopped_on_conflict: bool,
+    /// #477 HF-31: set while an interrupted `--skip`/`--abort` still has to
+    /// finish; every position write clears it. Absent in older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_phase: Option<ControlPhase>,
+    /// #477 HF-31: `--ff` is a sequence option, so resumed picks fast-forward
+    /// the way the starting run would have. Absent (= false) in older rows.
+    #[serde(default)]
+    ff: bool,
+    /// #477 HF-31: the commit a fast-forward pick is about to move HEAD to,
+    /// written just before its `reset --hard`. `--continue` skips the stopped
+    /// commit only when this names it and HEAD already points at it; every
+    /// position write clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ff_landing: Option<String>,
+    /// #477 HF-31: identifies the run that claimed a multi-commit sequence, so
+    /// releasing that claim after an early refusal cannot erase a row another
+    /// start claimed since. Absent in older rows and single-commit picks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_token: Option<String>,
     #[serde(default)]
     append_source: bool,
     #[serde(default)]
@@ -450,6 +479,10 @@ impl CherryPickOpts {
     fn from_args(args: &CherryPickArgs) -> Self {
         Self {
             stopped_on_conflict: false,
+            control_phase: None,
+            ff: args.ff,
+            ff_landing: None,
+            claim_token: None,
             append_source: args.append_source,
             signoff: args.signoff,
             edit: args.edit,
@@ -472,6 +505,7 @@ impl CherryPickOpts {
     /// applying later merge commits along the chosen parent.
     fn into_args(self) -> CherryPickArgs {
         CherryPickArgs {
+            ff: self.ff,
             append_source: self.append_source,
             signoff: self.signoff,
             edit: self.edit,
@@ -487,6 +521,26 @@ impl CherryPickOpts {
             strategy_option: self.strategy_option.into_iter().collect(),
             ..Default::default()
         }
+    }
+}
+
+/// A `--skip`/`--abort` that recorded its intent before resetting (#477 HF-31).
+/// An interruption after the reset leaves the marker, so the same verb can be
+/// re-run to finish, and `--continue` refuses instead of committing the reset
+/// index as the stopped commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ControlPhase {
+    Skip,
+    Abort,
+}
+
+impl std::fmt::Display for ControlPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ControlPhase::Skip => "skip",
+            ControlPhase::Abort => "abort",
+        })
     }
 }
 
@@ -985,9 +1039,52 @@ async fn run_cherry_pick(
     preflight_pick_gitlinks(&commit_ids, &args).await?;
 
     let mut acc = PickAccumulator::default();
+    // #477 HF-31 X1/X7: a commit-per-pick run of several commits claims its
+    // sequence row before the first pick writes anything (Git creates its
+    // sequencer directory before the first pick, too) and moves the row with
+    // every landing, so an interruption between two picks still leaves
+    // `--continue`/`--skip`/`--abort` a sequence to act on.
+    let sequence_anchor = match head_orig {
+        Some(orig) if commit_ids.len() > 1 && !args.no_commit => Some(orig),
+        _ => None,
+    };
+    let (opts_json, claim_needle) = if sequence_anchor.is_some() {
+        opts_json_with_claim_token(&opts_json)
+    } else {
+        (opts_json, None)
+    };
+    if let Some(orig) = sequence_anchor {
+        claim_sequence_start(&CherryPickState {
+            head_name: head_name.clone(),
+            head_orig: orig,
+            current_oid: commit_ids[0],
+            todo: commit_ids[1..].iter().copied().collect(),
+            opts_json: opts_json_with_conflict_flag(&opts_json, false),
+        })
+        .await?;
+    }
+    let row_exists = sequence_anchor.is_some();
     for (i, commit_id) in commit_ids.iter().enumerate() {
-        match cherry_pick_single_commit(commit_id, &args, output, &SequenceAdvance::NoRow).await {
-            Ok(outcome) => record_outcome(outcome, commit_id, &mut acc),
+        let advance = match sequence_anchor {
+            Some(orig) => {
+                let rest: VecDeque<ObjectHash> = commit_ids[i + 1..].iter().copied().collect();
+                SequenceAdvance::after(&head_name, orig, commit_id, &rest, &opts_json)
+            }
+            None => SequenceAdvance::NoRow,
+        };
+        match cherry_pick_single_commit(commit_id, &args, output, &advance).await {
+            Ok(outcome) => {
+                if matches!(outcome, PickOutcome::Dropped(_)) {
+                    // HF-31 X6: a dropped pick moves no HEAD, so no transaction
+                    // carried the advance; apply it here.
+                    advance
+                        .apply_without_head_move()
+                        .await
+                        .map_err(CherryPickError::SaveFailed)?;
+                    after_drop_failpoint()?;
+                }
+                record_outcome(outcome, commit_id, &mut acc)
+            }
             Err(CherryPickSingleError::UntrackedOverwrite(path)) if i > 0 => {
                 // Earlier picks already landed (ADR-HF-04 U14). A commit-per-pick
                 // run stops at this commit with its state saved, so `--continue`
@@ -1010,10 +1107,12 @@ async fn run_cherry_pick(
                     todo: commit_ids[i + 1..].iter().copied().collect(),
                     opts_json: opts_json_with_conflict_flag(&opts_json, false),
                 };
-                state
-                    .claim_start()
-                    .await
-                    .map_err(CherryPickError::SaveFailed)?;
+                let persisted = if row_exists {
+                    state.save().await
+                } else {
+                    state.claim_start().await
+                };
+                persisted.map_err(CherryPickError::SaveFailed)?;
                 return Err(CherryPickError::UntrackedOverwrite {
                     commit: label,
                     path,
@@ -1042,20 +1141,35 @@ async fn run_cherry_pick(
                     // durably (§C.5 conflict-phase discriminator).
                     opts_json: opts_json_with_conflict_flag(&opts_json, true),
                 };
-                // The FIRST persistence of a fresh sequence: an atomic claim,
-                // not a replace (§C.4.4). `resume_picks` keeps the upsert —
-                // by then the caller owns the row and advancing it is the
-                // point.
-                state
-                    .claim_start()
-                    .await
-                    .map_err(CherryPickError::SaveFailed)?;
+                // A multi-commit run already claimed its row before the first
+                // pick (§C.4.4, HF-31), so the stop replaces the row it owns; a
+                // single-commit stop makes the first, atomic claim here.
+                let persisted = if row_exists {
+                    state.save().await
+                } else {
+                    state.claim_start().await
+                };
+                persisted.map_err(CherryPickError::SaveFailed)?;
                 return Err(CherryPickError::Conflict {
                     commit: label,
                     reason: format!("conflicts in {} path(s)", paths.len()),
                 });
             }
-            Err(other) => return Err(map_single_error(other, &args.commits[i])),
+            Err(other) => {
+                // Nothing landed yet (HEAD unmoved): release this run's claim so
+                // the refusal leaves no sequence, as before HF-31. Once HEAD has
+                // moved, the row stays for `--continue`/`--skip`/`--abort`.
+                if row_exists && Head::current_commit().await == head_orig {
+                    release_sequence_claim(claim_needle.as_deref())
+                        .await
+                        .map_err(|error| {
+                        CherryPickError::SaveFailed(format!(
+                            "{error}; the refused pick left its sequence claim in place (run 'libra cherry-pick --quit')"
+                        ))
+                    })?;
+                }
+                return Err(map_single_error(other, &args.commits[i]));
+            }
         }
     }
 
@@ -1089,10 +1203,142 @@ fn opts_json_with_conflict_flag(opts_json: &str, stopped_on_conflict: bool) -> S
     match serde_json::from_str::<CherryPickOpts>(opts_json) {
         Ok(mut opts) => {
             opts.stopped_on_conflict = stopped_on_conflict;
+            // A position write means no `--skip`/`--abort` is still pending
+            // and no fast-forward is between its row write and its reset.
+            opts.control_phase = None;
+            opts.ff_landing = None;
             serde_json::to_string(&opts).unwrap_or_else(|_| opts_json.to_string())
         }
         Err(_) => opts_json.to_string(),
     }
+}
+
+/// The `--skip`/`--abort` still pending in a row's options (#477 HF-31); `None`
+/// for unmarked rows, rows from older binaries and unreadable options.
+fn opts_json_control_phase(opts_json: &str) -> Option<ControlPhase> {
+    serde_json::from_str::<CherryPickOpts>(opts_json)
+        .ok()
+        .and_then(|opts| opts.control_phase)
+}
+
+/// `opts_json` marked with a pending control phase, or `None` when the options
+/// cannot be read (the control verb then proceeds unmarked, as before).
+fn opts_json_with_control_phase(opts_json: &str, phase: ControlPhase) -> Option<String> {
+    let mut opts = serde_json::from_str::<CherryPickOpts>(opts_json).ok()?;
+    opts.control_phase = Some(phase);
+    serde_json::to_string(&opts).ok()
+}
+
+/// `opts_json` naming `landing` as the fast-forward about to move HEAD (HF-31
+/// X2); unreadable options are returned unchanged (no marker, so `--continue`
+/// re-attempts instead of skipping).
+fn opts_json_with_ff_landing(opts_json: &str, landing: &ObjectHash) -> String {
+    match serde_json::from_str::<CherryPickOpts>(opts_json) {
+        Ok(mut opts) => {
+            opts.ff_landing = Some(landing.to_string());
+            serde_json::to_string(&opts).unwrap_or_else(|_| opts_json.to_string())
+        }
+        Err(_) => opts_json.to_string(),
+    }
+}
+
+/// `opts_json` stamped with a fresh claim token, plus the payload fragment a
+/// fenced release matches (HF-31). Unreadable options stay unstamped, and the
+/// release then falls back to the scoped clear.
+fn opts_json_with_claim_token(opts_json: &str) -> (String, Option<String>) {
+    let Ok(mut opts) = serde_json::from_str::<CherryPickOpts>(opts_json) else {
+        return (opts_json.to_string(), None);
+    };
+    let token = uuid::Uuid::new_v4().to_string();
+    opts.claim_token = Some(token.clone());
+    match serde_json::to_string(&opts) {
+        Ok(stamped) => (stamped, Some(format!("\"claim_token\":\"{token}\""))),
+        Err(_) => (opts_json.to_string(), None),
+    }
+}
+
+/// Test-only stand-in for a concurrent `--quit` followed by a new start that
+/// claims this worktree's sequence before a refused run releases its own
+/// claim (HF-31 X7; gated on `LIBRA_TEST`).
+async fn reclaim_before_release_failpoint() {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_RECLAIM_BEFORE_RELEASE").is_some()
+        && let Ok(Some(mut row)) = CherryPickState::load().await
+    {
+        let _ = CherryPickState::clear().await;
+        row.opts_json = opts_json_with_claim_token(&row.opts_json).0;
+        let _ = row.claim_start().await;
+    }
+}
+
+/// Test-only stand-in for a concurrent start that claims this worktree's
+/// sequence between the in-progress check and this run's claim (HF-31 X7;
+/// gated on `LIBRA_TEST`).
+async fn race_before_claim_failpoint(state: &CherryPickState) {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_RACE_BEFORE_CLAIM").is_some()
+    {
+        let _ = state.claim_start().await;
+    }
+}
+
+/// Claim a multi-commit sequence before its first pick writes anything
+/// (HF-31 X1/X7). Losing the claim to a concurrent start is the ordinary
+/// in-progress refusal, and nothing has been written yet.
+async fn claim_sequence_start(state: &CherryPickState) -> Result<(), CherryPickError> {
+    race_before_claim_failpoint(state).await;
+    state.claim_start().await.map_err(|error| {
+        if error.contains("already in progress") {
+            CherryPickError::InProgress
+        } else {
+            CherryPickError::SaveFailed(error)
+        }
+    })
+}
+
+/// Test-only interruption right after a dropped pick advanced the sequence row
+/// (HF-31 X6; gated on `LIBRA_TEST`).
+fn after_drop_failpoint() -> Result<(), CherryPickError> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_DROP").is_some()
+    {
+        return Err(CherryPickError::SaveFailed(
+            "test-injected cherry-pick interruption after a dropped pick".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Release this run's sequence claim after a refusal before anything landed
+/// (HF-31 X7). `LIBRA_TEST_CHERRY_PICK_FAIL_RELEASE_CLAIM` (gated on
+/// `LIBRA_TEST`) injects a failure so the caller's error path is testable.
+async fn release_sequence_claim(claim_needle: Option<&str>) -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_FAIL_RELEASE_CLAIM").is_some()
+    {
+        return Err("test-injected failure releasing the sequence claim".to_string());
+    }
+    reclaim_before_release_failpoint().await;
+    match claim_needle {
+        // Fenced by this run's token: a row claimed by a later start stays.
+        Some(needle) => sequencer::clear_if_payload_contains(SequenceKind::CherryPick, needle)
+            .await
+            .map(|_| ()),
+        None => CherryPickState::clear().await,
+    }
+}
+
+/// Test-only interruption right after `--skip`/`--abort` reset the index and
+/// worktree, before the sequence row changes (gated on `LIBRA_TEST`).
+fn after_control_reset_failpoint() -> Result<(), CherryPickError> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_CONTROL_RESET").is_some()
+    {
+        return Err(CherryPickError::SaveFailed(
+            "test-injected cherry-pick interruption after the control reset".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// ADR-MG-01 gate for a WHOLE cherry-pick sequence, ahead of its first write.
@@ -1247,10 +1493,20 @@ async fn resume_picks(
             opts_json: opts_json_with_conflict_flag(opts_json, false),
         };
         pending.save().await.map_err(CherryPickError::SaveFailed)?;
-        let advance = SequenceAdvance::after(head_name, head_orig, &todo, opts_json);
+        let advance = SequenceAdvance::after(head_name, head_orig, &commit_id, &todo, opts_json);
 
         match cherry_pick_single_commit(&commit_id, opts_args, output, &advance).await {
-            Ok(outcome) => record_outcome(outcome, &commit_id, acc),
+            Ok(outcome) => {
+                if matches!(outcome, PickOutcome::Dropped(_)) {
+                    // HF-31 X6: a dropped pick moves no HEAD; advance the row here.
+                    advance
+                        .apply_without_head_move()
+                        .await
+                        .map_err(CherryPickError::SaveFailed)?;
+                    after_drop_failpoint()?;
+                }
+                record_outcome(outcome, &commit_id, acc)
+            }
             Err(CherryPickSingleError::UntrackedOverwrite(path)) => {
                 // `pending` (conflict flag stripped) already records this commit
                 // as the stop, so `--continue` re-attempts it (ADR-HF-04 U12/U13).
@@ -1291,6 +1547,9 @@ async fn run_cherry_pick_continue(
 ) -> Result<CherryPickOutput, CherryPickError> {
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
+    if let Some(phase) = opts_json_control_phase(&state.opts_json) {
+        return Err(CherryPickError::ControlPending(phase));
+    }
 
     // The conflicted index must be fully resolved (no stage 1/2/3 left).
     let index = Index::load(path::index())
@@ -1314,12 +1573,22 @@ async fn run_cherry_pick_continue(
     // before the flag existed keep finalizing from the index.
     let reattempt_current =
         !opts.stopped_on_conflict && opts_json_has_conflict_flag(&state.opts_json);
+    let ff_landed = opts.ff_landing.as_deref() == Some(state.current_oid.to_string().as_str());
     let opts_args = opts.into_args();
 
     if reattempt_current {
         let mut todo = state.todo;
-        todo.push_front(state.current_oid);
         let mut acc = PickAccumulator::default();
+        if ff_landed && Head::current_commit().await == Some(state.current_oid) {
+            // HF-31 X2: a fast-forward pick marks its commit in the row, then
+            // moves HEAD through `reset --hard` outside that write. A marked
+            // commit that HEAD already points at landed before an interruption;
+            // anything else (HF-31 X8: HEAD moved by hand) is re-attempted.
+            acc.picked
+                .push(make_entry(&state.current_oid, Some(state.current_oid)));
+        } else {
+            todo.push_front(state.current_oid);
+        }
         resume_picks(
             &state.head_name,
             state.head_orig,
@@ -1358,6 +1627,7 @@ async fn run_cherry_pick_continue(
     let advance = SequenceAdvance::after(
         &state.head_name,
         state.head_orig,
+        &state.current_oid,
         &state.todo,
         &state.opts_json,
     );
@@ -1392,10 +1662,24 @@ async fn run_cherry_pick_continue(
 async fn run_cherry_pick_skip(output: &OutputConfig) -> Result<CherryPickOutput, CherryPickError> {
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
+    if opts_json_control_phase(&state.opts_json) == Some(ControlPhase::Abort) {
+        return Err(CherryPickError::ControlPending(ControlPhase::Abort));
+    }
+
+    // HF-31 X3: record the skip before resetting, so an interruption after the
+    // reset leaves a row that `--skip` finishes and `--continue` refuses.
+    if let Some(opts_json) = opts_json_with_control_phase(&state.opts_json, ControlPhase::Skip) {
+        let marked = CherryPickState {
+            opts_json,
+            ..state.clone()
+        };
+        marked.save().await.map_err(CherryPickError::SaveFailed)?;
+    }
 
     // Drop the current conflicted commit: restore index+worktree to the last
     // successful tip (current HEAD), discarding the conflict markers/stages.
     reset_hard("HEAD", output).await?;
+    after_control_reset_failpoint()?;
 
     let opts: CherryPickOpts = serde_json::from_str(&state.opts_json)
         .map_err(|e| CherryPickError::LoadObject(format!("failed to read saved options: {e}")))?;
@@ -1425,8 +1709,18 @@ async fn run_cherry_pick_abort(output: &OutputConfig) -> Result<CherryPickOutput
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
 
+    // HF-31 X4: record the abort before resetting; re-running `--abort` after an
+    // interruption resets to the same commit again and then clears the row.
+    if let Some(opts_json) = opts_json_with_control_phase(&state.opts_json, ControlPhase::Abort) {
+        let marked = CherryPickState {
+            opts_json,
+            ..state.clone()
+        };
+        marked.save().await.map_err(CherryPickError::SaveFailed)?;
+    }
     let restored = state.head_orig.to_string();
     reset_hard(&restored, output).await?;
+    after_control_reset_failpoint()?;
     CherryPickState::clear()
         .await
         .map_err(CherryPickError::SaveFailed)?;
@@ -1546,9 +1840,23 @@ async fn cherry_pick_single_commit(
             Index::new()
         };
         ensure_no_untracked_overwrite(&current_index, &target_index)?;
+        // HF-31 X2: `reset --hard` moves HEAD outside the sequence row's
+        // transaction, so first write a row naming this commit with the
+        // `ff_landing` marker; an interruption before the advance below leaves
+        // HEAD at the marked commit, which `--continue` resumes after.
+        if let Some(row) = advance.landing_row(commit_id) {
+            sequencer::save(&row)
+                .await
+                .map_err(CherryPickSingleError::SaveFailed)?;
+        }
         reset_hard(&commit_id.to_string(), output)
             .await
             .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))?;
+        after_head_move_failpoint()?;
+        advance
+            .apply_without_head_move()
+            .await
+            .map_err(CherryPickSingleError::SaveFailed)?;
         return Ok(PickOutcome::Committed(*commit_id));
     }
 
@@ -2098,7 +2406,7 @@ async fn create_cherry_pick_commit(
                 match &advance {
                     SequenceAdvance::NoRow => {}
                     SequenceAdvance::Save(next) => sequencer::save_with_conn(txn, next).await?,
-                    SequenceAdvance::Clear => {
+                    SequenceAdvance::Clear(_) => {
                         sequencer::clear_with_conn(txn, SequenceKind::CherryPick).await?
                     }
                 }
@@ -2462,36 +2770,68 @@ fn after_head_move_failpoint() -> Result<(), CherryPickSingleError> {
 /// naming a commit that already landed (which `--continue` would replay).
 #[derive(Debug, Clone)]
 enum SequenceAdvance {
-    /// No sequence row exists yet (a fresh pick before any stop).
+    /// No sequence row is involved (a single-commit or `--no-commit` pick).
     NoRow,
-    /// Point the row at the next commit to attempt.
+    /// Point the existing row at the next commit to attempt.
     Save(SequenceState),
-    /// The landed commit was the last one: remove the row.
-    Clear,
+    /// The landed commit was the last one: remove the row. Carries the row that
+    /// names the landing commit, written first by a fast-forward pick.
+    Clear(SequenceState),
 }
 
 impl SequenceAdvance {
-    /// The row once the commit ahead of `todo` lands: the next commit with the
-    /// conflict flag cleared (a later `--continue` re-attempts it), or no row.
+    /// The row once `landing` (the commit ahead of `todo`) lands: the next
+    /// commit with the conflict flag cleared (a later `--continue` re-attempts
+    /// it), or no row.
     fn after(
         head_name: &str,
         head_orig: ObjectHash,
+        landing: &ObjectHash,
         todo: &VecDeque<ObjectHash>,
         opts_json: &str,
     ) -> Self {
+        let row = |current_oid: ObjectHash, todo: VecDeque<ObjectHash>| {
+            CherryPickState {
+                head_name: head_name.to_string(),
+                head_orig,
+                current_oid,
+                todo,
+                opts_json: opts_json_with_conflict_flag(opts_json, false),
+            }
+            .to_sequence()
+        };
         let mut rest = todo.clone();
         match rest.pop_front() {
-            Some(next) => SequenceAdvance::Save(
-                CherryPickState {
-                    head_name: head_name.to_string(),
-                    head_orig,
-                    current_oid: next,
-                    todo: rest,
-                    opts_json: opts_json_with_conflict_flag(opts_json, false),
-                }
-                .to_sequence(),
-            ),
-            None => SequenceAdvance::Clear,
+            Some(next) => SequenceAdvance::Save(row(next, rest)),
+            None => SequenceAdvance::Clear(row(*landing, VecDeque::new())),
+        }
+    }
+
+    /// The row naming `landing` itself, written before a fast-forward pick
+    /// moves HEAD outside the transaction (HF-31 X2).
+    fn landing_row(&self, landing: &ObjectHash) -> Option<SequenceState> {
+        let mut row = match self {
+            SequenceAdvance::NoRow => return None,
+            SequenceAdvance::Save(next) => {
+                let mut row = next.clone();
+                row.todo.insert(0, row.current_oid.clone());
+                row.current_oid = landing.to_string();
+                row
+            }
+            SequenceAdvance::Clear(landed) => landed.clone(),
+        };
+        row.payload = opts_json_with_ff_landing(&row.payload, landing);
+        Some(row)
+    }
+
+    /// Apply the transition when no HEAD transaction carries it: after a
+    /// fast-forward's `reset --hard`, or for a pick dropped by `--empty=drop`
+    /// (HF-31 X6).
+    async fn apply_without_head_move(&self) -> Result<(), String> {
+        match self {
+            SequenceAdvance::NoRow => Ok(()),
+            SequenceAdvance::Save(next) => sequencer::save(next).await,
+            SequenceAdvance::Clear(_) => sequencer::clear(SequenceKind::CherryPick).await,
         }
     }
 }
@@ -2701,6 +3041,14 @@ mod tests {
             "a cherry-pick is already in progress",
         );
         assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Skip).to_string(),
+            "an interrupted 'libra cherry-pick --skip' has not finished",
+        );
+        assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Abort).to_string(),
+            "an interrupted 'libra cherry-pick --abort' has not finished",
+        );
+        assert_eq!(
             CherryPickError::NoCherryPickInProgress.to_string(),
             "no cherry-pick in progress",
         );
@@ -2811,6 +3159,14 @@ mod tests {
             StableErrorCode::ConflictOperationBlocked,
         );
         assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Skip).stable_code(),
+            StableErrorCode::RepoStateInvalid,
+        );
+        assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Abort).stable_code(),
+            StableErrorCode::RepoStateInvalid,
+        );
+        assert_eq!(
             CherryPickError::NoCherryPickInProgress.stable_code(),
             StableErrorCode::RepoStateInvalid,
         );
@@ -2913,29 +3269,106 @@ mod tests {
     }
 
     /// The row written with a landed pick names the next commit with the
-    /// conflict flag cleared, or clears the sequence after the last commit.
+    /// conflict flag cleared, or clears the sequence after the last commit; a
+    /// fast-forward first writes the row naming the landing commit itself with
+    /// the `ff_landing` marker (#477 HF-31).
     #[test]
     fn sequence_advance_points_at_next_commit_or_clears() {
         let oid = |c: char| ObjectHash::from_str(&c.to_string().repeat(40)).unwrap();
         let args = CherryPickArgs::try_parse_from(["cherry-pick", "abc"]).unwrap();
         let mut opts = CherryPickOpts::from_args(&args);
         opts.stopped_on_conflict = true;
+        opts.control_phase = Some(ControlPhase::Skip);
         let opts_json = serde_json::to_string(&opts).unwrap();
         let todo = VecDeque::from([oid('b'), oid('c')]);
-        match SequenceAdvance::after("main", oid('a'), &todo, &opts_json) {
+        let advance = SequenceAdvance::after("main", oid('a'), &oid('d'), &todo, &opts_json);
+        match &advance {
             SequenceAdvance::Save(row) => {
                 assert_eq!(row.current_oid, oid('b').to_string());
                 assert_eq!(row.todo, vec![oid('c').to_string()]);
                 let saved: CherryPickOpts = serde_json::from_str(&row.payload).unwrap();
                 assert!(!saved.stopped_on_conflict);
+                assert_eq!(saved.control_phase, None);
                 assert!(opts_json_has_conflict_flag(&row.payload));
             }
             other => panic!("expected Save, got {other:?}"),
         }
-        assert!(matches!(
-            SequenceAdvance::after("main", oid('a'), &VecDeque::new(), &opts_json),
-            SequenceAdvance::Clear
-        ));
+        let landing = advance
+            .landing_row(&oid('d'))
+            .expect("a row names the landing commit");
+        assert_eq!(landing.current_oid, oid('d').to_string());
+        assert_eq!(
+            landing.todo,
+            vec![oid('b').to_string(), oid('c').to_string()]
+        );
+        let marked: CherryPickOpts = serde_json::from_str(&landing.payload).unwrap();
+        assert_eq!(marked.ff_landing, Some(oid('d').to_string()));
+        let cleared: CherryPickOpts =
+            serde_json::from_str(&opts_json_with_conflict_flag(&landing.payload, false)).unwrap();
+        assert_eq!(cleared.ff_landing, None);
+
+        let last =
+            SequenceAdvance::after("main", oid('a'), &oid('d'), &VecDeque::new(), &opts_json);
+        match &last {
+            SequenceAdvance::Clear(row) => {
+                assert_eq!(row.current_oid, oid('d').to_string());
+                assert!(row.todo.is_empty());
+            }
+            other => panic!("expected Clear, got {other:?}"),
+        }
+        assert!(SequenceAdvance::NoRow.landing_row(&oid('d')).is_none());
+    }
+
+    /// M-CRASH X5 (#477 HF-31): rows without a control phase (older binaries)
+    /// report none, a marked row reports its verb, and a position write clears it.
+    #[test]
+    fn control_phase_round_trips_and_legacy_rows_have_none() {
+        let args = CherryPickArgs::try_parse_from(["cherry-pick", "abc"]).unwrap();
+        let current = serde_json::to_string(&CherryPickOpts::from_args(&args)).unwrap();
+        assert!(!current.contains("control_phase"), "{current}");
+        assert_eq!(opts_json_control_phase(&current), None);
+        assert_eq!(
+            opts_json_control_phase(r#"{"stopped_on_conflict":true,"signoff":false}"#),
+            None
+        );
+        let skipping = opts_json_with_control_phase(&current, ControlPhase::Skip).unwrap();
+        assert_eq!(opts_json_control_phase(&skipping), Some(ControlPhase::Skip));
+        assert_eq!(
+            opts_json_control_phase(&opts_json_with_conflict_flag(&skipping, false)),
+            None
+        );
+        assert!(opts_json_with_control_phase("not json", ControlPhase::Abort).is_none());
+        let ff_args = CherryPickArgs::try_parse_from(["cherry-pick", "--ff", "abc"]).unwrap();
+        let ff_opts = CherryPickOpts::from_args(&ff_args);
+        assert!(ff_opts.ff, "--ff is persisted with the sequence");
+        assert!(ff_opts.into_args().ff, "--ff is restored for resumed picks");
+        let (stamped, needle) = opts_json_with_claim_token(&current);
+        let needle = needle.expect("readable options get a claim token");
+        assert!(stamped.contains(&needle), "{stamped}");
+        assert!(
+            opts_json_with_conflict_flag(&stamped, true).contains(&needle),
+            "position writes keep the claim token"
+        );
+        assert_eq!(opts_json_with_claim_token("not json").1, None);
+        let legacy: CherryPickOpts = serde_json::from_str(r#"{"signoff":false}"#).unwrap();
+        assert!(!legacy.ff && legacy.ff_landing.is_none());
+        assert_eq!(opts_json_control_phase("not json"), None);
+    }
+
+    /// HF-31: the refusal names the control verb to re-run.
+    #[test]
+    fn control_pending_names_the_verb_to_rerun() {
+        for (phase, verb) in [
+            (ControlPhase::Skip, "--skip"),
+            (ControlPhase::Abort, "--abort"),
+        ] {
+            let rendered = CliError::from(CherryPickError::ControlPending(phase)).render_json();
+            assert!(
+                rendered.contains(&format!("libra cherry-pick {verb}")),
+                "{rendered}"
+            );
+            assert!(rendered.contains("LBR-REPO-003"), "{rendered}");
+        }
     }
 
     /// M-UNMERGED U5: a `--no-commit` conflict mentions neither a multi-commit
