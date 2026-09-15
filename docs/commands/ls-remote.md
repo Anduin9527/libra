@@ -101,3 +101,14 @@ see `docs/development/commands/_general.md` item B).
 - `--get-url` exits before protocol discovery and prints the same redacted URL form used by remote diagnostics.
 - `--exit-code` is a silent script signal: no matches returns status 2 without rendering an error.
 - `--symref` prints a `ref: <target>\t<name>` line above a symbolic ref's own OID line when its name survives the active filters. Advertised `symref=` capabilities remain authoritative. If a transport omits that capability (notably a local Libra source), Libra derives `HEAD` from the advertised HEAD OID and branch tips using the same deterministic resolver as fetch (OID match, then `main`, `master`, first branch). JSON reports the same result in `symrefs[]`.
+
+## Malformed HTTP(S) discovery responses
+
+During HTTP(S) reference discovery, Libra rejects a zero-byte advertisement and
+malformed pkt-line frames, including short or non-hexadecimal headers, frame
+lengths below four, and truncated payloads. A valid `0000` flush remains distinct
+from an absent response; a valid empty-repository advertisement is supported.
+An unsupported object-format capability reports the fixed message
+`Unsupported object format capability` without echoing its remote value.
+Check that the URL points to a Git smart HTTP service and that a proxy has not
+truncated or replaced the response; then retry.

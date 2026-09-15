@@ -75,3 +75,19 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Malformed HTTP(S) discovery responses
+
+During HTTP(S) reference discovery, Libra rejects a zero-byte advertisement and
+malformed pkt-line frames, including short or non-hexadecimal headers, frame
+lengths below four, and truncated payloads. A valid `0000` flush remains distinct
+from an absent response; a valid empty-repository advertisement is supported.
+An unsupported object-format capability reports the fixed message
+`Unsupported object format capability` without echoing its remote value.
+Check that the URL points to a Git smart HTTP service and that a proxy has not
+truncated or replaced the response; then retry.
+
+The buffered parser preserves typed pkt-line failures as raw `GitError::NetworkError`
+details with the shared leading marker. Empty discovery responses use the same
+marker. Command error mapping and streaming transport readers are separate
+boundaries; this change does not alter their classification by itself.

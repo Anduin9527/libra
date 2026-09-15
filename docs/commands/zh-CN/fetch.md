@@ -295,3 +295,12 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 | 无法创建 pack 目录 | `LBR-IO-002` | 128 | "check filesystem permissions" |
 | 无法写入 pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
 | 本地状态损坏 | `LBR-REPO-002` | 128 | "inspect repository state and object integrity" |
+
+## 畸形 HTTP(S) discovery 响应
+
+在 HTTP(S) 引用发现（discovery）期间，Libra 会拒绝零字节广告和畸形
+pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度以及截断的 payload。
+合法的 `0000` flush 与未收到响应有明确区别；合法的空仓库广告仍受支持。
+不支持的 object-format capability 使用固定错误消息
+`Unsupported object format capability`，不回显远端提供的值。
+请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。

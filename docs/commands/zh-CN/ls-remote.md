@@ -81,3 +81,12 @@ libra --json ls-remote --tags origin
 - `ls-remote` 只执行协议发现（对本地 Git 仓库等价于 `git-upload-pack --advertise-refs`）。
 - 它不会写入对象、远程跟踪引用、配置或工作树文件。
 - `--heads` 和 `--tags` 可以组合使用，以同时显示分支和标签引用，同时排除 `HEAD`。
+
+## 畸形 HTTP(S) discovery 响应
+
+在 HTTP(S) 引用发现（discovery）期间，Libra 会拒绝零字节广告和畸形
+pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度以及截断的 payload。
+合法的 `0000` flush 与未收到响应有明确区别；合法的空仓库广告仍受支持。
+不支持的 object-format capability 使用固定错误消息
+`Unsupported object format capability`，不回显远端提供的值。
+请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。

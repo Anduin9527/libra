@@ -402,3 +402,14 @@ by default for maximum script friendliness.
 | Failed to create pack directory | `LBR-IO-002` | 128 | "check filesystem permissions" |
 | Failed to write pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
 | Local state corruption | `LBR-REPO-002` | 128 | "inspect repository state and object integrity" |
+
+## Malformed HTTP(S) discovery responses
+
+During HTTP(S) reference discovery, Libra rejects a zero-byte advertisement and
+malformed pkt-line frames, including short or non-hexadecimal headers, frame
+lengths below four, and truncated payloads. A valid `0000` flush remains distinct
+from an absent response; a valid empty-repository advertisement is supported.
+An unsupported object-format capability reports the fixed message
+`Unsupported object format capability` without echoing its remote value.
+Check that the URL points to a Git smart HTTP service and that a proxy has not
+truncated or replaced the response; then retry.

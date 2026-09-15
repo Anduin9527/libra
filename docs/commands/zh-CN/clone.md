@@ -420,3 +420,12 @@ Init 错误会通过 `InitError -> CliError` 透明转发。
 - Clone 始终引导 vault 签名；如有需要，可在克隆后使用 `libra config` 禁用
 - `--depth` 值必须是正整数；0 或负数会在解析时被拒绝
 - `--no-checkout` 会设置 objects/refs/HEAD 但跳过工作区检出；若想完全不要工作树（无 `.libra` 工作区布局），改用 `--bare`
+
+## 畸形 HTTP(S) discovery 响应
+
+在 HTTP(S) 引用发现（discovery）期间，Libra 会拒绝零字节广告和畸形
+pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度以及截断的 payload。
+合法的 `0000` flush 与未收到响应有明确区别；合法的空仓库广告仍受支持。
+不支持的 object-format capability 使用固定错误消息
+`Unsupported object format capability`，不回显远端提供的值。
+请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。

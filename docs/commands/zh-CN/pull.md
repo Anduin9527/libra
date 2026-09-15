@@ -276,3 +276,12 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 ### Phase 详情
 
 当子操作失败时，错误 JSON 会在 details 对象中包含 `phase` 键（`"fetch"`、`"merge"` 或 `"rebase"`），以便代理区分失败阶段。
+
+## 畸形 HTTP(S) discovery 响应
+
+在 HTTP(S) 引用发现（discovery）期间，Libra 会拒绝零字节广告和畸形
+pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度以及截断的 payload。
+合法的 `0000` flush 与未收到响应有明确区别；合法的空仓库广告仍受支持。
+不支持的 object-format capability 使用固定错误消息
+`Unsupported object format capability`，不回显远端提供的值。
+请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。
