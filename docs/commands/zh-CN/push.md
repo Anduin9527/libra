@@ -490,3 +490,11 @@ Git discovery 对长度 `0001`–`0003`、缺失/不完整的必需标头及截�
 flush `0000`、空数据 `0004` 与最大长度 `ffff` 的语义不变；普通网络错误及超时保留
 原有分类。尚无完整 pack 时的空 fetch 数据流仍属于网络失败，完整 pack 之后的 EOF
 保留成功语义。上文 SSH 主机信任例外、捕获上限及清理截止时间保持不变。
+
+## 远端 push 拒绝消息
+
+receive-pack 返回 `ng <refname> <reason>` 时，Libra 先确认 refname 属于本次提交给远端的本地更新集合。未知 ref 返回 `LBR-NET-002`（退出128）及固定原因 `receive-pack rejected an unexpected ref`，不回显未知名字或原因，提示检查远端 Git 服务或代理。
+
+已确认 ref 的拒绝消息保留可读性。refname 与 reason 使用相同净化规则：Unicode 控制字符（含 C0、DEL、C1/CSI）显示为字面转义文本；转义后每个字段最多200个 Unicode 字符，截断时另加 `…`。不会切断转义序列或 UTF-8 字符，因此保留部分可能短于200字符。普通短消息不变。规则在 human、JSON、machine 渲染之前应用，解码后的 JSON message 同样安全化。
+
+已知 ref 的拒绝仍使用 `LBR-NET-002` / 退出128与原分支保护提示。JSON message/hints 结构不变，不新增独立 reason 字段。可读远端文字不等于可信本地结论。拒绝响应不更新本地 tracking ref，也不能证明远端已回滚部分更新；结果不明确时应先核对远端状态再重试。

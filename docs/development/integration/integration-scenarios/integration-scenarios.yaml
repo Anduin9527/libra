@@ -106,7 +106,7 @@ notes: |
   Actual run evidence is recorded in plan-20260901.md. No cli.* scenario is added.
   Two existing command_test cases, test_fetch_ssh_host_key_failure_is_reported
   and test_push_ssh_host_key_failure_is_reported, also run human/JSON/machine CLI
-  modes. Under PKT-11 they pin exit128/NET001, fixed host-verification guidance,
+  modes. Under PKT-11 they pin exit 128/NET001, fixed host-verification guidance,
   each command's complete network-hint vector, no raw stderr in either stream,
   and push ref safety. Fetch checks network connectivity; push checks the remote
   URL and network connectivity. The earlier PKT-12 NET002/headerEOF/SSH255 and
@@ -161,6 +161,13 @@ notes: |
   still fail the operation. Unavailable diagnostics produce only a fixed debug
   notice, without fabricated empty-stream counts or digests. Stdout collection or
   process-wait failures retain their normal error handling.
+
+  PKT-14 retains three named Cargo library gates for expected-ref membership,
+  shared refname/reason control escaping and the 200-character display budget.
+  The actual local HTTP push-handler fixture checks three renderings (including
+  decoded JSON), exact hints, request bytes and unchanged tracking refs.
+  No new cli.* scenario or Cargo target is added; local fixtures do not prove
+  remote rollback. Accepted results are recorded in plan-20260901.md.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

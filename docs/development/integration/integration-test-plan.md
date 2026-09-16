@@ -736,3 +736,38 @@ preserve the ordinary network wrapper. Fetch no-echo and empty-stream cases use
 target or shared test helper is introduced. These are local fixtures, not live
 OpenSSH authentication;
 actual execution and release acceptance are recorded in plan-20260901.md.
+
+## Remote push rejection messages
+
+When receive-pack reports `ng <refname> <reason>`, Libra first checks that the
+refname is one of the local refs submitted for this push. A rejection for any
+other ref fails with `LBR-NET-002` (exit 128) and the fixed reason
+`receive-pack rejected an unexpected ref`; the unrecognized name and its reason
+are not echoed. Its hint asks you to check the remote Git service or proxy.
+
+For a recognized ref, the remote rejection remains readable. Both its name and
+reason use the same sanitizer: Unicode control characters, including C0, DEL,
+and C1/CSI, become literal escape text. Each displayed field is limited to 200
+Unicode characters after escaping, plus `…` when truncated. An escape sequence
+or UTF-8 character is never split, so the visible prefix can be shorter than 200
+characters. Ordinary short rejection text is unchanged. These rules apply before
+human, JSON, and machine rendering, including the decoded JSON message.
+
+Known-ref rejection still returns `LBR-NET-002` / exit 128 with the existing branch
+protection hint. JSON keeps the existing message/hints envelope; a separate
+structured reason field is not introduced. Readable remote text is not a trusted
+local assertion. A rejected response leaves local tracking refs unchanged; it
+does not prove that the server rolled back a partial remote update. Inspect the
+remote state before retrying when the server's result is uncertain.
+
+### Rejection validation scope
+
+The three original PKT-14 gates exercise exact expected-ref membership, both
+sanitized fields, all C0 plus DEL/CSI controls, Unicode/escape boundaries and
+ordinary rejection compatibility. The rendering gate drives a real local HTTP
+receive-pack discovery and delete-only POST through push `execute_safe`, then
+checks human/report/decoded-JSON messages, exact hints, wire request and unchanged
+tracking refs. The HTTP fixture is local; it does not claim TLS, SSH, or server
+rollback evidence. The two hash algorithms also cover direct zero-object-ID
+construction without a production `expect`. No test target or shared harness is
+added. Actual execution, failure history and release evidence belong in the plan.

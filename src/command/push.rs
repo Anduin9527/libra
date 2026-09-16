@@ -2270,6 +2270,30 @@ async fn collect_tag_object_chain(
     }
 }
 
+/// Escape terminal controls before limiting each displayed remote field to
+/// 200 Unicode characters, plus an ellipsis when truncated. Never split an
+/// escape sequence or UTF-8 character; processing stops at the display limit.
+fn sanitize_remote_ref_rejection(value: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut result = String::new();
+    let mut retained = 0;
+    for ch in value.chars() {
+        let escaped = if ch.is_control() {
+            ch.escape_default().to_string()
+        } else {
+            ch.to_string()
+        };
+        let width = escaped.chars().count();
+        if retained + width > LIMIT {
+            result.push('…');
+            break;
+        }
+        result.push_str(&escaped);
+        retained += width;
+    }
+    result
+}
+
 fn validate_receive_pack_response(
     mut response_data: Bytes,
     plans: &[RefUpdatePlan],
@@ -2314,9 +2338,16 @@ fn validate_receive_pack_response(
             let (refname, reason) = rest
                 .split_once(' ')
                 .unwrap_or((rest, "remote rejected update"));
+            if !expected_refs.contains(refname) {
+                return Err(PushError::Protocol {
+                    detail: format!(
+                        "{PKT_LINE_PROTOCOL_ERROR_PREFIX}receive-pack rejected an unexpected ref"
+                    ),
+                });
+            }
             return Err(PushError::RemoteRefUpdateFailed {
-                refname: refname.to_string(),
-                reason: reason.to_string(),
+                refname: sanitize_remote_ref_rejection(refname),
+                reason: sanitize_remote_ref_rejection(reason),
             });
         }
         return Err(PushError::Protocol {
@@ -3032,8 +3063,10 @@ fn incremental_objs_from_haves(
 }
 
 fn zero_object_hash() -> ObjectHash {
-    ObjectHash::from_bytes(&vec![0u8; get_hash_kind().size()])
-        .expect("zero hash should match hash kind size")
+    match get_hash_kind() {
+        HashKind::Sha1 => ObjectHash::Sha1([0; 20]),
+        HashKind::Sha256 => ObjectHash::Sha256([0; 32]),
+    }
 }
 
 /// Check if `ancestor` is an ancestor of `descendant` using breadth-first search.
@@ -3148,6 +3181,224 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn pkt_line_push_ng_reason_escaped_and_capped() {
+        assert_eq!(
+            sanitize_remote_ref_rejection("protected branch hook declined"),
+            "protected branch hook declined"
+        );
+        assert_eq!(
+            sanitize_remote_ref_rejection("a\n\r\t\0\x1b[31m\x7f\u{9b}31mz"),
+            r"a\n\r\t\u{0}\u{1b}[31m\u{7f}\u{9b}31mz"
+        );
+        for ch in (0u8..=31).chain([127, 155]).map(char::from) {
+            let actual = sanitize_remote_ref_rejection(&format!("a{ch}z"));
+            assert!(!actual.chars().any(char::is_control));
+            assert!(actual.starts_with('a') && actual.ends_with('z'));
+            assert!(actual.contains('\\'));
+        }
+        for ch in ['x', '保', '🙂'] {
+            let exact = ch.to_string().repeat(200);
+            assert_eq!(sanitize_remote_ref_rejection(&exact), exact);
+            assert_eq!(
+                sanitize_remote_ref_rejection(&format!("{exact}{ch}")),
+                format!("{exact}…")
+            );
+        }
+        // Escaping is included in the displayed character budget. A final
+        // escape sequence which cannot fit is omitted whole, then ellipsis.
+        assert_eq!(
+            sanitize_remote_ref_rejection(&format!("{}\x1bTAIL", "x".repeat(198))),
+            format!("{}…", "x".repeat(198))
+        );
+        assert_eq!(
+            sanitize_remote_ref_rejection(&format!("{}\n", "x".repeat(198))),
+            format!("{}\\n", "x".repeat(198))
+        );
+        assert_eq!(
+            sanitize_remote_ref_rejection(&format!("{}\nZ", "x".repeat(198))),
+            format!("{}\\n…", "x".repeat(198))
+        );
+        assert_eq!(sanitize_remote_ref_rejection(""), "");
+        // The direct enum construction covers both algorithms without a
+        // fallible conversion, allocation, or a production expect.
+        let previous = get_hash_kind();
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            git_internal::hash::set_hash_kind(kind);
+            let oid = zero_object_hash();
+            assert_eq!(oid.as_ref(), vec![0u8; kind.size()]);
+            assert_eq!(oid.to_string(), "0".repeat(kind.size() * 2));
+            assert!(matches!(
+                (kind, oid),
+                (HashKind::Sha1, ObjectHash::Sha1(_)) | (HashKind::Sha256, ObjectHash::Sha256(_))
+            ));
+        }
+        git_internal::hash::set_hash_kind(previous);
+    }
+
+    #[test]
+    fn pkt_line_push_refname_validated_or_protocol() {
+        let plans = [test_ref_update_plan("refs/heads/main")];
+        for unexpected in [
+            "refs/heads/main-extra",
+            "refs/heads/other",
+            "refs/heads/REMOTE_STATUS_SECRET_7c41\x1b[31m",
+            "refs/heads/main\u{9b}",
+        ] {
+            let line = format!("ng {unexpected} {STATUS_SENTINEL}\n");
+            assert_status_protocol(
+                validate_receive_pack_response(
+                    receive_pack_response(&["unpack ok\n", &line]),
+                    &plans,
+                )
+                .unwrap_err(),
+                "receive-pack rejected an unexpected ref",
+            );
+        }
+        assert_status_protocol(
+            validate_receive_pack_response(
+                receive_pack_response(&["unpack ok\n", "ng refs/heads/main rejected\n"]),
+                &[],
+            )
+            .unwrap_err(),
+            "receive-pack rejected an unexpected ref",
+        );
+        // Synthetic local plans prove refname sanitation uses the same rule as
+        // reason sanitation even if an earlier local ref validator is bypassed.
+        for (name, rendered) in [
+            (
+                "refs/heads/a\x1b[31m\u{9b}31mb".to_string(),
+                r"refs/heads/a\u{1b}[31m\u{9b}31mb".to_string(),
+            ),
+            (
+                format!("refs/heads/{}", "保".repeat(205)),
+                format!("refs/heads/{}…", "保".repeat(189)),
+            ),
+        ] {
+            let plans = [test_ref_update_plan(&name)];
+            let line = format!("ng {name} denied\rspoof\n");
+            let error = validate_receive_pack_response(
+                receive_pack_response(&["unpack ok\n", &line]),
+                &plans,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, PushError::RemoteRefUpdateFailed { refname, reason } if refname == &rendered && reason == r"denied\rspoof")
+            );
+            let cli = CliError::from(error);
+            let expected = format!("remote rejected ref update for '{rendered}': denied\\rspoof");
+            assert_eq!(cli.message(), expected);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&cli.render_json()).unwrap()["message"]
+                    .as_str(),
+                Some(expected.as_str())
+            );
+            assert!(!cli.message().chars().any(char::is_control));
+            for text in [
+                cli.render(),
+                cli.render_report(),
+                cli.render_json().to_string(),
+            ] {
+                assert!(!text.contains('\x1b') && !text.contains('\u{9b}') && !text.contains('\r'));
+            }
+        }
+        let error = validate_receive_pack_response(
+            receive_pack_response(&["unpack ok\n", "ng refs/heads/main\n"]),
+            &plans,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PushError::RemoteRefUpdateFailed { reason, .. } if reason == "remote rejected update")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(env, cwd, hash_kind)]
+    async fn pkt_line_push_ng_sentinel_human_and_json() {
+        use crate::utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in};
+        let _storage = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let tracking = "refs/remotes/origin/main";
+        let oid = "1111111111111111111111111111111111111111";
+        Branch::update_branch(tracking, oid, Some("origin"))
+            .await
+            .unwrap();
+        let mut server = ReceivePackTestServer::start().await;
+        ConfigKv::set("remote.origin.url", &server.url, false)
+            .await
+            .unwrap();
+        let ordinary_hint = "the remote rejected the update; check branch protection rules";
+        let cases = [
+            ("ng refs/heads/main blocked\x1b[31m\rspoof\u{9b}31m\x7fEND\n".to_string(), r"remote rejected ref update for 'refs/heads/main': blocked\u{1b}[31m\rspoof\u{9b}31m\u{7f}END".to_string(), ordinary_hint),
+            (format!("ng refs/heads/main {}\n", "保".repeat(205)), format!("remote rejected ref update for 'refs/heads/main': {}…", "保".repeat(200)), ordinary_hint),
+            (format!("ng refs/heads/{}\x1b[31m {}\rspoof\n", STATUS_SENTINEL, STATUS_SENTINEL), format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}receive-pack rejected an unexpected ref"), STATUS_PROTOCOL_HINT),
+            ("ng refs/heads/main protected branch hook declined\n".to_string(), "remote rejected ref update for 'refs/heads/main': protected branch hook declined".to_string(), ordinary_hint),
+        ];
+        for (line, expected, hint) in cases {
+            *server.state.response.lock().unwrap() = receive_pack_response(&["unpack ok\n", &line]);
+            let before = server.state.transcript.lock().unwrap().len();
+            let args = PushArgs::try_parse_from(["push", "origin", ":refs/heads/main"]).unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_secs(45),
+                execute_safe(args, &OutputConfig::default()),
+            )
+            .await
+            .expect("bounded push command")
+            .expect_err("remote rejection must fail");
+            assert_eq!(error.message(), expected);
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(error.exit_code(), 128);
+            assert_eq!(
+                error.hints().iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+                [hint]
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&error.render_json()).unwrap()["message"]
+                    .as_str(),
+                Some(expected.as_str())
+            );
+            assert!(!expected.chars().any(char::is_control));
+            for output in [
+                error.render(),
+                error.render_report(),
+                error.render_json().to_string(),
+            ] {
+                assert!(
+                    !output.contains('\x1b')
+                        && !output.contains('\r')
+                        && !output.contains('\u{9b}')
+                        && !output.contains('\x7f')
+                );
+                assert!(!output.contains(STATUS_SENTINEL));
+            }
+            let requests = server.state.transcript.lock().unwrap()[before..].to_vec();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                (&requests[0].0[..], &requests[0].1[..]),
+                ("GET", "/repo/info/refs?service=git-receive-pack")
+            );
+            assert_eq!(
+                (&requests[1].0[..], &requests[1].1[..]),
+                ("POST", "/repo/git-receive-pack")
+            );
+            let mut post = Bytes::copy_from_slice(&requests[1].2);
+            let (_, command) = read_pkt_line(&mut post).unwrap();
+            assert_eq!(
+                command.as_ref(),
+                format!("{oid} {} refs/heads/main\0report-status\n", "0".repeat(40)).as_bytes()
+            );
+            assert_eq!(post, "0000");
+            let branch = Branch::find_branch_result(tracking, Some("origin"))
+                .await
+                .unwrap()
+                .expect("rejection preserves tracking ref");
+            assert_eq!(branch.commit.to_string(), oid);
+        }
+        server.stop().await;
+    }
 
     const STATUS_SENTINEL: &str = "REMOTE_STATUS_SECRET_7c41";
     const STATUS_PROTOCOL_HINT: &str = "check the remote Git service or proxy response and retry";
