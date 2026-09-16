@@ -919,12 +919,11 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     // Determine transport: SSH or HTTPS
     let is_ssh = is_ssh_spec(&repo_url);
 
-    let remote_client =
-        RemoteClient::from_spec_with_remote(&repo_url, Some(&repository)).map_err(|e| {
-            PushError::InvalidRemoteUrl {
-                url: repo_url.clone(),
-                detail: e.to_string(),
-            }
+    let remote_client = RemoteClient::from_spec_with_remote(&repo_url, Some(&repository))
+        .await
+        .map_err(|e| PushError::InvalidRemoteUrl {
+            url: repo_url.clone(),
+            detail: e.to_string(),
         })?;
     let remote_client = remote_client
         .with_network_timeouts(PUSH_CONNECT_TIMEOUT, PUSH_IDLE_TIMEOUT)

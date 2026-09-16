@@ -2219,14 +2219,19 @@ async fn test_push_ssh_host_key_failure_is_reported() {
             .expect("failed to run push over fake ssh");
         assert_eq!(output.status.code(), Some(128), "{mode:?}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("\"error_code\""),
+            "{mode:?}: missing structured error: {stderr}"
+        );
         let (_, report) = super::parse_cli_error_stderr(&output.stderr);
-        assert_eq!(report.error_code, "LBR-NET-002", "{mode:?}: {report:?}");
+        assert_eq!(report.error_code, "LBR-NET-001", "{mode:?}: {report:?}");
         assert_eq!(report.exit_code, 128, "{mode:?}: {report:?}");
         for expected in [
-            "pkt-line protocol error: incomplete four-byte header",
-            "SSH exited with status 255",
-            "trusted host keys",
-            "ssh-agent authentication",
+            "SSH host trust needs confirmation:",
+            "SSH host key could not be verified",
+            "verify the host fingerprint",
+            "trusted provider console",
+            "ssh.strictHostKeyChecking",
         ] {
             assert!(
                 report.message.contains(expected),
@@ -2235,7 +2240,15 @@ async fn test_push_ssh_host_key_failure_is_reported() {
         }
         assert_eq!(
             report.hints.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["check the remote Git service or proxy response and retry"],
+            ["check the remote URL and network connectivity"],
+            "{mode:?}: {report:?}"
+        );
+        assert!(
+            !report.message.contains("pkt-line protocol error:"),
+            "{mode:?}: {report:?}"
+        );
+        assert!(
+            !report.message.contains("ssh-keyscan"),
             "{mode:?}: {report:?}"
         );
         let stdout = String::from_utf8_lossy(&output.stdout);

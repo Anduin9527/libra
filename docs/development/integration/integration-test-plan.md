@@ -631,9 +631,9 @@ CI 在 Wave 0 调用此脚本，失败即阻断 PR。
 The eleven `pkt_line_client_` PKT-12 library gates cover shared inner/outer error
 formatting, native non-zero SSH exits with fixed status/guidance, successful/failed
 output collection, preservation of collected output when cleanup fails, and real
-ordinary-error child reaping. The real-command gate uses non-terminal stdin;
-run it under nextest or redirect stdin from `/dev/null`, otherwise it fails
-explicitly rather than letting inherited stderr make the no-echo assertion empty.
+ordinary-error child reaping. PKT-11 captures stderr for terminal and
+non-terminal callers, so the real-command gate no longer requires non-terminal
+stdin. The original PKT-12 prerequisite remains historical run evidence only.
 Unix child gates include fifty malformed-frame command cases and five native
 exit-255/empty-advertisement cases across ls-remote/fetch/clone/pull/push. The
 existing `transport_timeout_uses_push_idle_timeout` gate covers push classifier
@@ -646,10 +646,66 @@ not claim Windows execution coverage.
 `command_test::command::fetch_test::test_fetch_ssh_host_key_failure_is_reported`
 and `command_test::command::push_test::test_push_ssh_host_key_failure_is_reported`
 retain their names and serial lanes. Each runs the real CLI in human, JSON and
-machine modes, pins exit 128 / `LBR-NET-002`, the incomplete-header reason, local
-SSH exit 255 and fixed SSH guidance, and rejects raw host-key stderr in both
-output streams. Full hint vectors are command-specific: fetch checks that the
-remote serves Git data and a proxy has not altered the response; push checks the
-remote Git service or proxy response. Push also verifies no remote ref was created.
-Actual results, including the rejected wrong-hint assertion and its corrected
-rerun, are recorded in plan-20260901.md; these are local fake-SSH CLI tests.
+machine modes. Under PKT-11 these cases pin exit 128 / `LBR-NET-001`, fixed
+host-verification guidance, and no raw host-key stderr in either output stream.
+Their complete network-hint vectors differ: fetch checks network connectivity;
+push checks the remote URL and network connectivity. Push also verifies no remote
+ref was created. The earlier PKT-12 NET002/incomplete-header/SSH255 and protocol
+hint expectations, including the rejected wrong-hint assertion and corrected
+rerun, remain historical evidence in plan-20260901.md. These are local fake-SSH
+CLI tests, with current source and execution acceptance recorded separately.
+
+## SSH capture validation scope
+
+The twelve named PKT-11 library gates retain the original plan names. They cover
+fixed diagnostics and metadata-only tracing, both service argument lists, three
+non-zero-exit paths, malformed-advertisement cleanup and all six capture paths
+under stderr floods. The flood gate also covers retained-prefix/full-stream
+digest accounting, collector cancellation, and oversized advertisement and push
+response rejection through actual clone/delete-only push commands, NET001, distinct
+network hints, decoded JSON and unchanged local tracking refs. The host-trust gate
+uses a current-thread runtime without a yield after setup; timeout precedence is
+also checked immediately after config writes. Both exercise asynchronous transport
+configuration without a blocking nested-runtime join. The host-trust gate covers native exit 255, typed primary
+error preservation through a secondary cleanup warning, the internal discovery
+carrier and an actual local fake-SSH clone command. Existing fetch/push CLI cases
+retain their names and test human, JSON and machine output plus remote-ref safety.
+The terminal gate uses a real local PTY. The passphrase gate creates an encrypted
+local key without an agent and exercises a simulated SSH failure; it does not
+claim live OpenSSH network authentication. Actual run IDs and results belong in
+plan-20260901.md after execution; the existence of these tests is not acceptance.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.

@@ -92,10 +92,13 @@ impl RemoteClient {
     /// Create a `RemoteClient` from a URL spec, optionally providing the
     /// logical remote name so that vault-backed SSH keys can be resolved
     /// via `vault.ssh.<remote>.privkey`.
-    pub(crate) fn from_spec_with_remote(spec: &str, remote: Option<&str>) -> Result<Self, String> {
+    pub(crate) async fn from_spec_with_remote(
+        spec: &str,
+        remote: Option<&str>,
+    ) -> Result<Self, String> {
         // Check for SSH-style URLs first (before Url::parse which doesn't handle SCP-style)
         if is_ssh_spec(spec) {
-            let client = configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote)?;
+            let client = configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote).await?;
             return Ok(Self::Ssh(client));
         }
 
@@ -122,7 +125,8 @@ impl RemoteClient {
                     Ok(Self::Git(GitClient::from_url(&url)))
                 }
                 "ssh" => {
-                    let client = configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote)?;
+                    let client =
+                        configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote).await?;
                     Ok(Self::Ssh(client))
                 }
                 other => Err(format!("unsupported remote scheme '{other}'")),
@@ -160,7 +164,10 @@ impl RemoteClient {
 
     /// Apply the connect/idle timeouts resolved from the environment, config, and
     /// built-in defaults for this remote. A no-op for local remotes.
-    pub(crate) fn with_resolved_fetch_timeouts(self, remote: Option<&str>) -> Result<Self, String> {
+    pub(crate) async fn with_resolved_fetch_timeouts(
+        self,
+        remote: Option<&str>,
+    ) -> Result<Self, String> {
         let is_local = matches!(self, Self::Local(_));
         if is_local {
             return Ok(self);
@@ -170,19 +177,22 @@ impl RemoteClient {
             "connectTimeout",
             "LIBRA_FETCH_CONNECT_TIMEOUT_MS",
             Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
-        );
+        )
+        .await;
         let idle = resolve_fetch_timeout(
             remote,
             "idleTimeout",
             "LIBRA_FETCH_IDLE_TIMEOUT_MS",
             Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
-        );
+        )
+        .await;
         let first_byte = resolve_fetch_timeout(
             remote,
             "firstByteTimeout",
             "LIBRA_FETCH_FIRST_BYTE_TIMEOUT_MS",
             Duration::from_secs(DEFAULT_FIRST_BYTE_TIMEOUT_SECS),
-        );
+        )
+        .await;
         let client = self.with_network_timeouts(connect, idle)?;
         // The first-byte timeout only applies to the git:// path today; http/ssh
         // bound the first response through their own read timeouts.
@@ -222,11 +232,14 @@ impl RemoteClient {
 
 const SSH_KEY_TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn configure_ssh_client(mut client: SshClient, remote: Option<&str>) -> Result<SshClient, String> {
+async fn configure_ssh_client(
+    mut client: SshClient,
+    remote: Option<&str>,
+) -> Result<SshClient, String> {
     if let Err(error) = cleanup_expired_vault_ssh_temp_files() {
         tracing::warn!("failed to clean up expired SSH key temp files: {error}");
     }
-    if let Some(mode) = load_ssh_host_key_checking_mode() {
+    if let Some(mode) = load_ssh_host_key_checking_mode().await {
         client = client.with_strict_host_key_checking(mode)?;
     }
     // Try to load vault SSH key for authentication.
@@ -234,9 +247,9 @@ fn configure_ssh_client(mut client: SshClient, remote: Option<&str>) -> Result<S
     // 1. vault.ssh.<remote>.privkey (vault-encrypted, decrypted to temp file)
     // 2. Legacy filesystem path ~/.libra/ssh-keys/<repo-id>/id_ed25519
     // 3. No explicit key (fall back to system default SSH agent/keys)
-    if let Some(key_file) = try_load_vault_ssh_key_for_remote(remote)? {
+    if let Some(key_file) = try_load_vault_ssh_key_for_remote(remote).await? {
         client = client.with_temp_key_file(key_file);
-    } else if let Some(key_path) = try_load_legacy_ssh_key_path() {
+    } else if let Some(key_path) = try_load_legacy_ssh_key_path().await {
         client = client.with_key_path(key_path);
     }
     Ok(client)
@@ -248,7 +261,7 @@ fn configure_ssh_client(mut client: SshClient, remote: Option<&str>) -> Result<S
 /// to a secure temporary file, and keeps that file alive for the lifetime
 /// of the SSH client. On abnormal process termination, the 24h GC pass will
 /// clean up stale `.tmp` files under `~/.libra/tmp/`.
-fn try_load_vault_ssh_key_for_remote(
+async fn try_load_vault_ssh_key_for_remote(
     remote: Option<&str>,
 ) -> Result<Option<tempfile::NamedTempFile>, String> {
     let Some(remote) = remote else {
@@ -261,7 +274,7 @@ fn try_load_vault_ssh_key_for_remote(
     }
 
     let privkey_key = format!("vault.ssh.{remote}.privkey");
-    let Some(entry) = load_config_entry_sync(&privkey_key)? else {
+    let Some(entry) = load_config_entry(&privkey_key).await? else {
         return Ok(None);
     };
 
@@ -272,7 +285,8 @@ fn try_load_vault_ssh_key_for_remote(
     }
 
     // Decrypt the private key using the vault unseal key.
-    let unseal_key = load_vault_unseal_key_sync()?
+    let unseal_key = load_unseal_key()
+        .await
         .ok_or_else(|| format!("failed to load vault unseal key for remote '{remote}'"))?;
     let ciphertext = hex::decode(&entry.value)
         .map_err(|e| format!("failed to decode vault SSH private key '{privkey_key}': {e}"))?;
@@ -313,47 +327,14 @@ fn try_load_vault_ssh_key_for_remote(
     Ok(Some(tmp_file))
 }
 
-/// Load a full config entry (including the `encrypted` flag) synchronously.
-fn load_config_entry_sync(dotted_key: &str) -> Result<Option<ConfigKvEntry>, String> {
+/// Load a full config entry (including the `encrypted` flag) without blocking
+/// the runtime worker that returns connections to the shared SQLite pool.
+async fn load_config_entry(dotted_key: &str) -> Result<Option<ConfigKvEntry>, String> {
     use crate::internal::config::ConfigKv;
 
-    fn read_entry_sync(dotted_key: &str) -> Result<Option<ConfigKvEntry>, String> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("failed to create tokio runtime for config read: {e}"))?;
-        // `get_best_effort` returns an actionable `Err` (instead of panicking)
-        // when the repository database cannot be opened — e.g. an enclosing
-        // repo whose schema is out of date.
-        rt.block_on(ConfigKv::get_best_effort(dotted_key))
-            .map_err(|e| format!("failed to read config key '{dotted_key}': {e}"))
-    }
-
-    let key = dotted_key.to_string();
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::scope(|s| {
-            s.spawn(|| read_entry_sync(&key))
-                .join()
-                .map_err(|_| format!("failed to join config read thread for key '{key}'"))?
-        }),
-        Err(_) => read_entry_sync(&key),
-    }
-}
-
-/// Load the vault unseal key synchronously.
-fn load_vault_unseal_key_sync() -> Result<Option<Vec<u8>>, String> {
-    fn read_unseal_key_sync() -> Result<Option<Vec<u8>>, String> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("failed to create tokio runtime for vault read: {e}"))?;
-        Ok(rt.block_on(load_unseal_key()))
-    }
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::scope(|s| {
-            s.spawn(read_unseal_key_sync)
-                .join()
-                .map_err(|_| "failed to join vault read thread".to_string())?
-        }),
-        Err(_) => read_unseal_key_sync(),
-    }
+    ConfigKv::get_best_effort(dotted_key)
+        .await
+        .map_err(|e| format!("failed to read config key '{dotted_key}': {e}"))
 }
 
 fn resolve_home_directory() -> Result<PathBuf, String> {
@@ -470,13 +451,13 @@ fn cleanup_expired_vault_ssh_temp_files_in(
 
 /// Try to load SSH key from the legacy filesystem path
 /// `~/.libra/ssh-keys/<repo-id>/id_ed25519`.
-fn try_load_legacy_ssh_key_path() -> Option<String> {
+async fn try_load_legacy_ssh_key_path() -> Option<String> {
     // Only try vault key lookup inside a Libra repository.
     if try_get_storage_path(None).is_err() {
         return None;
     }
 
-    let repo_id = load_repo_id_sync()?;
+    let repo_id = load_config("libra", None, "repoid").await?;
     let home = dirs::home_dir()?;
     let key_path = home
         .join(".libra")
@@ -491,10 +472,6 @@ fn try_load_legacy_ssh_key_path() -> Option<String> {
     }
 }
 
-fn load_repo_id_sync() -> Option<String> {
-    load_config_sync("libra", None, "repoid")
-}
-
 /// Load host key checking mode from env/config for SSH transport.
 ///
 /// Precedence:
@@ -503,10 +480,10 @@ fn load_repo_id_sync() -> Option<String> {
 ///
 /// When unset, the `SshClient` default (`ask`) applies: no
 /// `StrictHostKeyChecking` option is passed to `ssh`, so the user's
-/// `~/.ssh/config` governs and OpenSSH runs its interactive trust prompt on
-/// first connection (TOFU) — matching Git's transport behavior. Supported
+/// `~/.ssh/config` governs the host-key policy. BatchMode is always enabled,
+/// so interactive trust and passphrase prompts run separately. Supported
 /// values: `ask`, `yes`, `accept-new`, `no`.
-fn load_ssh_host_key_checking_mode() -> Option<String> {
+async fn load_ssh_host_key_checking_mode() -> Option<String> {
     if let Ok(raw) = std::env::var("LIBRA_SSH_STRICT_HOST_KEY_CHECKING") {
         let mode = raw.trim();
         if !mode.is_empty() {
@@ -518,7 +495,7 @@ fn load_ssh_host_key_checking_mode() -> Option<String> {
     if util::try_get_storage_path(None).is_err() {
         return None;
     }
-    load_config_sync("ssh", None, "strictHostKeyChecking")
+    load_config("ssh", None, "strictHostKeyChecking").await
 }
 
 /// Default connect timeout for a network fetch (seconds).
@@ -538,7 +515,7 @@ const DEFAULT_FIRST_BYTE_TIMEOUT_SECS: u64 = 30;
 /// falls through to the *next* source (not straight to the default) — so a typo
 /// or a `0` can never leave a fetch with a zero-duration timeout, and a bad
 /// remote-scoped value never masks a valid un-scoped `fetch.<key>`.
-fn resolve_fetch_timeout(
+async fn resolve_fetch_timeout(
     remote: Option<&str>,
     config_key: &str,
     env_var: &str,
@@ -560,18 +537,18 @@ fn resolve_fetch_timeout(
     }
     // 2. remote-scoped config `fetch.<remote>.<key>` (seconds), validated on its own.
     if let Some(remote) = remote
-        && let Some(duration) = parse_secs(load_config_sync("fetch", Some(remote), config_key))
+        && let Some(duration) = parse_secs(load_config("fetch", Some(remote), config_key).await)
     {
         return duration;
     }
     // 3. un-scoped config `fetch.<key>` (seconds).
-    if let Some(duration) = parse_secs(load_config_sync("fetch", None, config_key)) {
+    if let Some(duration) = parse_secs(load_config("fetch", None, config_key).await) {
         return duration;
     }
     default
 }
 
-fn load_config_sync(configuration: &str, name: Option<&str>, key: &str) -> Option<String> {
+async fn load_config(configuration: &str, name: Option<&str>, key: &str) -> Option<String> {
     use crate::internal::config::ConfigKv;
 
     let dotted_key = match name {
@@ -579,29 +556,15 @@ fn load_config_sync(configuration: &str, name: Option<&str>, key: &str) -> Optio
         None => format!("{configuration}.{key}"),
     };
 
-    // `get_best_effort` never panics when the (possibly *enclosing*) repository
-    // database is missing or its schema is out of date; it returns an `Err`
-    // that we log and swallow here, so transport setup degrades to "no config
-    // value" instead of dumping a panic to stderr during `clone`/`fetch`.
-    fn read_value_sync(dotted_key: &str) -> Option<String> {
-        let rt = tokio::runtime::Runtime::new().ok()?;
-        match rt.block_on(ConfigKv::get_best_effort(dotted_key)) {
-            Ok(entry) => entry.map(|e| e.value),
-            Err(err) => {
-                tracing::debug!("skipping config read for '{dotted_key}': {err}");
-                None
-            }
+    // Await on the caller's runtime: blocking a worker can strand the task
+    // returning the cached pool's only connection (see internal::db).
+    // Preserve best-effort configuration when an enclosing repo is unusable.
+    match ConfigKv::get_best_effort(&dotted_key).await {
+        Ok(entry) => entry.map(|e| e.value),
+        Err(err) => {
+            tracing::debug!("skipping config read for '{dotted_key}': {err}");
+            None
         }
-    }
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::scope(|s| {
-            s.spawn(|| read_value_sync(&dotted_key))
-                .join()
-                .ok()
-                .flatten()
-        }),
-        Err(_) => read_value_sync(&dotted_key),
     }
 }
 
@@ -1426,16 +1389,21 @@ pub(crate) async fn discover_remote_with_name(
     remote_spec: &str,
     remote_name: Option<&str>,
 ) -> Result<(RemoteClient, DiscoveryResult), FetchError> {
-    let remote_client = RemoteClient::from_spec_with_remote(remote_spec, remote_name)
-        .and_then(|client| client.with_resolved_fetch_timeouts(remote_name))
-        .map_err(|message| {
-            let (kind, reason) = classify_remote_spec_error(remote_spec, &message);
-            FetchError::InvalidRemoteSpec {
-                spec: remote_spec.to_string(),
-                kind,
-                reason,
-            }
-        })?;
+    let remote_client = async {
+        RemoteClient::from_spec_with_remote(remote_spec, remote_name)
+            .await?
+            .with_resolved_fetch_timeouts(remote_name)
+            .await
+    }
+    .await
+    .map_err(|message| {
+        let (kind, reason) = classify_remote_spec_error(remote_spec, &message);
+        FetchError::InvalidRemoteSpec {
+            spec: remote_spec.to_string(),
+            kind,
+            reason,
+        }
+    })?;
     let discovery = remote_client
         .discovery_reference(UploadPack)
         .await
@@ -3770,8 +3738,8 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use git_internal::hash::ObjectHash;
 
-    #[test]
-    fn resolve_fetch_timeout_env_millis_wins() {
+    #[tokio::test]
+    async fn resolve_fetch_timeout_env_millis_wins() {
         // A unique env var name so no concurrent real fetch reads it. The env
         // branch returns before any config read, keeping this deterministic.
         let var = "LIBRA_TEST_FETCH_TIMEOUT_ENV_WINS";
@@ -3779,13 +3747,14 @@ mod tests {
         // is unique to this test so no other thread observes it.
         unsafe { std::env::set_var(var, "2500") };
         let resolved =
-            super::resolve_fetch_timeout(None, "connectTimeout", var, Duration::from_secs(30));
+            super::resolve_fetch_timeout(None, "connectTimeout", var, Duration::from_secs(30))
+                .await;
         unsafe { std::env::remove_var(var) };
         assert_eq!(resolved, Duration::from_millis(2500));
     }
 
-    #[test]
-    fn resolve_fetch_timeout_ignores_unparseable_env() {
+    #[tokio::test]
+    async fn resolve_fetch_timeout_ignores_unparseable_env() {
         let var = "LIBRA_TEST_FETCH_TIMEOUT_GARBAGE";
         // SAFETY: as above.
         unsafe { std::env::set_var(var, "not-a-number") };
@@ -3796,24 +3765,93 @@ mod tests {
             "connectTimeoutTestUnset",
             var,
             Duration::from_secs(9),
-        );
+        )
+        .await;
         unsafe { std::env::remove_var(var) };
         assert_eq!(resolved, Duration::from_secs(9));
     }
 
-    #[test]
-    fn resolve_fetch_timeout_ignores_zero_env() {
+    #[tokio::test]
+    #[serial_test::serial(env, cwd, hash_kind)]
+    async fn resolve_fetch_timeout_ignores_zero_env() {
+        use crate::{
+            internal::config::ConfigKv,
+            utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
+        };
+
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
         let var = "LIBRA_TEST_FETCH_TIMEOUT_ZERO";
-        // SAFETY: as above. A `0` must not become a zero-duration timeout.
-        unsafe { std::env::set_var(var, "0") };
-        let resolved = super::resolve_fetch_timeout(
-            None,
-            "connectTimeoutTestUnset",
-            var,
-            Duration::from_secs(11),
-        );
-        unsafe { std::env::remove_var(var) };
-        assert_eq!(resolved, Duration::from_secs(11));
+        let _env = ScopedEnvVar::set(var, "0");
+        // No yield or extra workers: every config write must return its pooled
+        // connection while the immediately following asynchronous read awaits it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    None,
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_secs(11)
+            );
+            ConfigKv::set("fetch.connectTimeoutTestZeroEnv", "7", false)
+                .await
+                .unwrap();
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    Some("origin"),
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_secs(7)
+            );
+            ConfigKv::set("fetch.origin.connectTimeoutTestZeroEnv", "3", false)
+                .await
+                .unwrap();
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    Some("origin"),
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_secs(3)
+            );
+            for invalid in ["0", "invalid", "-1"] {
+                ConfigKv::set("fetch.origin.connectTimeoutTestZeroEnv", invalid, false)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    super::resolve_fetch_timeout(
+                        Some("origin"),
+                        "connectTimeoutTestZeroEnv",
+                        var,
+                        Duration::from_secs(11)
+                    )
+                    .await,
+                    Duration::from_secs(7)
+                );
+            }
+            let _env = ScopedEnvVar::set(var, "250");
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    Some("origin"),
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_millis(250)
+            );
+        })
+        .await
+        .expect("config precedence must resolve without blocking the runtime worker");
     }
     use tempfile::tempdir;
 

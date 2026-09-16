@@ -261,12 +261,12 @@ async fn run_ls_remote(args: LsRemoteArgs) -> Result<LsRemoteOutput, LsRemoteErr
         });
     }
 
-    let client = RemoteClient::from_spec_with_remote(&remote_url, remote_name.as_deref()).map_err(
-        |reason| LsRemoteError::InvalidRemote {
+    let client = RemoteClient::from_spec_with_remote(&remote_url, remote_name.as_deref())
+        .await
+        .map_err(|reason| LsRemoteError::InvalidRemote {
             spec: visible_remote.clone(),
             reason: sanitize_remote_error_reason(&reason, &remote_url),
-        },
-    )?;
+        })?;
     let discovery = client
         .discovery_reference(UploadPack)
         .await
@@ -716,19 +716,70 @@ mod pkt_line_boundary_tests {
     }
     #[test]
     fn pkt_line_matrix_non_marker_clone_discovery_stays_net_001() {
+        use crate::internal::protocol::ssh_client::{
+            SSH_HOST_KEY_CHANGED_GUIDANCE, SSH_HOST_KEY_CHANGED_SIGNAL, SSH_HOST_KEY_GUIDANCE,
+            SSH_HOST_KEY_UNCONFIRMED_SIGNAL,
+        };
+
         non_marker_cases(&[Boundary::CloneDiscovery], "origin");
-        let error = discovery_boundary(
-            Boundary::CloneDiscovery,
-            "ssh://example.invalid/repo",
-            GitError::NetworkError("Host key verification failed.".to_string()),
-        );
-        assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
-        assert!(
-            error
-                .hints()
-                .iter()
-                .any(|hint| hint.as_str().contains("~/.ssh/known_hosts"))
-        );
+        // Only the local carrier at the start of the inner NetworkError selects
+        // host guidance; raw diagnostic lookalikes remain ordinary network errors.
+        for detail in [
+            "Host key verification failed.".to_string(),
+            "REMOTE HOST IDENTIFICATION HAS CHANGED".to_string(),
+            format!("context: {SSH_HOST_KEY_UNCONFIRMED_SIGNAL}lookalike"),
+            format!("context: {SSH_HOST_KEY_CHANGED_SIGNAL}lookalike"),
+        ] {
+            let error = discovery_boundary(
+                Boundary::CloneDiscovery,
+                "ssh://example.invalid/repo",
+                GitError::NetworkError(detail),
+            );
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+            assert_eq!(error.exit_code(), 128);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                ["check the remote host, DNS, VPN/proxy, and network connectivity"]
+            );
+        }
+        for (signal, message, guidance) in [
+            (
+                SSH_HOST_KEY_UNCONFIRMED_SIGNAL,
+                "SSH host key could not be verified",
+                SSH_HOST_KEY_GUIDANCE,
+            ),
+            (
+                SSH_HOST_KEY_CHANGED_SIGNAL,
+                "SSH host identity has changed",
+                SSH_HOST_KEY_CHANGED_GUIDANCE,
+            ),
+        ] {
+            let error = discovery_boundary(
+                Boundary::CloneDiscovery,
+                "ssh://example.invalid/repo",
+                GitError::NetworkError(format!("{signal}{message}; MATRIX_HOST_SENTINEL")),
+            );
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+            assert_eq!(error.exit_code(), 128);
+            assert_eq!(error.message(), message);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [guidance]
+            );
+            assert!(error.hints()[0].as_str().contains("~/.ssh/known_hosts"));
+            for rendered in [error.render(), error.render_report(), error.render_json()] {
+                assert!(!rendered.contains(signal));
+                assert!(!rendered.contains("MATRIX_HOST_SENTINEL"));
+            }
+        }
     }
     #[test]
     fn pkt_line_matrix_non_marker_clone_fetch_phase_stays_net_001() {
