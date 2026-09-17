@@ -394,7 +394,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_header_git_frame_errors_end_to_end_net_002() {
         use clap::Parser;
 

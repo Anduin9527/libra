@@ -7562,6 +7562,7 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn test_diff_algorithms_use_selected_line_anchors() {
         let old = "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n";
         let new = "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n";
@@ -7579,6 +7580,7 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn anchored_patience_locks_qualifying_crossing_line() {
         let old = ["ANCHOR", "b", "c"];
         let new = ["b", "c", "ANCHOR"];
@@ -8006,7 +8008,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_maybe_colorize_diff_respects_flag() {
         let diff = "diff --git a/file.txt b/file.txt\n--- /dev/null\n+++ b/file.txt\n+line\n";
         let _guard = ColorOverrideReset;
@@ -8026,7 +8028,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_color_moved_uses_distinct_colors() {
         let _guard = ColorOverrideReset;
         colored::control::set_override(true);
@@ -8046,7 +8048,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     /// Tests that the get_files_blobs function properly respects .libraignore patterns.
     /// Verifies ignored files are correctly excluded from the blob collection process.
     async fn test_get_files_blob_gitignore() {
@@ -8072,7 +8074,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_get_files_blobs_reuses_index_hash_when_stat_matches() {
         let temp_path = tempdir().unwrap();
         test::setup_with_new_libra_in(temp_path.path()).await;

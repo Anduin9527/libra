@@ -443,7 +443,7 @@ mod tests {
     /// binary path, a second install is a no-op, uninstall removes the file,
     /// and a second uninstall stays idempotent.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn install_round_trip_is_idempotent() {
         let tmp = TempDir::new().expect("tmp dir");
         seed_libra_repo(tmp.path());
@@ -479,7 +479,7 @@ mod tests {
     /// A user-owned (unmarked) plugin file at the managed path is never
     /// overwritten by install and never removed by uninstall.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn user_owned_plugin_file_is_never_touched() {
         let tmp = TempDir::new().expect("tmp dir");
         seed_libra_repo(tmp.path());
@@ -516,7 +516,7 @@ mod tests {
     /// directory is cleaned by both uninstall and install, while a user file
     /// at that location survives.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn stray_managed_duplicate_in_plugins_dir_is_cleaned() {
         let tmp = TempDir::new().expect("tmp dir");
         seed_libra_repo(tmp.path());

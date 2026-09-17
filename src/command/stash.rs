@@ -3254,7 +3254,7 @@ mod tests {
     /// with `StackChanged` and leaves the stack byte-for-byte untouched,
     /// and a stack that vanished entirely maps to `StackChanged` too.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn do_drop_cas_misses_leave_the_stack_untouched() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
@@ -3357,7 +3357,7 @@ mod tests {
     /// the upgrade misses its CAS (the safe direction), and every line on
     /// disk is ABA-proof.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publication_backfills_generations_onto_legacy_lines() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
@@ -3416,7 +3416,7 @@ mod tests {
     /// GENERATION column is what makes each line non-reusable: the delayed
     /// CAS misses the reincarnation and the new entry survives.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn a_reused_visible_line_does_not_satisfy_the_cas() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
@@ -3462,7 +3462,7 @@ mod tests {
     /// to what a later stack read parses — the push-time capture really is
     /// the entry's identity (autostash carries it across the pull).
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn update_stash_ref_returns_the_parsed_raw_line() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
@@ -3491,7 +3491,7 @@ mod tests {
     /// (so `stash push` proceeds and surfaces real errors) instead of the
     /// old silent `false` that no-op'd as "No local changes to save".
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn has_changes_fails_safe_on_unreadable_head_commit() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());

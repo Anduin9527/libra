@@ -8399,6 +8399,7 @@ mod tests {
     /// injection: the operation table is dropped between begin and finish, so
     /// the close cannot write its outcome.
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn finish_repair_operation_surfaces_close_failure() {
         use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 

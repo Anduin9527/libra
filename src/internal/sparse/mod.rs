@@ -383,7 +383,7 @@ mod tests {
 
     /// Store round-trip: set/add/list ordering + enable/disable/clear.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn store_round_trip() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -431,7 +431,7 @@ mod tests {
     /// compile would judge worktree B's paths against worktree A's patterns —
     /// and `contains()` decides what materialization and `clean` may touch.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn a_compiled_view_matches_the_pinned_worktree_not_the_cwd() {
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
@@ -470,7 +470,7 @@ mod tests {
     /// W1 §C.4.1.1: two scopes hold patterns and enabled state independently
     /// — one scope's replace/clear/disable never leaks into the other's view.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn scopes_are_isolated() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -515,7 +515,7 @@ mod tests {
     /// "everything in view" verdict. The tolerant display path (`load`)
     /// still degrades.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn try_load_fails_closed_on_missing_tables() {
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
 

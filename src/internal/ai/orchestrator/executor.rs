@@ -4127,7 +4127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn test_execute_gate_task() {
         let (_helper_guard, _bwrap_guard) = force_no_ambient_bwrap();
         let task = TaskSpec {
@@ -4151,7 +4151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn execute_gate_task_reports_failed_check_details() {
         let (_helper_guard, _bwrap_guard) = force_no_ambient_bwrap();
         let task = TaskSpec {
@@ -4180,7 +4180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn execute_gate_task_runs_cargo_checks_in_manifest_touch_scope() {
         let (_helper_guard, _bwrap_guard) = force_no_ambient_bwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -4229,7 +4229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn test_execute_gate_task_emits_check_progress_events() {
         let (_helper_guard, _bwrap_guard) = force_no_ambient_bwrap();
         let task = TaskSpec {
@@ -4265,7 +4265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn test_execute_gate_task_with_default_security() {
         let (_helper_guard, _bwrap_guard) = force_no_ambient_bwrap();
         let task = TaskSpec {
@@ -4293,7 +4293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn execute_task_runs_gate_checks_in_isolated_worktree() {
         let (_helper_guard, _bwrap_guard) = force_no_ambient_bwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -4851,7 +4851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn execute_dag_fails_noop_implementation_task() {
         let repo = tempfile::tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -4890,7 +4890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn execute_dag_replays_parallel_task_worktrees_back_to_main_workspace() {
         let repo = tempfile::tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -4969,7 +4969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn execute_dag_retries_busy_sync_back_without_reexecuting_completed_task() {
         let repo = tempfile::tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -5022,7 +5022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn execute_dag_skips_parallel_stale_cargo_lock_side_effects() {
         let repo = tempfile::tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -5084,7 +5084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn execute_dag_syncs_cargo_project_without_treating_lockfile_or_target_as_scope_creep() {
         #[cfg(unix)]
         {
@@ -5199,7 +5199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn execute_dag_keeps_main_workspace_clean_when_serial_task_fails() {
         let repo = tempfile::tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -5787,6 +5787,7 @@ Done.";
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn gate_runtime_uses_workspace_write_sandbox() {
         let runtime = runtime_context_for_gate_task(&spec(), Path::new("/tmp/workspace"), None);
         let sandbox = runtime
@@ -5802,6 +5803,7 @@ Done.";
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn task_runtime_prefers_touch_files_as_writable_roots() {
         let workspace = tempfile::tempdir().unwrap();
         let src_dir = workspace.path().join("src");
@@ -5824,6 +5826,7 @@ Done.";
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn task_runtime_falls_back_to_scope_roots_when_touch_files_are_absent() {
         let mut task = implementation_task();
         task.contract.touch_files.clear();

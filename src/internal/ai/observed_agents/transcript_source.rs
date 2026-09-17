@@ -1040,6 +1040,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn resolve_none_when_no_path() {
         let agent = ClaudeCodeObservedAgent::new();
         let adapter: &dyn ObservedAgent = &agent;
@@ -1051,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn resolve_none_when_untrusted_path() {
         let home = tempfile::tempdir().unwrap();
         let _g = HomeGuard::set(home.path());
@@ -1074,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn resolve_file_reads_bytes_and_root_relative_source_id() {
         let home = tempfile::tempdir().unwrap();
         let _g = HomeGuard::set(home.path());
@@ -1109,7 +1110,7 @@ mod tests {
     // cannot change the bytes the writer reads (the TOCTOU invariant).
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn open_handle_survives_path_swap() {
         let home = tempfile::tempdir().unwrap();
         let _g = HomeGuard::set(home.path());
@@ -1136,7 +1137,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn provider_root_component_symlink_is_rejected() {
         let home = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -1163,7 +1164,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn provider_root_intermediate_component_symlink_is_rejected() {
         let container = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -1217,7 +1218,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn fifo_source_is_rejected_without_blocking() {
         use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Duration};
 
@@ -1243,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn read_bounded_refuses_oversize() {
         let home = tempfile::tempdir().unwrap();
         let _g = HomeGuard::set(home.path());

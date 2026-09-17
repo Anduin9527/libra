@@ -201,33 +201,39 @@ fn supervised_ignore_child() {
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn ordinary_ignore_rules_preserve_tracked_paths() {
     run_case("ordinary_ignore_rules_preserve_tracked_paths");
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn invalid_utf8_per_directory_ignore_stays_partial_until_repaired() {
     run_case("invalid_utf8_per_directory_ignore_stays_partial_until_repaired");
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn invalid_utf8_core_excludes_file_stays_partial_until_repaired() {
     run_case("invalid_utf8_core_excludes_file_stays_partial_until_repaired");
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn listing_consumes_original_deadline_before_ignore_lookup() {
     run_case("listing_consumes_original_deadline_before_ignore_lookup");
 }
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(cwd, env)]
 fn fifo_per_directory_ignore_returns_partial_within_capture_budget() {
     run_case("fifo_per_directory");
 }
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(cwd, env)]
 fn fifo_core_excludes_file_returns_partial_within_capture_budget() {
     run_case("fifo_configured");
 }

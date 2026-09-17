@@ -1732,7 +1732,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(cwd, env)]
     async fn run_init_is_silent_for_internal_callers() {
         let repo = tempdir().expect("failed to create temp repo");
         test::setup_clean_testing_env_in(repo.path());

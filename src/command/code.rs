@@ -6253,6 +6253,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_same_web_and_mcp_ports() {
         let mut args = base_args();
         args.mcp_port = args.port;
@@ -6263,6 +6264,7 @@ mod tests {
     /// `GoalSpec::new` does so a malformed objective fails CLI
     /// parsing instead of crashing the supervisor at session start.
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_well_formed_goal_objective() {
         let mut args = base_args();
         args.goal = Some("ship feature X".to_string());
@@ -6270,6 +6272,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_blank_goal_objective() {
         let mut args = base_args();
         args.goal = Some("   ".to_string());
@@ -6278,6 +6281,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_oversized_goal_objective() {
         use crate::internal::ai::goal::MAX_OBJECTIVE_LEN;
         let mut args = base_args();
@@ -6291,6 +6295,7 @@ mod tests {
     /// Web launch. Managed Codex `--resume` is rejected outright (pinned by
     /// `bare_codex_resume_is_rejected_after_legacy_tui_removal`).
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_resume_in_non_codex_web_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Ollama);
@@ -6305,6 +6310,7 @@ mod tests {
     /// `libra code --provider codex --resume` must fail closed with a
     /// migration hint instead of silently starting a fresh Web session.
     #[test]
+    #[serial_test::serial(env)]
     fn bare_codex_resume_is_rejected_after_legacy_tui_removal() {
         let args = CodeArgs::try_parse_from([
             "libra",
@@ -6326,6 +6332,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_env_file_and_approval_ttl_for_managed_codex_web() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Codex);
@@ -6351,6 +6358,7 @@ mod tests {
     /// flag, the mode, and a corrective action — so the legacy-only contract has a
     /// regression guard on both non-interactive modes.
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_resume_in_stdio_mode() {
         let mut args = base_args();
         args.stdio = true;
@@ -6559,6 +6567,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_web_flags_in_stdio_mode() {
         let mut args = base_args();
         args.stdio = true;
@@ -6588,6 +6597,7 @@ mod tests {
     /// C2 (GAP-1): web-only now accepts every supported provider — the headless
     /// web runtime + Codex web branch are reachable, not just Gemini.
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_all_supported_providers_in_web_only_mode() {
         let providers = [
             CodeProvider::Gemini,
@@ -6612,6 +6622,7 @@ mod tests {
     /// C2 (GAP-3): web-only accepts `--model`, a non-Codex `--api-base`, and
     /// `--temperature` — all consumed by the headless runtime.
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_model_api_base_and_temperature_in_web_only_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Ollama);
@@ -6624,6 +6635,7 @@ mod tests {
     /// C2 (GAP-3): a provider-specific flag that MATCHES the selected provider is
     /// accepted under web-only.
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_matching_provider_flag_in_web_only_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Ollama);
@@ -6635,6 +6647,7 @@ mod tests {
     /// pinned across the relaxed provider surface, not just Ollama — DeepSeek
     /// and Kimi tuning flags are accepted under web-only with their provider.
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_matching_deepseek_flag_in_web_only_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Deepseek);
@@ -6643,6 +6656,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_matching_kimi_flag_in_web_only_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Kimi);
@@ -6654,6 +6668,7 @@ mod tests {
     /// the web relaxation, so its 0.0–2.0 contract is enforced
     /// mode-independently. Out-of-range and non-finite values are rejected.
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_out_of_range_temperature() {
         for bad in [2.5_f64, -0.1, f64::NAN, 3.0] {
             let mut args = base_args();
@@ -6681,6 +6696,7 @@ mod tests {
     /// cross-provider match gate — a provider-specific flag that does not match
     /// the selected provider is still rejected under web-only.
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_mismatched_provider_flag_in_web_only_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Deepseek);
@@ -6694,6 +6710,7 @@ mod tests {
 
     /// C2 (R2): the Codex `--api-base` rejection survives the web-only relaxation.
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_api_base_under_codex_in_web_only_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Codex);
@@ -6708,6 +6725,7 @@ mod tests {
     /// W3-13: `--env-file` / `--approval-ttl` are accepted under the Web launch;
     /// `--network-access allow` stays rejected until Plan owns sandbox network.
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_env_file_and_approval_ttl_in_web_only_mode_but_rejects_network_allow() {
         let mut env_file_args = base_args();
         env_file_args.env_file = Some(PathBuf::from(".env.test"));
@@ -6735,6 +6753,7 @@ mod tests {
     /// C2 (R1 + codex R2, critical): `--stdio` stays fully provider-locked. One
     /// regression per class — provider, model, api-base, provider-specific flag.
     #[test]
+    #[serial_test::serial(env)]
     fn stdio_mode_stays_provider_locked() {
         // provider != gemini
         let mut args = base_args();
@@ -6778,12 +6797,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_default_web_mode() {
         let args = base_args();
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_control_write_in_default_web_mode_without_alias() {
         let mut args = base_args();
         args.control = ControlMode::Write;
@@ -6918,6 +6939,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_control_write_in_stdio_mode() {
         let mut args = base_args();
         args.stdio = true;
@@ -6933,6 +6955,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn control_stdio_allows_discovery_without_explicit_url_or_token() {
         let mut args = base_args();
         args.control = ControlMode::Stdio;
@@ -6949,6 +6972,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_mcp_stdio_combined_with_control_stdio() {
         let mut args = base_args();
         args.control = ControlMode::Stdio;
@@ -6965,6 +6989,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_plan_mode_false_with_control_stdio() {
         let mut args = base_args();
         args.control = ControlMode::Stdio;
@@ -6979,6 +7004,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_provider_flags_with_control_stdio() {
         let mut args = base_args();
         args.control = ControlMode::Stdio;
@@ -6993,6 +7019,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_control_write_with_non_loopback_host() {
         let mut args = base_args();
         args.control = ControlMode::Write;
@@ -7003,6 +7030,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_env_file_cli_arg_in_default_web_mode() {
         let args = CodeArgs::try_parse_from(["libra", "--env-file", ".env.test"]).unwrap();
 
@@ -7011,6 +7039,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_env_file_in_web_mode() {
         let mut args = base_args();
         args.env_file = Some(PathBuf::from(".env.test"));
@@ -7019,6 +7048,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_approval_ttl_in_web_mode() {
         let mut args = base_args();
         args.approval_ttl = Some(42);
@@ -7027,6 +7057,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_env_file_and_approval_ttl_in_stdio_mode() {
         let mut env_args = base_args();
         env_args.stdio = true;
@@ -7122,6 +7153,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn provider_env_file_value_overrides_process_lookup() {
         let env_file =
             parse_code_env_file("DEEPSEEK_API_KEY=file-key", Path::new(".env.test")).unwrap();
@@ -7134,6 +7166,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_network_access_on_default_web_launch() {
         let args = CodeArgs::try_parse_from(["libra", "--network-access", "allow"]).unwrap();
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
@@ -7144,6 +7177,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_allow_all_approval_policy_in_default_web_mode() {
         let args = CodeArgs::try_parse_from(["libra", "--approval-policy", "allow-all"]).unwrap();
 
@@ -7157,6 +7191,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_approval_ttl_cli_arg_in_default_web_mode() {
         let args = CodeArgs::try_parse_from(["libra", "--approval-ttl", "42"]).unwrap();
 
@@ -7280,6 +7315,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_explicit_plan_mode_true_for_non_codex_provider() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Gemini);
@@ -7289,6 +7325,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_explicit_plan_mode_false_for_non_codex_provider() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Gemini);
@@ -7304,6 +7341,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_network_access_flag_in_web_mode() {
         let mut args = base_args();
         args.network_access = CodeNetworkAccess::Allow;
@@ -7313,6 +7351,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_network_access_flag_in_stdio_mode() {
         let mut args = base_args();
         args.stdio = true;
@@ -7323,6 +7362,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_anthropic_provider_in_default_web_mode() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Anthropic);
@@ -7330,6 +7370,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_ollama_thinking_for_non_ollama_provider() {
         let mut args = base_args();
         args.ollama_thinking = Some(OllamaThinkingArg::High);
@@ -7337,6 +7378,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_ollama_thinking_for_ollama_provider() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Ollama);
@@ -7345,6 +7387,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_ollama_compact_tools_for_non_ollama_provider() {
         let mut args = base_args();
         args.ollama_compact_tools = true;
@@ -7352,6 +7395,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_ollama_compact_tools_for_ollama_provider() {
         let mut args = base_args();
         args.provider = Some(CodeProvider::Ollama);
@@ -7360,6 +7404,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_deepseek_reasoning_flags_for_deepseek_provider() {
         let args = CodeArgs::try_parse_from([
             "libra",
@@ -7416,6 +7461,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_deepseek_reasoning_flags_for_non_deepseek_provider() {
         let mut args = base_args();
         args.deepseek_thinking = Some(DeepSeekThinkingArg::Enabled);
@@ -7431,6 +7477,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_kimi_thinking_for_kimi_provider() {
         let args = CodeArgs::try_parse_from([
             "libra",
@@ -7453,6 +7500,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn defaults_kimi_stream_for_kimi_provider() {
         let args = CodeArgs::try_parse_from(["libra", "--provider", "kimi"]).unwrap();
 
@@ -7463,6 +7511,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_kimi_stream_override_for_kimi_provider() {
         let args =
             CodeArgs::try_parse_from(["libra", "--provider", "kimi", "--kimi-stream", "false"])
@@ -7475,6 +7524,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_kimi_thinking_for_non_kimi_provider() {
         let mut args = base_args();
         args.kimi_thinking = Some(KimiThinkingArg::Enabled);
@@ -7484,6 +7534,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rejects_kimi_stream_for_non_kimi_provider() {
         let mut args = base_args();
         args.kimi_stream = Some(true);
@@ -7493,6 +7544,7 @@ no_cache_unknown_network = true
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn accepts_deepseek_stream_alias_for_deepseek_provider() {
         let args =
             CodeArgs::try_parse_from(["libra", "--provider", "deepseek", "--stream", "false"])
@@ -8226,6 +8278,7 @@ no_cache_unknown_network = true
     /// non-Gemini providers reach this dispatch — cannot silently misroute a
     /// provider or strand one on the read-only placeholder.
     #[test]
+    #[serial_test::serial(env)]
     fn web_only_runtime_kind_routes_each_provider_to_its_runtime() {
         // Codex is the only provider that drives the managed app-server child.
         assert_eq!(
@@ -8436,6 +8489,7 @@ no_cache_unknown_network = true
     /// `execute_web_only` bootstrap chain and send the env-file credential on
     /// the wire — not a competing process-env value.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn default_web_execute_path_sends_env_file_credential_on_wire() {
         let _process = crate::utils::test::ScopedEnvVar::set("OPENAI_API_KEY", "from-process-env");
 
@@ -8584,6 +8638,7 @@ no_cache_unknown_network = true
     /// diagnostic rather than a bare error or a hang. Uses a freed local port
     /// (nothing listening) and a short injected timeout.
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn codex_ready_probe_times_out_with_human_readable_diagnostic() {
         let ws_url = {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

@@ -13,7 +13,7 @@
 use std::fs;
 
 use super::{
-    assert_cli_success, base_libra_command, historical_schema, parse_json_stdout,
+    LimitedChild, assert_cli_success, base_libra_command, historical_schema, parse_json_stdout,
     run_libra_command, run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
 
@@ -5216,7 +5216,7 @@ fn sparse_view_is_worktree_scoped() {
 fn registry_mutators_serialize_on_worktrees_lock() {
     /// Kill-and-reap on every exit path — an assertion failure must never
     /// leave a spawned add running against a removed temp repository.
-    struct ChildGuard(std::process::Child);
+    struct ChildGuard(LimitedChild);
     impl Drop for ChildGuard {
         fn drop(&mut self) {
             let _ = self.0.kill();

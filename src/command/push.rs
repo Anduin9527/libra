@@ -3183,6 +3183,7 @@ mod test {
     use super::*;
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn pkt_line_push_ng_reason_escaped_and_capped() {
         assert_eq!(
             sanitize_remote_ref_rejection("protected branch hook declined"),
@@ -3314,7 +3315,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_push_ng_sentinel_human_and_json() {
         use crate::utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in};
         let _storage = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
@@ -3653,7 +3654,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_push_malformed_receive_pack_end_to_end_lbr_net_002() {
         use crate::utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in};
         // The delete-only transaction may look up advertised haves. Select the
@@ -4159,7 +4160,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn incremental_objs_fast_forward_skips_unchanged_subtree_blobs() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4213,7 +4214,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn advertised_haves_same_tip_commit_sends_nothing() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4261,7 +4262,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn advertised_haves_direct_tree_and_blob_refs_send_nothing() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4296,7 +4297,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn advertised_haves_descendant_sends_only_new_delta() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4339,7 +4340,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn advertised_haves_annotated_tag_sends_only_tag_object() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4386,7 +4387,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn advertised_haves_invalid_or_unavailable_oids_are_ignored() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4430,7 +4431,7 @@ mod test {
     /// (== server tip) silently accept a push that the fresh full row (== the
     /// expected OID) must reject.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn collect_lease_tracking_oids_prefers_fully_qualified_row() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4480,7 +4481,7 @@ mod test {
     /// merges are infeasible pre-fix (~2^40 queue operations) and
     /// instantaneous post-fix.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn collect_history_commits_dedupes_merge_heavy_history() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -4510,7 +4511,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn diff_tree_objs_recurses_by_path_for_changed_subtrees() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;

@@ -15,7 +15,7 @@ use libra::internal::{
     worktree_scope::RequestScope,
 };
 
-use super::{assert_cli_success, run_libra_command, spawn_libra_command_with_env};
+use super::{LimitedChild, assert_cli_success, run_libra_command, spawn_libra_command_with_env};
 
 /// A committed repo plus one linked worktree. Returns (repo_dir, wt_path).
 fn repo_with_linked_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -276,7 +276,7 @@ async fn linked_code_runtime_runs_via_resolver_after_enablement() {
         &wt,
         &[("GEMINI_API_KEY", "test-gemini-api-key")],
     );
-    struct KillChildOnDrop(Option<std::process::Child>);
+    struct KillChildOnDrop(Option<LimitedChild>);
     impl Drop for KillChildOnDrop {
         fn drop(&mut self) {
             if let Some(mut child) = self.0.take() {

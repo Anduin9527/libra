@@ -1868,7 +1868,7 @@ mod hf01_state_compat_tests {
     /// the conclusion's validate-then-write cannot interleave with the write of
     /// a freshly started revert — every mutator goes through this same lock.
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn revert_state_lock_excludes_a_second_holder() {
         use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
 

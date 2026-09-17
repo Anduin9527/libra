@@ -2123,7 +2123,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn claude_subagent_rejects_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -2166,7 +2166,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn claude_subagent_discovery_enforces_budget_and_persists_only_opaque_identity() {
         let home = tempfile::tempdir().expect("home");
         let old_home = std::env::var_os("LIBRA_TEST_HOME");
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn claude_subagent_discovery_supports_legacy_safe_session_components() {
         let home = tempfile::tempdir().expect("home");
         let old_home = std::env::var_os("LIBRA_TEST_HOME");
@@ -2274,7 +2274,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn claude_subagent_discovery_counts_non_json_entries_toward_directory_bound() {
         let home = tempfile::tempdir().expect("home");
         let old_home = std::env::var_os("LIBRA_TEST_HOME");

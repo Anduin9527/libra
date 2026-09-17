@@ -136,6 +136,7 @@ mod tests {
     // Env-var tests mutate process state — keep them in ONE test so they
     // cannot race each other (cargo test runs tests in parallel threads).
     #[test]
+    #[serial_test::serial(env)]
     fn endpoint_gating_matrix() {
         let clear = || {
             unsafe {

@@ -2292,7 +2292,7 @@ mod tests {
     /// actually returns. The worktree fixture uses a Unix symlink.
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn object_read_still_succeeds_after_the_worktree_budget_is_spent() {
         use std::time::Duration;
 
@@ -2362,7 +2362,7 @@ mod tests {
     /// point — the same accounting branch a growing file exercises, without
     /// the test hook mutating the file.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn worktree_total_charges_bytes_read_not_stale_stat() {
         use std::time::Duration;
 
@@ -2448,7 +2448,7 @@ mod tests {
     /// batch run to a multiple of itself while every individual operation
     /// looked compliant.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn sequential_ops_share_the_batch_deadline() {
         use std::time::Duration;
 
@@ -2482,7 +2482,7 @@ mod tests {
     /// the batch deadline. The seam stands in for a FIFO/hung-mount
     /// attributes file.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn lfs_classification_is_bounded_by_the_batch_deadline() {
         use std::time::Duration;
 
@@ -2511,7 +2511,7 @@ mod tests {
     /// `worktree_blob_oid_and_size` path used by status's exact gate must
     /// bound its LFS classification by the batch deadline too.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn lfs_classification_is_bounded_on_the_oid_path_too() {
         use std::time::Duration;
 
@@ -2540,7 +2540,7 @@ mod tests {
     /// without the harness gate. Arming the env vars WITHOUT `LIBRA_TEST`
     /// must not slow any operation, so a short batch still succeeds.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn slow_op_seams_are_ignored_without_the_harness_gate() {
         use std::time::Duration;
 

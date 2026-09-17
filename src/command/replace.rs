@@ -573,7 +573,7 @@ mod tests {
     /// The REAL `replace -d` path: its removal is visible to the very next
     /// resolve in the same process (no snapshot can outlive the mutation).
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd)]
     async fn delete_mutation_path_invalidates_the_cache() {
         let repo = repo_fixture();
         let objects = repo.path().join(".libra").join("objects");

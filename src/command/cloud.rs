@@ -5884,6 +5884,7 @@ async fn restore_legacy_capture_refs_if_unowned(
 #[cfg(test)]
 mod tests {
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn merge_import_tombstones_keeps_newest_and_fingerprints() {
         use crate::utils::d1_client::AgentImportTombstoneRow;
 
@@ -6242,7 +6243,7 @@ mod tests {
     /// `IS NULL` and update the existing HEAD/branch rows instead of inserting
     /// duplicates that leave HEAD pointing at the init-time repository state.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_updates_existing_null_remote_references() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -6303,7 +6304,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_never_moves_generation_fenced_traces_ref() {
         let rt = tokio::runtime::Runtime::new().expect("create test runtime");
         let repo = tempdir().expect("create repo tempdir");
@@ -6369,7 +6370,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_reinstates_legacy_traces_ref_without_a_generation() {
         let rt = tokio::runtime::Runtime::new().expect("create test runtime");
         let repo = tempdir().expect("create repo tempdir");
@@ -6429,7 +6430,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_strict_fails_when_metadata_object_is_missing() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -6456,7 +6457,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_strict_fails_when_metadata_has_no_local_head() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -6493,7 +6494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_restore_indexed_objects_downloads_skips_and_verifies_hash() {
         let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
@@ -6530,7 +6531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_restore_indexed_objects_reports_hash_mismatch() {
         let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
@@ -6591,7 +6592,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn create_r2_storage_reads_values_from_local_config() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7006,7 +7007,7 @@ mod tests {
     /// erased. Both the session and its checkpoints must be dropped, and
     /// everything else must still restore.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_skips_locally_tombstoned_sessions_and_their_checkpoints() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7106,7 +7107,7 @@ mod tests {
     /// checkpoints into the local catalog. Smoke-tests the happy path
     /// without spinning up a D1 client.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_inserts_fresh_rows() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7164,7 +7165,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_rejects_locally_pruned_remote_checkpoint() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7268,7 +7269,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_round_trips_subagent_companion_relations() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7360,7 +7361,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_subagent_revision_conflict_rolls_back_claim_advance_atomically() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7892,7 +7893,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn agent_capture_snapshot_never_publishes_catalog_beyond_object_generation() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7987,7 +7988,7 @@ mod tests {
     /// existing row in place rather than inserting a duplicate or erroring
     /// on the unique index (`idx_agent_session_provider`).
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_upserts_existing_session_on_conflict() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8054,7 +8055,7 @@ mod tests {
     /// Immutable checkpoint fields never change merely because a remote row
     /// carries a generation number.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_rejects_immutable_checkpoint_conflict() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8104,7 +8105,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_applies_newer_checkpoint_prune_rewrite() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8165,7 +8166,7 @@ mod tests {
     /// otherwise claims/checkpoints from a partially applied remote snapshot
     /// can become visible together with stale local companions.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_partial_failure_returns_err() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8207,7 +8208,7 @@ mod tests {
     /// rows into a half-built catalogue. This test simulates that
     /// scenario by dropping the checkpoint table after init.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_warns_when_checkpoint_table_missing() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8270,7 +8271,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn validate_cloud_backup_env_surfaces_config_resolution_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();

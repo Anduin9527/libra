@@ -3250,6 +3250,7 @@ mod tests {
     /// worker-template manifest — the one in common storage. Deriving it from
     /// the invoking worktree's root forked the deploy drift gate per worktree.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_manifest_resolves_into_common_storage_for_linked_worktrees() {
         let temp = tempfile::tempdir().expect("tempdir");
         let main_gitdir = temp.path().join("main").join(".libra");
@@ -3571,7 +3572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publish_sync_materializes_revision_file_inputs_from_commit_tree() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3624,7 +3625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publish_sync_non_dry_run_all_refs_persists_revision_rows_and_site_index() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3705,7 +3706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publish_sync_non_dry_run_targeted_ref_does_not_advance_full_refs_generation() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3751,7 +3752,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publish_sync_non_dry_run_latest_uses_default_ref_revision() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3795,7 +3796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publish_sync_non_dry_run_persists_ai_artifacts_and_counts() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3847,7 +3848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publish_sync_non_dry_run_default_planner_exports_history_ai_objects() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3939,7 +3940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn publish_sync_non_dry_run_fails_when_ai_projection_cannot_rebuild() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -4205,6 +4206,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_init_materializes_worker_template_and_manifest() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
 
@@ -4288,6 +4290,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_status_reports_current_after_init() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
@@ -4534,6 +4537,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_deploy_skip_deploy_builds_worker_and_skips_cloud_mutations() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         materialize_deployable_worker(temp.path());
@@ -4569,6 +4573,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_deploy_applies_migrations_deploys_and_extracts_url() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         materialize_deployable_worker(temp.path());
@@ -4617,6 +4622,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_deploy_requires_configured_d1_database_id_before_commands() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
@@ -4649,6 +4655,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_deploy_requires_configured_r2_bucket_name_before_commands() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
@@ -4680,6 +4687,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_unpublish_requires_yes() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         materialize_deployable_worker(temp.path());
@@ -4706,6 +4714,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_unpublish_marks_site_disabled_with_wrangler_d1_execute() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         materialize_deployable_worker(temp.path());
@@ -4858,6 +4867,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_status_reports_modified_template_file() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
@@ -4876,6 +4886,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_status_reports_outdated_template_file() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
@@ -4911,6 +4922,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_init_refuses_to_overwrite_modified_template_file() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         let worker_dir = temp.path().join("worker");
@@ -4941,6 +4953,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_init_refuses_worker_symlink() {
         use std::os::unix::fs::symlink;
 

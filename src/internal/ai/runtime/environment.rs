@@ -724,7 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn provider_provisions_and_cleans_task_worktree() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -782,7 +782,7 @@ mod tests {
     /// `LeaseHeartbeat`; the deadline must move strictly forward without
     /// minting a new fence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn heartbeat_timer_extends_the_lease_deadline() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -837,7 +837,7 @@ mod tests {
 
     /// The renewal step reports a takeover instead of resurrecting the claim.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn lease_renewal_reports_a_takeover_instead_of_resurrecting_the_claim() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -916,7 +916,7 @@ mod tests {
     /// longer holds it: a doctor that presumed this runtime dead may have
     /// handed the workspace to someone else who is writing to it now.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn sync_back_refuses_once_the_lease_has_been_reclaimed() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -978,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn sync_back_reports_a_held_operation_lease_as_retryable() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn sync_back_reports_publication_failure_after_replay_without_inviting_retry() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -1105,7 +1105,7 @@ mod tests {
     /// mid-operation. Without this, a long sync started on a still-valid proof
     /// could keep writing after another owner reclaimed the workspace.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn expired_lease_stops_the_sync_worker_mid_operation() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -1151,7 +1151,7 @@ mod tests {
     /// passed, the sync-back proceeds. Once that proof ages out, it fails
     /// closed instead of guessing.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn unverifiable_lease_proceeds_while_the_deadline_still_holds() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;
@@ -1219,7 +1219,7 @@ mod tests {
     /// `workspace_lease_test::concurrent_acquire_overlap_is_decided_by_the_unique_index`,
     /// which uses two independent connections.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn parallel_task_worktrees_get_independent_leases() {
         let main = TempDir::new().unwrap();
         test::setup_with_new_libra_in(main.path()).await;

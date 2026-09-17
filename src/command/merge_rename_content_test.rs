@@ -38,7 +38,7 @@ fn merge(
 }
 
 #[test]
-#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial_test::serial(cwd)]
 fn binary_fold_uses_original_content_and_independently_merged_mode() {
     let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: both binary versions diverged and one side made it executable.
@@ -57,7 +57,7 @@ fn binary_fold_uses_original_content_and_independently_merged_mode() {
 }
 
 #[test]
-#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial_test::serial(cwd)]
 fn binary_fold_without_a_regular_original_records_empty_content() {
     let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: a missing or symlink original with genuinely divergent binaries.
@@ -76,7 +76,7 @@ fn binary_fold_without_a_regular_original_records_empty_content() {
 }
 
 #[test]
-#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial_test::serial(cwd)]
 fn binary_fold_does_not_hide_an_unresolved_mode_conflict() {
     let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: without a regular original, both regular modes differ from it.
@@ -95,7 +95,7 @@ fn binary_fold_does_not_hide_an_unresolved_mode_conflict() {
 }
 
 #[test]
-#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial_test::serial(cwd)]
 fn symlink_fold_restores_the_complete_original_and_remains_unclean() {
     let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: nontrivial symlink versions, including a different original kind.
@@ -116,7 +116,7 @@ fn symlink_fold_restores_the_complete_original_and_remains_unclean() {
 }
 
 #[test]
-#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial_test::serial(cwd, env, hash_kind)]
 fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
     let _repository = super::repository_fixture::MergeTestRepository::new();
     let _cwd_lock = crate::utils::test::cwd_lock_guard();
@@ -144,7 +144,7 @@ fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
 }
 
 #[test]
-#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial_test::serial(cwd)]
 fn binary_fold_resolves_trivial_oids_before_the_virtual_original_fallback() {
     let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: one side changes content while the other changes only the mode.
@@ -164,7 +164,7 @@ fn binary_fold_resolves_trivial_oids_before_the_virtual_original_fallback() {
 }
 
 #[test]
-#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial_test::serial(cwd, env, hash_kind)]
 fn outer_binary_content_selection_preserves_mode_and_mode_conflicts() {
     let _repository = super::repository_fixture::MergeTestRepository::new();
     let _cwd_lock = crate::utils::test::cwd_lock_guard();

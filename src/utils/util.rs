@@ -3298,6 +3298,7 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     ///Test get current directory success.
     fn cur_dir_returns_current_directory() {
         let _cwd_lock = test::cwd_lock_guard();
@@ -3318,7 +3319,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     ///Test the function of is_sub_path.
     fn test_is_sub_path() {
         let _guard = test::ChangeDirGuard::new(Path::new(env!("CARGO_MANIFEST_DIR")));
@@ -3336,7 +3337,7 @@ mod test {
     /// a string `starts_with`, `srcfoo/x` would falsely read as inside
     /// `src` — a scope-escape. Pin the rejection.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_is_sub_path_rejects_byte_prefix_sibling_and_unrelated_paths() {
         let _guard = test::ChangeDirGuard::new(Path::new(env!("CARGO_MANIFEST_DIR")));
 
@@ -3370,7 +3371,7 @@ mod test {
     /// otherwise only by the root-escape test — is pinned for the
     /// in-scope / sibling-escape cases too.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_is_sub_path_resolves_interior_parent_dir() {
         let _guard = test::ChangeDirGuard::new(Path::new(env!("CARGO_MANIFEST_DIR")));
 
@@ -3406,7 +3407,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn list_workdir_files_prunes_libraignored_directories() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3437,7 +3438,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_rejects_unborn_branch_before_hash_fallback() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3499,7 +3500,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_head_navigation_reports_unborn_head() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3512,7 +3513,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_tag_object_hash_with_caret_zero_resolves_commit() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3558,7 +3559,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_peels_nested_tag_object_hash_to_commit() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3607,7 +3608,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_reports_tag_cycle_as_corruption() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3657,7 +3658,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     ///Test the function of to_workdir_path.
     async fn test_to_workdir_path() {
         let temp_path = tempdir().unwrap();
@@ -3674,7 +3675,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that files matching patterns in .libraignore are correctly identified as ignored.
     fn test_check_gitignore_ignore_files() {
         let temp_path = tempdir().unwrap();
@@ -3688,7 +3689,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that directories matching patterns in .libraignore are correctly identified as ignored.
     fn test_check_gitignore_ignore_directory() {
         let temp_path = tempdir().unwrap();
@@ -3702,7 +3703,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests ignore pattern matching in subdirectories with .libraignore files at different directory levels.
     fn test_check_gitignore_ignore_subdirectory_files() {
         let temp_path = tempdir().unwrap();
@@ -3720,7 +3721,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that files not matching patterns in .libraignore are correctly identified as not ignored.
     fn test_check_gitignore_not_ignore() {
         let temp_path = tempdir().unwrap();
@@ -3735,7 +3736,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that files not matching subdirectory-specific patterns in .libraignore are correctly identified as not ignored.
     fn test_check_gitignore_not_ignore_subdirectory_files() {
         let temp_path = tempdir().unwrap();
@@ -3804,7 +3805,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_ignores_global_libra_dir_without_repo_markers() {
         let temp = tempdir().unwrap();
         let home_like = temp.path();
@@ -3824,7 +3825,7 @@ mod test {
         );
     }
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_accepts_valid_repo_under_ancestor_with_global_libra_dir() {
         let temp = tempdir().unwrap();
         let home_like = temp.path();
@@ -3852,7 +3853,7 @@ mod test {
         );
     }
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_rejects_libra_dir_with_only_hooks() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("project");
@@ -3870,7 +3871,7 @@ mod test {
         );
     }
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_rejects_libra_dir_with_only_objects() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("project");
@@ -4103,6 +4104,7 @@ mod test {
     /// trust its local configuration as the repository's. Discovery must
     /// also STOP there rather than climbing into an ancestor repository.
     #[test]
+    #[serial_test::serial(env)]
     fn test_pointerless_linked_gitdir_fails_closed() {
         let temp = tempdir().unwrap();
         // An ancestor repository the walk must NOT climb into.
@@ -4140,7 +4142,7 @@ mod test {
     /// `config` table — and the printed `libra config --global` hint could
     /// never fix it (global config lives in `~/.libra/config.db`).
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_global_libra_home_is_never_repository_storage() {
         let temp = tempdir().unwrap();
         let home = temp.path().join(ROOT_DIR);
@@ -4363,6 +4365,7 @@ mod test {
     /// Concurrent status walks must not clear each other's failure latch
     /// (Codex WIO-02 r32 P1).
     #[test]
+    #[serial_test::serial(cwd)]
     fn concurrent_ignore_walks_keep_independent_failure_latches() {
         use std::sync::Barrier;
 
@@ -4407,6 +4410,7 @@ mod test {
 
     /// A timed-out worker from a finished walk must not poison a later walk.
     #[test]
+    #[serial_test::serial(cwd)]
     fn finished_ignore_walk_rejects_late_worker_latch() {
         let epoch = {
             let _walk = begin_secure_ignore_walk();

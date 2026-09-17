@@ -2966,6 +2966,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn phase1_capture_rejects_change_between_content_and_metadata_scans() {
         let temp = tempfile::tempdir().expect("temp dir");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3039,6 +3040,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn phase1_exact_validation_rejects_identity_change_after_content_scan() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 
@@ -3477,6 +3479,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn phase1_context_budget_counts_legacy_root_sidecars_and_recovers_after_gc() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store = crate::internal::ai::session::jsonl::SessionJsonlStore::new(
@@ -3498,6 +3501,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn phase1_context_budget_rejects_total_bytes_at_preflight() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store = crate::internal::ai::session::jsonl::SessionJsonlStore::new(

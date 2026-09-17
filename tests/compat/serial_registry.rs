@@ -58,11 +58,18 @@ fn registry() -> BTreeMap<String, (String, String)> {
 }
 
 fn classify_raw() -> String {
-    let out = Command::new("sh")
-        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+    classify_raw_on_tree(None)
+}
+
+fn classify_raw_on_tree(tree: Option<&str>) -> String {
+    let mut cmd = Command::new("sh");
+    cmd.arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
         .current_dir(repo_root())
-        .output()
-        .expect("run tests/SERIAL_CLASSIFY.sh");
+        .env_remove("SERIAL_CLASSIFY_TREE");
+    if let Some(tree) = tree {
+        cmd.env("SERIAL_CLASSIFY_TREE", tree);
+    }
+    let out = cmd.output().expect("run tests/SERIAL_CLASSIFY.sh");
     assert!(
         out.status.success(),
         "SERIAL_CLASSIFY.sh failed: {}",
@@ -325,6 +332,34 @@ fn classifier_is_deterministic() {
         classify_raw(),
         classify_raw(),
         "SERIAL_CLASSIFY.sh is not deterministic"
+    );
+}
+
+/// plan-20260917 SH-01: the default face is tests/, and an explicit
+/// `SERIAL_CLASSIFY_TREE=tests` must not change a byte of stdout.
+#[test]
+fn classify_tree_default_matches_tests_baseline() {
+    assert_eq!(
+        classify_raw(),
+        classify_raw_on_tree(Some("tests")),
+        "SERIAL_CLASSIFY_TREE=tests must match the default (unset) face"
+    );
+}
+
+/// plan-20260917 SH-01: unknown TREE values fail closed with exit 2.
+#[test]
+fn classify_tree_rejects_unknown_value() {
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+        .current_dir(repo_root())
+        .env("SERIAL_CLASSIFY_TREE", "bogus")
+        .output()
+        .expect("run tests/SERIAL_CLASSIFY.sh");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bogus TREE must exit 2, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -2117,5 +2152,192 @@ fn no_full_universe_expansion_remains() {
         offenders.is_empty(),
         "full-universe #[serial] expansion found (narrow it to the lanes the body \
          really needs, e.g. #[serial(cwd, env, hash_kind)]): {offenders:?}"
+    );
+}
+
+fn serial_keys_of(attr_line: &str) -> Option<Vec<String>> {
+    let inner = attr_line
+        .trim_start()
+        .strip_prefix("#[serial_test::serial(")
+        .or_else(|| attr_line.trim_start().strip_prefix("#[serial("))?;
+    let inner = inner.strip_suffix(")]")?;
+    Some(inner.split(',').map(|k| k.trim().to_string()).collect())
+}
+
+fn attr_keys_before_fn(lines: &[&str], idx: usize) -> (Vec<String>, bool) {
+    let mut keys = Vec::new();
+    let mut is_test = false;
+    for prev in lines[..idx].iter().rev() {
+        let text = prev.trim();
+        if text.is_empty() || text.starts_with("//") || text.starts_with("///") {
+            continue;
+        }
+        if let Some(found) = serial_keys_of(prev) {
+            keys.extend(found);
+            continue;
+        }
+        if text.starts_with("#[") {
+            if text.starts_with("#[test") || text.starts_with("#[tokio::test") {
+                is_test = true;
+            }
+            continue;
+        }
+        break;
+    }
+    (keys, is_test)
+}
+
+fn fn_is_test(source: &str, fn_name: &str) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let sig = format!("fn {fn_name}(");
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let is_fn = trimmed.starts_with("fn ") || trimmed.starts_with("async fn ");
+        if !is_fn || !trimmed.contains(&sig) {
+            continue;
+        }
+        if attr_keys_before_fn(&lines, idx).1 {
+            return true;
+        }
+    }
+    false
+}
+
+fn serial_keys_on_fn(source: &str, fn_name: &str) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let sig = format!("fn {fn_name}(");
+    let mut fallback = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let is_fn = trimmed.starts_with("fn ") || trimmed.starts_with("async fn ");
+        if !is_fn || !trimmed.contains(&sig) {
+            continue;
+        }
+        let (keys, is_test) = attr_keys_before_fn(&lines, idx);
+        if is_test {
+            return keys;
+        }
+        if fallback.is_empty() {
+            fallback = keys;
+        }
+    }
+    fallback
+}
+
+/// plan-20260917 SH-02: every census `touches!=none` src test holds those lanes.
+#[test]
+fn src_process_global_tests_hold_matching_lanes() {
+    let census = std::fs::read_to_string(repo_root().join("tests/SRC_SERIAL_CENSUS.tsv"))
+        .expect("read SRC_SERIAL_CENSUS.tsv");
+    let mut missing = Vec::new();
+    for (n, line) in census.lines().enumerate() {
+        if n == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert!(cols.len() >= 4, "census line {}", n + 1);
+        let (file, fn_name, touches) = (cols[0], cols[1], cols[3]);
+        if touches == "none" {
+            continue;
+        }
+        let source = std::fs::read_to_string(repo_root().join(file)).expect(file);
+        // Census indexes serial-adjacent helpers (and doc comments that mention
+        // `#[serial]`). Those are not rustc tests; putting serial_test on them
+        // rewrites the helper into a 0-arg test and breaks callers.
+        if !fn_is_test(&source, fn_name) {
+            continue;
+        }
+        let keys = serial_keys_on_fn(&source, fn_name);
+        for lane in touches.split('+') {
+            if matches!(lane, "env" | "cwd" | "hash_kind") && !keys.iter().any(|k| k == lane) {
+                missing.push(format!("{file}::{fn_name} missing {lane} (have {keys:?})"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "src process-global tests missing lanes: {missing:?}"
+    );
+}
+
+/// plan-20260917 SH-02: src/ must not keep the five-key universe expansion.
+#[test]
+fn no_full_universe_expansion_remains_in_src() {
+    let mut offenders = Vec::new();
+    let mut stack = vec![repo_root().join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/ dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read src");
+                for (n, line) in text.lines().enumerate() {
+                    if let Some(keys) = serial_keys_of(line)
+                        && keys.iter().any(|k| k == "cloud_live")
+                        && keys.iter().any(|k| k == "workspace_failpoints")
+                    {
+                        offenders.push(format!("{}:{}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "src/ still has full-universe #[serial] expansion: {offenders:?}"
+    );
+}
+
+/// plan-20260917 SH-02: SRC_SERIAL_REGISTRY.tsv lists file+fn for converted rows
+/// and agrees with SERIAL_CLASSIFY_TREE=src on (fn, lane) multisets.
+#[test]
+fn src_serial_registry_matches_src_classifier() {
+    let text = std::fs::read_to_string(repo_root().join("tests/SRC_SERIAL_REGISTRY.tsv"))
+        .expect("read SRC_SERIAL_REGISTRY.tsv");
+    let mut registry: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        if n == 0 {
+            assert_eq!(line, "file\tfn\tlane\treason", "src registry header");
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 4, "src registry line {}", n + 1);
+        let prior = registry.insert(
+            (cols[0].to_string(), cols[1].to_string()),
+            cols[2].to_string(),
+        );
+        assert!(
+            prior.is_none(),
+            "duplicate src registry row {} {}",
+            cols[0],
+            cols[1]
+        );
+    }
+    assert!(!registry.is_empty(), "src registry is empty");
+
+    let classified = classify_raw_on_tree(Some("src"));
+    let mut class_fns: BTreeMap<String, usize> = BTreeMap::new();
+    for line in classified.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (fn_name, _verdict) = line.split_once('\t').expect("src classify fn\\tverdict");
+        *class_fns.entry(fn_name.to_string()).or_insert(0) += 1;
+    }
+    let mut missing = Vec::new();
+    for (_, fn_name) in registry.keys() {
+        if !class_fns.contains_key(fn_name) {
+            missing.push(fn_name.clone());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "SRC_SERIAL_REGISTRY fns missing from TREE=src classify: {missing:?}"
     );
 }

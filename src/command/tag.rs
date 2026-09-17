@@ -1311,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_create_and_list_lightweight_tag() {
         let (_temp_dir, _guard) = setup_repo_with_commit().await;
         create_tag("v1.0-light", None, false).await;
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_create_and_list_lightweight_tag_force() {
         let (_temp_dir, _guard) = setup_repo_with_commit().await;
         create_tag("v1.0-light", None, false).await;
@@ -1334,7 +1334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_create_and_list_annotated_tag() {
         let (_temp_dir, _guard) = setup_repo_with_commit().await;
         create_tag("v1.0-annotated", Some("Release v1.0".to_string()), false).await;
@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_create_and_list_annotated_tag_force() {
         let (_temp_dir, _guard) = setup_repo_with_commit().await;
         create_tag("v1.0-annotated", Some("Release v1.0".to_string()), false).await;
@@ -1365,7 +1365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_show_lightweight_tag() {
         let (_temp_dir, _guard) = setup_repo_with_commit().await;
         create_tag("v1.0-light", None, false).await;
@@ -1377,7 +1377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_show_annotated_tag() {
         let (_temp_dir, _guard) = setup_repo_with_commit().await;
         create_tag("v1.0-annotated", Some("Test message".to_string()), false).await;
@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_delete_tag() {
         let (_temp_dir, _guard) = setup_repo_with_commit().await;
         create_tag("v1.0", None, false).await;

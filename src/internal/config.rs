@@ -3248,6 +3248,7 @@ mod tests {
     /// entirely. A store that still carries the table keeps serving its
     /// legacy rows through the same reader.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn legacy_config_fallback_tolerates_missing_table() {
         let temp = tempfile::tempdir().expect("create tempdir");
         let latest = crate::internal::db::migration::latest_builtin_schema_version()

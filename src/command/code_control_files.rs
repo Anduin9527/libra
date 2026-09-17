@@ -1552,6 +1552,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn code_control_files_write_control_info_accepts_bare_relative_path() {
         let temp = tempfile::tempdir().unwrap();
         let _cwd = crate::utils::test::ChangeDirGuard::new(temp.path());

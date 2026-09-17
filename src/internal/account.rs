@@ -130,7 +130,7 @@ mod tests {
     use crate::{internal::config::ConfigKv, utils::test};
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn remove_session_deletes_global_session_not_local_key() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn remove_all_sessions_deletes_global_sessions_not_local_keys() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;

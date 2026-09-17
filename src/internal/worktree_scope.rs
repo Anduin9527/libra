@@ -345,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn linked_scope_carries_its_id_in_both_key_forms() {
         let scope = WorktreeScope::Linked("wt-abc123".to_string());
         assert!(scope.is_linked());
@@ -361,7 +362,7 @@ mod tests {
     /// follows would land in whatever worktree the cwd had become, deleting
     /// A's sequence while A's checkout stays on disk.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn a_pinned_scope_survives_a_cwd_change() {
         let repo = tempfile::tempdir().expect("repo");
         {
@@ -414,7 +415,7 @@ mod tests {
     /// next lands in scope B's gitdir — pairing one worktree's database state
     /// with another's file state, which is worse than either alone.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn a_pinned_workdir_keeps_sidecars_in_their_own_gitdir() {
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
@@ -466,7 +467,7 @@ mod tests {
     /// directory and overwrite B's files. Pinning a SUBDIRECTORY also proves
     /// the root is the resolved worktree root, not the invocation directory.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn a_pinned_request_resolves_storage_and_worktree_root_once() {
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
@@ -514,7 +515,7 @@ mod tests {
     /// later reads never find them, so a second sequence could start and strand
     /// the first one's recovery state.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn the_request_database_follows_the_pin_not_the_cwd() {
         let repo_a = tempfile::tempdir().expect("repo a");
         let repo_b = tempfile::tempdir().expect("repo b");
@@ -566,7 +567,7 @@ mod tests {
     /// the outer one, so worktree A's rows are read for an operation that has
     /// nothing to do with A.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn an_unresolvable_pin_installs_nothing_and_never_inherits() {
         let outer = tempfile::tempdir().expect("the enclosing repository");
         let ambient = tempfile::tempdir().expect("the repository the cwd is in");

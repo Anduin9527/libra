@@ -1392,7 +1392,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(env)]
     async fn fetch_objects_propagates_reachable_commit_walk_errors() {
         let repo_dir = tempdir().unwrap();
         setup_with_new_libra_in(repo_dir.path()).await;
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(cwd, env)]
     async fn with_repo_current_dir_restores_current_dir_when_task_is_cancelled() {
         let caller_dir = tempdir().unwrap();
         let repo_dir = tempdir().unwrap();
@@ -1455,7 +1455,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(cwd, env)]
     async fn with_repo_current_dir_serializes_concurrent_operations() {
         let caller_dir = tempdir().unwrap();
         let repo_a = tempdir().unwrap();

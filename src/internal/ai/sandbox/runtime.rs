@@ -1581,7 +1581,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_linux_seccomp_falls_back_when_helper_is_missing() {
         let _helper = EnvVarGuard::unset("LIBRA_LINUX_SANDBOX_EXE");
         let _bwrap = EnvVarGuard::set("LIBRA_BWRAP_BINARY", "/does/not/exist/bwrap");
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_linux_required_enforcement_rejects_missing_helper() {
         let _helper = EnvVarGuard::unset("LIBRA_LINUX_SANDBOX_EXE");
         let _bwrap = EnvVarGuard::set("LIBRA_BWRAP_BINARY", "/does/not/exist/bwrap");
@@ -2121,7 +2121,7 @@ mod tests {
     /// built-in bwrap path is gated to that platform.
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_threads_seccomp_policy_into_exec_env_on_linux_bwrap_path() {
         let tmpdir = tempfile::tempdir().expect("tempdir for seccomp threading test");
         let fake_bwrap = tmpdir.path().join("bwrap");
@@ -2198,7 +2198,7 @@ mod tests {
     /// matrix can run the built-in bwrap path without relying on
     /// host-installed bubblewrap.
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn locate_bwrap_binary_honours_override_env_var() {
         let tmpdir = tempfile::tempdir().expect("tempdir for override probe");
         let fake_bwrap = tmpdir.path().join("bwrap");
@@ -2289,7 +2289,7 @@ mod tests {
     /// gated behind `#[cfg(target_os = "linux")]`.
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_uses_built_in_bwrap_when_helper_is_missing_but_bwrap_is_available() {
         let tmpdir = tempfile::tempdir().expect("tempdir for built-in bwrap test");
         let fake_bwrap = tmpdir.path().join("bwrap");
@@ -2544,6 +2544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_sets_cargo_target_dir_inside_fuse_worktree() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-fuse-7-019d/workspace/src");
@@ -2559,6 +2560,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_skips_when_caller_already_set_target_dir() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-fuse-7-019d/workspace");
@@ -2575,6 +2577,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_skips_when_ambient_env_has_target_dir() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-fuse-7-019d/workspace");
@@ -2587,6 +2590,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_noops_outside_fuse_worktree() {
         let mut env = HashMap::new();
         apply_fuse_workspace_env_overrides(Path::new("/repo/src"), &mut env, false);
@@ -2594,6 +2598,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_uses_task_local_home_cargo_and_log_paths() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-copy-9-019e/workspace/src");
@@ -2634,6 +2639,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_does_not_inject_task_local_env_outside_task_worktree() {
         let spec = CommandSpec::shell_inner(
             "echo ok",
@@ -2750,6 +2756,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_injects_cargo_target_dir_inside_fuse_workspace() {
         // Production wrapper test: drives the inner constructor with an
         // explicit ambient-env flag so we don't rely on whatever the test
@@ -2778,6 +2785,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_skips_injection_when_ambient_env_has_target_dir() {
         // When the operator has `CARGO_TARGET_DIR` exported the inner
         // constructor must respect that choice, even inside a FUSE worktree.
@@ -2798,6 +2806,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_does_not_inject_cargo_target_dir_outside_fuse_workspace() {
         let cwd = std::env::temp_dir();
         let spec = CommandSpec::shell_inner(
@@ -3094,6 +3103,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     #[cfg_attr(target_os = "linux", serial_test::serial(sandbox_env))]
     fn seam_trusted_bwrap_field_consumed() {
         let cwd = tempfile::tempdir().expect("tempdir");

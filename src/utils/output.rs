@@ -730,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn resolve_term_dumb_disables_auto_color() {
         let _term = crate::utils::test::ScopedEnvVar::set("TERM", "dumb");
 

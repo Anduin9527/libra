@@ -1964,6 +1964,7 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn test_pathspec_looks_like_glob() {
         assert!(pathspec_looks_like_glob("b*"));
         assert!(pathspec_looks_like_glob("file?.txt"));
@@ -1973,6 +1974,7 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn test_stdout_is_tty_for_add_respects_test_gate() {
         // The unit test process sets LIBRA_TEST in some suites and not in
         // others; the helper must not panic either way.

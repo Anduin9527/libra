@@ -400,7 +400,7 @@ mod tests {
     /// retired `OnceLock<bool>` the second pin received the first pin's
     /// latched verdict.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd)]
     fn workdir_probe_is_not_latched_across_worktrees() {
         use crate::internal::worktree_scope::WorktreeScope;
 
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn sync_ignore_case_uses_supplied_repo_dir_not_process_cwd() {
         let repo = tempfile::tempdir().unwrap();
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;

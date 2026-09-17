@@ -4696,6 +4696,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn commit_graph_build_roundtrip() {
         use std::str::FromStr;
 
@@ -4759,6 +4760,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn commit_graph_build_writes_octopus_edge_chunk() {
         use std::str::FromStr;
 

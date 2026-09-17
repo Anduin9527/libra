@@ -138,65 +138,77 @@ fn supervised_lease_child() {
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn same_scope_second_operation_refuses_before_callback() {
     run_case("same_scope", false);
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn linked_scope_operation_runs_while_main_scope_is_held() {
     run_case("different_scope", false);
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn another_process_holding_scope_lock_is_a_prompt_refusal() {
     run_case("external_holder", true);
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn cancelled_scope_waiter_does_not_strand_blocking_work() {
     run_case("cancelled_waiter", true);
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn cancelling_a_started_operation_releases_its_scope_lease() {
     run_case("cancelled_operation", false);
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn released_scope_lease_can_be_acquired_again() {
     run_case("released", false);
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn lease_open_error_preserves_resource_and_os_cause() {
     run_case("open_error", false);
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn acquiring_a_lease_does_not_append_to_existing_lock_contents() {
     run_case("unchanged_contents", false);
 }
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(cwd, env)]
 fn operation_scope_lock_honors_shared_group_permissions() {
     run_case("shared_group_permissions", false);
 }
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(cwd, env)]
 fn symlink_lock_leaf_is_rejected_without_writing_its_target() {
     run_case("symlink_leaf", false);
 }
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(cwd, env)]
 fn symlink_info_directory_is_rejected_without_creating_external_lock() {
     run_case("symlink_parent", false);
 }
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(cwd, env)]
 fn fifo_lock_leaf_is_rejected_without_waiting_for_a_reader() {
     run_case("fifo_leaf", false);
 }

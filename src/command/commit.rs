@@ -3496,7 +3496,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn lfs_auto_stage_pointer_matches_atomically_replaced_backup() {
         let temp = tempdir().expect("create LFS auto-stage test directory");
         setup_with_new_libra_in(temp.path()).await;
@@ -3763,7 +3763,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     // Tests the recursive tree creation from index entries (uses original test data via absolute path)
     async fn test_create_tree() {
         // 1. Initialize a temporary Libra repository

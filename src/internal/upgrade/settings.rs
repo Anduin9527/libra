@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn padded_on_disk_mode_is_rejected() {
         let (_dir, _env) = scoped_home();
         let path = settings_path().expect("test fixture operation should succeed");
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn lenient_read_warns_exactly_once_per_process() {
         use crate::utils::output::{reset_warning_tracker, warning_was_emitted};
         let (_dir, _env) = scoped_home();
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn missing_file_reads_as_none() {
         let (_dir, _env) = scoped_home();
         assert_eq!(
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn write_then_read_roundtrips_and_keeps_file_on_off() {
         let (_dir, _env) = scoped_home();
         let path = write_mode(UpgradeMode::Auto).expect("test fixture operation should succeed");
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     #[cfg(unix)]
     fn written_file_and_dir_have_private_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn corrupt_json_is_a_strict_error_but_lenient_off() {
         let (_dir, _env) = scoped_home();
         let path = settings_path().expect("test fixture operation should succeed");
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn invalid_mode_value_is_a_strict_error() {
         let (_dir, _env) = scoped_home();
         let path = settings_path().expect("test fixture operation should succeed");
@@ -410,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn newer_schema_version_is_rejected() {
         let (_dir, _env) = scoped_home();
         let path = settings_path().expect("test fixture operation should succeed");
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn missing_or_null_mode_field_is_damaged_state() {
         let (_dir, _env) = scoped_home();
         let path = settings_path().expect("test fixture operation should succeed");
@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn unknown_fields_are_ignored() {
         let (_dir, _env) = scoped_home();
         let path = settings_path().expect("test fixture operation should succeed");

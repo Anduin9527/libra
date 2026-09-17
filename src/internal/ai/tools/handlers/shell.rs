@@ -652,6 +652,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn rejects_git_version_control_commands() {
         let temp = TempDir::new().unwrap();
         let inv = make_invocation(
@@ -668,6 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn rejects_destructive_shell_commands_before_spawn() {
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("target");
@@ -693,6 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn rejects_wrapped_destructive_shell_commands_before_spawn() {
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("wrapped-target");
@@ -719,6 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn needs_human_shell_safety_uses_approval_prompt() {
         let temp = TempDir::new().unwrap();
         let (runtime_context, mut approval_rx) = runtime_with_approval(AskForApproval::OnRequest);
@@ -748,6 +752,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn mutating_shell_command_cannot_target_outside_workspace() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -899,6 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn test_shell_workdir_outside_sandbox_fails() {
         let sandbox = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -919,6 +925,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn test_shell_workdir_symlink_escape_fails() {
         use std::os::unix::fs::symlink;
 
@@ -1047,7 +1054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, cwd)]
     async fn test_shell_metadata_tracks_written_paths() {
         let temp = TempDir::new().unwrap();
         let outside_repo = TempDir::new().unwrap();
@@ -1106,7 +1113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, cwd)]
     async fn test_shell_metadata_includes_text_file_diffs() {
         let temp = TempDir::new().unwrap();
         std::fs::write(temp.path().join("Cargo.toml"), "[dependencies]\n").unwrap();
@@ -1137,7 +1144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, cwd)]
     async fn test_shell_metadata_ignores_cargo_home_registry_manifest_diffs() {
         let temp = TempDir::new().unwrap();
         std::fs::create_dir_all(temp.path().join("cargo-home/registry/src/index/dep-1.0.0"))
@@ -1163,7 +1170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, cwd)]
     async fn test_shell_metadata_omits_non_manifest_diffs() {
         let temp = TempDir::new().unwrap();
         std::fs::create_dir(temp.path().join("src")).unwrap();
@@ -1228,6 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn test_shell_incompatible_payload() {
         let temp = TempDir::new().unwrap();
         let inv = ToolInvocation::new(

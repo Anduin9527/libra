@@ -3617,6 +3617,7 @@ mod tests {
     // Scenario: long IDs keep their first eight characters; short IDs are fully
     // masked.
     #[test]
+    #[serial_test::serial(cwd, hash_kind)]
     fn session_id_redaction_masks_suffix() {
         assert_eq!(redact_session_id("gemini__session-123"), "gemini__***");
         assert_eq!(redact_session_id("short"), "***");
@@ -3625,6 +3626,7 @@ mod tests {
     // Scenario: a synthetic ended session includes the schema id, state machine
     // counters, message-count summary, and transcript path in the payload.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn v2_payload_contains_state_machine_and_summary() {
         let mut session = SessionState::new("/tmp/repo");
         session.id = "gemini__s-1".to_string();
@@ -4597,7 +4599,7 @@ mod tests {
     /// silently captured with empty transcripts (exactly what the A6.5
     /// real-CLI smoke observed with its isolated CODEX_HOME).
     #[test]
-    #[serial]
+    #[serial(env)]
     fn codex_transcript_root_honors_codex_home_override() {
         let adapter = crate::internal::ai::observed_agents::agent_for(
             crate::internal::ai::observed_agents::AgentKind::Codex,
@@ -4655,7 +4657,7 @@ mod tests {
     /// envelope at it, and asserts the persisted blob contains the marker
     /// (proving full capture) with the secret scrubbed.
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn session_end_checkpoint_captures_full_transcript_via_adapter() {
         let (dir, conn) = ingest_fresh_conn().await;
         let repo_path = dir.path().to_path_buf();

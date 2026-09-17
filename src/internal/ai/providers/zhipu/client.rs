@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_reads_zhipu_api_key_from_process_env() {
         let key_guard = TestEnvGuard::set("ZHIPU_API_KEY", Some("zh-test-resolved"));
         let base_guard = TestEnvGuard::set("ZHIPU_BASE_URL", None);
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_errors_when_no_layer_supplies_api_key() {
         let key_guard = TestEnvGuard::set("ZHIPU_API_KEY", None);
         let base_guard = TestEnvGuard::set("ZHIPU_BASE_URL", None);
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn from_env_process_env_overrides_global_vault_and_vault_is_fallback() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let key_guard = TestEnvGuard::set("ZHIPU_API_KEY", Some("zh-env-key"));

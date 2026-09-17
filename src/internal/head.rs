@@ -773,7 +773,7 @@ mod tests {
     use crate::utils::test::{self, ChangeDirGuard};
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn current_commit_result_with_conn_returns_corrupt_when_head_row_missing() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn current_commit_result_with_conn_returns_corrupt_for_invalid_detached_hash() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -836,7 +836,7 @@ mod tests {
     /// `Option::None`) and lets callers cleanly distinguish "no remote HEAD
     /// recorded" from "remote HEAD is corrupt".
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn remote_current_result_with_conn_returns_none_for_unknown_remote() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -859,7 +859,7 @@ mod tests {
     /// The error message names the canonical refspec
     /// (`refs/remotes/<remote>/HEAD`) so operators can locate the bad row.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn remote_current_result_with_conn_returns_corrupt_for_invalid_detached_hash() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -898,7 +898,7 @@ mod tests {
     /// message contract so a future refactor of the Result-returning
     /// helper cannot silently drift the lossy variant's diagnostic output.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     #[should_panic(expected = "HEAD row in reference table is corrupt")]
     async fn current_with_conn_panics_with_invariant_message_when_head_corrupt() {
         let repo = tempdir().unwrap();
@@ -924,7 +924,7 @@ mod tests {
     /// row whose stored commit hash is unparseable, then call the lossy
     /// variant.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     #[should_panic(expected = "remote HEAD row in reference table is corrupt")]
     async fn remote_current_with_conn_panics_with_invariant_message_when_remote_head_corrupt() {
         let repo = tempdir().unwrap();

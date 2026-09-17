@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn from_resolved_env_reads_deepseek_api_key_from_process_env() {
         let key_guard = TestEnvGuard::set("DEEPSEEK_API_KEY", Some("ds-test-resolved"));
         let global_guard = TestEnvGuard::set(
@@ -241,7 +241,7 @@ mod tests {
     /// unset. Mirrors v0.17.906's config_test::resolve_env_for_target_process_
     /// env_overrides_global_vault fix.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn from_env_process_env_overrides_global_vault() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let key_guard = TestEnvGuard::set("DEEPSEEK_API_KEY", Some("ds-env-key"));
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn from_resolved_env_errors_when_no_layer_supplies_api_key() {
         let key_guard = TestEnvGuard::set("DEEPSEEK_API_KEY", None);
         let global_guard = TestEnvGuard::set(

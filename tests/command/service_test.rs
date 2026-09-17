@@ -4,7 +4,7 @@
 //!
 //! **Layer:** L1 — deterministic, loopback networking only.
 
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 
 use super::*;
 
@@ -33,7 +33,7 @@ fn service_repo() -> tempfile::TempDir {
     create_committed_repo_via_cli()
 }
 
-struct ServiceGuard(Child);
+struct ServiceGuard(LimitedChild);
 
 impl Drop for ServiceGuard {
     fn drop(&mut self) {

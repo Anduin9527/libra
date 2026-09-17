@@ -3445,6 +3445,7 @@ mod tests {
     /// M-CRASH X5 (#477 HF-31): rows without a control phase (older binaries)
     /// report none, a marked row reports its verb, and a position write clears it.
     #[test]
+    #[serial_test::serial(env)]
     fn control_phase_round_trips_and_legacy_rows_have_none() {
         let args = CherryPickArgs::try_parse_from(["cherry-pick", "abc"]).unwrap();
         let current = serde_json::to_string(&CherryPickOpts::from_args(&args)).unwrap();

@@ -2101,14 +2101,14 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn stderr_render_mode_env_defaults_to_auto_for_falsey_values() {
         let _guard = ScopedEnvVar::set(LIBRA_ERROR_JSON_ENV, "0");
         assert_eq!(StructuredStderrMode::from_env(), StructuredStderrMode::Auto);
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn stderr_render_mode_env_can_force_structured_output() {
         let _guard = ScopedEnvVar::set(LIBRA_ERROR_JSON_ENV, "1");
         assert_eq!(
@@ -2119,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn fine_exit_codes_env_returns_legacy_category_codes() {
         let _guard = ScopedEnvVar::set(LIBRA_FINE_EXIT_CODES_ENV, "1");
 

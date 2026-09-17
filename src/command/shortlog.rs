@@ -950,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn execute_safe_requires_repository() {
         let temp = tempdir().unwrap();
         test::setup_clean_testing_env_in(temp.path());

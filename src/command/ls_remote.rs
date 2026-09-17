@@ -1059,7 +1059,7 @@ mod pkt_line_boundary_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(env, cwd, hash_kind)]
+    #[serial(cwd, env)]
     async fn pkt_line_matrix_parametrized_https_marker_maps_net_002() {
         marker_cases(&ALL, "https://example.invalid/repo");
         let parent = tempdir().unwrap();
@@ -1110,7 +1110,7 @@ mod pkt_line_boundary_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(env, cwd, hash_kind)]
+    #[serial(cwd, env)]
     async fn pkt_line_discovery_empty_response_regression_fetch_clone_lsremote_pull() {
         let mut server = TestServer::start(ResponseMode::EmptyAdvertisement).await;
         for command in ["fetch", "clone", "ls-remote", "pull"] {

@@ -498,7 +498,7 @@ mod tests {
     /// worktree B has its own sequence in the same repository. Reading the
     /// process cwd instead of the passed scope is exactly the bug this pins.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn each_scope_projects_its_own_sequence() {
         use crate::internal::sequencer::{SequenceKind, SequenceState};
 
@@ -592,7 +592,7 @@ mod tests {
     /// `CHERRY_PICK_HEAD`, while `ORIG_HEAD` (a "where did it start" fact)
     /// stays defined.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn a_non_conflict_stop_defines_no_cherry_pick_head() {
         use crate::internal::sequencer::{SequenceKind, SequenceState};
 
@@ -646,7 +646,7 @@ mod tests {
     /// split-fact this pins against. Reverting the pinned constructor makes
     /// this fail.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn for_request_keeps_the_pinned_worktree_after_a_cwd_move() {
         let repo_a = tempfile::tempdir().expect("repo A");
         let repo_b = tempfile::tempdir().expect("repo B");
@@ -708,7 +708,7 @@ mod tests {
     /// demands of `WorktreePseudoRefs` (the public `rev-parse` surface stays
     /// deferred by §C.5 — `tests/compat/pseudo_ref_surface.rs` pins that).
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn linked_pseudo_refs_resolve_per_worktree() {
         use crate::internal::sequencer::{SequenceKind, SequenceState};
 
@@ -802,7 +802,7 @@ mod tests {
     /// must project its own scope's `stopped_sha`, never the other's — and a
     /// rebase that has not stopped defines no `REBASE_HEAD` at all.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn each_scope_projects_its_own_rebase_head() {
         use sea_orm::{ConnectionTrait, Statement};
 
@@ -885,7 +885,7 @@ mod tests {
     /// linked worktree, gives each a different sidecar, and asserts each scope
     /// reads its own.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn each_scope_reads_its_own_sidecars() {
         let repo = tempfile::tempdir().expect("repo");
         let _cd = crate::utils::test::ChangeDirGuard::new(repo.path());
@@ -974,6 +974,7 @@ mod tests {
     /// silently resolved by priority — only one operation may be in progress
     /// per worktree, so disagreement is leftover state a caller must see.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn disagreeing_sources_are_an_error_and_agreeing_ones_are_not() {
         let same = |oid: &str, source: &'static str| ResolvedPseudoRef {
             name: PseudoRef::OrigHead.name(),

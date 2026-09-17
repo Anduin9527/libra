@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_defaults_to_local_base_url_when_unset() {
         let base_guard = TestEnvGuard::set("OLLAMA_BASE_URL", None);
         let key_guard = TestEnvGuard::set("OLLAMA_API_KEY", None);
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_picks_up_ollama_cloud_api_key_when_base_is_cloud() {
         let base_guard = TestEnvGuard::set("OLLAMA_BASE_URL", Some("https://ollama.com"));
         let key_guard = TestEnvGuard::set("OLLAMA_API_KEY", Some("oll-test-cloud-key"));
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_flags_missing_key_for_cloud_base_url() {
         let base_guard = TestEnvGuard::set("OLLAMA_BASE_URL", Some("https://ollama.com"));
         let key_guard = TestEnvGuard::set("OLLAMA_API_KEY", None);

@@ -2430,7 +2430,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn guarded_worktree_snapshots_restore_file_directory_transitions() {
         let temp = tempfile::tempdir().expect("create reset snapshot test directory");
         let _guard = crate::utils::test::ChangeDirGuard::new(temp.path());

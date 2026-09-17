@@ -1970,7 +1970,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn rebuild_materializes_multi_intent_heads_and_ready_queue() {
         let (_dir, storage, history, db_conn) = setup_projection_history().await;
         let actor = ActorRef::human("alice").expect("actor");
@@ -2083,7 +2083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn targeted_rebuild_materializes_only_requested_thread() {
         let (_dir, storage, history, db_conn) = setup_projection_history().await;
         let actor = ActorRef::human("alice").expect("actor");
@@ -2152,7 +2152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn rebuild_materializes_run_state_and_indexes() {
         let (_dir, storage, history, db_conn) = setup_projection_history().await;
         let actor = ActorRef::agent("projection-rebuild-test").expect("actor");

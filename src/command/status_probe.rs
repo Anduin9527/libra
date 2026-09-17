@@ -1082,7 +1082,7 @@ mod tests {
     /// harness: with the variables set but `LIBRA_TEST` absent, production
     /// defaults stay in effect; with the gate present, the overrides bite.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn seam_timeouts_and_probe_limits_require_the_harness_gate() {
         // SAFETY: serialized test body; every variable is removed again
         // before the test returns.

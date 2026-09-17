@@ -447,6 +447,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn non_utf8_paths_use_conservative_tracked_fallback() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -479,7 +480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn respect_policy_ignores_untracked_files() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -521,7 +522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn include_ignored_policy_keeps_untracked_files() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -558,7 +559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn only_ignored_policy_returns_only_ignored_paths() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -600,7 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn only_ignored_policy_excludes_tracked_entries() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -660,7 +661,7 @@ mod tests {
     /// must not be staged by `add .` or `add --force`, even when a
     /// `.libraignore` whitelist rule tries to un-ignore it.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn git_directory_is_force_ignored_like_git() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;

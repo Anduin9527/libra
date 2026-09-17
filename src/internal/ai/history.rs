@@ -6256,6 +6256,7 @@ mod tests {
     use tokio::time::sleep;
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn checkpoint_durability_aggregate_object_bound_is_fail_closed() {
         let mut durable = HashSet::new();
         insert_durable_oid_bounded(&mut durable, "one".to_string(), 2).expect("first object");
@@ -6392,7 +6393,7 @@ mod tests {
     /// entry point RETIRES it (the drain classifies untrustworthy rows as
     /// retirable), after which the listing succeeds again.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn doctor_repair_retires_future_dated_marker_and_unblocks_listing() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
@@ -6442,7 +6443,7 @@ mod tests {
     /// every destructive consumer (gc defer/roots, prune, erasure) stops
     /// instead of silently losing or trusting the row.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn listing_fails_closed_on_future_dated_marker_row() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());

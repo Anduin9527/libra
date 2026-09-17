@@ -2401,7 +2401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn task_worktree_paths_use_repo_storage_when_available() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -2636,7 +2636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn prepare_task_worktree_keeps_repo_storage_visible_in_runtime() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -2995,7 +2995,7 @@ mod tests {
     /// where the sessions root should be) and asserts the repo's
     /// `worktrees/tasks` dir is left empty — no leaked workspace.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn materialize_cleans_up_workspace_when_event_append_fails() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");

@@ -656,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     fn file_blob_hash_helper_uses_request_workdir_not_spawn_cwd() {
         use std::{ffi::OsString, path::Path};
 

@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn init_sync_data_from_env_reads_the_flag() {
         let previous = sync_data_enabled();
 

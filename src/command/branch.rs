@@ -2798,6 +2798,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn edit_description_flag_parses_optional_branch() {
         // Bare flag defaults to "" (the current branch).
         let args = BranchArgs::try_parse_from(["branch", "--edit-description"]).unwrap();
@@ -2903,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn commit_contains_surfaces_typed_commit_load_failure() {
         let repo = tempfile::tempdir().expect("temp repo");
         let rt = tokio::runtime::Runtime::new().expect("runtime");

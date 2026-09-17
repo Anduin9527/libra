@@ -599,7 +599,7 @@ mod tests {
         utils::test,
     };
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     /// Test objects can be correctly saved to and loaded from storage.
     async fn test_save_load_object() {
         let temp_path = tempdir().unwrap();

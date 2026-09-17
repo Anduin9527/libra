@@ -66,6 +66,7 @@ fn run_child_case(case: &str) {
 }
 
 #[test]
+#[serial_test::serial(cwd, env)]
 fn resolver_tests_preserve_caller_env() {
     if let Some(case) = std::env::var_os(CHILD_CASE) {
         let ready = std::env::var_os(CHILD_READY).expect("supervisor supplies ready path");

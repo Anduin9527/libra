@@ -1169,6 +1169,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn pkt_line_client_debug_trace_records_status_length_digest() {
         let trace = Pkt11Trace::default();
         let mut output = pkt12_output_with_code(23);
@@ -1383,7 +1384,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial(env)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_client_batch_mode_enforced() {
         for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
             for mode in ["ask", "yes", "accept-new", "no"] {
@@ -1421,7 +1422,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_client_host_key_fail_closed_guidance() {
         use clap::Parser;
 
@@ -1681,7 +1682,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_client_stderr_flood_capped() {
         use clap::Parser;
 
@@ -1994,7 +1995,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial(env)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_client_batch_mode_passphrase_error_points_to_agent() {
         use crate::utils::test::ScopedEnvVar;
         let root = tempfile::tempdir().unwrap();
@@ -2387,6 +2388,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_client_ssh_read_error_no_hang() {
         let mut child = pkt12_fault_child(b"0001").await;
         let pid = child.id().unwrap();
@@ -2518,7 +2520,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_client_ssh_frame_errors_end_to_end_net_002() {
         use clap::Parser;
 
@@ -2749,6 +2751,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn test_parse_scp_style() {
         let client = SshClient::from_scp_style("git@github.com:user/repo.git").unwrap();
         assert_eq!(client.user, "git");
@@ -2758,6 +2761,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn test_parse_ssh_url() {
         let client = SshClient::from_ssh_url("ssh://git@github.com:2222/user/repo.git").unwrap();
         assert_eq!(client.user, "git");
@@ -2767,6 +2771,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn test_parse_ssh_url_default_user() {
         let client = SshClient::from_ssh_url("ssh://github.com/user/repo.git").unwrap();
         assert_eq!(client.user, "git");
@@ -2774,6 +2779,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn test_shell_single_quote() {
         assert_eq!(shell_single_quote("user/repo.git"), "'user/repo.git'");
         assert_eq!(
@@ -2783,6 +2789,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn test_default_host_key_checking_is_ask() {
         // The default defers host-key policy to ssh_config. BatchMode still
         // prevents interactive TOFU and passphrase prompts.
@@ -2793,6 +2800,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn test_with_strict_host_key_checking_accepts_git_modes() {
         for mode in ["ask", "yes", "accept-new", "no", "ACCEPT-NEW"] {
             let client = SshClient::from_scp_style("git@github.com:user/repo.git")
@@ -2804,6 +2812,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn test_with_strict_host_key_checking_invalid_value() {
         let result = SshClient::from_scp_style("git@github.com:user/repo.git")
             .unwrap()

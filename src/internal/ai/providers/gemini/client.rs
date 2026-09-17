@@ -175,7 +175,7 @@ mod tests {
     /// resolver path returns the key verbatim — no global-config DB
     /// involvement needed.
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn from_resolved_env_reads_gemini_api_key_from_process_env() {
         let key_guard = TestEnvGuard::set("GEMINI_API_KEY", Some("gm-test-resolved"));
         // Point the global config DB at a nonexistent path so the resolver
@@ -199,7 +199,7 @@ mod tests {
     /// config DB supplies a key, the error must mention `GEMINI_API_KEY`
     /// by name so users know which setting to populate.
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn from_resolved_env_errors_when_no_layer_supplies_api_key() {
         let key_guard = TestEnvGuard::set("GEMINI_API_KEY", None);
         let global_guard = TestEnvGuard::set(
@@ -221,6 +221,7 @@ mod tests {
 
     /// Debug formatting must not leak the secret API key.
     #[test]
+    #[serial_test::serial(env)]
     fn gemini_provider_debug_masks_api_key() {
         let provider = GeminiProvider::new("gm-secret-key-1234".to_string());
         let debug_str = format!("{provider:?}");

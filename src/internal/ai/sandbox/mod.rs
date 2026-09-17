@@ -3046,6 +3046,7 @@ mod tests {
     /// don't customise `SandboxRuntimeConfig` directly.
     #[cfg_attr(target_os = "linux", serial)]
     #[test]
+    #[serial_test::serial(env)]
     fn seccomp_policy_env_resolves_path_only_when_non_empty() {
         // SAFETY: test-only env mutation.
         let prior = std::env::var_os(SANDBOX_SECCOMP_POLICY_ENV);
@@ -3084,6 +3085,7 @@ mod tests {
     // Bridge default and env groups (env alone misses default), in that order.
     #[serial_test::serial(inner_attrs = [serial_test::serial(env)])]
     #[test]
+    #[serial_test::serial(env)]
     fn seccomp_policy_path_falls_back_to_default_and_obeys_explicit_disable() {
         let temp = tempfile::tempdir().expect("tempdir for default seccomp path test");
         let _home = ScopedEnvVar::set("HOME", temp.path());
@@ -3631,7 +3633,7 @@ mod tests {
     /// available so the same inputs select `MacosSeatbelt` instead.
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     fn build_command_from_spec_records_evidence_on_enforcement_failed() {
         use std::sync::Arc;
 
@@ -3830,7 +3832,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd)]
     fn repair_missing_process_cwd_restores_deleted_process_cwd() {
         struct RestoreCwd(Option<PathBuf>);
 
@@ -4564,7 +4566,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[serial(sandbox_env)]
+    #[serial(sandbox_env, env)]
     async fn prefer_strict_missing_linux_helper_requires_fallback_approval() {
         let _env_guard = EnvVarGuard::unset("LIBRA_LINUX_SANDBOX_EXE");
         let _bwrap_guard = EnvVarGuard::set("LIBRA_BWRAP_BINARY", "/tmp/libra-never-exists");
@@ -4650,6 +4652,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn directory_ttl_approval_reuses_for_same_command_family_in_cwd() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let store = Arc::new(tokio::sync::Mutex::new(ApprovalStore::default()));

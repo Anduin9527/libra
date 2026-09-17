@@ -1173,6 +1173,7 @@ mod tests {
     /// object round-trips, and the shard directory holds only the final object
     /// with no leftover temp file.
     #[tokio::test]
+    #[serial_test::serial(hash_kind)]
     async fn put_writes_loose_object_atomically() {
         use git_internal::{
             hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -1207,6 +1208,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hash_kind)]
     async fn bounded_get_rejects_oversized_loose_declaration_before_payload_decode() {
         use std::{io::Write as _, str::FromStr};
 
@@ -1247,6 +1249,7 @@ mod tests {
     /// (offset 420) against base blob `b1a36d77…` (offset 241); the buggy code
     /// would read at 420-241=179 (garbage) instead of 241.
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn read_pack_obj_resolves_ofs_delta_base() {
         use std::str::FromStr;
 
@@ -1283,6 +1286,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn object_size_probe_does_not_build_a_missing_pack_index() {
         use std::str::FromStr;
 
@@ -1311,6 +1315,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hash_kind)]
     async fn bounded_pack_read_does_not_build_an_unrelated_missing_index() {
         use std::str::FromStr;
 
@@ -1348,6 +1353,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hash_kind)]
     async fn bounded_delta_read_does_not_populate_the_global_pack_cache() {
         use std::str::FromStr;
 

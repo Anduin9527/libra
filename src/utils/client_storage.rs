@@ -3381,7 +3381,7 @@ mod tests {
     /// path that `clone`/`fetch` rely on so they can fall back to packs when the
     /// loose-object directory is absent.
     #[test]
-    #[serial]
+    #[serial(hash_kind)]
     fn client_storage_reads_pack_sha1() -> Result<(), GitError> {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         let blob = Blob::from_content("client-storage-sha1");
@@ -3465,7 +3465,7 @@ mod tests {
     /// header layout and crc table; this test pins backwards/forwards compatibility
     /// for repositories created with `core.objectformat=sha256`.
     #[test]
-    #[serial]
+    #[serial(hash_kind)]
     fn client_storage_reads_pack_sha256() -> Result<(), GitError> {
         let _guard = set_hash_kind_for_test(HashKind::Sha256);
         let blob = Blob::from_content("client-storage-sha256");
@@ -3530,7 +3530,7 @@ mod tests {
     /// silently returning an empty match list. This protects users from acting on
     /// stale or corrupt references without realising it.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_search_result_surfaces_corrupt_branch_storage() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -3566,7 +3566,7 @@ mod tests {
     /// object in the repository. The test verifies that we instead return an empty
     /// vector — the safe behaviour for invalid navigation requests.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_search_result_rejects_empty_base_ref_navigation() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -3605,7 +3605,7 @@ mod tests {
     /// from the process CWD. Regression guard for a bug where two repositories sharing
     /// a CWD could cross-pollinate their object indexes.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd)]
     async fn background_index_update_uses_storage_database_instead_of_cwd() {
         let workspace = tempdir().unwrap();
         let storage_path = workspace.path().join(".libra");
@@ -3637,7 +3637,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn durable_index_marker_survives_failure_and_repairs_idempotently() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -3729,7 +3729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn blob_save_returns_marker_error_and_retry_recreates_the_marker() {
         ClientStorage::wait_for_background_tasks();
         let repo = tempdir().expect("create temporary repository");
@@ -4064,7 +4064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn marker_retirement_failure_is_counted_and_remains_repairable() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4106,7 +4106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn late_failure_stays_with_the_invocation_that_enqueued_it() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4154,7 +4154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn concurrent_direct_storage_work_is_not_charged_to_cli_scope() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4207,7 +4207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn direct_fifo_backlog_does_not_delay_invocation_scoped_updates() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4253,7 +4253,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(env)]
     async fn command_owned_spawn_is_registered_before_it_enqueues_index_work() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4303,7 +4303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn replay_retirement_fences_a_delayed_queued_writer_after_prune() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4380,7 +4380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn queued_reconciliation_ignores_an_unrelated_deletion_fence() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -4483,7 +4483,7 @@ mod tests {
     /// A missing database cannot be treated as successful reconciliation: doing
     /// so would let the queue retire its only durable repair marker.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn update_object_index_rejects_missing_database() {
         let missing_root = tempdir().unwrap();
         let missing_db = missing_root.path().join(crate::utils::util::DATABASE);
@@ -4494,7 +4494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn queued_update_keeps_marker_until_a_moved_database_is_restored() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage directory");
@@ -4600,7 +4600,7 @@ mod tests {
     /// tooling that filtered by o_type lost visibility on captured
     /// transcripts. We exercise the upgrade branch directly here.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn update_object_index_upgrades_generic_blob_to_agent_specific_o_type() {
         use sea_orm::{ConnectionTrait, Statement};
 
@@ -4696,7 +4696,7 @@ mod tests {
     /// primary mechanism users rely on to keep storage credentials inside the
     /// repository config rather than in their shell rc.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn resolve_env_sync_reads_non_allowlisted_local_config_values() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -4723,7 +4723,7 @@ mod tests {
     /// invalid global config would silently degrade remote storage to local-only
     /// without telling the user anything is wrong.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn resolve_env_sync_surfaces_global_config_connection_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();

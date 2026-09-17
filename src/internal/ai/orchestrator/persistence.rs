@@ -5683,6 +5683,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn execution_audit_session_persists_runtime_side_objects() {
         let server = setup_server().await;
         let spec = test_spec(vec![]);

@@ -211,7 +211,7 @@ Libra 自身（HEAD `1524ecab726a5eb663b8de09a37082ffa601d073`，`Cargo.toml` ve
  - **LR-09**：FastCDC media transport 已合入（`1a590b6`、`ca997dd`，feature `fastcdc` 默认 OFF），本轮 `823cb628` 撤销文件容量硬上限、`8c77f9c` 对齐双仓 Media 计划；仍不等于 partial clone／VFS 完成。
 - **Memory**：M2 计划 `plan-20260819.md` 仍无实现合入（`ls src/internal/ai/memory` 不存在、`src/cli.rs` 无 `memory` 子命令），MEM-01/MEM-02 维持「已排期」。
  - **未发布变更（v0.22.19..HEAD，3 条）**：`1524ecab` SQLite pool lifecycle 修复；`823cb628` FastCDC 计划移除文件容量硬上限；`8c77f9c` FastCDC 双仓计划关系对齐。前两项分别触及数据库可靠性／Media 行为契约，应在各自计划收口时保留迁移、容量和回滚证据。
- - **日期计划对账**：磁盘 24 份 `plan-2026*.md`，索引已补齐 `plan-20260902`..`plan-20260913`；计划状态统一使用 `已完成`、`实施中`、`已排期`、`未建` 四词。最新计划仍为设计态，未提前视为实现完成。
+ - **日期计划对账**：磁盘含 `plan-20260916.md` / `plan-20260917.md`；索引已补齐 `plan-20260902`..`plan-20260917`。计划状态统一使用 `已完成`、`实施中`、`已排期`、`未建` 四词。最新计划仍为设计态，未提前视为实现完成。
 - deepseek-harness bridge：`plan-20260818.md` 事实不变；本轮复核 deepseek 上游 `session/created|event|flush|disposed` 事件面仍在（`packages/core/session/src/index.ts` 52–83 行），Libra `agent_bridge/ingress.rs:67` 依赖成立，bridge 无需变更。
 
 ---
@@ -746,6 +746,8 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260911.md`](plan-20260911.md) | B（hook boundary） | 已排期 | 设计计划，任务卡尚未执行 |
 | [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | 已排期 | 设计计划，任务卡尚未执行 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 已排期 | 设计计划，任务卡尚未执行；Libra 侧以前置 `plan-20260907` 完整收口为准 |
+| [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | 承接 monoengine `DEFER-AC-01`：新增 `libra agent capture-push` HTTP 客户端；双评审 PASS，任务卡尚未执行 |
+| [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | 已排期 | 收口与 nextest 分组无关的 `--lib` 串行锁对齐 + `command_test` 高并行 spawn；禁止改 nextest 成员 |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---

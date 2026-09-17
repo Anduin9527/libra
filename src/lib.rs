@@ -90,14 +90,14 @@ mod tests {
     /// CWD. If the guard cannot construct, every other test in the suite is unsafe to
     /// run, so we exercise the happy path here as a canary.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_libra_init() {
         let tmp_dir = TempDir::new().unwrap();
         let _guard = test::ChangeDirGuard::new(tmp_dir.path());
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn exec_async_object_index_drain_yields_current_thread_executor() {
         std::thread::Builder::new()
             .name("exec-async-drain-test".to_string())

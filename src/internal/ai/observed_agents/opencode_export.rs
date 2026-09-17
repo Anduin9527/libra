@@ -1396,6 +1396,7 @@ mod tests {
     /// A symlinked entry is refused at pin time (`O_NOFOLLOW`).
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn pin_store_under_captures_inode_atomically() {
         use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -1442,6 +1443,7 @@ mod tests {
     /// the host at the pinned inode. Skips without a trusted, usable bwrap.
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn pin_store_binds_rw_through_bwrap() {
         use std::os::fd::AsRawFd;
         if !trusted_bwrap_available() {
@@ -1529,6 +1531,7 @@ mod tests {
     /// bwrap is unavailable (the production path then fails closed).
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn opencode_export_offline_sandbox_profile() {
         // Detect "trusted AND usable", not merely present (Codex M3 R3): a
         // bwrap under a user-writable path is refused by the integrity policy,
@@ -1587,6 +1590,7 @@ printf 'offline-ok'"#,
     /// process group, 3s wall clock).
     /// Linux keep_fds store fd is non-CLOEXEC.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn runner_controls_preserved() {
         assert_eq!(EXPORT_MAX_BYTES, 16 * 1024 * 1024);
         assert_eq!(EXPORT_DEADLINE, Duration::from_secs(3));
@@ -1677,7 +1681,7 @@ printf 'offline-ok'"#,
     /// rejects a symlink (O_NOFOLLOW). Production classification
     /// (`pin_opencode_store`) treats only an absent store as `Ok(None)`.
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_pin_three_states() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1722,7 +1726,7 @@ printf 'offline-ok'"#,
 
     /// SBX-04: F_GETPATH / canonical path resolution failure is fail-closed.
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_pin_fgetpath_failure() {
         fn fail_resolve(_: &std::os::fd::OwnedFd, _: &std::path::Path) -> Result<String> {
@@ -1742,7 +1746,7 @@ printf 'offline-ok'"#,
 
     /// SBX-04: macOS pin shares `pin_store_under` with Linux.
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_pin_shares_pin_store_under() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1763,7 +1767,7 @@ printf 'offline-ok'"#,
 
     /// SBX-04: transform on macOS selects seatbelt (`sandbox-exec`).
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_transform_selects_seatbelt() {
         assert!(
@@ -1826,6 +1830,7 @@ printf 'offline-ok'"#,
     /// pinned fd, not accepted as-is.
     #[cfg(target_os = "macos")]
     #[test]
+    #[serial_test::serial(env)]
     fn macos_scratch_bind_tightens_wide_mode() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -1856,6 +1861,7 @@ printf 'offline-ok'"#,
     /// the writable-bind (O_NOFOLLOW pin refuses it).
     #[cfg(target_os = "macos")]
     #[test]
+    #[serial_test::serial(env)]
     fn macos_scratch_bind_refuses_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("elsewhere");
@@ -1931,6 +1937,7 @@ printf 'offline-ok'"#,
     // Bridge default and env groups (env alone misses default), in that order.
     #[serial_test::serial(inner_attrs = [serial_test::serial(env, export_sandbox_env)])]
     #[test]
+    #[serial_test::serial(export_sandbox_env, env)]
     fn bwrap_argv_equivalent() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
@@ -2007,6 +2014,7 @@ printf 'offline-ok'"#,
     /// export bytes (hence no claim) are produced.
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn trusted_bwrap_rejects_user_writable() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
@@ -2030,6 +2038,7 @@ printf 'offline-ok'"#,
     /// capability degrades (no authorized bytes to claim).
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn backend_missing_degrades_metadata_only() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
@@ -2050,7 +2059,7 @@ printf 'offline-ok'"#,
     /// SBX-03: trusted_bwrap_exe is the only bwrap channel — transform must
     /// not consume `LIBRA_BWRAP_BINARY` or `linux_sandbox_exe`.
     #[cfg(target_os = "linux")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn trusted_bwrap_exe_channel_used() {
         let dir = tempfile::tempdir().unwrap();

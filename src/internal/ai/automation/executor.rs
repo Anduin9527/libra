@@ -238,6 +238,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn dry_run_constructor_sets_dry_run_flag_true() {
         let executor = AutomationExecutor::dry_run();
         assert!(

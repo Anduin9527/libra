@@ -3725,6 +3725,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_header_three_transports_bad_header_net_002() {
         use crate::internal::protocol::{git_client::tests as git, ssh_client::tests as ssh};
         // Real asynchronous reader loops, followed by the public PacketRead CLI
@@ -3743,6 +3744,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_header_non_marker_regression() {
         use crate::utils::error::{CliError, StableErrorCode};
         let mut empty: FetchStream = stream::empty().boxed();
@@ -3829,6 +3831,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_header_shared_helper_single_source() {
         use crate::{
             git_protocol::{decode_pkt_line_header, read_pkt_line},
@@ -3866,6 +3869,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_fetch_async_zero_echo_sentinel() {
         use crate::utils::error::{CliError, StableErrorCode};
         // The remote bytes enter the real streaming fetch reader. No manually
@@ -3907,6 +3911,7 @@ mod tests {
     use git_internal::hash::ObjectHash;
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn resolve_fetch_timeout_env_millis_wins() {
         // A unique env var name so no concurrent real fetch reads it. The env
         // branch returns before any config read, keeping this deterministic.
@@ -3922,6 +3927,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn resolve_fetch_timeout_ignores_unparseable_env() {
         let var = "LIBRA_TEST_FETCH_TIMEOUT_GARBAGE";
         // SAFETY: as above.
@@ -3940,7 +3946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial(cwd, env)]
     async fn resolve_fetch_timeout_ignores_zero_env() {
         use crate::{
             internal::config::ConfigKv,
@@ -4579,6 +4585,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_fetch_async_rejects_len_below_four() {
         use crate::git_protocol::PktFrameError;
 
@@ -4595,6 +4602,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_fetch_async_flush_regression() {
         let mut input = b"00000004".as_slice();
         assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (0, vec![]));
@@ -4603,6 +4611,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_fetch_async_len4_regression() {
         let mut input = b"00040005x".as_slice();
         assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (4, vec![]));
@@ -4614,6 +4623,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_fetch_async_upper_bound_regression() {
         let payload = vec![0xa5; 65_531];
         let mut frame = b"ffff".to_vec();
@@ -4627,6 +4637,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_fetch_async_helper_single_source() {
         use crate::git_protocol::{PktFrameError, pkt_frame_payload_len};
 
@@ -4660,6 +4671,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn pkt_line_fetch_async_reach_pack_truncated_eof() {
         use std::{
             io,
@@ -4906,6 +4918,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn read_fetch_stream_accepts_eof_after_complete_pack_without_flush() {
         let pack = empty_pack_bytes();
         let mut response = BytesMut::new();
@@ -4928,6 +4941,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn read_fetch_stream_rejects_a_truncated_pack() {
         // A valid pack with its trailing checksum chopped off: the stream reaches
         // the pack but it never completes, so it must surface as an explicit
@@ -4983,6 +4997,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn read_fetch_stream_finishes_complete_pack_when_transport_stays_open() {
         let pack = empty_pack_bytes();
         let mut response = BytesMut::new();
@@ -5011,6 +5026,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn read_fetch_stream_finishes_non_empty_pack_when_transport_stays_open() {
         let pack = include_bytes!("../../tests/data/packs/small-sha1.pack").to_vec();
         let mut response = BytesMut::new();
@@ -5179,6 +5195,7 @@ mod tests {
     // Bridge default and env groups (env alone misses default), in that order.
     #[serial_test::serial(inner_attrs = [serial_test::serial(env)])]
     #[test]
+    #[serial_test::serial(env)]
     fn test_ensure_vault_ssh_tmp_dir_uses_home_directory() {
         let temp_home = tempdir().expect("failed to create temp home");
         let _home = ScopedEnvVar::set("HOME", temp_home.path());

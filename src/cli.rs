@@ -3416,6 +3416,7 @@ mod tests {
     /// the real function, so removing an arm, or reintroducing one that should
     /// not exist, fails here.
     #[tokio::test]
+    #[serial_test::serial(cwd)]
     async fn sequencer_control_mapping_matches_the_cli_grammar() {
         use crate::internal::sequencer::{SequenceKind, SequencerControl};
 
@@ -3476,7 +3477,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn background_index_failures_warn_unless_command_owns_stricter_barrier() {
         output::reset_warning_tracker();
         report_background_index_update_outcome(4, 6, false);
@@ -3638,7 +3639,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(cwd, env)]
     async fn hash_object_read_only_preflight_skips_schema_guard() {
         let repo = tempfile::tempdir().expect("failed to create test repo");
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3729,7 +3730,7 @@ mod tests {
     /// as a benign, repo-free command that still runs the post-parse flag
     /// override before dispatch.
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(env)]
     async fn sync_data_flag_enables_durability_hook() {
         use crate::utils::atomic_write::{set_sync_data, sync_data_enabled};
 
@@ -3766,7 +3767,7 @@ mod tests {
     /// LocalOnly, overriding env) and `LIBRA_READ_POLICY` (baseline), and a run
     /// with neither resets to Auto.
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(env)]
     async fn read_policy_resolves_from_flag_and_env() {
         use crate::utils::read_policy::{ReadPolicy, read_policy, set_read_policy};
 
@@ -3825,7 +3826,7 @@ mod tests {
     /// Scenario: `--max-connections` (lore.md §0.9) resolves flag > env >
     /// default, always resets, and rejects an invalid env value.
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(env)]
     async fn max_connections_resolves_from_flag_and_env() {
         use crate::utils::resource_limits::{
             DEFAULT_MAX_CONNECTIONS, max_connections, set_max_connections,
@@ -3879,7 +3880,7 @@ mod tests {
     /// repository" from the process CWD. This guards a regression where preflight
     /// was hitting CWD before honoring `--repo`.
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(cwd, env)]
     async fn code_repo_flag_uses_target_repo_during_preflight() {
         let root = tempfile::tempdir().expect("failed to create test root");
         let repo = root.path().join("linked");

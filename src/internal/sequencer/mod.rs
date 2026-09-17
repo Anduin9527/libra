@@ -1961,6 +1961,7 @@ mod tests {
     /// what makes them scope-bearing actions at all. The enumeration is what
     /// LR-02's wrapper-coverage guard consumes.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn every_sequencer_control_declares_its_mutation_scope() {
         assert_eq!(
             SequencerControl::ALL.len(),
@@ -2173,7 +2174,7 @@ mod tests {
     /// the loser would silently replace the winner's todo while the winner's
     /// checkout stayed on disk. Exactly one claim may win.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn only_one_start_can_claim_this_worktrees_sequence() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -2364,7 +2365,7 @@ mod tests {
     /// #477 HF-31: a fenced clear removes the row only while its payload still
     /// carries the caller's token.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn clear_if_payload_contains_only_removes_the_owners_row() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -2397,7 +2398,7 @@ mod tests {
     /// Round-trip every SequenceKind through the unified table so the superset
     /// schema is validated for all four consumers (not just the migrated one).
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn save_load_clear_round_trip_all_kinds() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -2442,7 +2443,7 @@ mod tests {
     /// The symmetric mutex blocks a DIFFERENT sequence, allows the same kind
     /// (its own command handles same-op), and passes when idle.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn ensure_none_in_progress_cross_op_matrix() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());

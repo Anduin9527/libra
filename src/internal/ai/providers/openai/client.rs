@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_reads_openai_api_key_from_process_env() {
         let key_guard = TestEnvGuard::set("OPENAI_API_KEY", Some("sk-test-resolved"));
         let base_guard = TestEnvGuard::set("OPENAI_BASE_URL", None);
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_picks_up_openai_base_url_override() {
         let key_guard = TestEnvGuard::set("OPENAI_API_KEY", Some("sk-test"));
         let base_guard = TestEnvGuard::set("OPENAI_BASE_URL", Some("http://localhost:1234/v1"));
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_errors_when_no_layer_supplies_api_key() {
         let key_guard = TestEnvGuard::set("OPENAI_API_KEY", None);
         let base_guard = TestEnvGuard::set("OPENAI_BASE_URL", None);

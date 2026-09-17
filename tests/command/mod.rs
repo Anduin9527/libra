@@ -2,10 +2,13 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     fs,
-    io::Write,
+    io::{self, Write},
+    ops::{Deref, DerefMut},
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{Condvar, LazyLock, Mutex},
 };
 
 use git_internal::{
@@ -63,8 +66,165 @@ pub(crate) struct CliErrorReport {
     pub(crate) details: BTreeMap<String, Value>,
 }
 
+/// Default process-local cap on live CLI children (plan-20260917 SP-00/SP-01).
+/// Must stay ≥ 3 so `registry_mutators_serialize_on_worktrees_lock` cannot
+/// deadlock under nextest (one process, three concurrent `worktree add`s).
+/// 8 still SIGKILL'd `create_committed_repo_via_cli` once in two
+/// `--test-threads=32` runs (plan-20260917 SP-01); 4 stays under the
+/// SP-00 crush band while leaving the three-add barrier runnable.
+const DEFAULT_CLI_SPAWN_LIMIT: usize = 4;
+
+fn parse_cli_spawn_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .filter(|&limit| limit >= 1)
+        .unwrap_or(DEFAULT_CLI_SPAWN_LIMIT)
+}
+
+struct CliSpawnLimiter {
+    max: usize,
+    live: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl CliSpawnLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            live: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> CliSpawnPermit<'_> {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *live >= self.max {
+            live = self
+                .cv
+                .wait(live)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *live += 1;
+        CliSpawnPermit { limiter: self }
+    }
+
+    fn release(&self) {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *live = live.saturating_sub(1);
+        self.cv.notify_one();
+    }
+}
+
+struct CliSpawnPermit<'a> {
+    limiter: &'a CliSpawnLimiter,
+}
+
+impl Drop for CliSpawnPermit<'_> {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+static CLI_SPAWN_LIMITER: LazyLock<CliSpawnLimiter> = LazyLock::new(|| {
+    CliSpawnLimiter::new(parse_cli_spawn_limit(
+        std::env::var("LIBRA_TEST_CLI_SPAWN_LIMIT").ok().as_deref(),
+    ))
+});
+
+/// `Command` wrapper that holds a limiter permit for the life of the child.
+pub(crate) struct LimitedCommand {
+    inner: Command,
+}
+
+impl LimitedCommand {
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.inner.env(key, value);
+        self
+    }
+
+    fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
+        self.inner.env_remove(key);
+        self
+    }
+
+    fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stdin(cfg);
+        self
+    }
+
+    fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stdout(cfg);
+        self
+    }
+
+    fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stderr(cfg);
+        self
+    }
+
+    fn output(&mut self) -> io::Result<Output> {
+        // One SIGKILL retry: even at DEFAULT_CLI_SPAWN_LIMIT, cargo-test
+        // --test-threads=32 still occasionally reaps a debug `libra` child
+        // with signal 9 (SP-01 cap 8 and cap 4 each lost one fixture add/commit).
+        {
+            let _permit = CLI_SPAWN_LIMITER.acquire();
+            let output = self.inner.output()?;
+            if unix_exit_signal(output.status) != Some(9) {
+                return Ok(output);
+            }
+        }
+        let _permit = CLI_SPAWN_LIMITER.acquire();
+        self.inner.output()
+    }
+
+    fn spawn(&mut self) -> io::Result<LimitedChild> {
+        let permit = CLI_SPAWN_LIMITER.acquire();
+        Ok(LimitedChild {
+            child: self.inner.spawn()?,
+            permit: Some(permit),
+        })
+    }
+}
+
+pub(crate) struct LimitedChild {
+    child: Child,
+    permit: Option<CliSpawnPermit<'static>>,
+}
+
+impl LimitedChild {
+    fn wait_with_output(mut self) -> io::Result<Output> {
+        let permit = self.permit.take();
+        let output = self.child.wait_with_output();
+        drop(permit);
+        output
+    }
+}
+
+impl Deref for LimitedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl DerefMut for LimitedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
 /// Run the Libra binary with an isolated HOME so host config never leaks into tests.
-fn base_libra_command(args: &[&str], cwd: &Path) -> Command {
+fn base_libra_command(args: &[&str], cwd: &Path) -> LimitedCommand {
     let home = cwd.join(".libra-test-home");
     let config_home = home.join(".config");
     let global_db = home.join(".libra").join("config.db");
@@ -91,7 +251,7 @@ fn base_libra_command(args: &[&str], cwd: &Path) -> Command {
         // do not fall back to writing `default.profraw` inside the temp repo.
         command.env("LLVM_PROFILE_FILE", llvm_profile_file);
     }
-    command
+    LimitedCommand { inner: command }
 }
 
 /// Run the Libra binary with an isolated HOME so host config never leaks into tests.
@@ -106,7 +266,7 @@ fn spawn_libra_command_with_env(
     args: &[&str],
     cwd: &Path,
     extra_env: &[(&str, &str)],
-) -> std::process::Child {
+) -> LimitedChild {
     let mut command = base_libra_command(args, cwd);
     for (key, value) in extra_env {
         command.env(key, value);
@@ -171,12 +331,41 @@ fn run_libra_command_with_stdin_and_env(
         .expect("failed to collect libra command output")
 }
 
-/// Assert that a CLI command succeeded and include stderr in the failure output.
+fn cli_output_prefix(bytes: &[u8]) -> String {
+    const PREFIX: usize = 200;
+    String::from_utf8_lossy(&bytes[..bytes.len().min(PREFIX)]).into_owned()
+}
+
+fn unix_exit_signal(status: ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn format_cli_failure(output: &Output, context: &str) -> String {
+    format!(
+        "{context}: success={} code={:?} signal={:?} stderr={:?} stdout={:?}",
+        output.status.success(),
+        output.status.code(),
+        unix_exit_signal(output.status),
+        cli_output_prefix(&output.stderr),
+        cli_output_prefix(&output.stdout)
+    )
+}
+
+/// Assert that a CLI command succeeded and include status / stdout / stderr.
 fn assert_cli_success(output: &Output, context: &str) {
     assert!(
         output.status.success(),
-        "{context}: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "{}",
+        format_cli_failure(output, context)
     );
 }
 
@@ -286,6 +475,57 @@ fn skip_permission_denied_test_if_root(test_name: &str) -> bool {
     }
 
     is_root
+}
+
+#[test]
+fn assert_cli_success_reports_signal() {
+    let repo = tempdir().expect("temp repo");
+    let failed = run_libra_command(&["definitely-not-a-libra-command"], repo.path());
+    assert!(!failed.status.success(), "garbage argv must fail");
+    let message = format_cli_failure(&failed, "probe");
+    assert!(
+        message.contains("success=false"),
+        "status flag missing: {message}"
+    );
+    assert!(message.contains("code="), "exit code missing: {message}");
+    assert!(
+        message.contains("signal="),
+        "signal field missing: {message}"
+    );
+    assert!(
+        message.contains("stderr="),
+        "stderr prefix missing: {message}"
+    );
+    assert!(
+        message.contains("stdout="),
+        "stdout prefix missing: {message}"
+    );
+
+    #[cfg(unix)]
+    {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        child.kill().expect("kill sleep");
+        let killed = child.wait_with_output().expect("reap sleep");
+        let signaled = format_cli_failure(&killed, "killed");
+        assert!(
+            signaled.contains("signal=Some("),
+            "unix signal must be Some: {signaled}"
+        );
+    }
+}
+
+#[test]
+fn cli_spawn_limit_rejects_zero_and_garbage() {
+    assert_eq!(parse_cli_spawn_limit(None), DEFAULT_CLI_SPAWN_LIMIT);
+    assert_eq!(parse_cli_spawn_limit(Some("0")), DEFAULT_CLI_SPAWN_LIMIT);
+    assert_eq!(parse_cli_spawn_limit(Some("nope")), DEFAULT_CLI_SPAWN_LIMIT);
+    assert_eq!(parse_cli_spawn_limit(Some("8")), 8);
+    assert_eq!(parse_cli_spawn_limit(Some("3")), 3);
 }
 
 mod add_cli_test;

@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn from_resolved_env_reads_kimi_api_key_from_process_env() {
         let key_guard = TestEnvGuard::set("MOONSHOT_API_KEY", Some("kimi-test-resolved"));
         let base_guard = TestEnvGuard::set("MOONSHOT_BASE_URL", None);
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn from_resolved_env_errors_when_no_layer_supplies_api_key() {
         let key_guard = TestEnvGuard::set("MOONSHOT_API_KEY", None);
         let base_guard = TestEnvGuard::set("MOONSHOT_BASE_URL", None);

@@ -97,7 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd)]
     fn root_session_nonce_lifecycle() -> io::Result<()> {
         let repo = tempfile::tempdir()?;
         std::fs::create_dir(repo.path().join(crate::utils::util::ROOT_DIR))?;

@@ -4464,7 +4464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn normalize_mirror_refs_promotes_branches_and_clears_tracking() {
         let repo = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -4567,7 +4567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_clone_restore_test_restores_default_ref_objects_refs_head_and_worktree() {
         let parent = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -4672,7 +4672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_clone_no_checkout_skips_worktree_but_restores_refs() {
         let parent = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -4756,7 +4756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_clone_restore_test_restores_tag_selector_as_detached_head() {
         let parent = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -4848,7 +4848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_clone_restore_test_cleans_destination_when_refs_metadata_missing() {
         let parent = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -4916,7 +4916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_clone_restore_test_cleans_destination_when_refs_metadata_has_no_head() {
         let parent = tempdir().unwrap();
         let home = tempdir().unwrap();

@@ -2906,7 +2906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn code_thread_graph_route_returns_not_found_for_missing_thread() {
         let temp = tempfile::tempdir().expect("temp repo");
         crate::utils::test::setup_with_new_libra_in(temp.path()).await;
@@ -2921,7 +2921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn code_thread_graph_route_returns_redacted_indexed_graph() {
         use axum::extract::connect_info::MockConnectInfo;
         use chrono::{TimeZone, Utc};
@@ -3616,6 +3616,7 @@ mod tests {
     /// future refactor of the audit pipeline cannot quietly drop
     /// any of them.
     #[test]
+    #[serial_test::serial(env)]
     fn sanitized_audit_client_id_truncates_at_80_chars() {
         let redactor = SecretRedactor::default_runtime();
         let long = "x".repeat(200);
@@ -3628,6 +3629,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn sanitized_audit_client_id_replaces_control_characters_with_underscore() {
         let redactor = SecretRedactor::default_runtime();
         // Cover the full `char::is_control()` set the implementation
@@ -3661,6 +3663,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn sanitized_audit_client_id_falls_back_to_unknown_when_empty() {
         let redactor = SecretRedactor::default_runtime();
         // Whitespace-only inputs trim to empty, so the fallback
@@ -3682,6 +3685,7 @@ mod tests {
     /// markers WILL pass through; that's a documented gap, not a
     /// silent failure (Codex pass-1 P2 C5).
     #[test]
+    #[serial_test::serial(env)]
     fn sanitized_audit_client_id_runs_marker_redactor_over_input() {
         let redactor = SecretRedactor::default_runtime();
         let raw = "client-id:token=top-secret-payload";
@@ -3693,6 +3697,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn sanitized_audit_client_id_scrubs_configured_env_file_literals() {
         let redactor = SecretRedactor::default_runtime()
             .with_forbidden_env_values([("OPENAI_API_KEY", "sk-audit-envfile-literal")]);
@@ -3712,6 +3717,7 @@ mod tests {
     /// adopting pattern-based detection) appear as an obvious
     /// `assert!(...)` failure that needs a deliberate update.
     #[test]
+    #[serial_test::serial(env)]
     fn sanitized_audit_client_id_does_not_mask_bare_secret_shaped_input() {
         let redactor = SecretRedactor::default_runtime();
         // A bare secret-SHAPED string with no marker prefix:
@@ -3739,6 +3745,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn sanitized_audit_client_id_caps_chars_not_bytes() {
         let redactor = SecretRedactor::default_runtime();
         // 120 four-byte emoji codepoints. The cap is 80 CHARS
@@ -4179,6 +4186,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn code_usage_returns_persisted_totals_for_session_filter() {
         use axum::extract::connect_info::MockConnectInfo;
 

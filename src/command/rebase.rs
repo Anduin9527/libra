@@ -5101,7 +5101,7 @@ mod rebuild_index_tests {
     };
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn rebuild_index_from_tree_preserves_executable_and_symlink_modes() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -5134,7 +5134,7 @@ mod rebuild_index_tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn rebuild_index_from_tree_returns_path_context_for_missing_blob() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -5157,7 +5157,7 @@ mod rebuild_index_tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn rebuild_index_from_tree_registers_gitlink_entries_verbatim() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;

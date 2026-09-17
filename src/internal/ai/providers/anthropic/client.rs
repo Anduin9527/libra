@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_reads_anthropic_api_key_from_process_env() {
         let key_guard = TestEnvGuard::set("ANTHROPIC_API_KEY", Some("sk-ant-test-resolved"));
         let base_guard = TestEnvGuard::set("ANTHROPIC_BASE_URL", None);
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     async fn from_resolved_env_errors_when_no_layer_supplies_api_key() {
         let key_guard = TestEnvGuard::set("ANTHROPIC_API_KEY", None);
         let base_guard = TestEnvGuard::set("ANTHROPIC_BASE_URL", None);

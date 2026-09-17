@@ -7010,6 +7010,7 @@ mod argv_normalization_test {
     /// silent clamp to exact-only, and the clap parser path refuses the
     /// value outright (2026-08-05 R0-4 review).
     #[test]
+    #[serial_test::serial(cwd)]
     fn api_percent_above_100_fails_closed() {
         use clap::Parser as _;
 
@@ -7135,7 +7136,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn sequence_notice_surfaces_corrupt_sequence_kind() {
         let repo = tempdir().expect("failed to create temp repo");
         test::setup_with_new_libra_in(repo.path()).await;
@@ -7167,7 +7168,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn resolve_upstream_info_surfaces_branch_config_query_failures() {
         let repo = tempdir().expect("failed to create temp repo");
         test::setup_with_new_libra_in(repo.path()).await;
@@ -7245,6 +7246,7 @@ mod test {
     /// no worktree problem is published as `metadata`, and no object problem
     /// is published as `worktree`.
     #[test]
+    #[serial_test::serial(cwd)]
     fn content_skips_map_to_metadata_and_worktree_warnings() {
         use rename_detect::SkipReason;
         let mut stats = rename_detect::RenameDetectStats::default();
@@ -7316,6 +7318,7 @@ mod rename_destination_budget_test {
     /// restore a detection pass added after it would restart with fresh
     /// budgets, silently doubling the call-level caps (§B.3.4).
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn destination_detector_restores_budgets_and_records_comparisons() {
         let repo = tempfile::tempdir().expect("temp repo");
         // Minimal bare-layout markers so path discovery treats the temp dir
@@ -7437,7 +7440,7 @@ mod seam_gate_test {
     /// test harness: without `LIBRA_TEST` the production cap stays in
     /// effect; with the gate the override bites.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn comparison_budget_override_requires_the_harness_gate() {
         // SAFETY: serialized test body; every variable is removed again
         // before the test returns.

@@ -4340,6 +4340,7 @@ mod tests {
     };
 
     #[test]
+    #[serial_test::serial(env)]
     fn agent_capture_restore_budget_is_shared_across_tables() {
         let mut remaining = 5;
         charge_agent_capture_restore_rows(&mut remaining, 3, "sessions")
@@ -5255,7 +5256,7 @@ mod tests {
     /// happy path users follow when storing credentials in `vault.env.*` rather
     /// than in their shell profile.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn d1_client_from_env_reads_values_from_local_config() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -5295,7 +5296,7 @@ mod tests {
     /// when env is unset. Mirrors v0.17.906's resolve_env_for_target_process_
     /// env_overrides_local_vault fix.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn d1_client_from_env_process_env_overrides_local_config() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -5349,7 +5350,7 @@ mod tests {
     /// "missing variable". This pins the contract that lets the cloud-backup
     /// command surface actionable errors.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn d1_client_from_env_surfaces_global_config_connection_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -5387,6 +5388,7 @@ mod tests {
     /// collapsed an entire trigger block into a single multi-
     /// statement payload.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn split_sql_statements_handles_triggers_and_comments() {
         let sql = r#"
             -- Header comment, ignored.
@@ -5422,6 +5424,7 @@ mod tests {
     /// semicolons (e.g. `RAISE(ABORT, 'must be > 0; restart')`).
     /// A naive splitter would chop the literal in two.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn split_sql_statements_preserves_quoted_semicolons() {
         let sql = r#"
             SELECT 'one; two; three' AS phrase;
@@ -5437,6 +5440,7 @@ mod tests {
     /// non-empty statement list and the BEGIN/END trigger blocks must
     /// not be chopped. Acts as a smoke test for `ensure_publish_schema`.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_migrations_split_cleanly() {
         let sql_0001 = include_str!("../../sql/publish/0001_publish.sql");
         let sql_0002 = include_str!("../../sql/publish/0002_publish_digest_check.sql");
@@ -5615,6 +5619,7 @@ mod tests {
     /// `END;` because the `;` cleared the keyword buffer before the
     /// `END` was processed at a word boundary.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn publish_0002_splits_one_statement_per_trigger() {
         let sql = include_str!("../../sql/publish/0002_publish_digest_check.sql");
         let stmts = split_sql_statements(sql);

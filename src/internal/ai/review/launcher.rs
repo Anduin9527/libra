@@ -557,6 +557,7 @@ mod tests {
     /// and parentheses — including `") ("` — so only the LAST `)` is a
     /// safe anchor.
     #[test]
+    #[serial_test::serial(cwd)]
     fn stat_start_ticks_parser_survives_parens_and_spaces_in_comm() {
         // Plain comm: fields 3..22 follow the ')'; starttime (field 22)
         // is the 20th tail field.
