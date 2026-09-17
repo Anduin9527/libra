@@ -18,13 +18,31 @@ fn main() {
     let web_dir = Path::new(&manifest_dir).join("web");
 
     // Re-run this build script when any web source file changes.
-    println!("cargo:rerun-if-changed=web/src");
-    println!("cargo:rerun-if-changed=web/public");
-    println!("cargo:rerun-if-changed=web/next.config.ts");
-    println!("cargo:rerun-if-changed=web/package.json");
-    println!("cargo:rerun-if-changed=web/pnpm-lock.yaml");
-    println!("cargo:rerun-if-changed=web/tsconfig.json");
-    println!("cargo:rerun-if-changed=web/tailwind.config.ts");
+    //
+    // Only existing paths may be declared: Cargo treats a MISSING
+    // `rerun-if-changed` path as permanently stale, which re-runs this script
+    // on every invocation and, because the `libra` lib depends on it, forces
+    // a full lib rebuild plus a relink of every test binary even with no
+    // source change (a stale `web/tailwind.config.ts` entry — Tailwind v4 is
+    // configured through `postcss.config.mjs` — did exactly that, 2026-09-17).
+    for rel in [
+        "web/src",
+        "web/public",
+        "web/next.config.ts",
+        "web/package.json",
+        "web/pnpm-lock.yaml",
+        "web/tsconfig.json",
+        "web/postcss.config.mjs",
+    ] {
+        if Path::new(&manifest_dir).join(rel).exists() {
+            println!("cargo:rerun-if-changed={rel}");
+        } else {
+            println!(
+                "cargo:warning=build.rs: skipping rerun-if-changed for missing path `{rel}` \
+                 (declaring a missing path would force a full rebuild on every invocation)"
+            );
+        }
+    }
 
     // Re-run this build script when relevant environment variables change.
     println!("cargo:rerun-if-env-changed=LIBRA_PNPM");
