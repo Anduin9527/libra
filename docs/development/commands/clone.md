@@ -327,3 +327,23 @@ preserve the ordinary network wrapper. Fetch no-echo and empty-stream cases use
 target or shared test helper is introduced. These are local fixtures, not live
 OpenSSH authentication;
 actual execution and release acceptance are recorded in plan-20260901.md.
+
+## Empty-repository discovery framing
+
+An HTTP(S) advertisement that declares an empty repository still has all remaining
+pkt-line frames checked. A malformed header, an unsupported length 1..3, or a truncated
+payload after the zero object ID returns `LBR-NET-002` (exit 128), with a fixed
+reason that does not echo the remote bytes. It is no longer reported as a
+successful empty response. Check the remote Git service or proxy response before
+retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
+existing command hints and structured error fields retain their behavior.
+
+This check reuses the shared pkt-line reader only before the zero-object-ID
+early return. It preserves capability validation and earlier error precedence.
+Each successful iteration consumes at least four bytes of the already buffered
+response; work is linear in the remaining frames, using byte slices without
+copying their payloads. Existing HTTP body buffering and transport limits are
+unchanged. This is framing validation, not a new advertisement content grammar:
+a missing final flush at a frame boundary and well-framed semantically unused
+tail data retain their existing treatment. Git/SSH readers already validate the
+framing of the advertisement buffer before calling the shared parser.

@@ -603,3 +603,13 @@ structured reason field is not introduced. Readable remote text is not a trusted
 local assertion. A rejected response leaves local tracking refs unchanged; it
 does not prove that the server rolled back a partial remote update. Inspect the
 remote state before retrying when the server's result is uncertain.
+
+## Empty-repository discovery framing
+
+An HTTP(S) advertisement that declares an empty repository still has all remaining
+pkt-line frames checked. A malformed header, an unsupported length 1..3, or a truncated
+payload after the zero object ID returns `LBR-NET-002` (exit 128), with a fixed
+reason that does not echo the remote bytes. It is no longer reported as a
+successful empty response. Check the remote Git service or proxy response before
+retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
+existing command hints and structured error fields retain their behavior.

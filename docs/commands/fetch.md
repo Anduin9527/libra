@@ -609,3 +609,13 @@ meaning. Ordinary network errors and timeouts retain their existing categories.
 An empty fetch data stream before any complete pack remains a network failure;
 EOF after a completed pack keeps the existing success behavior. The SSH host-trust
 exception, captured-diagnostic limits and cleanup deadlines described above remain.
+
+## Empty-repository discovery framing
+
+An HTTP(S) advertisement that declares an empty repository still has all remaining
+pkt-line frames checked. A malformed header, an unsupported length 1..3, or a truncated
+payload after the zero object ID returns `LBR-NET-002` (exit 128), with a fixed
+reason that does not echo the remote bytes. It is no longer reported as a
+successful empty response. Check the remote Git service or proxy response before
+retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
+existing command hints and structured error fields retain their behavior.

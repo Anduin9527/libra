@@ -3812,6 +3812,68 @@ mod test {
     }
 
     #[test]
+    fn pkt_line_empty_discovery_push_tail_maps_net_002() {
+        use crate::git_protocol::PktFrameError;
+
+        for (width, cap) in [(40, "object-format=sha1"), (64, "object-format=sha256")] {
+            for (tail, expected) in [
+                (
+                    b"zzzzREMOTE_EMPTY_TAIL_SECRET".as_slice(),
+                    PktLineError::InvalidHexHeader,
+                ),
+                (
+                    b"0001REMOTE_EMPTY_TAIL_SECRET",
+                    PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+                ),
+                (
+                    b"ffffREMOTE_EMPTY_TAIL_SECRET",
+                    PktLineError::TruncatedPayload,
+                ),
+            ] {
+                let mut bytes = BytesMut::new();
+                add_pkt_line_string(&mut bytes, "# service=git-receive-pack\n".to_string());
+                bytes.extend_from_slice(b"0000");
+                add_pkt_line_string(
+                    &mut bytes,
+                    format!(
+                        "{} capabilities^{{}}\0report-status {cap}\n",
+                        "0".repeat(width)
+                    ),
+                );
+                bytes.extend_from_slice(tail);
+                let source = crate::internal::protocol::parse_discovered_references(
+                    bytes.freeze(),
+                    ReceivePack,
+                )
+                .expect_err("empty receive-pack advertisement must reject malformed tail");
+                let error = map_push_discovery_error("https://example.invalid/repo", source);
+                assert!(
+                    matches!(&error, PushError::Protocol { detail } if detail == &expected.to_string())
+                );
+                let error = CliError::from(error);
+                assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+                assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+                assert_eq!(
+                    error
+                        .hints()
+                        .iter()
+                        .map(|hint| hint.as_str())
+                        .collect::<Vec<_>>(),
+                    ["check the remote Git service or proxy response and retry"]
+                );
+                for rendered in [error.render(), error.render_report(), error.render_json()] {
+                    assert!(!rendered.contains("REMOTE_EMPTY_TAIL_SECRET"));
+                    assert!(!rendered.contains("zzzz"));
+                }
+                let json: serde_json::Value = serde_json::from_str(&error.render_json()).unwrap();
+                assert_eq!(json["ok"], false);
+                assert_eq!(json["error_code"], "LBR-NET-002");
+                assert_eq!(json["exit_code"], 128);
+            }
+        }
+    }
+
+    #[test]
     fn pkt_line_push_cli_maps_protocol_to_lbr_net_002() {
         let error = CliError::from(PushError::from(PktLineError::TruncatedPayload));
         assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);

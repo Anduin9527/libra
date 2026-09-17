@@ -771,3 +771,30 @@ tracking refs. The HTTP fixture is local; it does not claim TLS, SSH, or server
 rollback evidence. The two hash algorithms also cover direct zero-object-ID
 construction without a production `expect`. No test target or shared harness is
 added. Actual execution, failure history and release evidence belong in the plan.
+
+## Empty-repository advertisement tail regression (FIX-PKT-05)
+
+Four new library test names extend the existing pkt-line gates without replacing
+the original 113 plan gates or adding a Cargo target / cli.* scenario:
+
+- `internal::protocol::test::pkt_line_empty_discovery_rejects_malformed_tail`:
+  SHA-1/SHA-256 and both services, short/encoding/hex/sign/space/length/payload
+  errors after zero OID, exact typed Display reasons and no sentinel echo.
+- `internal::protocol::test::pkt_line_empty_discovery_preserves_valid_tail`:
+  empty refs/capabilities/hash kind and existing flush/0004/ffff framing behavior.
+- `command::ls_remote::pkt_line_boundary_tests::pkt_line_empty_discovery_http_tail_maps_net_002`:
+  real local HTTP through HttpsClient and fetch/clone/ls-remote/pull execute_safe,
+  fixed NET002/128/hints, three renderings and decoded JSON, GET-only transcript,
+  original repository refs/FETCH_HEAD and local sentinel unchanged. Valid empty
+  ls-remote retains empty entries and command success. No TLS or external server
+  coverage is claimed. Existing two-worker runtime, 45-second command bounds,
+  bounded server cleanup and env/cwd/hash_kind exclusion are retained.
+- `command::push::test::pkt_line_empty_discovery_push_tail_maps_net_002`:
+  real ReceivePack parser through the production discovery mapper and CLI
+  conversion; exact push hint, fixed reasons, JSON and sentinel assertions.
+  This is mapping coverage, not a remote push/rollback test.
+
+The inline serial test is outside SERIAL_CLASSIFY's tests/**/*.rs input; it
+uses the existing adjacent HTTP tests' keys. No registry or nextest configuration
+change is needed. Actual source/local/full/review/release acceptance must be
+recorded separately in plan-20260901.md.

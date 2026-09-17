@@ -169,6 +169,14 @@ notes: |
   No new cli.* scenario or Cargo target is added; local fixtures do not prove
   remote rollback. Accepted results are recorded in plan-20260901.md.
 
+  FIX-PKT-05 adds four inline Cargo library gates for malformed framing after
+  zero-OID empty advertisements, valid empty tails, real local HTTP command
+  failures/success, and receive-pack push discovery mapping. They preserve the
+  original 113 plan gates and existing hints/JSON, assert no remote-byte echo
+  and local ref/FETCH_HEAD/sentinel safety, and add no cli.* scenario or Cargo
+  target. HTTP fixtures do not test TLS; push mapping is not remote rollback.
+  See integration-test-plan.md for exact names and plan-20260901.md for results.
+
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---
   - id: cli.config-basic-kv

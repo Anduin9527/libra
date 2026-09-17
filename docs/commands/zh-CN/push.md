@@ -498,3 +498,11 @@ receive-pack 返回 `ng <refname> <reason>` 时，Libra 先确认 refname 属于
 已确认 ref 的拒绝消息保留可读性。refname 与 reason 使用相同净化规则：Unicode 控制字符（含 C0、DEL、C1/CSI）显示为字面转义文本；转义后每个字段最多200个 Unicode 字符，截断时另加 `…`。不会切断转义序列或 UTF-8 字符，因此保留部分可能短于200字符。普通短消息不变。规则在 human、JSON、machine 渲染之前应用，解码后的 JSON message 同样安全化。
 
 已知 ref 的拒绝仍使用 `LBR-NET-002` / 退出128与原分支保护提示。JSON message/hints 结构不变，不新增独立 reason 字段。可读远端文字不等于可信本地结论。拒绝响应不更新本地 tracking ref，也不能证明远端已回滚部分更新；结果不明确时应先核对远端状态再重试。
+
+## 空仓库 discovery 的帧校验
+
+HTTP(S) 广告声明仓库为空后，仍会校验剩余的全部 pkt-line 帧。零 object ID 之后
+出现畸形标头、小于四的帧长度或截断 payload 时，返回 `LBR-NET-002`（退出128），
+原因固定且不回显远端字节，不再误报为空仓库成功。重试前请核对远端 Git 服务或代理
+响应。合法空仓库、支持的 SHA-1/SHA-256 广告、既有命令 hint 和结构化错误字段保持
+原有行为。

@@ -716,3 +716,13 @@ Whole-tree reset concludes stopped cherry-pick/revert state only after its resul
 Reset recovery warnings are printed to stderr after the result in human, `--json`, and `--machine` modes, with the existing JSON schema unchanged; `--exit-code-on-warning` returns 9 after an otherwise successful reset. No stopped pick/revert means no sequence-recovery warning solely because the index is unmerged. Rebase and merge metadata remain outside this conclusion behavior.
 
 Internal resets used by cherry-pick and am retain their sequence-state behavior. Their existing filesystem-cleanup warnings are now visible on stderr in structured modes too; their warning-exit tracking is unchanged.
+
+## Empty-repository discovery framing
+
+An HTTP(S) advertisement that declares an empty repository still has all remaining
+pkt-line frames checked. A malformed header, an unsupported length 1..3, or a truncated
+payload after the zero object ID returns `LBR-NET-002` (exit 128), with a fixed
+reason that does not echo the remote bytes. It is no longer reported as a
+successful empty response. Check the remote Git service or proxy response before
+retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
+existing command hints and structured error fields retain their behavior.

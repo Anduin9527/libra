@@ -172,6 +172,11 @@ pub fn parse_discovered_references(
                     "discovery for {:?} returned zero hash, treating as empty repository",
                     service
                 );
+                // Empty refs end semantic discovery, not validation of the response framing.
+                while !response_content.is_empty() {
+                    read_pkt_line(&mut response_content)
+                        .map_err(|error| GitError::NetworkError(error.to_string()))?;
+                }
                 break;
             }
 
@@ -414,6 +419,106 @@ mod test {
                         .expect("valid empty repository");
                 assert!(empty.refs.is_empty());
                 assert_eq!(empty.hash_kind, kind);
+            }
+        }
+    }
+
+    fn empty_advertisement_with_tail(width: usize, cap: &str, tail: &[u8]) -> Bytes {
+        let mut bytes = BytesMut::new();
+        add_pkt_line_string(&mut bytes, "# service=git-upload-pack\n".to_string());
+        bytes.extend_from_slice(b"0000");
+        add_pkt_line_string(
+            &mut bytes,
+            format!("{} capabilities^{{}}\0{cap}\n", "0".repeat(width)),
+        );
+        bytes.extend_from_slice(tail);
+        bytes.freeze()
+    }
+
+    #[test]
+    fn pkt_line_empty_discovery_rejects_malformed_tail() {
+        use crate::git_protocol::PktFrameError;
+
+        let cases: &[(&[u8], PktLineError)] = &[
+            (b"0", PktLineError::TruncatedHeader),
+            (b"00", PktLineError::TruncatedHeader),
+            (b"000", PktLineError::TruncatedHeader),
+            (b"\xff000", PktLineError::InvalidHeaderEncoding),
+            (b"zzzz", PktLineError::InvalidHexHeader),
+            (b"+004", PktLineError::InvalidHexHeader),
+            (b" 004", PktLineError::InvalidHexHeader),
+            (
+                b"0001",
+                PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            ),
+            (
+                b"0002",
+                PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            ),
+            (
+                b"0003",
+                PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            ),
+            (b"0008abc", PktLineError::TruncatedPayload),
+            (
+                b"ffffREMOTE_EMPTY_TAIL_SECRET",
+                PktLineError::TruncatedPayload,
+            ),
+        ];
+        for (width, cap) in [(40, "object-format=sha1"), (64, "object-format=sha256")] {
+            for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+                for (tail, expected) in cases {
+                    // Also reject a corrupt later frame after accepted empty frames.
+                    for prefix in [b"".as_slice(), b"0004", b"00000004"] {
+                        let suffix = [prefix, tail].concat();
+                        let error = parse_discovered_references(
+                            empty_advertisement_with_tail(width, cap, &suffix),
+                            service,
+                        )
+                        .expect_err("zero object ID must not hide malformed framing");
+                        let GitError::NetworkError(detail) = error else {
+                            panic!("expected network error, got {error:?}");
+                        };
+                        assert_eq!(
+                            detail,
+                            expected.to_string(),
+                            "{width}/{service:?}/{suffix:?}"
+                        );
+                        assert_eq!(detail.matches(PKT_LINE_PROTOCOL_ERROR_PREFIX).count(), 1);
+                        assert!(!detail.contains("REMOTE_EMPTY_TAIL_SECRET"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pkt_line_empty_discovery_preserves_valid_tail() {
+        let maximum = [b"ffff".as_slice(), &vec![b'x'; 0xffff - 4], b"0000"].concat();
+        for (kind, width, cap) in [
+            (HashKind::Sha1, 40, "object-format=sha1"),
+            (HashKind::Sha256, 64, "object-format=sha256"),
+        ] {
+            for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+                // Missing flush and semantically unused payloads retain the existing
+                // parser behavior; this fix validates framing only, not new grammar.
+                for tail in [
+                    b"".as_slice(),
+                    b"0000",
+                    b"0004",
+                    b"0004000000040000",
+                    maximum.as_slice(),
+                ] {
+                    let caps = format!("multi_ack {cap}");
+                    let result = parse_discovered_references(
+                        empty_advertisement_with_tail(width, &caps, tail),
+                        service,
+                    )
+                    .expect("existing valid frame semantics stay compatible");
+                    assert!(result.refs.is_empty());
+                    assert_eq!(result.hash_kind, kind);
+                    assert_eq!(result.capabilities, ["multi_ack", cap]);
+                }
             }
         }
     }

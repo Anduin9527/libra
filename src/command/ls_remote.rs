@@ -926,6 +926,7 @@ mod pkt_line_boundary_tests {
     #[derive(Clone, Copy)]
     enum ResponseMode {
         EmptyAdvertisement,
+        EmptyAdvertisementTail { width: usize, tail: &'static [u8] },
         MalformedFetch,
     }
     type Transcript = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
@@ -968,6 +969,19 @@ mod pkt_line_boundary_tests {
             && path == "/repo/info/refs?service=git-upload-pack"
         {
             let mut bytes = bytes::BytesMut::new();
+            if let ResponseMode::EmptyAdvertisementTail { width, tail } = state.mode {
+                add_pkt_line_string(&mut bytes, "# service=git-upload-pack\n".to_string());
+                bytes.extend_from_slice(b"0000");
+                let format = if width == 64 { "sha256" } else { "sha1" };
+                add_pkt_line_string(
+                    &mut bytes,
+                    format!(
+                        "{} capabilities^{{}}\0multi_ack object-format={format}\n",
+                        "0".repeat(width)
+                    ),
+                );
+                bytes.extend_from_slice(tail);
+            }
             if matches!(state.mode, ResponseMode::MalformedFetch) {
                 add_pkt_line_string(&mut bytes, "# service=git-upload-pack\n".to_string());
                 bytes.extend_from_slice(b"0000");
@@ -1181,5 +1195,197 @@ mod pkt_line_boundary_tests {
             );
         }
         server.stop().await;
+    }
+
+    // Exclude legacy unkeyed cwd mutators as well as named resource lanes.
+    // The later bare attribute wraps the named one, taking the legacy lock first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(env, cwd, hash_kind)]
+    #[serial]
+    async fn pkt_line_empty_discovery_http_tail_maps_net_002() {
+        use sea_orm::{EntityTrait, QueryOrder};
+
+        use crate::{
+            git_protocol::{PktFrameError, PktLineError},
+            internal::{db::get_db_conn_instance, model::reference},
+        };
+
+        // Tokio block_on polls this root future on its calling thread.
+        tokio::task::yield_now().await;
+        for key in [None, Some("cwd"), Some("env"), Some("hash_kind")] {
+            assert!(
+                serial_test::is_locked_serially(key),
+                "empty-discovery HTTP test must hold legacy and resource locks: {key:?}"
+            );
+        }
+
+        for width in [40, 64] {
+            let repo = tempdir().unwrap();
+            setup_with_new_libra_in(repo.path()).await;
+            {
+                let _cwd = ChangeDirGuard::new(repo.path());
+                let mut server = TestServer::start(ResponseMode::EmptyAdvertisementTail {
+                    width,
+                    tail: b"0000",
+                })
+                .await;
+                let data = tokio::time::timeout(
+                    Duration::from_secs(45),
+                    super::run_ls_remote(
+                        LsRemoteArgs::try_parse_from(["ls-remote", server.url.as_str()]).unwrap(),
+                    ),
+                )
+                .await
+                .expect("valid empty advertisement must terminate")
+                .expect("valid empty remote");
+                assert!(data.entries.is_empty());
+                assert!(!data.exit_code);
+                tokio::time::timeout(
+                    Duration::from_secs(45),
+                    super::execute_safe(
+                        LsRemoteArgs::try_parse_from(["ls-remote", server.url.as_str()]).unwrap(),
+                        &OutputConfig::default(),
+                    ),
+                )
+                .await
+                .expect("empty command must terminate")
+                .expect("empty remote exits successfully");
+                assert_eq!(server.requests().len(), 2);
+                assert!(server.requests().iter().all(|r| r.0 == "GET"
+                    && r.1 == "/repo/info/refs?service=git-upload-pack"
+                    && r.2.is_empty()));
+                server.stop().await;
+            }
+            for tail in [
+                b"zzzzREMOTE_EMPTY_TAIL_SECRET".as_slice(),
+                b"0001REMOTE_EMPTY_TAIL_SECRET",
+                b"ffffREMOTE_EMPTY_TAIL_SECRET",
+            ] {
+                let mut server =
+                    TestServer::start(ResponseMode::EmptyAdvertisementTail { width, tail }).await;
+                for command in ["fetch", "clone", "ls-remote", "pull"] {
+                    let repo = tempdir().unwrap();
+                    setup_with_new_libra_in(repo.path()).await;
+                    let _cwd = ChangeDirGuard::new(repo.path());
+                    if matches!(command, "fetch" | "pull") {
+                        ConfigKv::set("remote.origin.url", &server.url, false)
+                            .await
+                            .unwrap();
+                    }
+                    let db = get_db_conn_instance().await;
+                    let refs_before = reference::Entity::find()
+                        .order_by_asc(reference::Column::Id)
+                        .all(&db)
+                        .await
+                        .unwrap();
+                    let fetch_head = repo.path().join(".libra/FETCH_HEAD");
+                    let fetch_head_before = std::fs::read(&fetch_head).ok();
+                    let sentinel = repo.path().join("keep-local.txt");
+                    std::fs::write(&sentinel, b"unchanged local data\n").unwrap();
+                    let output = OutputConfig::default();
+                    let destination = repo.path().join("clone-target");
+                    let before = server.requests().len();
+                    let error = tokio::time::timeout(Duration::from_secs(45), async {
+                        match command {
+                            "fetch" => fetch::execute_safe(
+                                FetchArgs::try_parse_from(["fetch", "origin"]).unwrap(),
+                                &output,
+                            )
+                            .await
+                            .unwrap_err(),
+                            "clone" => clone::execute_safe(
+                                CloneArgs::try_parse_from([
+                                    "clone",
+                                    server.url.as_str(),
+                                    destination.to_str().unwrap(),
+                                ])
+                                .unwrap(),
+                                &output,
+                            )
+                            .await
+                            .unwrap_err(),
+                            "ls-remote" => super::execute_safe(
+                                LsRemoteArgs::try_parse_from(["ls-remote", server.url.as_str()])
+                                    .unwrap(),
+                                &output,
+                            )
+                            .await
+                            .unwrap_err(),
+                            "pull" => pull::execute_safe(
+                                PullArgs::try_parse_from(["pull", "--ff-only", "origin", "main"])
+                                    .unwrap(),
+                                &output,
+                            )
+                            .await
+                            .unwrap_err(),
+                            _ => unreachable!(),
+                        }
+                    })
+                    .await
+                    .expect("malformed empty advertisement must terminate");
+                    assert_eq!(
+                        error.stable_code(),
+                        StableErrorCode::NetworkProtocol,
+                        "{command}: {error:?}"
+                    );
+                    assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+                    let reason = if tail.starts_with(b"zzzz") {
+                        PktLineError::InvalidHexHeader
+                    } else if tail.starts_with(b"0001") {
+                        PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader)
+                    } else {
+                        PktLineError::TruncatedPayload
+                    };
+                    assert!(
+                        error.message().contains(&reason.to_string()),
+                        "{command}: {error:?}"
+                    );
+                    assert_eq!(
+                        error
+                            .hints()
+                            .iter()
+                            .map(|hint| hint.as_str())
+                            .collect::<Vec<_>>(),
+                        [PROTOCOL_HINT]
+                    );
+                    for rendered in [error.render(), error.render_report(), error.render_json()] {
+                        assert!(
+                            !rendered.contains("REMOTE_EMPTY_TAIL_SECRET"),
+                            "{command}: {rendered}"
+                        );
+                        assert!(!rendered.contains("zzzz"), "{command}: {rendered}");
+                    }
+                    let json: serde_json::Value =
+                        serde_json::from_str(&error.render_json()).unwrap();
+                    assert_eq!(json["ok"], false);
+                    assert_eq!(json["error_code"], "LBR-NET-002");
+                    assert_eq!(json["exit_code"], 128);
+                    if command == "pull" {
+                        assert_eq!(
+                            error.details().get("phase"),
+                            Some(&serde_json::json!("fetch"))
+                        );
+                    }
+                    assert_eq!(
+                        reference::Entity::find()
+                            .order_by_asc(reference::Column::Id)
+                            .all(&db)
+                            .await
+                            .unwrap(),
+                        refs_before
+                    );
+                    assert_eq!(std::fs::read(&fetch_head).ok(), fetch_head_before);
+                    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged local data\n");
+                    let requests = server.requests();
+                    assert_eq!(requests.len(), before + 1, "{command}: {requests:?}");
+                    assert_eq!(
+                        (&requests[before].0[..], &requests[before].1[..]),
+                        ("GET", "/repo/info/refs?service=git-upload-pack")
+                    );
+                    assert!(requests[before].2.is_empty());
+                }
+                server.stop().await;
+            }
+        }
     }
 }
