@@ -46,7 +46,11 @@ sequence. `-n/--no-commit` and `-m/--mainline` apply only to a single commit.
 
 A new revert refuses to start while the index has unmerged entries: before resolving any target or writing to the index, working tree, refs, or `revert-state.json`, it exits 128 with `LBR-CONFLICT-001` and names up to ten unmerged paths (Git refuses with `your index file is unmerged`). Resolve each path and `libra add` it, or discard the conflict with `libra reset --hard`, then rerun the revert; the refusal writes no revert state, so `--continue`, `--skip`, and `--abort` do not apply to it.
 
+A stopped revert does not outlive the working tree it stopped in: a later reset that clears unresolved index stages ends the stopped single-commit revert, so the next revert starts cleanly. A multi-commit sequence keeps its remaining commits and records that the stopped commit was concluded: `--continue` then refuses with `LBR-REPO-003` instead of recording the reset index as that revert, so use `libra revert --skip` to revert the remaining commits or `libra revert --abort` to restore HEAD, index, and tracked files to the pre-revert state, discarding later tracked changes (including the reset target).
+
 ## Options
+
+Revert currently stores textual conflicts as stage-0 blobs. A whole-tree reset also checks those staged blobs at the stopped revert's conflict paths: remaining `<<<<<<<` markers or an unreadable blob preserve the revert state and emit a recovery warning. This includes `--soft` even when `ls-files --unmerged` is empty. Resolving and staging the content (or removing the path from the index), or replacing the index with a clean `--mixed`/`--hard` reset, allows conclusion. Markers left only in the working tree do not prevent a mixed reset from concluding the stop. The existing revert conflict representation and `--continue` behavior are unchanged.
 
 ### `-n`, `--no-commit`
 
@@ -289,9 +293,10 @@ three-way merge while preserving every clean inverse hunk.
 |------|-----------|------|
 | `LBR-REPO-001` | Not inside a libra repository | Initialize with `libra init` or navigate to a repo |
 | `LBR-REPO-003` | HEAD is detached (not on a branch) | Switch to a branch with `libra switch <branch>` |
+| `LBR-REPO-003` | `--continue` on a stop a later reset already concluded the stopped revert | Drain the rest with `libra revert --skip`, or restore the pre-revert state with `libra revert --abort` (discards later tracked changes) |
 | `LBR-CLI-003` | Cannot resolve the commit reference | Use `libra log` to find valid commit references |
 | `LBR-CLI-002` | Merge commit without `-m`, invalid mainline, invalid `--cleanup`, or an editor/empty-message failure | Pass a valid mainline/cleanup mode; for `--edit`, configure an editor and save a non-empty message |
-| `LBR-CONFLICT-001` | File was modified by a later commit, creating a conflict | Resolve conflicts then `libra revert --continue`, skip the commit with `libra revert --skip`, or cancel with `libra revert --abort` |
+| `LBR-CONFLICT-001` | File was modified by a later commit, creating a conflict | Resolve conflicts then `libra revert --continue`, skip the commit with `libra revert --skip`, or restore the pre-revert state with `libra revert --abort` (discards later tracked changes) |
 | `LBR-CONFLICT-001` | A new revert refused because the index already has unmerged entries (no revert state is written) | Resolve the listed paths and `libra add` them (or discard with `libra reset --hard`), then rerun the revert; `--continue`/`--skip`/`--abort` do not apply |
 | `LBR-REPO-002` | The index is corrupt or unreadable during apply/continue/skip/abort | Repair or restore `.libra/index`; the revert state is retained so recovery can be retried |
 | `LBR-IO-001` | Failed to load object (commit, tree, blob) | Check repository integrity |

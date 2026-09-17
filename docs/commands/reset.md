@@ -32,9 +32,13 @@ unsupported diagnostic.
 
 When pathspecs are provided, the command performs a targeted mixed reset: only the named files are reset in the index to match the target commit, without moving HEAD. This is the primary way to un-stage specific files. Like Git, a bare first positional that is a known path and not a revision is treated as a pathspec with target `HEAD`, so `libra reset src/lib.rs` is equivalent to `libra reset HEAD -- src/lib.rs`. If a token is both a revision and a filename, reset refuses it as ambiguous; use `libra reset <revision> -- <file>` for a target revision or `libra reset -- <file>` for a path. Pathspecs are incompatible with `--soft`, `--hard`, `--merge`, and `--keep`. When a pathspec reset restores a symlink from the target commit, the index entry keeps mode `120000` and the blob remains the link target bytes.
 
+A whole-tree reset (no pathspecs) ends a stopped sequence item only when its resulting index has no unresolved conflict stages: it clears a stopped single-commit cherry-pick or revert, so the next pick or revert starts cleanly. A multi-commit sequence keeps its remaining commits and records that the stopped commit was concluded here; finish it with `libra cherry-pick --skip` (or `--quit`) or `libra revert --skip` to apply remaining commits on the reset target. `libra revert --abort` instead restores the pre-revert HEAD/index/tracked files and discards later tracked changes. A reset with pathspecs changes no sequence state, and in-progress rebase and merge metadata are left alone. When a stopped pick or revert exists and `--soft` leaves conflict stages untouched or `--merge` carries them forward, reset warns and preserves the complete stopped state so the existing operation can still be continued or aborted. Libra retains its existing ability to perform a soft reset with an unmerged index; Git refuses that soft reset. If the post-reset index cannot be read, state is also preserved with a warning; the already-completed reset is not rolled back. If other bookkeeping fails, the reset still succeeds and the leftover state is named in a warning. In a repository with linked-worktree history (including removed worktrees), a common-storage revert sidecar without proven main-worktree ownership is left byte-for-byte unchanged. Reset still succeeds and warns to inspect it with `libra worktree doctor`; it neither deletes that evidence nor assigns it a new owner.
+
 The default target is `HEAD`, making `libra reset` (with no arguments) equivalent to un-staging everything.
 
 ## Options
+
+Revert currently stores textual conflicts as stage-0 blobs. A whole-tree reset also checks those staged blobs at the stopped revert's conflict paths: remaining `<<<<<<<` markers or an unreadable blob preserve the revert state and emit a recovery warning. This includes `--soft` even when `ls-files --unmerged` is empty. Resolving and staging the content (or removing the path from the index), or replacing the index with a clean `--mixed`/`--hard` reset, allows conclusion. Markers left only in the working tree do not prevent a mixed reset from concluding the stop. The existing revert conflict representation and `--continue` behavior are unchanged.
 
 | Flag | Long | Value | Description |
 |------|------|-------|-------------|
@@ -249,3 +253,7 @@ Mixed mode is the safest general-purpose reset: it un-stages changes without dis
 | Pathspec escapes the working directory | `LBR-CLI-002` | "pathspecs must stay within the repository working directory." |
 | Pathspec file/stdin read failure | `LBR-IO-001` | "check that the pathspec file exists and is readable." |
 | Rollback failure | (primary code) | (primary hint) |
+
+Reset emits recovery and cleanup warnings to stderr after rendering its result, including with `--json` and `--machine`. The success JSON schema stays unchanged; `--exit-code-on-warning` returns 9 when such a warning occurs, even though the reset itself completed. An unmerged index without a stopped pick/revert does not produce a sequence-recovery warning.
+
+This warning delivery also applies to internal resets used by cherry-pick and am: existing filesystem-cleanup warnings are now visible on stderr in structured modes. Their sequence-state handling and warning-exit tracking stay unchanged.

@@ -25,6 +25,8 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 
 提供 pathspec 时，命令执行有针对性的 mixed reset：只将命名文件在索引中重置为匹配目标提交，不移动 HEAD。这是取消暂存特定文件的主要方式。与 Git 一样，如果第一个裸位置参数是已知路径且不是 revision，`libra reset src/lib.rs` 会按 `HEAD` 目标的 pathspec reset 处理，等价于 `libra reset HEAD -- src/lib.rs`。如果同一个 token 既是 revision 又是文件名，reset 会拒绝猜测并报歧义；要把它作为目标 revision，请使用 `libra reset <revision> -- <file>`，要把它作为路径，请使用 `libra reset -- <file>`。Pathspec 与 `--soft`、`--hard`、`--merge`、`--keep` 不兼容。当 pathspec reset 从目标提交恢复符号链接时，索引条目会保留 mode `120000`，blob 仍是链接目标字节。
 
+无 pathspec 的整树 reset 仅在结果索引已无未合并冲突阶段时结束已停止的序列项：清除已停止的单提交 cherry-pick 或 revert 状态，使下一次 pick 或 revert 可以正常开始。多提交序列保留剩余提交，并记录被停提交已在此结束；用 `libra cherry-pick --skip`（或 `--quit`）或 `libra revert --skip` 在 reset 目标上应用其余提交；`libra revert --abort` 则恢复 revert 前的 HEAD、索引和已跟踪文件，丢弃之后的已跟踪改动。带 pathspec 的 reset 不改动任何序列状态，进行中的 rebase 与 merge 元数据也不受影响。若存在停止的 pick/revert 且 `--soft` 保持冲突阶段或 `--merge` 携带这些阶段，reset 会警告并完整保留停止状态，原操作仍可继续或中止。Libra 保留既有的未合并索引下 soft reset 行为；Git 会拒绝该 soft reset。若 reset 后读不出索引，也警告并保留状态，不回滚已完成的 reset。其他收尾写入失败时，reset 仍然成功，并在 warning 中指明残留状态。 有过关联工作树的仓库（包括已删除的工作树）中，若公共存储里的 revert 侧车无法证明属于主工作树，reset 会原样保留其字节并成功返回，warning 指向 `libra worktree doctor`；不会删除该证据或替它重新标注属主。
+
 默认目标是 `HEAD`，因此不带参数的 `libra reset` 等价于取消暂存所有内容。
 
 `reset --hard` 恢复工作树时会保留 tree 中的文件类型：符号链接会恢复为真正的 symlink，链接 blob 字节作为目标路径写入；若工作树当前位置已有普通文件或已有 symlink，必要时会被替换为目标 symlink。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写入普通文件。
@@ -223,3 +225,11 @@ Mixed 模式是最安全的通用 reset：它取消暂存更改但不丢弃工�
 | `--merge`/`--keep` 会覆盖本地变更 | `LBR-CONFLICT-002` | "commit or stash the local changes, then retry the reset." |
 | Pathspec 不匹配 | `LBR-CLI-003` | "check the path and try again." |
 | 回滚失败 | （主错误码） | （主提示） |
+
+Reset 在输出结果后将恢复及清理 warning 写入 stderr，`--json` 和 `--machine` 也如此。成功 JSON schema 不变；指定 `--exit-code-on-warning` 时，有此类 warning 会返回 9，即使 reset 本身已经完成。仅有未合并索引、没有停止的 pick/revert 时，不产生序列恢复 warning。
+
+同一警告输出也适用于 cherry-pick 与 am 内部调用的 reset：既有文件系统清理 warning 在结构化模式下也会显示在 stderr。内部序列状态处理与 warning-exit 计数保持原有行为。
+
+### 暂存文本冲突与 reset 收尾
+
+revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也检查该次 revert 冲突路径的暂存内容：仍有 `<<<<<<<` 标记或 blob 无法读取时，保留 revert 状态并发出恢复警告。因此即使 `ls-files --unmerged` 为空，`--soft` 也不会丢掉恢复状态。解决并重新暂存内容（或从索引移除路径），或通过 `--mixed`/`--hard` 将索引替换为干净内容后，可以正常收尾。仅工作树中残留的标记不阻止 mixed reset 收尾。本次不改变 revert 的冲突表示及 `--continue` 行为。
