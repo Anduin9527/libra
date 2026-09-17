@@ -2417,7 +2417,14 @@ fn test_add_success_summary_output() {
 
     std::fs::write(repo.join("new.txt"), "hello").unwrap();
 
-    let output = run_libra_command(&["add", "new.txt"], &repo);
+    // Since #499 the default `add` summary follows Git and stays silent when
+    // stdout is not a terminal; under LIBRA_TEST the summary is opted in with
+    // LIBRA_ADD_TTY (the same gate `add_test` uses), which is what this test
+    // asserts on.
+    let output =
+        spawn_libra_command_with_env(&["add", "new.txt"], &repo, &[("LIBRA_ADD_TTY", "1")])
+            .wait_with_output()
+            .expect("failed to wait for libra add");
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
