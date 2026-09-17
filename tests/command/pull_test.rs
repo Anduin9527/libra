@@ -1428,7 +1428,7 @@ async fn test_stash_push_works_on_a_packed_head_from_pull() {
 /// repository — the five fetch packs collapse into one (old packs deleted),
 /// while history and a blob staged only in a linked worktree stay readable.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_incremental_repack_consolidates_with_linked_worktree_roots() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
     let local_repo = tempdir().expect("local repo");

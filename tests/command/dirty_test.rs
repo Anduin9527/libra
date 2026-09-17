@@ -454,7 +454,7 @@ fn scan_stale_lock_broken_pipe_stays_silent() {
 /// lands inside the widened read→re-verify window, and the fallback carries
 /// `dirty_cache_concurrent_invalidate` in JSON warnings with clean stderr.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn json_check_dirty_concurrent_invalidate_warning() {
     use std::process::Stdio;
     let repo = dirty_repo();

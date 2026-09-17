@@ -2065,6 +2065,57 @@ fn nextest_groups_toml_matches_generator_and_registry() {
         "external group binary(=..) members must equal the pure-global site \
          rows' host targets"
     );
-    assert_eq!(toml_fns.len(), 213, "union fn member count drifted");
+    // DEFER-NP-02 (executed 2026-09-17, user-directed): the TA-03 fail-closed
+    // expansions carry only the in-process closed set {cwd, env, hash_kind},
+    // so the union group holds exactly the genuinely external rows — the
+    // hand-keyed cloud_live (10) and workspace_failpoints (1) tests. A count
+    // drift here means a new test was keyed with an external resource (fine,
+    // but deliberate) or a fail-closed body was re-widened by hand (not fine).
+    assert_eq!(toml_fns.len(), 11, "union fn member count drifted");
     assert_eq!(toml_bins.len(), 7, "site host target count drifted");
+}
+
+/// DEFER-NP-02 standing invariant: no `tests/**` attribute may carry the
+/// pre-narrowing TA-03 expansion (`cloud_live` and `workspace_failpoints`
+/// alongside the in-process set). Those two keys were never resource evidence
+/// for a fail-closed body — the classifier can only prove cwd/env/hash_kind
+/// pollution — and carrying them serialized ~150 default-build tests inside
+/// the single-threaded nextest `external` group. A body that genuinely touches
+/// an external resource names that key alone (`#[serial(cloud_live)]`), never
+/// the whole universe.
+#[test]
+fn no_full_universe_expansion_remains() {
+    fn keys_of(attr_line: &str) -> Option<Vec<&str>> {
+        let inner = attr_line
+            .trim_start()
+            .strip_prefix("#[serial_test::serial(")
+            .or_else(|| attr_line.trim_start().strip_prefix("#[serial("))?;
+        let inner = inner.strip_suffix(")]")?;
+        Some(inner.split(',').map(str::trim).collect())
+    }
+    let mut offenders = Vec::new();
+    let mut stack = vec![repo_root().join("tests")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read tests/ dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read test source");
+                for (n, line) in text.lines().enumerate() {
+                    if let Some(keys) = keys_of(line)
+                        && keys.contains(&"cloud_live")
+                        && keys.contains(&"workspace_failpoints")
+                    {
+                        offenders.push(format!("{}:{}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "full-universe #[serial] expansion found (narrow it to the lanes the body \
+         really needs, e.g. #[serial(cwd, env, hash_kind)]): {offenders:?}"
+    );
 }

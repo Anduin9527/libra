@@ -2406,7 +2406,7 @@ fn interop_setup(
 /// unpack-objects below it), with a fixture guaranteeing a real delta win.
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_push_thin_roundtrip_real_git_both_unpack_paths() {
     for unpack_limit in ["1", "10000"] {
         let temp_root = tempfile::tempdir().expect("temp root");

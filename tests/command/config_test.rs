@@ -1550,7 +1550,7 @@ async fn test_config_generate_gpg_key_rejects_invalid_usage() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_config_scope_path_logic() {
     let inherited = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB");
     assert_eq!(config::ConfigScope::Local.get_config_path(), None);
@@ -1565,7 +1565,7 @@ async fn test_config_scope_path_logic() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_config_cross_platform_paths() {
     let inherited = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB");
     let isolated = tempdir().unwrap();
@@ -2513,7 +2513,7 @@ fn test_config_upgrade_mode_corrupt_file_is_strict_error() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3129,7 +3129,7 @@ fn config_bare_read_sensitive_key_never_leaks_value() {
 /// error. Drive it on a real pty instead, which is what the plan's manual
 /// evidence item called for.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn config_bare_read_protected_key_interactive_pty() {
     const SENTINEL: &str = "ct101-typed-sentinel-must-not-echo";
 

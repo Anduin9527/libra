@@ -1668,7 +1668,7 @@ fn test_revert_remaining_persists_resolved_ids() {
 /// `--continue` (here a merge commit needing `-m`) must clear the state, so the
 /// already-finished conflict is not left lingering as in-progress.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_revert_continue_clears_state_on_drain_error() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");
@@ -1704,7 +1704,7 @@ fn test_revert_continue_clears_state_on_drain_error() {
 /// Regression (skip side): a non-conflict drain error after `--skip` must also
 /// clear the state.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_revert_skip_clears_state_on_drain_error() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");

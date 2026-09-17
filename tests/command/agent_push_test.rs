@@ -326,7 +326,7 @@ fn add_fake_ssh_remote(local_dir: &Path, remote_dir: &Path) {
 
 #[cfg(unix)]
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn agent_push_writes_private_agent_traces_ref() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -402,7 +402,7 @@ fn agent_push_writes_private_agent_traces_ref() {
 ///    with `--force-rewrite` (the lease protects).
 #[cfg(unix)]
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn agent_push_after_prune_requires_force_rewrite_and_lease_protects() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -601,7 +601,7 @@ async fn wait_for_seeded_object_index(repo: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn agent_push_seed_waits_for_durable_index_retirement() {
     let repo = tempfile::tempdir().expect("create seed-readiness fixture");
     init_repo_base(repo.path());
@@ -653,7 +653,7 @@ fn agent_push_seed_waits_for_durable_index_retirement() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn agent_push_seed_readiness_rejects_terminal_marker() {
     let repo = tempfile::tempdir().expect("create terminal-marker fixture");
     let marker_dir = repo.path().join(".libra/object-index-repair");
@@ -676,7 +676,7 @@ async fn agent_push_seed_readiness_rejects_terminal_marker() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn agent_push_seed_readiness_rejects_marker_path_io_error() {
     let repo = tempfile::tempdir().expect("create marker-path fixture");
     fs::create_dir(repo.path().join(".libra")).expect("create storage directory");
@@ -698,7 +698,7 @@ async fn agent_push_seed_readiness_rejects_marker_path_io_error() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn agent_push_seed_readiness_accepts_missing_or_empty_marker_dir() {
     let repo = tempfile::tempdir().expect("create empty-marker fixture");
     wait_for_seeded_object_index(repo.path())

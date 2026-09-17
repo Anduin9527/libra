@@ -21,6 +21,12 @@
 #                                     -> filter = 'binary(=<target>)'
 # cwd/env/hash_kind never generate groups (in-process locks dissolve
 # under one-process-per-test).
+# DEFER-NP-02 (2026-09-17): TA-03 fail-closed expansions carry only the
+# in-process closed set `#[serial(cwd, env, hash_kind)]` — the classifier
+# can prove nothing beyond those three lanes, so the former full-universe
+# expansion (cloud_live+…+workspace_failpoints) was never resource evidence
+# and only serialized ~150 default-build tests in this group. The group
+# therefore holds exactly the hand-keyed external rows (guard-pinned).
 #
 # usage: sh tests/NEXTEST_GROUPS.sh            # rewrite .config/nextest.toml
 #        sh tests/NEXTEST_GROUPS.sh --stdout   # print to stdout (drift check)

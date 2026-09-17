@@ -504,7 +504,7 @@ fn init_repo_with_commit(main: &Path) {
 /// composition only (the FUSE repair mutates `worktrees-fuse.json`).
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn fuse_repair_shares_one_audit_boundary_with_core_repair() {
     let dir = tempdir().expect("tempdir");
     let main = dir.path();
@@ -545,7 +545,7 @@ async fn fuse_repair_shares_one_audit_boundary_with_core_repair() {
 /// FUSE mutation, leaving the failure unrecorded.
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn fuse_repair_failure_closes_the_shared_audit_row_failed() {
     let dir = tempdir().expect("tempdir");
     let main = dir.path();

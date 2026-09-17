@@ -1333,7 +1333,7 @@ async fn setup_local_fetch_with_tags_fixture() -> (TempDir, PathBuf, String) {
 /// and their targets — the regression that previously forced tag fetch to be
 /// backed out).
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_fetch_tags_creates_local_tags_and_is_idempotent() {
     let (_root, repo_dir, _branch) = setup_local_fetch_with_tags_fixture().await;
 
@@ -1387,7 +1387,7 @@ async fn test_fetch_tags_creates_local_tags_and_is_idempotent() {
 /// (Git's default): the lightweight tag's commit is fetched, and the annotated
 /// tag object arrives via the `include-tag` capability.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_fetch_default_auto_follows_reachable_tags() {
     let (_root, repo_dir, _branch) = setup_local_fetch_with_tags_fixture().await;
 
@@ -1443,7 +1443,7 @@ async fn test_fetch_no_tags_skips_even_reachable_tags() {
 /// `--force` overwrites a conflicting local tag; without it the local tag is
 /// kept (already covered by `test_fetch_tags_does_not_clobber_existing_local_tag`).
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_fetch_tags_force_clobbers_conflicting_local_tag() {
     let (_root, repo_dir, _branch) = setup_local_fetch_with_tags_fixture().await;
 
@@ -1505,7 +1505,7 @@ async fn test_fetch_tagopt_all_fetches_every_tag() {
 
 /// `--tags` never clobbers an existing local tag that points elsewhere.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_fetch_tags_does_not_clobber_existing_local_tag() {
     let (_root, repo_dir, _branch) = setup_local_fetch_with_tags_fixture().await;
 
@@ -1547,7 +1547,7 @@ async fn test_fetch_tags_does_not_clobber_existing_local_tag() {
 
 /// `--tags --dry-run` previews the new tags without downloading or writing them.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_fetch_tags_dry_run_previews_without_writing() {
     let (_root, repo_dir, _branch) = setup_local_fetch_with_tags_fixture().await;
 
@@ -1595,7 +1595,7 @@ fn test_fetch_tags_and_no_tags_are_mutually_overriding() {
 /// `libra clone` fetches all tags by default (Git parity); `--no-tags` skips
 /// them and records `remote.origin.tagOpt=--no-tags`.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_clone_fetches_all_tags_by_default() {
     let temp_root = tempdir().expect("temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1891,7 +1891,7 @@ async fn origin_tracking_ref_exists(branch: &str) -> bool {
 /// `fetch --prune` removes `refs/remotes/origin/*` refs the remote no longer
 /// advertises, while leaving live tracking refs intact.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_fetch_prune_removes_stale_tracking_refs() {
     let (temp_root, _repo_dir, default_branch, _guard) =
         setup_multi_branch_remote_and_fetch().await;
@@ -1944,7 +1944,7 @@ async fn test_fetch_prune_removes_stale_tracking_refs() {
 /// `fetch --dry-run --prune` reports stale refs but must not delete them; a real
 /// `fetch --prune` afterwards removes them.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_fetch_prune_dry_run_previews_without_deleting() {
     let (temp_root, _repo_dir, _default_branch, _guard) =
         setup_multi_branch_remote_and_fetch().await;

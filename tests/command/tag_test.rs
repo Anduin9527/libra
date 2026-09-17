@@ -742,7 +742,7 @@ fn test_tag_json_unborn_head_returns_repo_state_error() {
 // Test cases
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_basic_tag_creation() {
     // Create an isolated temporary repository and ensure a commit exists.
     let (_temp, _guard) = setup_repo_with_commit().await;
@@ -761,7 +761,7 @@ async fn test_basic_tag_creation() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_tag_with_message() {
     // Create a tag with an annotation message (annotated tag) and verify presence.
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Commit with message").await;
@@ -791,7 +791,7 @@ async fn test_tag_with_message() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_force_tag() {
     // Verify that forcing a tag replaces the ref target.
     let (_temp, _guard) = setup_repo_with_commit_with("v1", "First").await;
@@ -872,7 +872,7 @@ async fn test_force_tag() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_force_tag_store_failure_preserves_existing_ref() {
     if skip_permission_denied_test_if_root("test_force_tag_store_failure_preserves_existing_ref") {
         return;
@@ -919,7 +919,7 @@ async fn test_force_tag_store_failure_preserves_existing_ref() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_internal_create_returns_metadata_for_annotated_tag() {
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Base").await;
 
@@ -942,7 +942,7 @@ async fn test_internal_create_returns_metadata_for_annotated_tag() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_list_tags() {
     // Verify listing returns created tag names.
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Base").await;
@@ -960,7 +960,7 @@ async fn test_list_tags() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_delete_tag() {
     // Verify delete removes the tag ref.
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Delete base").await;
@@ -996,7 +996,7 @@ async fn test_delete_tag() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_annotation_lines_tag() {
     let (_temp, _guard) = setup_repo_with_commit_with("lightweight-tag", "First").await;
 

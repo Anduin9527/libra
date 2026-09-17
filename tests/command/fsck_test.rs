@@ -678,7 +678,7 @@ fn test_fsck_heal_json_includes_report() {
 }
 
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 /// Tests fsck rejects annotated tag objects that are syntactically valid UTF-8
 /// but missing required tag headers.
 fn test_fsck_rejects_tag_object_missing_tagger() {
@@ -970,7 +970,7 @@ fn store_strict_commit(repo: &std::path::Path, email: &str, tz: &str) -> String 
 /// `--strict` flags a commit whose author/committer email lacks `@`; the default
 /// (non-strict) check does not.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_strict_commit_bad_email() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -994,7 +994,7 @@ fn test_strict_commit_bad_email() {
 /// `--strict` flags a commit whose timezone is out of range; the default check
 /// does not.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_strict_commit_bad_timezone() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());

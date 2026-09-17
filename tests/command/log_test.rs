@@ -3105,7 +3105,7 @@ async fn test_log_positional_ambiguous_rev_and_path_errors() {
 /// the full ancestor closure of the excluded side, verified on a DIVERGENT
 /// history (a regression guard for both the symmetric-range and exclusion fixes).
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_positional_symmetric_and_exclusion_divergent() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -3160,7 +3160,7 @@ fn test_log_positional_symmetric_and_exclusion_divergent() {
 /// A pathspec that merely contains `..` (a parent-directory path) is NOT
 /// misclassified as a revision range — it falls back to a pathspec filter.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_positional_parent_dir_path_not_misclassified() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -3234,7 +3234,7 @@ fn trailer_repo() -> tempfile::TempDir {
 }
 
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_trailer_filter_and_json() {
     let repo = trailer_repo();
     let p = repo.path();
@@ -3295,7 +3295,7 @@ fn test_log_trailer_filter_and_json() {
 }
 
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_only_trailers_display_and_errors() {
     let repo = trailer_repo();
     let p = repo.path();

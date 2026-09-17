@@ -3531,7 +3531,7 @@ fn test_merge_dry_run_already_up_to_date() {
 }
 
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_merge_dry_run_clean_three_way_writes_no_objects() {
     // Divergent but non-overlapping edits: a clean three-way preview. The
     // auto-merged blob must be computed in memory only — the object store,

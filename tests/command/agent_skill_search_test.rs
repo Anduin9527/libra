@@ -95,7 +95,7 @@ async fn seed_skill_checkpoint(
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn agent_skill_search() {
     let repo_guard = create_committed_repo_via_cli();
     let repo = repo_guard.path().to_path_buf();

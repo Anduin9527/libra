@@ -922,7 +922,7 @@ fn loose_object_file(repo: &std::path::Path, oid: &str) -> std::path::PathBuf {
 /// blob reachable from a commit keeps both its object and its row;
 /// `--dry-run` only counts, and a second run is a no-op.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn agent_object_gc_findings_reachability() {
     let repo = create_committed_repo_via_cli();
 

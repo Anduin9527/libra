@@ -356,7 +356,7 @@ async fn runtime_formal_writes_preserve_order_and_minimal_object_set() {
 /// - Artifacts are correctly stored in R2
 /// - Connectivity to the remote storage provider works as expected
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_ai_flow_r2() {
     if std::env::var("R2_ENDPOINT").map_or(true, |v| v.is_empty()) {
         eprintln!("skipped (R2_ENDPOINT not set)");
