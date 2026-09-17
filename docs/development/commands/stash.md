@@ -54,6 +54,7 @@ flowchart TD
 ## 当前状态
 
 - 公开状态：已公开；模块状态：已导出。
+- 路径匹配审计（AU-05）：`stash push -- <pathspec>` 经 `paths_matching_pathspec` 做相等或目录前缀匹配，不通配。全局 `--literal-pathspecs` 下与关闭时相同（天然字面）。
 - 用户文档：`docs/commands/stash.md`。
 - Synopsis：`libra stash (push [-m <message>] [-- <pathspec>...] | pop [<stash>] | list | apply [<stash>] | drop [<stash>] | show [<stash>] [-p | --patch] [--name-only | --name-status] | branch <branch> [<stash>] | clear [--force])`。
 - 公开参数/子命令包括：`push [-m, --message <MESSAGE>] [-u, --include-untracked] [--no-include-untracked] [-a, --all] [-k, --keep-index] [-- <pathspec>...]`、`pop [<stash>]`、`list`、`apply [<stash>]`、`drop [<stash>]`、`show [<stash>] [-p, --patch] [--name-only] [--name-status]`、`branch <branch> [<stash>]`、`clear [--force]`。

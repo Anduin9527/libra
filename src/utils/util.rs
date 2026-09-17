@@ -3458,6 +3458,7 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
         commit::execute(CommitArgs {
@@ -3532,6 +3533,7 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
         commit::execute(CommitArgs {
@@ -3577,6 +3579,7 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
         commit::execute(CommitArgs {
@@ -3625,6 +3628,7 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
         commit::execute(CommitArgs {

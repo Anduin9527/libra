@@ -80,6 +80,7 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -259,6 +260,7 @@ async fn test_execute_commit() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         };
         add::execute(args).await;
     }
@@ -356,6 +358,7 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -435,6 +438,7 @@ async fn test_commit_with_all_flag_records_deletions() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -539,6 +543,7 @@ async fn test_commit_sha256() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -632,6 +637,7 @@ async fn test_commit_with_custom_author() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -894,6 +900,7 @@ async fn test_commit_with_actual_changes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     };
     add::execute(add_args).await;
 
@@ -981,6 +988,7 @@ async fn test_commit_signoff_persists_trailer() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1149,6 +1157,7 @@ async fn test_commit_without_identity_fails_by_default() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1235,6 +1244,7 @@ async fn test_commit_cleanup_strips_comments() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1426,6 +1436,7 @@ async fn test_commit_trailer_appended() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1464,6 +1475,7 @@ async fn test_commit_dry_run_does_not_create_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1503,6 +1515,7 @@ async fn test_commit_reuse_message() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1529,6 +1542,7 @@ async fn test_commit_reuse_message() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1569,6 +1583,7 @@ async fn test_commit_fixup_sets_subject() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1593,6 +1608,7 @@ async fn test_commit_fixup_sets_subject() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {

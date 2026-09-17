@@ -91,6 +91,7 @@ async fn stage(paths: &[&str]) {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 }

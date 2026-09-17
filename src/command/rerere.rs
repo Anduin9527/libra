@@ -280,6 +280,7 @@ async fn stage_path(path: &str) -> CliResult<()> {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     };
     crate::command::add::run_add(&args).await?;
 

@@ -35,6 +35,7 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) -> ChangeDirGuard {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 

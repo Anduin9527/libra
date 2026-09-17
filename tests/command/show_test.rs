@@ -1299,3 +1299,31 @@ fn test_show_raw_diff_format() {
         "--raw replaces the patch: {stdout}"
     );
 }
+
+#[test]
+fn test_show_literal_pathspecs_global() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "paths", "--no-verify"], p),
+        "commit",
+    );
+    let out = run_libra_command(
+        &[
+            "--literal-pathspecs",
+            "show",
+            "--stat",
+            "HEAD",
+            "--",
+            "*.txt",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "show literal");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("*.txt"), "{text}");
+    assert!(!text.contains("x.txt"), "{text}");
+}

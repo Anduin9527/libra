@@ -19,8 +19,9 @@
 //!   change set before pathspec validation runs.
 
 use std::{
+    collections::BTreeSet,
     env,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
@@ -59,7 +60,8 @@ EXAMPLES:
     libra add -u                       Update tracked files only (no new files)
     libra add --dry-run .              Preview what would be staged
     libra add -f ignored_file.log      Force-add an ignored file
-    libra add --refresh                Refresh index metadata without staging";
+    libra add --refresh                Refresh index metadata without staging
+    libra add --resolved               Stage resolved unmerged paths";
 
 /// Stage file contents for the next commit.
 // EXAMPLES are wired via `#[command(after_help = ADD_EXAMPLES)]` and render
@@ -133,6 +135,13 @@ pub struct AddArgs {
     /// failing. Mirrors Git's `add --ignore-missing`, which requires `--dry-run`.
     #[clap(long = "ignore-missing", requires = "dry_run")]
     pub ignore_missing: bool,
+
+    /// Stage only unmerged (conflict) paths after the working-tree copies have
+    /// been resolved. Refuses to run together with `-u`/`-A`. Does not require
+    /// a pathspec; a pathspec, when given, limits which unmerged paths are
+    /// considered. Mirrors Git's `add --resolved`.
+    #[clap(long)]
+    pub resolved: bool,
 }
 
 /// Domain error for `libra add`.
@@ -160,6 +169,11 @@ pub enum AddError {
     /// [`StableErrorCode::CliInvalidTarget`].
     #[error("pathspec '{pathspec}' did not match any files")]
     PathspecNotMatched { pathspec: String },
+    /// `add -u` pathspec named an untracked working-tree path that is not in
+    /// the index (any stage). Distinct from [`Self::PathspecNotMatched`] so
+    /// callers can tell "does not exist" from "exists but is not tracked".
+    #[error("pathspec '{pathspec}' did not match any file(s) known to the index")]
+    PathspecNotKnownToIndex { pathspec: String },
     /// The (canonical) pathspec resolves outside the repository working tree,
     /// for example via `..` traversal or an absolute path to another repo.
     #[error("'{path}' is outside repository at '{repo_root}'")]
@@ -211,10 +225,12 @@ impl From<AddError> for CliError {
             AddError::NotInRepo => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoNotFound)
                 .with_hint("run 'libra init' to create a repository"),
-            AddError::PathspecNotMatched { .. } => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-                .with_hint("check the path and try again.")
-                .with_hint("use 'libra status' to inspect tracked and untracked files."),
+            AddError::PathspecNotMatched { .. } | AddError::PathspecNotKnownToIndex { .. } => {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+                    .with_hint("check the path and try again.")
+                    .with_hint("use 'libra status' to inspect tracked and untracked files.")
+            }
             AddError::PathOutsideRepo { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("all paths must be within the repository working tree"),
@@ -452,6 +468,330 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     Ok(())
 }
 
+const CONFLICT_MARKER_SIZE: usize = 7;
+
+/// Git `die_for_incompatible_opt3` for `-u` / `-A` / `--resolved`.
+/// Kept out of the clap `mode` group so the diagnostic uses Git's
+/// `cannot be used together` wording instead of clap's `cannot be used with`.
+fn resolved_option_conflict(args: &AddArgs) -> Option<CliError> {
+    if !args.resolved {
+        return None;
+    }
+    if args.update && args.all {
+        return Some(CliError::command_usage(
+            "options '-u/--update', '-A/--all' and '--resolved' cannot be used together",
+        ));
+    }
+    if args.update {
+        return Some(CliError::command_usage(
+            "options '-u/--update' and '--resolved' cannot be used together",
+        ));
+    }
+    if args.all {
+        return Some(CliError::command_usage(
+            "options '-A/--all' and '--resolved' cannot be used together",
+        ));
+    }
+    None
+}
+
+fn collect_unmerged_paths(index: &Index) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for stage in 1..=3 {
+        for entry in index.tracked_entries(stage) {
+            paths.insert(entry.name.clone());
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn path_has_conflict_stages(index: &Index, name: &str) -> bool {
+    (1..=3).any(|stage| index.tracked(name, stage))
+}
+
+fn clear_conflict_stages(index: &mut Index, name: &str) {
+    for stage in 1..=3 {
+        index.remove(name, stage);
+    }
+}
+
+fn pathspec_looks_like_glob(raw: &str) -> bool {
+    raw.contains('*') || raw.contains('?') || raw.contains('[')
+}
+
+/// Whether default (non-verbose, non-dry-run) add summaries should go to
+/// stdout. Non-terminal stdout is silent, matching Git; tests default to
+/// silent unless `LIBRA_ADD_TTY` is set (same idea as the pager's
+/// `LIBRA_TEST` gate).
+fn stdout_is_tty_for_add() -> bool {
+    if env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some() {
+        return env::var_os("LIBRA_ADD_TTY").is_some();
+    }
+    io::stdout().is_terminal()
+}
+
+fn index_paths_any_stage(index: &Index) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    for stage in 0..=3 {
+        for entry in index.tracked_entries(stage) {
+            paths.insert(PathBuf::from(&entry.name));
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn remove_all_stages(index: &mut Index, name: &str) {
+    for stage in 0..=3 {
+        index.remove(name, stage);
+    }
+}
+
+/// Git `merge-ll.c:is_conflict_marker_line` with a fixed marker size of 7.
+fn is_conflict_marker_line(line: &[u8]) -> bool {
+    if line.len() < CONFLICT_MARKER_SIZE + 1 {
+        return false;
+    }
+    let first = line[0];
+    if !matches!(first, b'=' | b'>' | b'<' | b'|') {
+        return false;
+    }
+    if line[1..CONFLICT_MARKER_SIZE]
+        .iter()
+        .any(|&byte| byte != first)
+    {
+        return false;
+    }
+    let after = line[CONFLICT_MARKER_SIZE];
+    if matches!(first, b'<' | b'>') && after != b' ' {
+        return false;
+    }
+    after.is_ascii_whitespace()
+}
+
+fn line_is_binary(line: &[u8]) -> bool {
+    line.contains(&0)
+}
+
+/// Git `merge-ll.c:has_conflict_markers` without `conflict-marker-size`.
+fn file_has_conflict_markers(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let mut start = 0usize;
+    for i in 0..=bytes.len() {
+        if i != bytes.len() && bytes[i] != b'\n' {
+            continue;
+        }
+        let end = if i < bytes.len() { i + 1 } else { i };
+        let line = &bytes[start..end];
+        if is_conflict_marker_line(line) {
+            return true;
+        }
+        if line_is_binary(line) {
+            return false;
+        }
+        start = i.saturating_add(1);
+    }
+    false
+}
+
+fn worktree_regular_file_has_markers(workdir: &Path, rel: &str) -> bool {
+    let abs = workdir.join(rel);
+    let Ok(meta) = abs.symlink_metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    file_has_conflict_markers(&abs)
+}
+
+fn conflict_markers_error(paths: &[String]) -> CliError {
+    let listing = paths
+        .iter()
+        .map(|path| format!("\t{path}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    CliError::fatal(format!(
+        "the following paths still have conflict markers:\n{listing}"
+    ))
+    .with_stable_code(StableErrorCode::ConflictUnresolved)
+}
+
+fn stage_resolved_path(
+    file: &str,
+    index: &mut Index,
+    workdir: &Path,
+    storage_path: &Path,
+) -> Result<StagedAction, AddError> {
+    let rel = Path::new(file);
+    let file_abs = workdir.join(rel);
+    if !util::is_sub_path(&file_abs, workdir) {
+        return Err(AddError::PathOutsideRepo {
+            path: file.to_string(),
+            repo_root: workdir.to_path_buf(),
+        });
+    }
+    if util::is_sub_path(&file_abs, storage_path) {
+        return Ok(StagedAction::Unchanged);
+    }
+
+    match file_abs.symlink_metadata() {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            remove_all_stages(index, file);
+            Ok(StagedAction::Removed)
+        }
+        Err(source) => Err(AddError::CreateIndexEntry {
+            path: rel.to_path_buf(),
+            source,
+        }),
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(StagedAction::Unchanged),
+        Ok(_) => {
+            let pre_read = file_abs.symlink_metadata().ok();
+            let blob =
+                gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+                    path: rel.to_path_buf(),
+                    source,
+                })?;
+            blob.try_save().map_err(|source| AddError::ObjectSave {
+                path: rel.to_path_buf(),
+                source,
+            })?;
+            let entry =
+                crate::command::verified_index_entry(rel, blob.id, workdir, pre_read.as_ref())
+                    .map_err(|source| AddError::CreateIndexEntry {
+                        path: rel.to_path_buf(),
+                        source,
+                    })?;
+            for stage in 1..=3 {
+                index.remove(file, stage);
+            }
+            index.add(entry);
+            Ok(StagedAction::Modified)
+        }
+    }
+}
+
+async fn run_add_resolved(
+    args: &AddArgs,
+    workdir: &Path,
+    index_path: &Path,
+    storage_path: &Path,
+    layer_scope: &crate::internal::worktree_scope::WorktreeScope,
+    pathspec_ctx: PathspecMatchContext<'_>,
+    mut index: Index,
+) -> CliResult<AddOutput> {
+    let pathspecs = PathspecSet::from_workdir_with_default_icase(
+        &args.pathspec,
+        pathspec_ctx.current_dir,
+        pathspec_ctx.workdir,
+        pathspec_ctx.ignore_case,
+    )
+    .map_err(|source| AddError::Pathspec { source })?;
+
+    if !args.pathspec.is_empty() {
+        let index_paths = index_paths_any_stage(&index);
+        if let Some(raw) = pathspecs.unmatched_positive(&index_paths)
+            && !args.ignore_missing
+        {
+            return Err(CliError::from(AddError::PathspecNotMatched {
+                pathspec: raw.to_string(),
+            }));
+        }
+    }
+
+    let unmerged = collect_unmerged_paths(&index);
+    let files: Vec<String> = unmerged
+        .into_iter()
+        .filter(|path| pathspecs.matches_path(Path::new(path)))
+        .collect();
+
+    let mut add_output = AddOutput::empty(args.dry_run);
+    if files.is_empty() {
+        return Ok(add_output);
+    }
+
+    let leftover: Vec<String> = files
+        .iter()
+        .filter(|path| worktree_regular_file_has_markers(workdir, path))
+        .cloned()
+        .collect();
+    if !leftover.is_empty() {
+        return Err(conflict_markers_error(&leftover));
+    }
+
+    crate::internal::layer::verify_staging_context(workdir, layer_scope)?;
+    let owned: std::collections::HashSet<String> =
+        crate::internal::layer::LayerStore::owned_path_set_strict(layer_scope)
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!(
+                    "cannot verify layer-owned paths before staging: {e}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+            .into_iter()
+            .collect();
+    if !owned.is_empty() {
+        let blocked: Vec<String> = files
+            .iter()
+            .filter(|path| owned.contains(path.as_str()))
+            .cloned()
+            .collect();
+        if let Some(first) = blocked.first() {
+            return Err(CliError::from(AddError::LayerPath {
+                path: first.clone(),
+                count: blocked.len(),
+            }));
+        }
+    }
+
+    if !args.dry_run {
+        crate::command::lfs::enforce_lock_policy(&files)
+            .await
+            .map_err(AddError::LockPolicy)?;
+    }
+
+    if args.dry_run {
+        for file in &files {
+            match workdir.join(file).symlink_metadata() {
+                Err(_) => add_output.removed.push(file.clone()),
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+                Ok(_) => add_output.modified.push(file.clone()),
+            }
+        }
+        return Ok(add_output);
+    }
+
+    for file in &files {
+        match stage_resolved_path(file, &mut index, workdir, storage_path) {
+            Ok(action) => match action {
+                StagedAction::Modified => add_output.modified.push(file.clone()),
+                StagedAction::Removed => add_output.removed.push(file.clone()),
+                StagedAction::Added | StagedAction::Unchanged => {}
+            },
+            Err(err) => {
+                if !args.ignore_errors {
+                    return Err(CliError::from(err));
+                }
+                add_output.failed.push(AddFailure {
+                    path: file.clone(),
+                    message: err.to_string(),
+                });
+            }
+        }
+    }
+
+    index
+        .save(index_path)
+        .map_err(|source| AddError::IndexSave {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+
+    Ok(add_output)
+}
+
 /// Pure staging implementation that produces [`AddOutput`] without printing.
 ///
 /// Functional scope:
@@ -478,6 +818,10 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
 /// See: tests::test_add_all_flag in tests/command/add_test.rs:100;
 /// tests::test_add_force_tracks_ignored_file in tests/command/add_test.rs:319.
 pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
+    if let Some(err) = resolved_option_conflict(args) {
+        return Err(err);
+    }
+
     let workdir = util::try_working_dir().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -515,8 +859,15 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     };
 
     // Resolve pathspecs. `--renormalize` implies `-u` (tracked-only), so it also
-    // permits an empty pathspec (operate on the whole tracked set).
-    if args.pathspec.is_empty() && !args.all && !args.update && !args.refresh && !args.renormalize {
+    // permits an empty pathspec (operate on the whole tracked set). `--resolved`
+    // likewise does not require a pathspec: it operates on unmerged index paths.
+    if args.pathspec.is_empty()
+        && !args.all
+        && !args.update
+        && !args.refresh
+        && !args.renormalize
+        && !args.resolved
+    {
         return Err(CliError::command_usage("nothing specified, nothing added")
             .with_stable_code(StableErrorCode::CliInvalidArguments)
             .with_hint("maybe you wanted to say 'libra add .'?"));
@@ -538,6 +889,19 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         ignore_case,
     };
 
+    if args.resolved {
+        return run_add_resolved(
+            args,
+            &workdir,
+            &index_path,
+            &storage_path,
+            &layer_scope,
+            pathspec_ctx,
+            index,
+        )
+        .await;
+    }
+
     let (mut visible_changes, mut ignored_changes) = if args.force {
         status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
             .map_err(|source| AddError::Status { source })?
@@ -557,6 +921,8 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         &ignored_changes,
         &index,
         args.ignore_missing,
+        args.update,
+        args.update && args.ignore_errors,
     )?;
 
     let mut add_output = AddOutput::empty(args.dry_run);
@@ -607,6 +973,16 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         }
         filter_candidates(&f, &validated.pathspecs)
     };
+    // Unmerged-only paths have no stage 0, so the status change calc skips
+    // them. Ordinary add (not --renormalize) must still stage them.
+    if !args.renormalize {
+        for path in collect_unmerged_paths(&index) {
+            let candidate = PathBuf::from(&path);
+            if validated.pathspecs.matches_path(&candidate) && !files.contains(&candidate) {
+                files.push(candidate);
+            }
+        }
+    }
     filter_out_current_executable(&mut files);
     files.sort();
     files.dedup();
@@ -1016,12 +1392,15 @@ fn render_add_output(
     let stdout = io::stdout();
     let mut w = stdout.lock();
 
-    if dry_run {
-        render_dry_run(&mut w, result)?;
-    } else if !result.refreshed.is_empty() {
-        render_refresh(&mut w, result, verbose)?;
-    } else {
-        render_normal(&mut w, result, verbose)?;
+    let emit_body = dry_run || verbose || !result.refreshed.is_empty() || stdout_is_tty_for_add();
+    if emit_body {
+        if dry_run {
+            render_dry_run(&mut w, result)?;
+        } else if !result.refreshed.is_empty() {
+            render_refresh(&mut w, result, verbose)?;
+        } else {
+            render_normal(&mut w, result, verbose)?;
+        }
     }
 
     // Warnings to stderr
@@ -1189,6 +1568,8 @@ fn validate_pathspecs(
     ignored_changes: &Changes,
     index: &Index,
     ignore_missing: bool,
+    update_known_only: bool,
+    ignore_unknown_pathspecs: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
     let pathspecs = PathspecSet::from_workdir_with_default_icase(
         raw_pathspecs,
@@ -1198,11 +1579,16 @@ fn validate_pathspecs(
     )
     .map_err(|source| AddError::Pathspec { source })?;
 
-    let tracked_files = index.tracked_files();
+    let index_known = index_paths_any_stage(index);
     let change_candidates = collect_change_candidates(visible_changes);
     let ignored_candidates = collect_change_candidates(ignored_changes);
-    let selectable_candidates = pathspec_candidates(&change_candidates, &tracked_files);
+    let selectable_candidates = if update_known_only {
+        index_known
+    } else {
+        pathspec_candidates(&change_candidates, &index_known)
+    };
     let all_candidates = pathspec_candidates(&selectable_candidates, &ignored_candidates);
+    let untracked_candidates = visible_changes.new.clone();
 
     let mut ignored = Vec::new();
     let mut missing = Vec::new();
@@ -1218,6 +1604,20 @@ fn validate_pathspecs(
             if ignore_missing {
                 missing.push(raw.to_string());
                 continue;
+            }
+            if ignore_unknown_pathspecs {
+                continue;
+            }
+            if update_known_only
+                && !pathspec_looks_like_glob(raw)
+                && pathspecs
+                    .unmatched_positive_specs(&untracked_candidates)
+                    .iter()
+                    .all(|spec| *spec != raw)
+            {
+                return Err(AddError::PathspecNotKnownToIndex {
+                    pathspec: raw.to_string(),
+                });
             }
             return Err(AddError::PathspecNotMatched {
                 pathspec: raw.to_string(),
@@ -1395,18 +1795,21 @@ async fn stage_a_file(
                         source,
                     })?,
             );
+            clear_conflict_stages(index, file_str);
             Ok(StagedAction::Added)
         }
         FileStatus::Modified => {
-            if index.is_modified(file_str, 0, workdir) {
-                // Stat BEFORE reading — see the `New` arm.
+            let unmerged = path_has_conflict_stages(index, file_str);
+            let missing_stage0 = !index.tracked(file_str, 0);
+            let content_dirty = !missing_stage0 && index.is_modified(file_str, 0, workdir);
+            if unmerged || missing_stage0 || content_dirty {
                 let pre_read = file_abs.symlink_metadata().ok();
                 let blob =
                     gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
                         path: file.to_path_buf(),
                         source,
                     })?;
-                if !index.verify_hash(file_str, 0, &blob.id) {
+                if missing_stage0 || !index.verify_hash(file_str, 0, &blob.id) {
                     blob.try_save().map_err(|source| AddError::ObjectSave {
                         path: file.to_path_buf(),
                         source,
@@ -1423,13 +1826,14 @@ async fn stage_a_file(
                             source,
                         })?,
                     );
-                    return Ok(StagedAction::Modified);
                 }
+                clear_conflict_stages(index, file_str);
+                return Ok(StagedAction::Modified);
             }
             Ok(StagedAction::Unchanged)
         }
         FileStatus::Deleted => {
-            index.remove(file_str, 0);
+            remove_all_stages(index, file_str);
             Ok(StagedAction::Removed)
         }
         FileStatus::Unchanged => Ok(StagedAction::Unchanged),
@@ -1469,15 +1873,20 @@ fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileS
         path: file.to_path_buf(),
     })?;
     let file_abs = workdir.join(file);
+    let unmerged = path_has_conflict_stages(index, file_str);
     if file_abs.symlink_metadata().is_err() {
-        if index.tracked(file_str, 0) {
+        if index.tracked(file_str, 0) || unmerged {
             Ok(FileStatus::Deleted)
         } else {
             Ok(FileStatus::NotFound)
         }
     } else if !index.tracked(file_str, 0) {
-        Ok(FileStatus::New)
-    } else if index.is_modified(file_str, 0, workdir) {
+        if unmerged {
+            Ok(FileStatus::Modified)
+        } else {
+            Ok(FileStatus::New)
+        }
+    } else if unmerged || index.is_modified(file_str, 0, workdir) {
         Ok(FileStatus::Modified)
     } else {
         Ok(FileStatus::Unchanged)
@@ -1520,6 +1929,13 @@ mod test {
             "pathspec 'src/missing.rs' did not match any files",
         );
         assert_eq!(
+            AddError::PathspecNotKnownToIndex {
+                pathspec: "baz".to_string(),
+            }
+            .to_string(),
+            "pathspec 'baz' did not match any file(s) known to the index",
+        );
+        assert_eq!(
             AddError::PathOutsideRepo {
                 path: "/tmp/elsewhere".to_string(),
                 repo_root: PathBuf::from("/home/user/repo"),
@@ -1545,6 +1961,68 @@ mod test {
         assert!(AddArgs::try_parse_from(["test", "-A", "--refresh"]).is_err());
         assert!(AddArgs::try_parse_from(["test", "-u", "--refresh"]).is_err());
         assert!(AddArgs::try_parse_from(["test", "-A", "-u", "--refresh"]).is_err());
+    }
+
+    #[test]
+    fn test_pathspec_looks_like_glob() {
+        assert!(pathspec_looks_like_glob("b*"));
+        assert!(pathspec_looks_like_glob("file?.txt"));
+        assert!(pathspec_looks_like_glob("file[ab].txt"));
+        assert!(!pathspec_looks_like_glob("baz"));
+        assert!(!pathspec_looks_like_glob("top"));
+    }
+
+    #[test]
+    fn test_stdout_is_tty_for_add_respects_test_gate() {
+        // The unit test process sets LIBRA_TEST in some suites and not in
+        // others; the helper must not panic either way.
+        let _ = stdout_is_tty_for_add();
+    }
+
+    #[test]
+    fn test_args_accepts_resolved() {
+        let args = AddArgs::try_parse_from(["test", "--resolved"]).expect("parse --resolved");
+        assert!(args.resolved);
+        assert!(args.pathspec.is_empty());
+        // Combinations with -u/-A must parse so run_add can emit Git's wording.
+        let with_u = AddArgs::try_parse_from(["test", "--resolved", "-u"]).expect("parse");
+        assert!(with_u.resolved && with_u.update);
+        let with_a = AddArgs::try_parse_from(["test", "--resolved", "-A"]).expect("parse");
+        assert!(with_a.resolved && with_a.all);
+    }
+
+    #[test]
+    fn test_conflict_marker_line_matches_git() {
+        assert!(is_conflict_marker_line(b"<<<<<<< HEAD\n"));
+        assert!(is_conflict_marker_line(b"=======\n"));
+        assert!(is_conflict_marker_line(b">>>>>>> theirs\n"));
+        assert!(is_conflict_marker_line(
+            b"||||||| merged common ancestors\n"
+        ));
+        assert!(!is_conflict_marker_line(b"<<<<<< x\n"));
+        assert!(!is_conflict_marker_line(b"<<<<<<<HEAD\n"));
+        assert!(!is_conflict_marker_line(b"not a marker\n"));
+        assert!(!is_conflict_marker_line(b"=======")); // no trailing whitespace
+    }
+
+    #[test]
+    fn test_conflict_markers_stop_on_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("text.txt");
+        std::fs::write(
+            &text,
+            "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\n",
+        )
+        .unwrap();
+        assert!(file_has_conflict_markers(&text));
+
+        let marker_then_nul = dir.path().join("bin");
+        std::fs::write(&marker_then_nul, b"<<<<<<< HEAD\n\0ours").unwrap();
+        assert!(file_has_conflict_markers(&marker_then_nul));
+
+        let binary_first = dir.path().join("bin_first");
+        std::fs::write(&binary_first, b"\0<<<<<<< HEAD\n").unwrap();
+        assert!(!file_has_conflict_markers(&binary_first));
     }
 
     /// Scenario: smoke-test `total_staged` and `is_empty` because every

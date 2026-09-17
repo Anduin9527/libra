@@ -1592,6 +1592,7 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1626,6 +1627,7 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1677,6 +1679,7 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1711,6 +1714,7 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1761,6 +1765,7 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1884,6 +1889,7 @@ async fn test_rebase_preserves_untracked_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1934,6 +1940,7 @@ async fn test_rebase_preserves_untracked_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1984,6 +1991,7 @@ async fn test_rebase_preserves_untracked_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2082,6 +2090,7 @@ async fn test_rebase_already_up_to_date() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2116,6 +2125,7 @@ async fn test_rebase_already_up_to_date() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2204,6 +2214,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2254,6 +2265,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2304,6 +2316,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2443,6 +2456,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2492,6 +2506,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2542,6 +2557,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2706,6 +2722,7 @@ async fn test_rebase_continue_no_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2776,6 +2793,7 @@ async fn test_rebase_skip_no_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2848,6 +2866,7 @@ async fn test_rebase_with_conflict_and_abort() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2902,6 +2921,7 @@ async fn test_rebase_with_conflict_and_abort() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2952,6 +2972,7 @@ async fn test_rebase_with_conflict_and_abort() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3110,6 +3131,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3159,6 +3181,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3208,6 +3231,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3342,6 +3366,7 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3397,6 +3422,7 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3436,6 +3462,7 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3486,6 +3513,7 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3615,6 +3643,7 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3669,6 +3698,7 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3719,6 +3749,7 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3808,6 +3839,7 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -3890,6 +3922,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3941,6 +3974,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3980,6 +4014,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4015,6 +4050,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4065,6 +4101,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4211,6 +4248,7 @@ async fn test_rebase_state_persistence() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4261,6 +4299,7 @@ async fn test_rebase_state_persistence() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4311,6 +4350,7 @@ async fn test_rebase_state_persistence() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4458,6 +4498,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4524,6 +4565,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4625,6 +4667,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4691,6 +4734,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4793,6 +4837,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4859,6 +4904,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4961,6 +5007,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5011,6 +5058,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5061,6 +5109,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5170,6 +5219,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5221,6 +5271,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5271,6 +5322,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5394,6 +5446,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5445,6 +5498,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5513,6 +5567,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5635,6 +5690,7 @@ async fn test_rebase_continue_requires_resolution() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5685,6 +5741,7 @@ async fn test_rebase_continue_requires_resolution() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5735,6 +5792,7 @@ async fn test_rebase_continue_requires_resolution() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {

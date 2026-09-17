@@ -140,6 +140,7 @@ async fn test_remove_single_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -221,6 +222,7 @@ async fn test_remove_cached() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -283,6 +285,7 @@ async fn test_remove_directory_recursive() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -377,6 +380,7 @@ async fn test_remove_directory_without_recursive() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -470,6 +474,7 @@ async fn test_remove_modified_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -551,6 +556,7 @@ async fn test_remove_multiple_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -612,6 +618,7 @@ async fn test_remove_dry_run() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -682,6 +689,7 @@ async fn test_remove_dry_run_cached() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -741,6 +749,7 @@ async fn test_remove_dry_run_recursive() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -808,6 +817,7 @@ async fn test_remove_ignore_unmatch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -865,6 +875,7 @@ async fn test_remove_pathspec_from_file_newline() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -915,6 +926,7 @@ async fn test_remove_pathspec_from_file_nul() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -965,6 +977,7 @@ async fn test_remove_pathspec_from_file_ignore_unmatch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 

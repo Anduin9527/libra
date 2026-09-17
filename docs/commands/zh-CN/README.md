@@ -25,6 +25,8 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `--quiet` | `-q` | 抑制 stdout |
 | `--exit-code-on-warning` | | 出现警告时返回退出码 9 |
 | `--progress` | | 控制进度输出（`json`、`text`、`none`、`auto`） |
+| `--literal-pathspecs` | | 把 pathspec 当字面路径（不通配、不解析 `:(magic)`）。也可用 `GIT_LITERAL_PATHSPECS=1`。 |
+| `--no-literal-pathspecs` | | 取消 `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS`（后出现的标志生效）。 |
 
 ## 命令索引
 

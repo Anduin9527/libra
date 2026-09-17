@@ -9,6 +9,7 @@ libra add [OPTIONS] [PATHSPEC...]
 libra add -A
 libra add -u [PATHSPEC...]
 libra add --refresh [PATHSPEC...]
+libra add --resolved [PATHSPEC...]
 ```
 
 ## Description
@@ -34,7 +35,11 @@ as the link itself rather than as the target file's contents.
 ### `[PATHSPEC...]`
 
 One or more files or directories to stage. Paths are resolved relative to the current
-directory. Required unless `-A`, `-u`, or `--refresh` is specified.
+directory. Required unless `-A`, `-u`, `--refresh`, or `--resolved` is specified.
+
+The global `--literal-pathspecs` flag (and `GIT_LITERAL_PATHSPECS`) disables
+globbing and `:(magic)` for this invocation; `--no-literal-pathspecs` turns
+that off. Unlike Git, the flag is also accepted after `add`.
 
 Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or
 directory prefix, wildcard pathspecs are supported, and the high-value magic
@@ -67,7 +72,11 @@ libra add -A
 
 Update the index only where it already has entries matching the pathspec. Stages
 modifications and deletions of tracked files but does not add new (untracked) files.
-Mutually exclusive with `-A` and `--refresh`.
+A pathspec that names an untracked working-tree file is refused before any
+staging (`pathspec '…' did not match any file(s) known to the index`,
+`LBR-CLI-003`, exit 129) and the index is left unchanged. `--ignore-errors`
+skips that check and stages the paths that do match. Mutually exclusive with
+`-A` and `--refresh`.
 
 ```bash
 libra add -u
@@ -173,6 +182,23 @@ ignored-path warnings.
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
 ```
 
+### `--resolved`
+
+Stage only unmerged (conflict) paths. Working-tree copies still containing
+conflict markers are refused as a group (`LBR-CONFLICT-001`, exit 128) and the
+index is left unchanged. A path whose working-tree file was deleted is removed
+from the index. Does not require a pathspec; when one is given, only matching
+unmerged paths are considered. Unconflicted local modifications are not staged.
+
+Mutually exclusive with `-u`/`--update` and `-A`/`--all`. The diagnostic is
+Git's `options '…' and '--resolved' cannot be used together` (`LBR-CLI-002`,
+exit 129). Git reports the same combination as exit 128.
+
+```bash
+libra add --resolved
+libra add --resolved path/to/file
+```
+
 ## Common Commands
 
 ```bash
@@ -186,11 +212,21 @@ libra add --pathspec-from-file paths.txt
 libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 libra add --chmod=+x scripts/build.sh
 libra add --renormalize
+libra add --resolved
 ```
+
+Unmerged (conflict) paths are part of the same candidate set: `add`, `add -A`,
+`add .`, and `add -u` write the working-tree copy to stage 0 and drop stages
+1–3 in the same index transaction. Ordinary `add` does not check leftover
+conflict markers (`--resolved` does). Resolved unmerged paths are reported as
+modified, not as new files.
 
 ## Human Output
 
-Default human mode writes the staging summary to `stdout`.
+When stdout is a terminal, default human mode writes the staging summary.
+When stdout is redirected or piped, default mode is silent (matching Git).
+`-v` and `--dry-run` always print. `--quiet` still suppresses stdout.
+Stderr warnings are unchanged.
 
 Single file:
 
@@ -393,6 +429,9 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
 | Status computation failed | `LBR-REPO-002` | 128 | -- |
 | All paths ignored (nothing staged) | `LBR-ADD-001` | 128 | "use -f if you really want to add them" |
 | No pathspec and no mode flag | `LBR-CLI-001` | 129 | "maybe you wanted to say 'libra add .'?" |
+| `add -u` pathspec is untracked | `LBR-CLI-003` | 129 | "did not match any file(s) known to the index" |
+| `--resolved` combined with `-u` or `-A` | `LBR-CLI-002` | 129 | Git's `cannot be used together` wording (Git itself exits 128) |
+| `--resolved` with leftover conflict markers | `LBR-CONFLICT-001` | 128 | Lists every still-marked path; the index is not written |
 
 ## Compatibility Notes
 

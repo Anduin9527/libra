@@ -32,6 +32,7 @@ async fn add_and_commit(message: &str, pathspec: Vec<String>) {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )

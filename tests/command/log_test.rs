@@ -825,6 +825,7 @@ async fn test_log_patch_no_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -859,6 +860,7 @@ async fn test_log_patch_no_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -954,6 +956,7 @@ async fn test_log_patch_with_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1088,6 +1091,7 @@ async fn test_log_stat() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1121,6 +1125,7 @@ async fn test_log_stat() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1182,6 +1187,7 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1215,6 +1221,7 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1294,6 +1301,7 @@ async fn test_log_stat_with_modifications() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1327,6 +1335,7 @@ async fn test_log_stat_with_modifications() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1539,6 +1548,7 @@ async fn test_log_graph_simple_chain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1572,6 +1582,7 @@ async fn test_log_graph_simple_chain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1623,6 +1634,7 @@ async fn test_log_stat_and_graph_combined() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1759,6 +1771,7 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1793,6 +1806,7 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2043,6 +2057,7 @@ async fn test_log_grep_filtering() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2077,6 +2092,7 @@ async fn test_log_grep_filtering() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2111,6 +2127,7 @@ async fn test_log_grep_filtering() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2200,6 +2217,7 @@ async fn test_log_reverse_outputs_oldest_first() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2224,6 +2242,7 @@ async fn test_log_reverse_outputs_oldest_first() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2264,6 +2283,7 @@ async fn test_log_range_excludes_start_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2289,6 +2309,7 @@ async fn test_log_range_excludes_start_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2328,6 +2349,7 @@ async fn test_log_all_includes_branches() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2382,6 +2404,7 @@ async fn test_log_all_includes_branches() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2424,6 +2447,7 @@ async fn test_log_follow_detects_rename() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2449,6 +2473,7 @@ async fn test_log_follow_detects_rename() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2489,6 +2514,7 @@ async fn test_log_line_range_flag_accepted() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2977,6 +3003,7 @@ async fn commit_file(path: &str, content: &str, message: &str) -> String {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3305,6 +3332,38 @@ fn test_log_only_trailers_display_and_errors() {
     assert_eq!(out.status.code(), Some(129), "conflicts with --oneline");
     let out = run_libra_command(&["log", "--trailer", "=x", "--no-pager"], p);
     assert_eq!(out.status.code(), Some(129), "empty key is a usage error");
+}
+
+#[test]
+fn test_log_literal_pathspecs_global() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], p), "add x");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "x", "--no-verify"], p),
+        "commit x",
+    );
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "*.txt"], p), "add star");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "star", "--no-verify"], p),
+        "commit star",
+    );
+    let out = run_libra_command(
+        &["--literal-pathspecs", "log", "--oneline", "--", "*.txt"],
+        p,
+    );
+    assert_cli_success(&out, "log literal");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("star"), "{text}");
+    assert_eq!(
+        text.lines().filter(|line| !line.is_empty()).count(),
+        1,
+        "only the *.txt commit: {text}"
+    );
 }
 
 #[test]

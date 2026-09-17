@@ -249,6 +249,7 @@ async fn test_basic_cherry_pick() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -303,6 +304,7 @@ async fn test_basic_cherry_pick() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -344,6 +346,7 @@ async fn test_basic_cherry_pick() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -496,6 +499,7 @@ async fn test_cherry_pick_with_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -546,6 +550,7 @@ async fn test_cherry_pick_with_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -653,6 +658,7 @@ async fn test_cherry_pick_multiple_commits() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -704,6 +710,7 @@ async fn test_cherry_pick_multiple_commits() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -740,6 +747,7 @@ async fn test_cherry_pick_multiple_commits() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1006,6 +1014,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(commit::CommitArgs {
@@ -1055,6 +1064,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(commit::CommitArgs {

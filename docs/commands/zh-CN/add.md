@@ -9,6 +9,7 @@ libra add [OPTIONS] [PATHSPEC...]
 libra add -A
 libra add -u [PATHSPEC...]
 libra add --refresh [PATHSPEC...]
+libra add --resolved [PATHSPEC...]
 ```
 
 ## 说明
@@ -23,7 +24,9 @@ libra add --refresh [PATHSPEC...]
 
 ### `[PATHSPEC...]`
 
-要暂存的一个或多个文件或目录。路径相对于当前目录解析。除非指定 `-A`、`-u` 或 `--refresh`，否则必需。
+要暂存的一个或多个文件或目录。路径相对于当前目录解析。除非指定 `-A`、`-u`、`--refresh` 或 `--resolved`，否则必需。
+
+全局 `--literal-pathspecs`（以及 `GIT_LITERAL_PATHSPECS`）会关闭通配和 `:(magic)`；`--no-literal-pathspecs` 取消。与 Git 不同，该标志也可以写在 `add` 子命令之后。
 
 Pathspec 使用 Libra 共享的 Git 风格匹配器：普通 pathspec 匹配文件或目录前缀，支持通配符，并支持高价值 magic 形式 `:(top)`、`:/`、`:(glob)`、`:(literal)`、`:(icase)`、`:(exclude)`、`:!`、`:^`。排除 pathspec 会从正向选择中扣除；启用 `core.ignorecase` 时，匹配会按忽略大小写处理。看起来像通配符的 pathspec 也会匹配同名的字面路径或目录前缀，以保留 Git 对 bracket 文件名和目录名的行为。
 
@@ -45,7 +48,7 @@ libra add -A
 
 ### `-u, --update`
 
-只更新索引中已有并匹配 pathspec 的条目。暂存已跟踪文件的修改和删除，但不添加新（未跟踪）文件。与 `-A` 和 `--refresh` 互斥。
+只更新索引中已有并匹配 pathspec 的条目。暂存已跟踪文件的修改和删除，但不添加新（未跟踪）文件。pathspec 若只点到工作树里的未跟踪文件，会在任何暂存之前拒绝（`pathspec '…' did not match any file(s) known to the index`，`LBR-CLI-003`，退出码 129），索引不变。`--ignore-errors` 会跳过该校验并暂存能匹配的路径。与 `-A` 和 `--refresh` 互斥。
 
 ```bash
 libra add -u
@@ -136,6 +139,17 @@ libra add --renormalize src/
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
 ```
 
+### `--resolved`
+
+只暂存未合并（冲突）路径。工作树里仍含冲突标记的文件会整组拒绝（`LBR-CONFLICT-001`，退出码 128），索引不做任何写入。工作树文件已被删除的路径会从索引移除。不要求 pathspec；给出 pathspec 时只处理匹配的未合并路径。未冲突的本地修改不会被顺带暂存。
+
+与 `-u`/`--update`、`-A`/`--all` 互斥。诊断文案为 Git 的 `options '…' and '--resolved' cannot be used together`（`LBR-CLI-002`，退出码 129）。Git 对同一组合退出 128。
+
+```bash
+libra add --resolved
+libra add --resolved path/to/file
+```
+
 ## 常用命令
 
 ```bash
@@ -149,11 +163,14 @@ libra add --pathspec-from-file paths.txt
 libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 libra add --chmod=+x scripts/build.sh
 libra add --renormalize
+libra add --resolved
 ```
+
+未合并（冲突）路径也在同一候选集里：`add`、`add -A`、`add .`、`add -u` 会把工作树内容写入 stage 0，并在同一索引事务里删掉 stage 1–3。普通 `add` 不检查残留冲突标记（`--resolved` 会检查）。解决后的未合并路径记为 modified，而不是 new file。
 
 ## 人类可读输出
 
-默认人类模式将暂存摘要写到 `stdout`。
+stdout 是终端时，默认人类模式才写暂存摘要。stdout 被重定向或接到管道时默认静默（与 Git 一致）。`-v` 与 `--dry-run` 总会打印。`--quiet` 仍然抑制 stdout。stderr 警告不受终端判定影响。
 
 单个文件：
 
@@ -334,6 +351,9 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | 状态计算失败 | `LBR-REPO-002` | 128 | -- |
 | 所有路径都被忽略（未暂存任何内容） | `LBR-ADD-001` | 128 | "use -f if you really want to add them" |
 | 无 pathspec 且无模式标志 | `LBR-CLI-001` | 129 | "maybe you wanted to say 'libra add .'?" |
+| `add -u` 的 pathspec 是未跟踪文件 | `LBR-CLI-003` | 129 | "did not match any file(s) known to the index" |
+| `--resolved` 与 `-u` 或 `-A` 同用 | `LBR-CLI-002` | 129 | Git 的 `cannot be used together` 文案（Git 自身退出 128） |
+| `--resolved` 时工作树仍含冲突标记 | `LBR-CONFLICT-001` | 128 | 列出全部仍含标记的路径；不写索引 |
 
 ## 兼容性说明
 

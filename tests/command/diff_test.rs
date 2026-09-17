@@ -526,6 +526,7 @@ async fn test_diff_after_init() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     let staged_file = output_dir.path().join("diff_staged_output.txt");
@@ -569,6 +570,7 @@ async fn test_basic_diff() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -639,6 +641,7 @@ async fn test_diff_staged() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -676,6 +679,7 @@ async fn test_diff_staged() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -739,6 +743,7 @@ async fn test_diff_between_commits() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -778,6 +783,7 @@ async fn test_diff_between_commits() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -858,6 +864,7 @@ async fn test_diff_with_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -936,6 +943,7 @@ async fn test_diff_output_to_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1009,6 +1017,7 @@ async fn test_diff_algorithms() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 

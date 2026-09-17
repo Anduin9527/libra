@@ -326,6 +326,16 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "N")]
     max_connections: Option<usize>,
 
+    /// Treat all pathspecs as literal (no glob, no `:(magic)`). Also settable
+    /// via `GIT_LITERAL_PATHSPECS`. Overridden by `--no-literal-pathspecs`.
+    #[arg(long, global = true, overrides_with = "no_literal_pathspecs")]
+    literal_pathspecs: bool,
+
+    /// Cancel `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` for this
+    /// invocation (last flag wins).
+    #[arg(long, global = true, overrides_with = "literal_pathspecs")]
+    no_literal_pathspecs: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -2233,6 +2243,21 @@ fn apply_global_runtime_flags(args: &Cli) -> CliResult<()> {
     };
     utils::resource_limits::set_max_connections(max_connections);
 
+    let (env_literal, invalid_literal) = utils::pathspec::literal_pathspecs_from_env();
+    if let Some(raw) = invalid_literal {
+        crate::utils::error::emit_warning(format!(
+            "ignoring unrecognized GIT_LITERAL_PATHSPECS value '{raw}'"
+        ));
+    }
+    let literal = if args.no_literal_pathspecs {
+        false
+    } else if args.literal_pathspecs {
+        true
+    } else {
+        env_literal
+    };
+    utils::pathspec::set_literal_pathspecs(literal);
+
     Ok(())
 }
 
@@ -3911,5 +3936,25 @@ mod tests {
             shell_quote_path(Path::new(r"C:\Program Files\repo")),
             r#""C:\Program Files\repo""#
         );
+    }
+
+    #[test]
+    fn literal_pathspecs_is_global_and_last_flag_wins() {
+        let on = Cli::try_parse_from(["libra", "--literal-pathspecs", "status"]).unwrap();
+        assert!(on.literal_pathspecs);
+        assert!(!on.no_literal_pathspecs);
+
+        let off = Cli::try_parse_from([
+            "libra",
+            "--literal-pathspecs",
+            "--no-literal-pathspecs",
+            "status",
+        ])
+        .unwrap();
+        assert!(off.no_literal_pathspecs);
+
+        // Libra accepts the flag after the subcommand (intentional vs Git).
+        let after = Cli::try_parse_from(["libra", "add", "--literal-pathspecs", "."]).unwrap();
+        assert!(after.literal_pathspecs);
     }
 }

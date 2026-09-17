@@ -31,6 +31,7 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -261,6 +262,7 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -288,6 +290,7 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1051,6 +1054,7 @@ async fn test_for_each_ref_sort_by_committerdate() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1081,6 +1085,7 @@ async fn test_for_each_ref_sort_by_committerdate() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1160,6 +1165,7 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1190,6 +1196,7 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1274,6 +1281,7 @@ async fn test_for_each_ref_sort_peels_nested_annotated_tags() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1752,6 +1760,7 @@ async fn test_for_each_ref_deref_size_errors_on_broken_tag_chain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2744,6 +2753,7 @@ async fn test_for_each_ref_symref_atom() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {

@@ -50,6 +50,7 @@ async fn test_add_single_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -87,6 +88,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )
@@ -118,6 +120,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )
@@ -175,6 +178,7 @@ async fn test_add_dispatches_vcs_automation_history() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -222,6 +226,7 @@ async fn test_add_dry_run_does_not_dispatch_vcs_automation_history() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -270,6 +275,7 @@ async fn test_add_multiple_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -328,6 +334,7 @@ async fn test_add_all_flag() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -390,6 +397,7 @@ async fn test_add_update_flag() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -423,6 +431,7 @@ async fn test_add_update_flag() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -494,6 +503,7 @@ async fn test_add_with_ignore_patterns() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -580,6 +590,7 @@ async fn test_add_force_tracks_ignored_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -606,6 +617,7 @@ async fn test_add_force_tracks_ignored_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -642,6 +654,7 @@ async fn test_add_force_tracks_ignored_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -692,6 +705,7 @@ async fn test_add_force_dot_includes_ignored_directory() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -726,6 +740,7 @@ async fn test_add_force_dot_includes_ignored_directory() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -770,6 +785,7 @@ async fn test_add_dry_run() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -809,6 +825,7 @@ async fn test_add_without_path_should_error() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -847,6 +864,7 @@ async fn test_add_nonexistent_file_should_error() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -889,6 +907,7 @@ async fn test_add_duplicate_file_should_not_duplicate_index() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
 
@@ -936,6 +955,7 @@ async fn test_add_empty_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -978,6 +998,7 @@ async fn test_add_sub_directory_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1021,6 +1042,7 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1064,6 +1086,7 @@ async fn test_add_pathspec_from_file_nul_stages_listed_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1382,4 +1405,649 @@ async fn test_add_ignore_missing_triggers_warning_exit() {
         p,
     );
     assert!(clean.status.success(), "no warning -> success exit");
+}
+
+fn t2207_conflicted_repo() -> tempfile::TempDir {
+    let repo = tempdir().expect("tempdir");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    for name in ["file1.txt", "file2.txt", "file3.txt", "file4.txt"] {
+        fs::write(p.join(name), "base\n").unwrap();
+    }
+    assert_cli_success(
+        &run_libra_command(
+            &["add", "file1.txt", "file2.txt", "file3.txt", "file4.txt"],
+            p,
+        ),
+        "add base files",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "initial", "--no-verify"], p),
+        "commit initial",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "topic"], p), "branch topic");
+    fs::write(p.join("file1.txt"), "ours 1\n").unwrap();
+    fs::write(p.join("file2.txt"), "ours 2\n").unwrap();
+    fs::write(p.join("file3.txt"), "ours 3\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "file1.txt", "file2.txt", "file3.txt"], p),
+        "add ours",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours", "--no-verify"], p),
+        "commit ours",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "topic"], p), "switch topic");
+    fs::write(p.join("file1.txt"), "theirs 1\n").unwrap();
+    fs::write(p.join("file2.txt"), "theirs 2\n").unwrap();
+    fs::write(p.join("file3.txt"), "theirs 3\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "file1.txt", "file2.txt", "file3.txt"], p),
+        "add theirs",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs", "--no-verify"], p),
+        "commit theirs",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    let merge = run_libra_command(&["merge", "topic"], p);
+    assert!(
+        !merge.status.success(),
+        "expected a content conflict, stderr:\n{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    repo
+}
+
+fn ls_unmerged(p: &std::path::Path, path: &str) -> String {
+    let out = if path.is_empty() {
+        run_libra_command(&["ls-files", "-u"], p)
+    } else {
+        run_libra_command(&["ls-files", "-u", path], p)
+    };
+    assert_cli_success(&out, "ls-files -u");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn ls_staged(p: &std::path::Path, path: &str) -> String {
+    let out = run_libra_command(&["ls-files", "-s", path], p);
+    assert_cli_success(&out, "ls-files -s");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn unmerged_line_count(text: &str) -> usize {
+    text.lines().filter(|line| !line.is_empty()).count()
+}
+
+fn index_bytes(p: &std::path::Path) -> Vec<u8> {
+    fs::read(p.join(".libra/index")).expect("read index")
+}
+
+/// Port of git `t/t2207-add-resolved.sh` (R1–R10 / AU-06).
+#[test]
+fn test_t2207_add_resolved_matrix() {
+    // R6: option conflict does not need a merge; still run inside a repo.
+    {
+        let repo = tempdir().unwrap();
+        init_repo_via_cli(repo.path());
+        let with_u = run_libra_command(&["add", "--resolved", "-u"], repo.path());
+        assert_eq!(with_u.status.code(), Some(129), "resolved -u exits 129");
+        let err = String::from_utf8_lossy(&with_u.stderr);
+        assert!(
+            err.contains("cannot be used together"),
+            "resolved -u diagnostic: {err}"
+        );
+        let with_a = run_libra_command(&["add", "--resolved", "-A"], repo.path());
+        assert_eq!(with_a.status.code(), Some(129), "resolved -A exits 129");
+        let err = String::from_utf8_lossy(&with_a.stderr);
+        assert!(
+            err.contains("cannot be used together"),
+            "resolved -A diagnostic: {err}"
+        );
+        let with_p = run_libra_command(&["add", "--resolved", "-p"], repo.path());
+        assert_eq!(with_p.status.code(), Some(129), "-p is still unknown");
+    }
+
+    // R7: no unmerged entries → success, no index write.
+    {
+        let repo = tempdir().unwrap();
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        fs::write(p.join("clean.txt"), "ok\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "clean.txt"], p), "add clean");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "clean", "--no-verify"], p),
+            "commit clean",
+        );
+        let before = index_bytes(p);
+        let out = run_libra_command(&["add", "--resolved"], p);
+        assert_cli_success(&out, "resolved with no unmerged paths");
+        assert_eq!(index_bytes(p), before, "R7 must not rewrite the index");
+    }
+
+    // R1: leftover markers refuse the whole operation and leave the index.
+    {
+        let repo = t2207_conflicted_repo();
+        let p = repo.path();
+        fs::write(p.join("file1.txt"), "resolved 1\n").unwrap();
+        let before = index_bytes(p);
+        let out = run_libra_command(&["add", "--resolved"], p);
+        assert!(!out.status.success(), "R1 must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("the following paths still have conflict markers:"),
+            "R1 message: {err}"
+        );
+        assert!(err.contains("file2.txt"), "R1 lists file2: {err}");
+        assert!(err.contains("file3.txt"), "R1 lists file3: {err}");
+        assert_eq!(index_bytes(p), before, "R1 zero index writes");
+        assert_eq!(unmerged_line_count(&ls_unmerged(p, "file1.txt")), 3);
+    }
+
+    // R8 dry-run with leftover markers still fails; with all resolved, no write.
+    {
+        let repo = t2207_conflicted_repo();
+        let p = repo.path();
+        let dry_fail = run_libra_command(&["add", "--dry-run", "--resolved"], p);
+        assert!(
+            !dry_fail.status.success(),
+            "dry-run still checks markers: {}",
+            String::from_utf8_lossy(&dry_fail.stderr)
+        );
+        fs::write(p.join("file1.txt"), "resolved 1\n").unwrap();
+        fs::write(p.join("file2.txt"), "resolved 2\n").unwrap();
+        fs::write(p.join("file3.txt"), "resolved 3\n").unwrap();
+        let before = index_bytes(p);
+        let dry_ok = run_libra_command(&["add", "--dry-run", "--resolved"], p);
+        assert_cli_success(&dry_ok, "dry-run resolved after markers removed");
+        assert_eq!(index_bytes(p), before, "R8 dry-run must not write");
+        assert!(!ls_unmerged(p, "").trim().is_empty(), "still unmerged");
+    }
+
+    // R2: all markers gone → stages collapse to stage 0.
+    {
+        let repo = t2207_conflicted_repo();
+        let p = repo.path();
+        fs::write(p.join("file1.txt"), "resolved 1\n").unwrap();
+        fs::write(p.join("file2.txt"), "resolved 2\n").unwrap();
+        fs::write(p.join("file3.txt"), "resolved 3\n").unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "--resolved"], p),
+            "resolved all files",
+        );
+        assert!(ls_unmerged(p, "").trim().is_empty(), "R2 ls-files -u empty");
+        assert_eq!(unmerged_line_count(&ls_staged(p, "file1.txt")), 1);
+        assert_eq!(unmerged_line_count(&ls_staged(p, "file2.txt")), 1);
+        assert_eq!(unmerged_line_count(&ls_staged(p, "file3.txt")), 1);
+    }
+
+    // R3: unconflicted dirty file is left unstaged.
+    {
+        let repo = t2207_conflicted_repo();
+        let p = repo.path();
+        let mut file4 = fs::read_to_string(p.join("file4.txt")).unwrap();
+        file4.push_str("unconflicted local change\n");
+        fs::write(p.join("file4.txt"), &file4).unwrap();
+        fs::write(p.join("file1.txt"), "resolved 1\n").unwrap();
+        fs::write(p.join("file2.txt"), "resolved 2\n").unwrap();
+        fs::write(p.join("file3.txt"), "resolved 3\n").unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "--resolved"], p),
+            "resolved ignoring file4",
+        );
+        assert!(ls_unmerged(p, "").trim().is_empty());
+        let diff = run_libra_command(&["diff", "file4.txt"], p);
+        assert_cli_success(&diff, "diff file4");
+        let diff_text = String::from_utf8_lossy(&diff.stdout);
+        assert!(
+            diff_text.contains("unconflicted local change"),
+            "file4 stays unstaged: {diff_text}"
+        );
+        let cached = run_libra_command(&["diff", "--cached", "file4.txt"], p);
+        assert_cli_success(&cached, "diff --cached file4");
+        assert!(
+            String::from_utf8_lossy(&cached.stdout).trim().is_empty(),
+            "file4 must not be cached"
+        );
+    }
+
+    // R4: deleted conflict file is removed from the index.
+    {
+        let repo = t2207_conflicted_repo();
+        let p = repo.path();
+        fs::write(p.join("file1.txt"), "resolved 1\n").unwrap();
+        fs::remove_file(p.join("file2.txt")).unwrap();
+        fs::write(p.join("file3.txt"), "resolved 3\n").unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "--resolved"], p),
+            "resolved with deletion",
+        );
+        assert!(
+            ls_staged(p, "file2.txt").trim().is_empty(),
+            "R4 file2 gone from index"
+        );
+    }
+
+    // R5: pathspec limits which unmerged path is resolved.
+    {
+        let repo = t2207_conflicted_repo();
+        let p = repo.path();
+        fs::write(p.join("file1.txt"), "resolved 1\n").unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "--resolved", "file1.txt"], p),
+            "resolved pathspec file1",
+        );
+        assert!(
+            ls_unmerged(p, "file1.txt").trim().is_empty(),
+            "file1 resolved"
+        );
+        assert_eq!(unmerged_line_count(&ls_unmerged(p, "file2.txt")), 3);
+    }
+
+    // R9: binary worktree content (NUL before any marker) is not treated as
+    // leftover markers. R10: --json reports resolved paths as modified.
+    {
+        let repo = t2207_conflicted_repo();
+        let p = repo.path();
+        fs::write(p.join("file1.txt"), b"\0binary-resolved").unwrap();
+        fs::write(p.join("file2.txt"), "resolved 2\n").unwrap();
+        fs::write(p.join("file3.txt"), "resolved 3\n").unwrap();
+        let json = run_libra_command(&["--json", "add", "--resolved"], p);
+        assert_cli_success(&json, "json resolved");
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json stdout");
+        let modified = value["data"]["modified"]
+            .as_array()
+            .expect("modified array");
+        let names: Vec<&str> = modified.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            names.contains(&"file1.txt")
+                && names.contains(&"file2.txt")
+                && names.contains(&"file3.txt"),
+            "json modified: {names:?}"
+        );
+        assert!(
+            value["data"]["added"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "resolved paths are modified, not added"
+        );
+        assert!(ls_unmerged(p, "").trim().is_empty());
+    }
+}
+
+fn run_libra_env(
+    args: &[&str],
+    cwd: &std::path::Path,
+    extra: &[(&str, &str)],
+) -> std::process::Output {
+    spawn_libra_command_with_env(args, cwd, extra)
+        .wait_with_output()
+        .expect("wait libra")
+}
+
+fn committed_top_and_untracked_baz() -> tempfile::TempDir {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("top"), "tracked\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "top"], p), "add top");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("top"), "tracked\nmodified\n").unwrap();
+    fs::write(p.join("baz"), "untracked\n").unwrap();
+    repo
+}
+
+/// AU-01 / M-UPD: `add -u` pathspec must name index-known paths.
+#[test]
+fn test_add_update_untracked_pathspec_fails_atomically_matrix() {
+    // U1/U2: untracked `baz` fails the whole `add -u` and leaves the index.
+    {
+        let repo = committed_top_and_untracked_baz();
+        let p = repo.path();
+        let before = index_bytes(p);
+        let out = run_libra_command(&["add", "-u", "baz", "top"], p);
+        assert!(!out.status.success(), "U1 must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("pathspec 'baz' did not match any file(s) known to the index"),
+            "U1 diagnostic: {err}"
+        );
+        assert_eq!(index_bytes(p), before, "U1 zero index writes");
+        let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+        assert!(
+            String::from_utf8_lossy(&cached.stdout).trim().is_empty(),
+            "U1 nothing staged"
+        );
+
+        let out = run_libra_command(&["add", "-u", "baz"], p);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("did not match any file(s) known to the index")
+        );
+        let out = run_libra_command(&["add", "-u", "top", "baz"], p);
+        assert!(!out.status.success());
+        assert_eq!(index_bytes(p), before);
+    }
+
+    // U3: glob that matches nothing in the index.
+    {
+        let repo = committed_top_and_untracked_baz();
+        let p = repo.path();
+        let before = index_bytes(p);
+        let out = run_libra_command(&["add", "-u", "b*", "top"], p);
+        assert!(!out.status.success(), "U3 glob must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("pathspec 'b*' did not match any files"),
+            "U3 diagnostic: {err}"
+        );
+        assert_eq!(index_bytes(p), before);
+    }
+
+    // U4: missing pathspec.
+    {
+        let repo = committed_top_and_untracked_baz();
+        let p = repo.path();
+        let before = index_bytes(p);
+        let out = run_libra_command(&["add", "-u", "nothere"], p);
+        assert!(!out.status.success(), "U4 must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("did not match any files"),
+            "U4 diagnostic"
+        );
+        assert_eq!(index_bytes(p), before);
+    }
+
+    // U5: dry-run still fails before preview / writes.
+    {
+        let repo = committed_top_and_untracked_baz();
+        let p = repo.path();
+        let before = index_bytes(p);
+        let out = run_libra_command(&["add", "-u", "-n", "baz", "top"], p);
+        assert!(!out.status.success(), "U5 dry-run must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "U5 no preview before failure: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(index_bytes(p), before);
+    }
+
+    // U6: --ignore-errors skips the unknown pathspec and stages the rest.
+    {
+        let repo = committed_top_and_untracked_baz();
+        let p = repo.path();
+        let out = run_libra_command(&["add", "-u", "--ignore-errors", "baz", "top"], p);
+        assert_cli_success(&out, "U6 ignore-errors");
+        let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+        let names = String::from_utf8_lossy(&cached.stdout);
+        assert!(names.contains("top"), "U6 staged top: {names}");
+        assert!(!names.contains("baz"), "U6 did not stage baz: {names}");
+    }
+
+    // U7: without -u, untracked baz is a valid add candidate.
+    {
+        let repo = committed_top_and_untracked_baz();
+        let p = repo.path();
+        assert_cli_success(
+            &run_libra_command(&["add", "baz", "top"], p),
+            "U7 add without -u",
+        );
+        let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+        let names = String::from_utf8_lossy(&cached.stdout);
+        assert!(names.contains("baz") && names.contains("top"), "{names}");
+    }
+
+    // U9: JSON envelope uses LBR-CLI-003.
+    {
+        let repo = committed_top_and_untracked_baz();
+        let p = repo.path();
+        let out = run_libra_command(&["--json", "add", "-u", "baz", "top"], p);
+        assert!(!out.status.success());
+        let blob = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(blob.contains("LBR-CLI-003"), "U9 error code: {blob}");
+    }
+}
+
+fn one_file_conflict_repo() -> tempfile::TempDir {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("c.txt"), "base\n").unwrap();
+    fs::write(p.join("bystander.txt"), "side\n").unwrap();
+    fs::write(p.join("k.txt"), "keep\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "c.txt", "bystander.txt", "k.txt"], p),
+        "add base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "other"], p), "branch other");
+    fs::write(p.join("c.txt"), "ours\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "c.txt"], p), "add ours");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours", "--no-verify"], p),
+        "commit ours",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "other"], p), "switch other");
+    fs::write(p.join("c.txt"), "theirs\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "c.txt"], p), "add theirs");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs", "--no-verify"], p),
+        "commit theirs",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    let merge = run_libra_command(&["merge", "other"], p);
+    assert!(!merge.status.success(), "expected conflict");
+    repo
+}
+
+/// AU-02 / M-UNM: staging an unmerged path writes stage 0 and drops 1–3.
+#[test]
+fn test_add_resolves_unmerged_entries_matrix() {
+    // N1: explicit add of a resolved conflict path.
+    {
+        let repo = one_file_conflict_repo();
+        let p = repo.path();
+        fs::write(p.join("c.txt"), "resolved\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "c.txt"], p), "N1 add c.txt");
+        assert!(ls_unmerged(p, "c.txt").trim().is_empty(), "N1 no UU");
+        assert_eq!(unmerged_line_count(&ls_staged(p, "c.txt")), 1);
+        let json = run_libra_command(&["--json", "status", "--short"], p);
+        // status --short after resolve should not show UU
+        let short = run_libra_command(&["status", "--short"], p);
+        let text = String::from_utf8_lossy(&short.stdout);
+        assert!(!text.contains("UU c.txt"), "N1 status after add: {text}");
+        let _ = json;
+    }
+
+    // N2/N3: -A / . / -u also resolve unmerged paths.
+    for args in [vec!["add", "-A"], vec!["add", "."], vec!["add", "-u"]] {
+        let repo = one_file_conflict_repo();
+        let p = repo.path();
+        fs::write(p.join("c.txt"), "resolved\n").unwrap();
+        assert_cli_success(&run_libra_command(&args, p), &format!("N2/N3 {args:?}"));
+        assert!(
+            ls_unmerged(p, "c.txt").trim().is_empty(),
+            "{args:?} left unmerged"
+        );
+    }
+
+    // N4: leftover markers are still staged by ordinary add.
+    {
+        let repo = one_file_conflict_repo();
+        let p = repo.path();
+        assert_cli_success(
+            &run_libra_command(&["add", "-u", "c.txt"], p),
+            "N4 add -u with markers",
+        );
+        assert!(ls_unmerged(p, "c.txt").trim().is_empty());
+    }
+
+    // N6: deleted conflict path is removed from the index.
+    {
+        let repo = one_file_conflict_repo();
+        let p = repo.path();
+        fs::remove_file(p.join("c.txt")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", "-u"], p), "N6 add -u delete");
+        assert!(ls_staged(p, "c.txt").trim().is_empty());
+    }
+
+    // N7: dry-run previews the unmerged path and does not write.
+    {
+        let repo = one_file_conflict_repo();
+        let p = repo.path();
+        fs::write(p.join("c.txt"), "resolved\n").unwrap();
+        let before = index_bytes(p);
+        let out = run_libra_command(&["add", "-u", "-n"], p);
+        assert_cli_success(&out, "N7 dry-run");
+        assert_eq!(index_bytes(p), before);
+        assert!(!ls_unmerged(p, "c.txt").trim().is_empty());
+        let preview = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            preview.contains("c.txt"),
+            "N7 preview includes unmerged path: {preview}"
+        );
+    }
+
+    // N9: JSON classifies the resolved path as modified.
+    {
+        let repo = one_file_conflict_repo();
+        let p = repo.path();
+        fs::write(p.join("c.txt"), "resolved\n").unwrap();
+        let json = run_libra_command(&["--json", "add", "c.txt"], p);
+        assert_cli_success(&json, "N9 json add");
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+        let modified = value["data"]["modified"].as_array().expect("modified");
+        assert!(
+            modified.iter().any(|v| v.as_str() == Some("c.txt")),
+            "N9 modified: {modified:?}"
+        );
+        assert!(
+            value["data"]["added"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+            "N9 not added"
+        );
+    }
+}
+
+/// AU-02 N5: deleting a bystander during a conflict does not rename-pair.
+#[test]
+fn test_t2200_add_u_avoids_rename_pairing_on_unmerged_paths() {
+    let repo = one_file_conflict_repo();
+    let p = repo.path();
+    fs::write(p.join("c.txt"), "resolved\n").unwrap();
+    fs::remove_file(p.join("bystander.txt")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-u"], p), "N5 add -u");
+    assert!(ls_unmerged(p, "").trim().is_empty(), "N5 no unmerged");
+    let listed = run_libra_command(&["ls-files", "bystander.txt", "c.txt"], p);
+    assert_cli_success(&listed, "ls-files");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("c.txt"), "{text}");
+    assert!(!text.contains("bystander.txt"), "{text}");
+}
+
+/// AU-03 / M-OUT: default add is silent when stdout is not a terminal.
+#[test]
+fn test_add_default_output_silent_when_not_terminal_matrix() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("a.txt"), "a\n").unwrap();
+
+    // O1: piped CLI stdout is empty on a successful default add.
+    let out = run_libra_command(&["add", "a.txt"], p);
+    assert_cli_success(&out, "O1 add");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "O1 stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // O3: -v still prints.
+    fs::write(p.join("b.txt"), "b\n").unwrap();
+    let verbose = run_libra_command(&["add", "-v", "b.txt"], p);
+    assert_cli_success(&verbose, "O3 -v");
+    assert!(
+        !String::from_utf8_lossy(&verbose.stdout).trim().is_empty(),
+        "O3 -v should print"
+    );
+
+    // O4: dry-run still prints.
+    fs::write(p.join("c.txt"), "c\n").unwrap();
+    let dry = run_libra_command(&["add", "-n", "c.txt"], p);
+    assert_cli_success(&dry, "O4 dry-run");
+    assert!(
+        String::from_utf8_lossy(&dry.stdout).contains("c.txt"),
+        "O4 dry-run preview"
+    );
+
+    // O2: forcing the TTY helper emits the existing summary.
+    fs::write(p.join("d.txt"), "d\n").unwrap();
+    let tty = run_libra_env(&["add", "d.txt"], p, &[("LIBRA_ADD_TTY", "1")]);
+    assert_cli_success(&tty, "O2 LIBRA_ADD_TTY");
+    assert!(
+        String::from_utf8_lossy(&tty.stdout).contains("d.txt"),
+        "O2 tty summary: {}",
+        String::from_utf8_lossy(&tty.stdout)
+    );
+}
+
+/// AU-04 / M-LIT: global `--literal-pathspecs` for `add`.
+#[test]
+fn test_literal_pathspecs_global_add_matrix() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("x.txt"), "x\n").unwrap();
+    fs::write(p.join("*.txt"), "star\n").unwrap();
+
+    // L4: literal mode only stages the file named `*.txt`.
+    let out = run_libra_command(&["--literal-pathspecs", "add", "--", "*.txt"], p);
+    assert_cli_success(&out, "L4 literal add");
+    let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    let names = String::from_utf8_lossy(&cached.stdout);
+    assert!(names.contains("*.txt"), "{names}");
+    assert!(!names.contains("x.txt"), "{names}");
+
+    // L8: flag after the subcommand is accepted.
+    let after = run_libra_command(&["add", "--literal-pathspecs", "-n", "--", "x.txt"], p);
+    assert_cli_success(&after, "L8 flag after subcommand");
+
+    // L7: --no-literal-pathspecs restores glob.
+    let restored = run_libra_command(
+        &[
+            "--literal-pathspecs",
+            "--no-literal-pathspecs",
+            "add",
+            "-n",
+            "--",
+            "*.txt",
+        ],
+        p,
+    );
+    assert_cli_success(&restored, "L7 restore glob");
+    let preview = String::from_utf8_lossy(&restored.stdout);
+    assert!(
+        preview.contains("x.txt") || preview.contains("*.txt"),
+        "L7 glob preview: {preview}"
+    );
 }

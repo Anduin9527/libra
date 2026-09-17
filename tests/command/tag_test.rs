@@ -622,6 +622,7 @@ async fn setup_repo_with_commit_with(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -818,6 +819,7 @@ async fn test_force_tag() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1020,6 +1022,7 @@ async fn test_annotation_lines_tag() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1078,6 +1081,7 @@ async fn test_annotation_lines_tag() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {

@@ -8,11 +8,40 @@
 use std::{
     ffi::OsStr,
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use regex::{Regex, RegexBuilder};
 
 use crate::utils::util;
+
+static LITERAL_PATHSPECS: AtomicBool = AtomicBool::new(false);
+
+/// Process-wide Git `GIT_LITERAL_PATHSPECS` / `--literal-pathspecs` switch.
+/// `apply_global_runtime_flags` resets this on every CLI invocation.
+pub fn set_literal_pathspecs(enabled: bool) {
+    LITERAL_PATHSPECS.store(enabled, Ordering::SeqCst);
+}
+
+pub fn literal_pathspecs() -> bool {
+    LITERAL_PATHSPECS.load(Ordering::SeqCst)
+}
+
+/// Parse `GIT_LITERAL_PATHSPECS`. `1/true/yes/on` enable; `0/false/no/off`
+/// and unset disable; any other value disables and returns `invalid`.
+pub fn literal_pathspecs_from_env() -> (bool, Option<String>) {
+    match std::env::var("GIT_LITERAL_PATHSPECS") {
+        Err(_) => (false, None),
+        Ok(raw) => {
+            let folded = raw.trim().to_ascii_lowercase();
+            match folded.as_str() {
+                "1" | "true" | "yes" | "on" => (true, None),
+                "0" | "false" | "no" | "off" | "" => (false, None),
+                _ => (false, Some(raw)),
+            }
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathspecError {
@@ -244,10 +273,21 @@ impl Pathspec {
         workdir: &Path,
         default_icase: bool,
     ) -> Result<Self, PathspecError> {
-        let (magic, body) = parse_magic(raw)?;
+        let force_literal = literal_pathspecs();
+        let (magic, body) = if force_literal {
+            (
+                Magic {
+                    literal: true,
+                    ..Magic::default()
+                },
+                raw,
+            )
+        } else {
+            parse_magic(raw)?
+        };
         let normalized = resolve_body(raw, body, magic.top, current_dir, workdir)?;
         let icase = magic.icase || default_icase;
-        let matcher = if magic.literal || !has_wildcard(&normalized) {
+        let matcher = if force_literal || magic.literal || !has_wildcard(&normalized) {
             PathMatcher::Prefix {
                 pattern: normalized.clone(),
                 icase,
@@ -536,9 +576,14 @@ fn char_class(chars: &[char]) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
+    static PARSE_LOCK: Mutex<()> = Mutex::new(());
+
     fn set(raw: &[&str], cwd: &str) -> PathspecSet {
+        let _guard = PARSE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let workdir = Path::new("/repo");
         let cwd = workdir.join(cwd);
         PathspecSet::from_workdir(
@@ -653,5 +698,46 @@ mod tests {
                 icase: true,
             }]
         );
+    }
+
+    fn with_literal_mode<T>(enabled: bool, body: impl FnOnce() -> T) -> T {
+        let _guard = PARSE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let previous = literal_pathspecs();
+        set_literal_pathspecs(enabled);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        set_literal_pathspecs(previous);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn parse_at_root(raw: &[&str]) -> PathspecSet {
+        let workdir = Path::new("/repo");
+        PathspecSet::from_workdir(
+            &raw.iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            workdir,
+            workdir,
+        )
+        .expect("pathspec compiles")
+    }
+
+    #[test]
+    fn literal_mode_disables_glob_and_magic() {
+        with_literal_mode(true, || {
+            let specs = parse_at_root(&["*.txt"]);
+            assert!(specs.matches_path("*.txt"));
+            assert!(!specs.matches_path("x.txt"));
+
+            let magic = parse_at_root(&[":(glob)*.txt"]);
+            assert!(magic.matches_path(":(glob)*.txt"));
+            assert!(!magic.matches_path("foo.txt"));
+        });
+        with_literal_mode(false, || {
+            let specs = parse_at_root(&["*.txt"]);
+            assert!(specs.matches_path("x.txt"));
+        });
     }
 }

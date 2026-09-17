@@ -37,6 +37,7 @@ async fn stage_file(path: &str, content: &str) {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 }

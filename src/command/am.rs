@@ -971,6 +971,7 @@ async fn stage_targets(targets: &[String]) -> CliResult<()> {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     };
     run_add(&args).await.map(|_| ()).map_err(|error| {
         am_state_error(format!(

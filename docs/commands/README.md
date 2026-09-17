@@ -29,6 +29,8 @@ Every Libra command accepts the following global flags:
 | `--quiet` | `-q` | Suppress stdout |
 | `--exit-code-on-warning` | | Return exit code 9 on warnings |
 | `--progress` | | Control progress output (`json`, `text`, `none`, `auto`) |
+| `--literal-pathspecs` | | Treat pathspecs as literal (no glob, no `:(magic)`). Also `GIT_LITERAL_PATHSPECS=1`. |
+| `--no-literal-pathspecs` | | Cancel `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` (last flag wins). |
 
 ## Command Index
 

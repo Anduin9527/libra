@@ -222,6 +222,7 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )
@@ -320,6 +321,7 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )
@@ -362,6 +364,7 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )
@@ -428,6 +431,7 @@ async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )
@@ -517,6 +521,7 @@ async fn test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_erro
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &OutputConfig::default(),
     )
@@ -1172,4 +1177,27 @@ fn test_checkout_no_overlay_is_accepted_noop() {
         String::from_utf8_lossy(&current.stdout).contains("feature"),
         "checkout --no-overlay switched to feature"
     );
+}
+
+#[test]
+fn test_checkout_literal_pathspecs_global() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    std::fs::write(p.join("x.txt"), "x2\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star2\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["--literal-pathspecs", "checkout", "--", "*.txt"], p),
+        "checkout literal",
+    );
+    assert_eq!(std::fs::read_to_string(p.join("*.txt")).unwrap(), "star\n");
+    assert_eq!(std::fs::read_to_string(p.join("x.txt")).unwrap(), "x2\n");
 }

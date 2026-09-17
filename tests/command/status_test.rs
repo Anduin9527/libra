@@ -228,6 +228,7 @@ async fn test_changes_to_be_staged() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -369,6 +370,7 @@ async fn test_status_porcelain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -388,6 +390,7 @@ async fn test_status_porcelain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     file2.write_all(b"modified content").unwrap();
@@ -531,6 +534,7 @@ async fn test_status_short_format() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -550,6 +554,7 @@ async fn test_status_short_format() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -650,6 +655,7 @@ async fn test_status_porcelain_v2_basic() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     file1.write_all(b" more").unwrap(); // unstaged modification
@@ -733,6 +739,7 @@ async fn test_status_porcelain_v2_branch_metadata_includes_upstream_counts() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -809,6 +816,7 @@ async fn test_status_porcelain_v2_untracked_files_no() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -872,6 +880,7 @@ async fn test_status_porcelain_v2_untracked_files_all() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -927,6 +936,7 @@ async fn test_status_untracked_files_no() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1157,6 +1167,7 @@ async fn test_status_untracked_files_all() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1246,6 +1257,7 @@ async fn test_status_mixed_changes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1315,6 +1327,7 @@ async fn test_status_deleted_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1389,6 +1402,7 @@ async fn test_status_with_subdirectories() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1480,6 +1494,7 @@ async fn test_status_verbose_output() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1539,6 +1554,7 @@ async fn test_status_short_format_with_branch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1608,6 +1624,7 @@ async fn test_status_porcelain_format_with_branch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1677,6 +1694,7 @@ async fn test_status_show_stash_with_existing_stash() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1704,6 +1722,7 @@ async fn test_status_show_stash_with_existing_stash() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1829,6 +1848,7 @@ async fn test_status_show_stash_without_stash() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1889,6 +1909,7 @@ async fn test_status_branch_detached_head() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1916,6 +1937,7 @@ async fn test_status_branch_detached_head() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1992,6 +2014,7 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(create_commit_args("Initial commit")).await;
@@ -2013,6 +2036,7 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -2033,6 +2057,7 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -2161,6 +2186,7 @@ async fn test_status_porcelain_v2_executable_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -2230,6 +2256,7 @@ async fn test_status_porcelain_v2_deleted_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(create_commit_args("Initial commit")).await;
@@ -2322,6 +2349,7 @@ async fn test_status_after_add() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -2963,6 +2991,7 @@ async fn test_status_short_branch_reports_up_to_date_with_fully_qualified_tracki
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )

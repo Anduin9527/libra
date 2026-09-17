@@ -503,6 +503,7 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
 
@@ -581,6 +582,7 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
 
@@ -621,6 +623,7 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
 
@@ -708,6 +711,7 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
         })
         .await;
 

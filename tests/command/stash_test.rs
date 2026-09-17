@@ -68,6 +68,7 @@ async fn test_stash_push_no_changes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -119,6 +120,7 @@ async fn test_stash_push_no_changes_json_output() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -171,6 +173,7 @@ async fn test_stash_push_and_pop() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -254,6 +257,7 @@ async fn test_stash_push_and_pop_preserves_dotfiles() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -436,6 +440,7 @@ async fn test_stash_list() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -563,6 +568,7 @@ async fn test_stash_drop() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -630,6 +636,7 @@ async fn test_stash_drop_missing_reflog_returns_no_stash_found() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -693,6 +700,7 @@ async fn test_stash_json_output() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1756,4 +1764,29 @@ fn stash_branch_failed_apply_rolls_back_branch_and_head() {
         "HEAD returned to the original branch: {}",
         String::from_utf8_lossy(&status.stdout)
     );
+}
+
+#[test]
+fn test_stash_push_literal_pathspecs_global() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("x.txt"), "x\n").unwrap();
+    fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    fs::write(p.join("x.txt"), "x2\n").unwrap();
+    fs::write(p.join("*.txt"), "star2\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["--literal-pathspecs", "stash", "push", "--", "*.txt"], p),
+        "stash literal",
+    );
+    let status = run_libra_command(&["status", "--short"], p);
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(text.contains("x.txt"), "x.txt left dirty: {text}");
+    assert!(!text.contains("*.txt"), "*.txt was stashed: {text}");
 }

@@ -46,6 +46,7 @@ flowchart TD
 ## 当前状态
 
 - 公开状态：已公开；模块状态：已导出。
+- 路径匹配审计（AU-05）：pathspec 按工作树存在 / 索引 stage 0 / HEAD tree 精确路径解析，不通配。全局 `--literal-pathspecs` 下与关闭时相同（天然字面）。
 - 用户文档：`docs/commands/reset.md`。
 - Synopsis：`libra reset [--soft | --mixed | --hard | --merge | --keep] [<target>]`；其余 pathspec forms 不变。
 - 公开参数在既有 surface 上新增 `--merge` 与 `--keep`，均属于 Clap `mode` 互斥组且拒绝 pathspec。

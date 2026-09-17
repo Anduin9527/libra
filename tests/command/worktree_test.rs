@@ -1013,6 +1013,7 @@ async fn test_worktree_add_rejects_existing_non_empty_directory() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1107,6 +1108,7 @@ async fn test_worktree_add_rolls_back_link_on_restore_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1172,6 +1174,7 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1373,6 +1376,7 @@ async fn test_worktree_add_does_not_reset_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1395,6 +1399,7 @@ async fn test_worktree_add_does_not_reset_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1444,6 +1449,7 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1465,6 +1471,7 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 

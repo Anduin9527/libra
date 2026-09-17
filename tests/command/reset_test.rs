@@ -648,6 +648,7 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -682,6 +683,7 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -766,6 +768,7 @@ async fn setup_standard_repo(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -830,6 +833,7 @@ async fn setup_standard_repo(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -894,6 +898,7 @@ async fn setup_standard_repo(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -958,6 +963,7 @@ async fn setup_standard_repo(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1031,6 +1037,7 @@ async fn setup_test_state() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 }
@@ -1235,6 +1242,7 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1270,6 +1278,7 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1331,6 +1340,7 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1366,6 +1376,7 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
 
@@ -1432,6 +1443,7 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1466,6 +1478,7 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1653,6 +1666,7 @@ async fn test_reset_hard_skips_ignored_directories() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2011,6 +2025,32 @@ fn reset_pathspec_from_file_rejects_escape() {
         "unexpected message: {}",
         report["message"]
     );
+}
+
+#[test]
+fn test_reset_literal_pathspecs_global() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    std::fs::write(p.join("x.txt"), "x2\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["--literal-pathspecs", "reset", "--", "*.txt"], p),
+        "reset literal",
+    );
+    let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    let names = String::from_utf8_lossy(&cached.stdout);
+    assert!(names.contains("x.txt"), "x.txt still staged: {names}");
+    assert!(!names.contains("*.txt"), "*.txt was reset: {names}");
 }
 
 /// A repo whose `feature` branch has a commit conflicting with `main`
