@@ -87,7 +87,7 @@ rg -n "CloudPublishSource|parse_cloud_publish_source|PublishStorage" src/command
 |---|---|---|
 | `libra publish` | `cli-only` → RC-35 删文件 | `cli.rs:724-725` |
 | `clone libra+cloud://` | `cli-only` 改写 | `clone.rs:2479` |
-| `worker/` | RC-36 删树 | `worker/package.json` 仍在 |
+| `worker/` | RC-36 删树 | 整树已删；版本面改为四处 |
 | `libra cloud` | KEEP | `create_r2_storage` 留下；只删 `create_publish_storage` |
 | `upgrade_publish_contract_test` | KEEP | 不在本清单删除集 |
 
