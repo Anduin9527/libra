@@ -41,7 +41,7 @@ Libra 不管理子模块内容。如果切换到分支或 detached 目标需要�
 | `-c` | `--create` | `<name>` | 创建新分支并切换到它 |
 | `-C` | `--force-create` | `<name>` | 创建新分支或重置已有分支并切换到它 |
 | | `--orphan` | `<name>` | 创建 unborn 无父提交分支并切换到它 |
-| `-d` | `--detach` | | 在给定提交、标签或分支上 detach HEAD |
+| `-d` | `--detach` | | 在给定提交、标签或分支上 detach HEAD。不给目标时在当前 HEAD 处分离（未诞生 HEAD 拒绝：`You are on a branch yet to be born`，`LBR-REPO-003`，退出码 128） |
 | | `--track` | | 创建跟踪给定远程分支的本地分支，并切换到它 |
 | | `--guess` | | 当 `<branch>` 唯一匹配某个远程跟踪分支时自动创建 tracking 分支（默认；DWIM） |
 | | `--no-guess` | | 禁用远程跟踪猜测；要求本地分支或显式 `--track` |

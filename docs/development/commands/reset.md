@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra reset` 的目标是移动 HEAD、索引和工作区到指定状态，覆盖 hard/mixed/soft/merge/keep 与 pathspec reset（含 `--pathspec-from-file` / `--pathspec-file-nul` / `--no-refresh`），并提供结构化输出。`--merge`/`--keep` 以完整预检与精确 snapshot rollback 保护本地变更。
+`libra reset` 的目标是移动 HEAD、索引和工作区到指定状态，覆盖 hard/mixed/soft/merge/keep 与 pathspec reset（含 `--pathspec-from-file` / `--pathspec-file-nul` / `--no-refresh`），并提供结构化输出。`--merge`/`--keep` 以完整预检与精确 snapshot rollback 保护本地变更。`reset -p` 的 Unstage 与 Apply 两种模式复用 `src/internal/patch_mode/`：对 HEAD/`@` 反向撤销暂存，对其它 tree-ish 把反向 diff 应用到索引；HEAD 与工作树不写。
 
 ## 对比 Git 与兼容性
 
@@ -73,6 +73,8 @@ flowchart TD
 外部收尾前重新读取结果索引；`--soft` 未清除、`--merge` 携带的冲突阶段会保留完整停止状态，并给 warning，保证原 `--continue`/`--abort` 恢复路径仍在。结果索引读取失败也只警告并保留状态，不把已完成的 reset 变成失败。该条件不改变内部 reset/pathspec 路径，也不把 Libra 既有的 unmerged soft-reset 行为声称为 Git 一致；Git 会拒绝该 soft reset。
 
 结果输出后用 `emit_post_envelope_warning` 保留 human/JSON/machine 三种模式下的 stderr 恢复提示与 warning exit 9；不改 JSON schema。无停止状态且两种快照均为 `Ok(None)` 时不读索引做序列收尾检查，不凭未合并索引产生恢复 warning；快照读错误仍必须发警告。
+
+- external conclusion of an in-progress merge by reset（#477 HF-26，ADR-HF-03 第 1 条第一项与第 5 条）：无 pathspec 的整树 `reset`（任意模式）成功后，先于 cherry-pick/revert 收尾处理进行中的 merge。状态在 `perform_reset` **之前**快照（`merge::snapshot_stopped_merge`：`merge-state.json` 原始字节 + 持锁读到的 `merge-autostash.json`）。reset 成功后按顺序 (a) 把 merge 持有的 autostash 经 `stash::store_stash_commit` 提升进 stash 列表并身份校验删除 sidecar，(b) 仅当 (a) 成功或本无 autostash 时清除 `merge-state.json` 与 `SequenceKind::Merge` 行。提升失败则两边 sidecar 原样保留，reset 仍 exit 0，warning 点名 sidecar 与 `libra merge --abort`，且不再触碰 cherry-pick/revert 状态。`LIBRA_TEST_MERGE_AUTOSTASH_PROMOTE=fail`（`LIBRA_TEST` 门控）注入该失败。带 pathspec 的 reset 不触发。rebase/am/bisect 状态仍不动。
 
 ### 暂存文本冲突与 reset 收尾
 

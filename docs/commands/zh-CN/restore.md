@@ -223,6 +223,8 @@ Git 的 `restore` 默认为仅恢复工作树，并要求 `--staged` 才能以�
 
 注意：jj 的 `restore` 作用于修订，而不是暂存区，将一个修订的内容恢复到另一个修订中。它不区分已暂存和未暂存更改。
 
+其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-p`/`--patch`，D15）。请用 `libra restore <pathspec>` 或 `libra restore --staged <pathspec>`。
+
 ## 错误处理
 
 | 代码 | 条件 |

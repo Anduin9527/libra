@@ -12,7 +12,7 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 `libra fetch` 联系远程仓库，协商本地存储缺少哪些对象，将它们作为 pack 文件下载，索引该 pack，并更新对应的远程跟踪引用（例如 `refs/remotes/origin/main`）。它永远不会修改工作树或当前分支；要进行这些操作，请使用 `libra pull` 或 `libra merge`。
 
-不带参数调用时，它从当前分支配置的 upstream 获取。给出 `--all` 时，会依次获取每个已配置远程。指定某个 `<repository>` 时，只联系该远程。可选 `<refspec>` 选择一个源引用，并可用 `<src>:<dst>` 精确映射到本地目标。未显式给出 refspec 时会遵守 `remote.<name>.fetch`；该配置不存在时才回退为把所有远程分支映射到 `refs/remotes/<name>/*`。
+不带参数调用时，它从当前分支配置的 upstream 获取。已配置的本地 upstream（`branch.<name>.remote=.`）会在任何网络或 `FETCH_HEAD` 写入前被拒绝（`LBR-CLI-003`，退出 129）；Git 2.54 的 `fetch` 可以对本地 upstream 操作——该支持延后到 [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480)。显式仓库参数 `.` 仍走现有的 `remote '.' not found`。给出 `--all` 时，会依次获取每个已配置远程。指定某个 `<repository>` 时，只联系该远程。可选 `<refspec>` 选择一个源引用，并可用 `<src>:<dst>` 精确映射到本地目标。未显式给出 refspec 时会遵守 `remote.<name>.fetch`；该配置不存在时才回退为把所有远程分支映射到 `refs/remotes/<name>/*`。
 
 Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ssh.<remote>.privkey` 时，会自动加载 vault-backed SSH 密钥。
 
@@ -283,6 +283,7 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 |----------|-----------------|------|------|
 | 没有配置 upstream / detached HEAD | `LBR-REPO-003` | 128 | "checkout a branch or specify a remote" |
 | 找不到远程 | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
+| 已配置本地 upstream（`branch.<name>.remote=.`） | `LBR-CLI-003` | 129 | 用 `libra branch --unset-upstream` 清除；网络支持见 issues/480 HP-16 |
 | 找不到远程分支 | `LBR-CLI-003` | 129 | "verify the remote branch name and try again" |
 | 无效或通配不匹配的 fetch refspec | `LBR-CLI-002` | 129 | 使用有效的 `<src>:<dst>` 与成对可选通配符 |
 | 读取配置 refspec 失败 | `LBR-IO-001` | 128 | 检查 `remote.<name>.fetch` 配置 |

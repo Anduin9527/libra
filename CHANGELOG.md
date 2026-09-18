@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.22.48] — 2026-09-18
+
+### Added: Git-aligned history rewrite and patch mode (#477)
+
+Libra now covers the remaining #477 / #495 history-rewrite gaps that were still
+open against git 2.54:
+
+- Sequencer recovery: `reset` and finishing `commit` clear stopped
+  cherry-pick / revert / merge state; `--continue` after an external finish of
+  the stopped item does not replay it; an in-progress merge can be completed
+  with an ordinary `commit`.
+- Conflict markers use the user-spelled target (for example `>>>>>>> y`)
+  rather than a 7-hex object id.
+- `commit --allow-empty-message` and typed empty-tree diagnostics; `branch
+  -u/--set-upstream-to <upstream> [<branch>]`, `--track` / `--no-track`,
+  refname-ordered listing, and `branch -d` refusals exit 1; local-upstream
+  refusals on `pull` / `push` / `fetch`; bare `switch --detach` /
+  `checkout --detach`; `tag -a/--annotate`; `rebase --autosquash` /
+  `--no-autosquash` and `rebase --root`.
+- `add -p` / `reset -p` (shared hunk engine, `--[no-]auto-advance`, `s` /
+  `e`, navigation). `add -i` and the remaining D15 patch surfaces stay
+  declined with stable diagnostics.
+- Public `rebase -i/--interactive` and `--edit-todo`: pick / reword / edit /
+  squash / fixup / exec / break / drop, plus `--autosquash`, `--root`,
+  `--exec`, and `--autostash` combinations. `--rebase-merges` and
+  `-i --update-refs` remain declined (D16 / DEFER-02).
+
+Website pages were not updated (`../libra-backend` is a `.libra` checkout;
+ER-06a fail-closed).
+
 ## [Unreleased]
 
 ### Changed: isolated agent tasks publish one main-workspace sync-back operation

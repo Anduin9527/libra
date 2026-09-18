@@ -46,6 +46,7 @@ pub mod obliteration;
 pub mod operation;
 pub mod operation_wrapper;
 pub mod pack_writer;
+pub mod patch_mode;
 pub mod process_terminate;
 pub mod protocol;
 pub mod pseudo_ref;

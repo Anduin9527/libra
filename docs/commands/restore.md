@@ -247,6 +247,8 @@ Unlike `git restore` which can operate on the entire worktree with `--worktree`,
 
 Note: jj's `restore` operates on revisions rather than a staging area, restoring the content of one revision into another. It does not distinguish between staged and unstaged changes.
 
+Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-p`/`--patch`, D15). Use `libra restore <pathspec>` or `libra restore --staged <pathspec>`.
+
 ## Error Handling
 
 | Code | Condition |
