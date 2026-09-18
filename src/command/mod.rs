@@ -38,6 +38,7 @@ pub mod commit;
 pub mod commit_tree;
 pub mod completions;
 pub mod config;
+pub mod control_lock;
 pub mod credential;
 pub mod deps;
 pub mod describe;

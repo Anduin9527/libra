@@ -5734,9 +5734,9 @@ async fn restore_metadata(
 /// Restore refs metadata and fail hard when the metadata object is missing.
 ///
 /// `libra cloud restore` keeps its historical warning-only behavior through
-/// [`restore_metadata`]. Cloud clone restore needs a stricter contract: without
-/// refs metadata it cannot set HEAD/branches safely, so the caller must fail and
-/// clean up the just-created destination.
+/// [`restore_metadata`]. The former clone-from-publish path needed a stricter
+/// contract (RC-34 removed that caller; RC-35 deletes the leftover).
+#[allow(dead_code)]
 pub(crate) async fn restore_metadata_strict(
     db_conn: &sea_orm::DatabaseConnection,
     r2_storage: &RemoteStorage,
@@ -5757,6 +5757,7 @@ async fn restore_metadata_from_bytes(
     restore_metadata_models(db_conn, references, false).await
 }
 
+#[allow(dead_code)] // RC-34: only reached from restore_metadata_strict
 async fn restore_metadata_from_bytes_strict(
     db_conn: &sea_orm::DatabaseConnection,
     data: &[u8],
@@ -5769,6 +5770,7 @@ async fn restore_metadata_from_bytes_strict(
         .map(|_| ())
 }
 
+#[allow(dead_code)] // RC-34: only reached from restore_metadata_strict
 fn validate_strict_refs_metadata(references: &[reference::Model]) -> CloudResult<()> {
     if !references
         .iter()

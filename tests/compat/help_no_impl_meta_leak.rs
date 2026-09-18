@@ -96,11 +96,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "remote",
     "open",
     "cloud",
-    "publish",
-    "code",
     "automation",
-    "usage",
-    "graph",
     "sandbox",
     "agent",
 ];

@@ -445,6 +445,7 @@ mod tests {
         "settings.json",      // EXTERNAL provider settings (e.g. Claude Code's
         // .claude/settings.json) written by `agent enable` — not a .libra surface
         "file_history.json", // legacy AI file-undo manifest, persisted state rather than configuration
+        "redaction_report.json", // E4 checkpoint sidecar (rule-hit stats only), not configuration
     ];
 
     /// Extract config-file name literals from the PRODUCTION half of one
