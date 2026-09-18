@@ -134,3 +134,9 @@ P1-05e R21 补强：bounded packed-object 读取改走专用 uncached 递归解�
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Issue #477 notes
+
+commit reads the in-progress merge state for parents and message
+NothingToCommit 按工作树状态分型
+--allow-empty-message 同时绕过空消息与模板未编辑检查

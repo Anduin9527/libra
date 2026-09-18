@@ -426,3 +426,7 @@ Libra 保留 Git 的 `stash@{N}` 引用语法以保持熟悉度。从 Git 迁移
 | `LBR-CLI-002` | stash 引用语法无效 |
 | `LBR-CLI-003` | stash 不存在 |
 | `LBR-CONFLICT-001` | 应用 stash 时发生合并冲突 |
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`

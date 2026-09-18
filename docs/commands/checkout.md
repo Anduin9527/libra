@@ -308,3 +308,8 @@ Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-p`/
 | Current branch (no-op) | N/A | Prints "Already on {branch}" and succeeds | 0 |
 | Branch storage query failure | `LBR-IO-001` | "failed to resolve checkout target: {detail}" | 128 |
 | Corrupt branch reference | `LBR-REPO-002` | "failed to resolve checkout target: {detail}" | 128 |
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
+`--detach` with no target detaches at the current commit

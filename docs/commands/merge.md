@@ -576,3 +576,9 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Unresolved conflict stages remain for `--continue` | `LBR-CONFLICT-002` | 128 |
 | Failed to read merge state or index | `LBR-IO-001` | 128 |
 | Failed to save state, index, tree, commit, HEAD, or worktree | `LBR-IO-002` | 128 |
+
+## Issue #477 notes
+
+reset clears an in-progress merge and moves its autostash into the stash list
+a plain commit concludes the in-progress merge
+conflict markers name the merge target as it was typed

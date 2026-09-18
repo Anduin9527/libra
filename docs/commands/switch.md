@@ -336,3 +336,7 @@ Every `SwitchError` variant maps to an explicit `StableErrorCode`.
 command conflict contract through `DelegatedCli`, so that path keeps the branch
 command's existing error shape instead of adding the `SwitchError::BranchAlreadyExists`
 hint.
+
+## Issue #477 notes
+
+`--detach` with no target detaches at the current commit

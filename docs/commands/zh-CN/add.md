@@ -383,3 +383,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 - `.gitignore` 与 `.libraignore` 都使用 Git ignore 模式语法；同目录内 `.libraignore` 可显式覆盖 `.gitignore`，导入和非 bare clone 仍会复制 `.gitignore` 规则，而不是删除或重命名原文件
 - LFS 跟踪文件会在暂存期间自动转换为指针文件
 - 其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-i`/`--interactive`，D15 剩余入口）。请用 `libra add -p` 或 `libra add <pathspec>`。
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`

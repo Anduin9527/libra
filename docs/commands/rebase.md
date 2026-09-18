@@ -487,3 +487,7 @@ Note: jj does not stop on conflicts during rebase. Instead, conflicts are materi
 Rewritten commits also pass through the ChangeRevisionBuilder. The resulting
 revision inherits the stable sidecar Change ID and records a typed `rebase`
 predecessor edge; no Change ID header is injected into the Git commit.
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

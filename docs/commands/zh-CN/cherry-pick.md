@@ -38,7 +38,7 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 `text`。因此 union driver 可把重叠 pick 解析为 current 内容后接 picked
 内容；binary driver 冲突则保留完整的存活侧（current 存在时优先），不插入文本标记。
 
-已停止的 pick 不会比它所在的工作树活得更久：之后的 reset 在清除索引冲突阶段后会结束已停止的单提交 pick，下一次 cherry-pick 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 pick。多提交序列会保留剩余提交并记录被停提交已结束；`--continue` 不会重新提交已在序列外结束的停止项，而是继续应用剩余提交。
+已停止的 pick 不会比它所在的工作树活得更久：之后的 reset 会结束已停止的单提交 pick（在清除索引冲突阶段后），下一次 cherry-pick 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 pick。多提交序列会保留剩余提交并记录被停提交已结束；`--continue` 不会重新提交已在序列外结束的停止项，而是继续应用剩余提交。
 
 ## 选项
 
@@ -313,3 +313,8 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 
 Cherry-pick revision 使用 sidecar Change ID 投影和类型化 predecessor 谱系。已有 commit header
 仍可用于导入读取，但新提交不依赖也不会注入 `change-id` header。
+
+## Issue #477 notes
+
+--continue 不会重新提交已在序列外结束的停止项
+冲突标记以缩写提交与主题标注被 pick 的一侧

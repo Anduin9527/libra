@@ -33,7 +33,7 @@ revert 提交使用当前 author 与 committer 身份/日期，并在创建提�
 
 新的 revert 在索引存在未合并条目时拒绝开始：在解析任何目标、写入索引、工作树、引用或 `revert-state.json` 之前，以 exit 128 与 `LBR-CONFLICT-001` 退出，并列出最多 10 条未合并路径（Git 以 `your index file is unmerged` 拒绝）。逐条解决后 `libra add`，或用 `libra reset --hard` 放弃冲突，然后重新执行 revert；该拒绝不写 revert state，`--continue`、`--skip`、`--abort` 对它不适用。
 
-已停止的 revert 不会比它所在的工作树活得更久：之后的 reset 在清除索引冲突阶段后会结束已停止的单提交 revert，下一次 revert 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 revert。多提交序列保留剩余提交并记录被停提交已结束：`--continue` 不会重新提交已在序列外结束的停止项，而是继续 revert 剩余提交。`libra revert --abort` 仍会将 HEAD、索引和已跟踪文件恢复到 revert 前的状态，丢弃之后的已跟踪改动（包括 reset 选择的目标）。
+已停止的 revert 不会比它所在的工作树活得更久：之后的 reset 会结束已停止的单提交 revert（在清除索引冲突阶段后），下一次 revert 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 revert。多提交序列保留剩余提交并记录被停提交已结束：`--continue` 不会重新提交已在序列外结束的停止项，而是继续 revert 剩余提交。`libra revert --abort` 仍会将 HEAD、索引和已跟踪文件恢复到 revert 前的状态，丢弃之后的已跟踪改动（包括 reset 选择的目标）。
 
 ## 选项
 
@@ -228,3 +228,8 @@ Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时
 ### 暂存文本冲突与 reset 收尾
 
 revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也检查该次 revert 冲突路径的暂存内容：仍有 `<<<<<<<` 标记或 blob 无法读取时，保留 revert 状态并发出恢复警告。因此即使 `ls-files --unmerged` 为空，`--soft` 也不会丢掉恢复状态。解决并重新暂存内容（或从索引移除路径），或通过 `--mixed`/`--hard` 将索引替换为干净内容后，可以正常收尾。仅工作树中残留的标记不阻止 mixed reset 收尾。本次不改变 revert 的冲突表示及 `--continue` 行为。
+
+## Issue #477 notes
+
+--continue 不会重新提交已在序列外结束的停止项
+冲突标记以「parent of」加缩写提交标注被 revert 的一侧

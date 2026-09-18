@@ -331,3 +331,7 @@ Git 的 `checkout` 被过度重载：它切换分支、恢复文件、detach HEA
 | 委托（branch/restore） | 原始代码 | 原始 | 原始提示 |
 
 `switch -c <existing-branch>` 当前通过 `DelegatedCli` 保留原始 `branch` 命令冲突契约，因此该路径保持 branch 命令现有错误形状，而不是添加 `SwitchError::BranchAlreadyExists` 提示。
+
+## Issue #477 notes
+
+不带目标的 `--detach` 在当前提交处分离

@@ -256,3 +256,12 @@ Git 将分支引用存储为 `.git/refs/heads/` 下的单独文件。这在规�
 | 无法写入 refs | `LBR-IO-002` | -- |
 | 存储查询失败 | `LBR-IO-001` | -- |
 | 存储的引用损坏 | `LBR-REPO-002` | -- |
+
+## Issue #477 notes
+
+本地分支作为 upstream（`branch.<name>.remote=.`）
+无效的 `-u` 目标以 129 结束（Git 为 128）
+创建分支时按 `--track` / `--no-track` 写入跟踪配置
+`--track <提交>` 以 129 拒绝（Git 为 128）
+按 refname 排序，当前分支只标记不置顶
+`branch -d` 的三类拒绝以退出码 1 结束

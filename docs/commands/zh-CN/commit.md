@@ -470,3 +470,10 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 - 支持 `--cleanup=<mode>` 消息清理（`strip`/`whitespace`/`verbatim`/`scissors`/`default`），未给时回退到 `commit.cleanup` 配置；`commit.verbose` 配置可使 `-v` 成为默认
 - Change identity 仅写入 sidecar 投影（`change_identity`/`change_revision`）；Libra 不向 Git commit 写入 `change-id` header。已有 header 只用于导入兼容。
 - 其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-p`/`--patch`/`--interactive`，D15）。请先 `libra add <pathspec>` 再提交。
+
+## Issue #477 notes
+
+结束进行中的 merge 并生成双亲提交
+无可提交内容时按工作树状态分三种提示
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`
+允许提交消息为空

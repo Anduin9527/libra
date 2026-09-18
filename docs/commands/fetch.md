@@ -620,3 +620,7 @@ reason that does not echo the remote bytes. It is no longer reported as a
 successful empty response. Check the remote Git service or proxy response before
 retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
 existing command hints and structured error fields retain their behavior.
+
+## Issue #477 notes
+
+refuses a local upstream (`branch.<name>.remote=.`)

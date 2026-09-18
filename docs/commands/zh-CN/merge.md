@@ -438,3 +438,9 @@ Merge aborted.
 | `--continue` 仍有未解决的冲突 stage | `LBR-CONFLICT-002` | 128 |
 | 无法读取 merge 状态或索引 | `LBR-IO-001` | 128 |
 | 无法保存状态、索引、树、提交、HEAD 或工作树 | `LBR-IO-002` | 128 |
+
+## Issue #477 notes
+
+reset 会清除进行中的 merge，并把其 autostash 移入 stash 列表
+普通 commit 会结束进行中的 merge
+冲突标记按命令行原文标注合并目标

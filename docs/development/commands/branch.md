@@ -82,3 +82,10 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Issue #477 notes
+
+本地 upstream（remote=.）的解析与显示
+创建时的 --track / --no-track 复用 upstream 解析
+分支列表按 refname 排序并按最长名对齐
+branch -d 三类拒绝以 exit 1 结束（稳定错误码不变）

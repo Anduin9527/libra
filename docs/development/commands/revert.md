@@ -83,3 +83,7 @@ flowchart TD
 ### 暂存文本冲突与 reset 收尾
 
 revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也检查该次 revert 冲突路径的暂存内容：仍有 `<<<<<<<` 标记或 blob 无法读取时，保留 revert 状态并发出恢复警告。因此即使 `ls-files --unmerged` 为空，`--soft` 也不会丢掉恢复状态。解决并重新暂存内容（或从索引移除路径），或通过 `--mixed`/`--hard` 将索引替换为干净内容后，可以正常收尾。仅工作树中残留的标记不阻止 mixed reset 收尾。本次不改变 revert 的冲突表示及 `--continue` 行为。
+
+## Issue #477 notes
+
+single conflict-label helper

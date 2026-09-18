@@ -440,3 +440,7 @@ Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`stas
 | `LBR-CLI-002` | Invalid stash reference syntax |
 | `LBR-CLI-003` | Stash does not exist |
 | `LBR-CONFLICT-001` | Merge conflict during stash apply |
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

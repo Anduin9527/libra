@@ -266,3 +266,9 @@ unsupported 子面。
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 修改 Git 兼容行为时，必须同步 `COMPATIBILITY.md`、本文件、对应 `docs/development/commands/<cmd>.md`、用户命令文档和测试。
 - 新增拒绝/延后项必须分配 D 编号，并在对应命令开发文档的未实现表中引用。
+
+## Issue #477 notes
+
+D15 拒绝诊断（HF-14）
+D16 拒绝诊断（HF-14）
+D-empty-message 已由 HF-06 实现

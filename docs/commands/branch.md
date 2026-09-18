@@ -306,3 +306,12 @@ The trade-off is that refs are not directly inspectable as plain files. Libra co
 | Failed to write refs | `LBR-IO-002` | -- |
 | Storage query failed | `LBR-IO-001` | -- |
 | Stored reference corrupt | `LBR-REPO-002` | -- |
+
+## Issue #477 notes
+
+a local branch as upstream (`branch.<name>.remote=.`)
+invalid `-u` targets exit 129 (Git: 128)
+`--track=inherit` copies the upstream of the start branch
+`--track <commit>` is refused with exit 129 (Git: 128)
+listed in refname order; the current branch is marked but not moved
+`branch -d` refusals exit with status 1

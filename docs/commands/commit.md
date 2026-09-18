@@ -747,3 +747,10 @@ candidate OIDs while holding that fence through the prune transaction. With
 - Vault signing replaces the external keyring; `commit.gpgSign` is honored while `user.signingkey` remains vault-managed
 - Change identity is stored in the sidecar projection (`change_identity`/`change_revision`); Libra does not write a `change-id` commit header. Existing headers are import-compatible metadata only.
 - Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-p`/`--patch`/`--interactive`, D15). Stage paths with `libra add <pathspec>` then commit.
+
+## Issue #477 notes
+
+concludes an in-progress merge with a two-parent commit
+no changes added to commit (use "libra add" and/or "libra commit -a")
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
+records a commit whose message is empty

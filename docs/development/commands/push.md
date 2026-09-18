@@ -336,3 +336,7 @@ unchanged. This is framing validation, not a new advertisement content grammar:
 a missing final flush at a frame boundary and well-framed semantically unused
 tail data retain their existing treatment. Git/SSH readers already validate the
 framing of the advertisement buffer before calling the shared parser.
+
+## Issue #477 notes
+
+本地 upstream（remote=.）fail-closed

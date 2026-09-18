@@ -268,3 +268,8 @@ Mixed mode is the safest general-purpose reset: it un-stages changes without dis
 Reset emits recovery and cleanup warnings to stderr after rendering its result, including with `--json` and `--machine`. The success JSON schema stays unchanged; `--exit-code-on-warning` returns 9 when such a warning occurs, even though the reset itself completed. An unmerged index without a stopped pick/revert does not produce a sequence-recovery warning.
 
 This warning delivery also applies to internal resets used by cherry-pick and am: existing filesystem-cleanup warnings are now visible on stderr in structured modes. Their sequence-state handling and warning-exit tracking stay unchanged.
+
+## Issue #477 notes
+
+clears an in-progress merge and moves its autostash into the stash list
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

@@ -435,3 +435,8 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 
 重写后的提交统一经过 ChangeRevisionBuilder，继承 sidecar 中的稳定
 Change ID，并记录类型化的 `rebase` predecessor 边；不会向 Git commit 注入 Change ID header。
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`
+交互式 rebase 的 todo 指令表

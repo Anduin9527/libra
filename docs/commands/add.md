@@ -459,3 +459,7 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
   remains the Libra-specific override file when both exist in the same directory
 - LFS-tracked files are automatically converted to pointer files during staging
 - Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-i`/`--interactive`, D15 remainder). Use `libra add -p` or `libra add <pathspec>`.
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

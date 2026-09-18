@@ -300,3 +300,8 @@ Git 肌肉记忆根深蒂固。使用 `git checkout` 多年的开发者会本能
 | 当前分支（no-op） | N/A | 打印 "Already on {branch}" 并成功 | 0 |
 | 分支存储查询失败 | `LBR-IO-001` | "failed to resolve checkout target: {detail}" | 128 |
 | 分支引用损坏 | `LBR-REPO-002` | "failed to resolve checkout target: {detail}" | 128 |
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`
+不带目标的 `--detach` 在当前提交处分离

@@ -263,3 +263,7 @@ Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-p`/
 | `LBR-CONFLICT-002` | The restore would replace a non-empty materialized gitlink directory, or would delete/overwrite something at a `160000` submodule path that Libra did not write — either direction across such a path is refused unless the index records it as ordinary tracked content, which is recoverable (exit 128) |
 
 > `--ours` and `--theirs` are mutually exclusive with each other and with `--source`, `--staged`, and `--ignore-unmerged`; any such combination is rejected as `LBR-CLI-002` with exit code 129. (`--source`, `--staged`, and `--ignore-unmerged` may otherwise be combined — e.g. `--ignore-unmerged --source HEAD`.)
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

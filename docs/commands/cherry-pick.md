@@ -43,7 +43,7 @@ can therefore resolve an overlapping pick by keeping current content followed
 by picked content; a binary-driver conflict keeps the complete surviving side
 (current when present) without adding text markers.
 
-A stopped pick does not outlive the working tree it stopped in: a later reset that clears unresolved index stages ends the stopped single-commit pick, so the next cherry-pick starts cleanly. Resolving the conflict and running a later commit ends the stopped single-commit pick the same way. In a multi-commit sequence the remaining commits are kept and the stopped commit is recorded as concluded; `--continue` does not re-commit a stop that was concluded outside the sequence, and instead applies the remaining commits.
+A stopped pick does not outlive the working tree it stopped in: a later reset ends the stopped single-commit pick once it clears unresolved index stages, so the next cherry-pick starts cleanly. Resolving the conflict and running a later commit ends the stopped single-commit pick the same way. In a multi-commit sequence the remaining commits are kept and the stopped commit is recorded as concluded; `--continue` does not re-commit a stop that was concluded outside the sequence, and instead applies the remaining commits.
 
 ## Options
 
@@ -317,3 +317,8 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 Cherry-picked revisions use the sidecar Change ID projection and typed
 predecessor genealogy. Existing commit headers remain readable for import, but
 new commits do not depend on or inject a `change-id` header.
+
+## Issue #477 notes
+
+--continue does not re-commit a stop that was concluded outside the sequence
+conflict markers label the picked side as the abbreviated commit and its subject
