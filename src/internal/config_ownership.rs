@@ -593,10 +593,6 @@ mod tests {
                 );
             }
         }
-        literals_of(
-            &fs::read_to_string(manifest_dir.join("src/command/publish.rs")).unwrap(),
-            &mut literals,
-        );
 
         for surface in CODE_AGENT_CONFIG_OWNERSHIP {
             if surface.kind != SurfaceKind::File {

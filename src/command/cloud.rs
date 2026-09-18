@@ -43,9 +43,7 @@ use crate::{
         error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, ProgressMode, emit_json_data},
         path,
-        storage::{
-            Storage, local::LocalStorage, publish_storage::PublishStorage, remote::RemoteStorage,
-        },
+        storage::{Storage, local::LocalStorage, remote::RemoteStorage},
         util,
     },
 };
@@ -2022,18 +2020,6 @@ async fn create_r2_storage_for_db_path(
 ) -> CloudResult<RemoteStorage> {
     let store = create_r2_object_store_for_db_path(local_db_path).await?;
     Ok(RemoteStorage::new_with_prefix(store, repo_id.to_string()))
-}
-
-/// Create publish arbitrary-object storage from the same R2
-/// environment/config surface used by `libra cloud sync`.
-pub(crate) async fn create_publish_storage(
-    repo_id: &str,
-    site_id: &str,
-) -> CloudResult<PublishStorage> {
-    let local_db_path = cloud_local_db_path()?;
-    let store = create_r2_object_store_for_db_path(&local_db_path).await?;
-    PublishStorage::new(store, repo_id, site_id)
-        .map_err(|e| CloudError::Generic(format!("failed to build publish storage prefix: {e}")))
 }
 
 async fn create_r2_object_store_for_db_path(

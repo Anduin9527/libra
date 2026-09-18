@@ -472,41 +472,6 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
-    MutableStateSurface {
-        table: "publish_ai_objects",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_ai_versions",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_files",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_refs",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_revisions",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_sites",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_sync_runs",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
 ];
 
 /// Tables a SINGLE migration creates and drops within its own transaction —
@@ -682,7 +647,7 @@ mod tests {
     /// Listed explicitly so a new such file is a reviewed decision.
     const NON_REPOSITORY_DDL_SOURCES: &[&str] = &[
         // The Cloudflare D1 backup mirror: a separate remote database with
-        // its own schema (`sql/publish/` + the mirror tables). Local
+        // its own schema (object/index mirror tables). Local
         // worktree scoping does not apply to it.
         "src/utils/d1_client.rs",
     ];

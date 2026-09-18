@@ -87,10 +87,6 @@ filter = 'test(/(^|::)fsck_heal_restores_object_from_durable_tier$/)'
 test-group = 'external'
 
 [[profile.default.overrides]]
-filter = 'test(/(^|::)publish_live_gate_prerequisites_are_explicit$/)'
-test-group = 'external'
-
-[[profile.default.overrides]]
 filter = 'test(/(^|::)r2_connection_basic$/)'
 test-group = 'external'
 

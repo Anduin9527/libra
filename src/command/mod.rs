@@ -88,7 +88,6 @@ pub mod op;
 pub mod open;
 pub mod pack_objects;
 pub mod package;
-pub mod publish;
 pub mod pull;
 pub mod push;
 pub mod read_tree;
