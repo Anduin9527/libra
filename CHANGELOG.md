@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.22.49] — 2026-09-18
+
+### Fixed: signed artifact size cap for Windows release binaries
+
+The official Windows `keyring` release binary for 0.22.48 grew to
+136,529,408 bytes, 2.2 MiB over the shared 128 MiB upload/install bound.
+The credential broker therefore rejected the Windows object list with
+`422 invalid_object_list`, so installers, Homebrew, and the stable
+manifest were not published.
+
+The signed-artifact cap is now 256 MiB across `libra upgrade`,
+`install.sh`, `install.ps1`, and the release broker. Windows installs of
+0.22.48 cannot `libra upgrade` across this bound; re-run `install.ps1`
+(or the updated installer after this release) to move onto 0.22.49.
+
 ## [0.22.48] — 2026-09-18
 
 ### Added: Git-aligned history rewrite and patch mode (#477)
