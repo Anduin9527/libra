@@ -712,8 +712,18 @@ fn build_raw_lines(
 /// engine; plain specs keep their prefix behavior. An empty pathspec list
 /// returns no filters (the renderers treat that as "all").
 async fn show_effective_paths(commit: &Commit, raw: &[String]) -> CliResult<Vec<PathBuf>> {
-    if raw.is_empty() {
+    let Some(set) = show_pathspec_set(raw)? else {
         return Ok(Vec::new());
+    };
+    let changed = get_changed_files_for_commit_matching_pathspec(commit, &set).await?;
+    Ok(changed.into_iter().map(|change| change.path).collect())
+}
+
+/// `FIX-AD-01`: build the shared-engine pathspec set for a `show` invocation
+/// (`None` when no pathspecs were given).
+fn show_pathspec_set(raw: &[String]) -> CliResult<Option<PathspecSet>> {
+    if raw.is_empty() {
+        return Ok(None);
     }
     let workdir = util::working_dir();
     let current_dir = std::env::current_dir().map_err(|error| {
@@ -722,8 +732,7 @@ async fn show_effective_paths(commit: &Commit, raw: &[String]) -> CliResult<Vec<
     })?;
     let set = PathspecSet::from_workdir(raw, &current_dir, &workdir)
         .map_err(|error| CliError::command_usage(format!("invalid pathspec: {error}")))?;
-    let changed = get_changed_files_for_commit_matching_pathspec(commit, &set).await?;
-    Ok(changed.into_iter().map(|change| change.path).collect())
+    Ok(Some(set))
 }
 
 async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<()> {
@@ -1025,6 +1034,8 @@ fn show_unsupported_object_type_error(object_type: impl Into<String>) -> CliErro
 async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
     let object_ref = args.object.as_deref().unwrap_or("HEAD");
     let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+    // `FIX-AD-01`: the JSON path also matches through the shared pathspec engine.
+    let path_specs = show_pathspec_set(&args.pathspec)?;
 
     if let Some((rev, path)) = object_ref.split_once(':') {
         return collect_commit_file_output(rev, path).await;
@@ -1033,7 +1044,7 @@ async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
     // Raw object IDs should keep their native schema, including annotated tag
     // objects, but hash-like ref names must still fall back to ref resolution.
     if let Some(hash) = resolve_existing_object_hash(object_ref) {
-        return collect_object_output(&hash, &paths).await;
+        return collect_object_output(&hash, &paths, path_specs.as_ref()).await;
     }
 
     if let Ok(commit_hash) = util::get_commit_base(object_ref).await {
@@ -1044,10 +1055,10 @@ async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
                 } else {
                     commit_hash
                 };
-                return collect_tag_output(&tag_hash, &paths).await;
+                return collect_tag_output(&tag_hash, &paths, path_specs.as_ref()).await;
             }
             _ => {
-                return collect_commit_output(&commit_hash, &paths).await;
+                return collect_commit_output(&commit_hash, &paths, path_specs.as_ref()).await;
             }
         }
     }
@@ -1055,15 +1066,19 @@ async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
     Err(show_bad_revision_error(object_ref))
 }
 
-async fn collect_object_output(hash: &ObjectHash, paths: &[PathBuf]) -> CliResult<ShowOutput> {
+async fn collect_object_output(
+    hash: &ObjectHash,
+    paths: &[PathBuf],
+    path_specs: Option<&PathspecSet>,
+) -> CliResult<ShowOutput> {
     let storage = ClientStorage::init(path::objects());
     let obj_type = storage
         .get_object_type(hash)
         .map_err(|e| show_object_load_error(hash, e))?;
 
     match obj_type {
-        ObjectType::Commit => collect_commit_output(hash, paths).await,
-        ObjectType::Tag => collect_tag_output(hash, paths).await,
+        ObjectType::Commit => collect_commit_output(hash, paths, path_specs).await,
+        ObjectType::Tag => collect_tag_output(hash, paths, path_specs).await,
         ObjectType::Tree => collect_tree_output(hash).await,
         ObjectType::Blob => collect_blob_output(hash).await,
         _ => Err(show_unsupported_object_type_error(format!("{obj_type:?}"))),
@@ -1079,11 +1094,17 @@ fn resolve_existing_object_hash(object_ref: &str) -> Option<ObjectHash> {
 async fn collect_commit_output(
     commit_hash: &ObjectHash,
     paths: &[PathBuf],
+    path_specs: Option<&PathspecSet>,
 ) -> CliResult<ShowOutput> {
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
     let (subject, body) = split_subject_and_body(&commit.message);
-    let files = get_changed_files_for_commit(&commit, paths).await?;
+    let files = match path_specs {
+        Some(set) if !set.is_empty() => {
+            get_changed_files_for_commit_matching_pathspec(&commit, set).await?
+        }
+        _ => get_changed_files_for_commit(&commit, paths).await?,
+    };
 
     Ok(ShowOutput::Commit(ShowCommitData {
         hash: commit.id.to_string(),
@@ -1112,7 +1133,11 @@ async fn collect_commit_output(
     }))
 }
 
-async fn collect_tag_output(hash: &ObjectHash, paths: &[PathBuf]) -> CliResult<ShowOutput> {
+async fn collect_tag_output(
+    hash: &ObjectHash,
+    paths: &[PathBuf],
+    path_specs: Option<&PathspecSet>,
+) -> CliResult<ShowOutput> {
     match tag::load_object_trait(hash).await {
         Ok(tag::TagObject::Tag(tag_obj)) => {
             // Validate the target object is accessible so that quiet / JSON
@@ -1134,7 +1159,9 @@ async fn collect_tag_output(hash: &ObjectHash, paths: &[PathBuf]) -> CliResult<S
                 target_type: format!("{:?}", tag_obj.object_type).to_lowercase(),
             }))
         }
-        Ok(tag::TagObject::Commit(commit)) => collect_commit_output(&commit.id, paths).await,
+        Ok(tag::TagObject::Commit(commit)) => {
+            collect_commit_output(&commit.id, paths, path_specs).await
+        }
         Ok(_) => Err(show_unsupported_object_type_error("tag target")),
         Err(e) => Err(show_object_load_error(hash, e)),
     }
