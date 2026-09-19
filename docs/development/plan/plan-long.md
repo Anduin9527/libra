@@ -160,7 +160,7 @@ Top-5 最重要差距（两榜合成）：
 | LR-08 | A | 已验证→已验证 | `walgit/walgit@4ff4f7a` 原生 Git URI 供包（E2） | `grep -rn 'trait Forge\|pull_request\|check_runs' src` = 0 | 无 Forge／PR／CI 机器接口 | 不变 | 保持 | E4 |
 | LR-09 | A | 已验证→已验证 | `walgit/walgit@bf65c01` 退役前可达性守恒证明（E2） | `src/internal/sparse/mod.rs:26`；`src/utils/media/transfer.rs`；`media_fastcdc_test` | sparse／hydrate／FastCDC 有基础；partial clone/VFS 缺，对象退役无守恒证明 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
 | LR-10 | B | 已验证→已验证 | `StepzeroLab/research-git@62bcdf5` capsule／provenance（E2，沿用） | `src/internal/ai/capability_package/manifest.rs:62`；`src/cli.rs` 未注册 package | artifact／skill 有基础，capsule lifecycle／ablation 缺失 | 不变 | 保持 | E4 |
-| RT-01 | B | 已实现→已实现 | `deepseek-ai/deepseek-harness@0d1f50007` session 事件面（E2） | `src/internal/ai/runtime/worker.rs`；`a643dfb`；v0.22.0；bridge `session/created\|event\|flush\|disposed` 面未变 | Web-only runtime 与 SSE v2 已发布；deepseek 格式升 v3 不影响按方法分发的 bridge | 不变（本轮复核 bridge 事件面） | 保持 | E4 |
+| RT-01 | B | 已实现→已实现 | `deepseek-ai/deepseek-harness@0d1f50007` session 事件面（E2） | `src/internal/ai/runtime/worker.rs`；`a643dfb`；v0.22.0；bridge `session/created\|event\|flush\|disposed` 面未变 | Web-only runtime 与 SSE v2 已发布；deepseek 格式升 v3 不影响按方法分发的 bridge | 不变（本轮复核 bridge 事件面）；Code UI/Web 执行器与公开 `libra code` 已由 plan-20260920 拆除（产品表面已拆除） | 保持 | E4 |
 | AG-ATTR | B | 候选→候选 | `git-ai-project/git-ai@7ace11b09` 会话按 rollout 文件名键控（E2，账本关闭） | `src/internal/ai/agent_import.rs`；`grep -rn ai_edit_trace src sql` = 0 | 原生 transcript 导入存在，归一化行级归因仍缺 | 不变 | 保持 | E4 |
 | MEM-01 | C | 已排期→已排期 | `akitaonrails/ai-memory@2be13836`+`c83076b3` 载荷转义修复与 no-op 回归（E2） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 命令 | VCS-native storage／privacy baseline 未实现；竞品隐私细节修复波加剧时间压力 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
 | MEM-02 | C | 已排期→已排期 | `rohitg00/agentmemory@e04ba88` hybrid retrieval（E2，沿用）；`ai-memory` v2.3.0 多 provider embedding（E2） | `grep -rn 'fts5\|bm25' src sql Cargo.toml` = 0 | 无本地 FTS/BM25 与有界 SessionStart 注入 | 不变 | 保持 | E4 |
@@ -170,7 +170,7 @@ Top-5 最重要差距（两榜合成）：
 | MEM-06 | C | 候选→已验证 | `akitaonrails/ai-memory@74bd791c` 跨项目 agent inbox/queue（E3，随 v2.3.0 发布） | `grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0；`workspace.rs:211` WorkspaceLease 同构基础 | 协调通道问题域被竞品实证可行，Libra 侧实现为零 | 扩大（竞品） | 更新状态（候选→已验证） | E3 |
 | SB-01 | SB | 实施中→实施中 | `git/git@997c1daf1d` worktree_basename 越界读修复（E2） | `src/git_protocol.rs:227 read_pkt_line` 返回 `Result`（pkt-line 已收口）；`src/internal/ai/tools/registry.rs:100` cwd `panic!` | pkt-line 切片完成；生产 panic 面未清零（ToolRegistry 等），解析越界/下溢防护需持续对齐 | 缩小（Libra）+扩大（竞品）＝双方 | 更新判据 | E4 |
 | SB-02 | SB | 实施中→实施中 | `anomalyco/opencode@709af586` 拒绝后停止 run（E2） | `src/internal/ai/mcp/server.rs:46-47` authz 默认 None；`src/internal/ai/tools/utils.rs` 写重定向 needs_human | authorizer 生产接线与 shell fail-closed 仍缺；权限路径规范化与拒绝后行为缺规范 | 扩大（竞品） | 补充完成判据 ×2 | E4 |
-| SB-03 | SB | 已验证→已验证 | `walgit/walgit@bf65c01` 退役权限与守恒证明（E2，参照列同时服务 LR-09） | `src/utils/d1_client.rs:3286 ensure_publish_schema` 逐语句、无事务；wrangler 第二套 runner | D1 runner 仍缺事务账本与单一迁移事实源 | 不变（本轮核对锚点行号） | 保持 | E2 |
+| SB-03 | SB | 已验证→已验证 | `walgit/walgit@bf65c01` 退役权限与守恒证明（E2，参照列同时服务 LR-09） | `ensure_publish_schema` 逐语句、无事务（**历史锚点：已随 plan-20260920 RC-35 删除**）；wrangler 第二套 runner | D1 runner 仍缺事务账本与单一迁移事实源 | 不变（本轮核对锚点行号） | 保持 | E2 |
 | SB-04 | SB | 实施中→实施中 | `epicgames/lore@7ccb6a1` shutdown 后调用显式失败（E2） | `grep -rn ProcessScope src tests` = 0；`src/internal/process_terminate.rs:12` ProcessTerminateGate；nextest CI `a8218ac` | 测试隔离已改善；child scope 抽象、中断清理与 shutdown 语义未统一 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
 
 不做 Top-3（按 (S+D+X) 从「不采纳/延后」候选中取）：
@@ -214,7 +214,7 @@ Libra 自身（HEAD `9da06b4bf700472781c2e76ec48e96815475caf3`，`Cargo.toml` ve
 - **LR-03**：**已排期→实施中**——sidecar Change ID 模块 `src/internal/change/{identity,genealogy,store,resolve,builder,workflows}.rs` 与 `tests/command/change_revision_provenance_test.rs` 随 `9da06b4` 合入（HEAD，**未发布**，v0.22.47 无 `internal/change/`）；`plan-20260822.md:123` ADR-OL-04 冻结 sidecar-only（不写 commit header）。
 - **LR-05**：cherry-pick 序列一致性修复（`3128bc2` HF-01、`7190507`、`9be09fe`，v0.22.39-42）与 unmerged staging（`06d0840`）；merge 主线继续收敛，versioned conflict object 仍无，状态保持实施中。
 - **CT-01**：仍实施中；本轮 `tests/compat-ledger/t4` 仍 34 toml 无新 wave；DEFER-09 关闭表述沿用第 11 轮。
-- **UP-01 / RT-01**：保持已实现（本周期 28 个 tag 均经签名链发布，属既有四证据的持续兑现，不重复登记）。
+- **UP-01 / RT-01**：保持已实现；RT-01 的产品表面（`libra code`/Web 执行器）已由 plan-20260920 拆除（本周期 28 个 tag 均经签名链发布，属既有四证据的持续兑现，不重复登记）。
 - **SB-02 / plan-20260830**：SBX-01..05 已合入维持；authorizer 生产仍未安装（`server.rs:46-47` 默认 None）。**SB-04 / plan-20260827**：nextest CI 与序列注册维持；`grep -rn ProcessScope src tests` = 0（child scope 仍缺）。
 - **Memory**：仍无实现——`ls src/internal/ai/memory` 不存在、`src/cli.rs` 无 memory 子命令、`grep -rn 'fts5\|bm25'` = 0、`grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0；MEM-01/02 维持已排期，MEM-06 本轮由竞品证据推进为已验证。
 - **未发布变更（v0.22.47..HEAD，3 条）**：`9da06b4` operation/change genealogy milestones（上两行）；`06d0840` add unmerged staging、`-u` pathspec 检查、literal-pathspecs（用户可见行为变更）；`07ba2d9` pkt-line 计划收口文档。CHANGELOG `[Unreleased]` 另有 isolated agent task 单一 `agent.task.sync-back` operation 语义与 operation-v2 HEAD pinning（触及「兼容与迁移」「数据正确性」门禁，须随发布补迁移/回滚证据）。
@@ -757,6 +757,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | 承接 monoengine `DEFER-AC-01`：新增 `libra agent capture-push` HTTP 客户端；双评审 PASS，任务卡尚未执行 |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | 已排期 | 收口与 nextest 分组无关的 `--lib` 串行锁对齐 + `command_test` 高并行 spawn；禁止改 nextest 成员 |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | 已排期 | 合并原 issues/469、484、489、491-494 及 490/476/470 的 add 卡；**在 [`issues/477.md`](issues/477.md) 全部剩余卡完成后执行**。`add -p` 仍由 477 Phase 4 交付 |
+| [`plan-20260920.md`](plan-20260920.md) | 横切（拆除 `libra code` / Publish / Worker） | 实施中（收尾） | 公开 Code/Publish 表面已随 0.23.0 删除；内部 SCC、leftover、Code UI 测试面与 `worker/` 已删；剩余 RC-32 文档收口 |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁到 XDG） | 已排期 | 用户 2026-09-19 裁决：global config DB + 全域 vault unseal key 迁到 `<XDG_CONFIG_HOME|~/.config>/libra`（macOS 同）；旧库首次使用自动迁移并保留备份；`~/.libra` 仍为 `LIBRA_HOME`；四个 `independent` 卡、`patch` 发布 |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
