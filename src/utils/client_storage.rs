@@ -41,8 +41,8 @@ use git_internal::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Statement,
-    Value,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbConn, DbErr, EntityTrait, QueryFilter,
+    Statement, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -117,10 +117,9 @@ const INDEX_REPAIR_STAGING_SCAN_CAP: usize = 1_024;
 const INDEX_REPAIR_STAGING_REMOVE_CAP: usize = 256;
 const INDEX_REPAIR_STAGING_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(not(test))]
-const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-const INDEX_REPAIR_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 100_000;
 #[cfg(test)]
@@ -411,12 +410,25 @@ fn try_acquire_index_repair_lock(
     try_acquire_index_repair_lock_file(&index_repair_lock_path(db_path, oid)?, purpose)
 }
 
+/// Git-style quadratic lock-wait backoff (ADR-OI-03 item 1; git `lockfile.c:206-251`):
+/// 1ms × (attempt+1)² starting at 1ms for attempt 0, ±25% jitter, single sleep
+/// capped at 1 second.
+/// `jitter_factor` ∈ [0, 1] is the uniform random draw (0 → −25%, 1 → +25%).
+fn index_repair_lock_backoff_sleep(attempt: u32, jitter_factor: f64) -> Duration {
+    let step =
+        u64::from(attempt.saturating_add(1)).saturating_mul(u64::from(attempt.saturating_add(1)));
+    let base_ms = step.min(1_000);
+    let jittered = base_ms as f64 * (0.75 + jitter_factor.clamp(0.0, 1.0) * 0.5);
+    Duration::from_micros((jittered * 1_000.0).round() as u64)
+}
+
 fn acquire_index_repair_lock_file(
     lock_path: &Path,
     identity: &str,
     purpose: &'static str,
 ) -> io::Result<ObjectIndexRepairLock> {
     let started = Instant::now();
+    let mut attempt: u32 = 0;
     loop {
         if let Some(lock) = try_acquire_index_repair_lock_file(lock_path, purpose)? {
             return Ok(lock);
@@ -427,7 +439,8 @@ fn acquire_index_repair_lock_file(
                 describe_index_repair_lock_timeout(lock_path, identity),
             ));
         }
-        std::thread::sleep(INDEX_REPAIR_LOCK_RETRY_INTERVAL);
+        std::thread::sleep(index_repair_lock_backoff_sleep(attempt, fastrand::f64()));
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -1631,6 +1644,26 @@ impl ClientStorage {
     pub(crate) async fn repair_pending_object_index_updates(
         db_path: &Path,
     ) -> Result<ObjectIndexRepairOutcome, String> {
+        Self::repair_pending_object_index_updates_with_lock_policy(db_path, false)
+            .await
+            .map(|page| page.expect("the blocking variant always replays instead of skipping"))
+    }
+
+    /// Like [`Self::repair_pending_object_index_updates`], but skip the replay
+    /// entirely (without waiting and without an error) when the generation
+    /// lock is busy: read-only preflight commands must not serialize behind a
+    /// batch writer (ADR-OI-03 item 2 / M-WAIT W5). Returns `Ok(None)` for a
+    /// skipped replay, `Ok(Some(outcome))` for a completed one.
+    pub(crate) async fn repair_pending_object_index_updates_if_uncontended(
+        db_path: &Path,
+    ) -> Result<Option<ObjectIndexRepairOutcome>, String> {
+        Self::repair_pending_object_index_updates_with_lock_policy(db_path, true).await
+    }
+
+    async fn repair_pending_object_index_updates_with_lock_policy(
+        db_path: &Path,
+        skip_when_busy: bool,
+    ) -> Result<Option<ObjectIndexRepairOutcome>, String> {
         let db_path = db_path.to_path_buf();
         let db_path_str = db_path.to_str().ok_or_else(|| {
             format!(
@@ -1650,44 +1683,31 @@ impl ClientStorage {
         let expected_oid_len = expected_index_repair_oid_len(&db_conn).await?;
         let load_path = db_path.clone();
         let page = tokio::task::spawn_blocking(move || {
-            load_pending_object_index_updates(&load_path, expected_oid_len)
+            let generation_lock = if skip_when_busy {
+                let Some(lock) = try_acquire_index_repair_lock_file(
+                    &index_repair_generation_lock_path(&load_path)?,
+                    "replay",
+                )?
+                else {
+                    return Ok(None);
+                };
+                lock
+            } else {
+                acquire_index_repair_generation_lock(&load_path, "replay")?
+            };
+            load_pending_object_index_updates(&load_path, expected_oid_len, generation_lock)
+                .map(Some)
         })
         .await
         .map_err(|error| format!("object-index repair marker reader failed: {error}"))?
         .map_err(|error| format!("failed to read object-index repair markers: {error}"))?;
-
-        if page.updates.is_empty() {
-            return Ok(ObjectIndexRepairOutcome {
-                repaired: 0,
-                remaining: page.has_more,
-            });
-        }
-        if cfg!(debug_assertions)
-            && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some()
-        {
-            return Err("injected object index update failure".to_string());
-        }
-        let repo_id = resolve_repo_id_for_index(&db_conn).await?;
-        let mut repaired = 0;
-        for batch in page.updates.chunks(INDEX_REPAIR_BATCH_SIZE) {
-            update_object_index_batch(&db_conn, &db_path, &repo_id, batch).await?;
-            for msg in batch {
-                if let Some(marker_path) = msg.marker_path.as_deref() {
-                    retire_index_repair_marker(marker_path).map_err(|error| {
-                        format!(
-                            "updated object index for {}, but failed to retire repair marker '{}': {error}",
-                            msg.hash,
-                            marker_path.display()
-                        )
-                    })?;
-                }
-                repaired += 1;
-            }
-        }
-        Ok(ObjectIndexRepairOutcome {
-            repaired,
-            remaining: page.has_more,
-        })
+        let Some(page) = page else {
+            // Generation lock busy: this replay was deliberately skipped.
+            return Ok(None);
+        };
+        apply_pending_object_index_page(&db_conn, &db_path, page)
+            .await
+            .map(Some)
     }
 
     /// Read a Git object's *raw payload* by its hash.
@@ -2763,11 +2783,51 @@ async fn expected_index_repair_oid_len(db_conn: &DatabaseConnection) -> Result<u
     }
 }
 
+/// Apply one loaded replay page to the object index, retiring each durable
+/// marker after its row update commits. Shared by the blocking and the
+/// uncontended preflight variants.
+async fn apply_pending_object_index_page(
+    db_conn: &DbConn,
+    db_path: &Path,
+    page: PendingObjectIndexPage,
+) -> Result<ObjectIndexRepairOutcome, String> {
+    if page.updates.is_empty() {
+        return Ok(ObjectIndexRepairOutcome {
+            repaired: 0,
+            remaining: page.has_more,
+        });
+    }
+    if cfg!(debug_assertions) && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some() {
+        return Err("injected object index update failure".to_string());
+    }
+    let repo_id = resolve_repo_id_for_index(db_conn).await?;
+    let mut repaired = 0;
+    for batch in page.updates.chunks(INDEX_REPAIR_BATCH_SIZE) {
+        update_object_index_batch(db_conn, db_path, &repo_id, batch).await?;
+        for msg in batch {
+            if let Some(marker_path) = msg.marker_path.as_deref() {
+                retire_index_repair_marker(marker_path).map_err(|error| {
+                    format!(
+                        "updated object index for {}, but failed to retire repair marker '{}': {error}",
+                        msg.hash,
+                        marker_path.display()
+                    )
+                })?;
+            }
+            repaired += 1;
+        }
+    }
+    Ok(ObjectIndexRepairOutcome {
+        repaired,
+        remaining: page.has_more,
+    })
+}
+
 fn load_pending_object_index_updates(
     db_path: &Path,
     expected_oid_len: usize,
+    generation_lock: ObjectIndexRepairLock,
 ) -> io::Result<PendingObjectIndexPage> {
-    let generation_lock = acquire_index_repair_generation_lock(db_path, "replay")?;
     scavenge_index_repair_staging(db_path)?;
     let marker_dir = db_path
         .parent()
@@ -3647,6 +3707,79 @@ mod tests {
         let oversized = dir.path().join("oversized");
         fs::write(&oversized, vec![b'x'; 2048]).expect("write oversized lock file");
         assert!(super::read_index_repair_lock_metadata(&oversized).is_none());
+    }
+
+    #[test]
+    fn lock_wait_uses_bounded_quadratic_backoff() {
+        // M-WAIT W3: 1ms × (attempt+1)², ±25% jitter, single sleep capped at 1s.
+        for (attempt, step_ms) in [
+            (0u32, 1u64),
+            (1, 4),
+            (2, 9),
+            (9, 100),
+            (30, 961),
+            (31, 1000),
+            (500, 1000),
+        ] {
+            let min = super::index_repair_lock_backoff_sleep(attempt, 0.0);
+            let max = super::index_repair_lock_backoff_sleep(attempt, 1.0);
+            assert_eq!(
+                min,
+                Duration::from_micros(step_ms * 750),
+                "attempt {attempt} lower bound"
+            );
+            assert_eq!(
+                max,
+                Duration::from_micros(step_ms * 1250),
+                "attempt {attempt} upper bound"
+            );
+            let mid = super::index_repair_lock_backoff_sleep(attempt, 0.5);
+            assert!(min <= mid && mid <= max, "attempt {attempt} midpoint");
+        }
+    }
+
+    #[test]
+    fn test_lock_wait_budget_stays_short_in_test_builds() {
+        // M-WAIT W7: the test-build budget must stay at 100ms so suites do
+        // not slow down behind the 10s production budget.
+        assert_eq!(
+            super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT,
+            Duration::from_millis(100)
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn nonblocking_preflight_skips_busy_generation_lock() {
+        // M-WAIT W5: with the generation lock busy, the uncontended preflight
+        // skips the replay immediately, without waiting and without an error.
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "skip-repo", false)
+            .await
+            .expect("set repo id");
+        let _held = super::acquire_index_repair_generation_lock(&db_path, "queued_update")
+            .expect("hold generation lock");
+
+        let started = Instant::now();
+        let outcome = ClientStorage::repair_pending_object_index_updates_if_uncontended(&db_path)
+            .await
+            .expect("busy preflight must not error");
+        assert!(
+            outcome.is_none(),
+            "a busy generation lock must skip the replay"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the skip must not wait for the lock"
+        );
     }
 
     #[test]

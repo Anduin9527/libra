@@ -2105,21 +2105,38 @@ async fn repair_pending_object_index_updates_before_command(
     require_complete: bool,
 ) -> CliResult<()> {
     let db_path = storage.join(utils::util::DATABASE);
-    match utils::client_storage::ClientStorage::repair_pending_object_index_updates(&db_path).await {
-        Ok(outcome) if outcome.remaining && require_complete => Err(CliError::fatal(format!(
+    let result = if require_complete {
+        utils::client_storage::ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .map(Some)
+    } else {
+        utils::client_storage::ClientStorage::repair_pending_object_index_updates_if_uncontended(
+            &db_path,
+        )
+        .await
+    };
+    match result {
+        Ok(None) => {
+            // The generation lock is busy (ADR-OI-03 item 2 / M-WAIT W5): skip
+            // this bounded replay without waiting and without a warning; the
+            // next repository command retries.
+            tracing::debug!("skipped object-index replay preflight: generation lock busy");
+            Ok(())
+        }
+        Ok(Some(outcome)) if outcome.remaining && require_complete => Err(CliError::fatal(format!(
             "cannot run this operation while durable local object-index repair is pending: repaired {} marker(s), but more remain for a later bounded replay",
             outcome.repaired
         ))
         .with_stable_code(utils::error::StableErrorCode::IoWriteFailed)
         .with_hint("rerun the command until the bounded repair queue is empty; if it does not shrink, inspect the repository database and repair-marker directory.")),
-        Ok(outcome) if outcome.remaining => {
+        Ok(Some(outcome)) if outcome.remaining => {
             utils::error::emit_warning(format!(
                 "replayed {} durable cloud object-index repair marker(s), but more remain for the next repository command; cloud operations and destructive agent cleanup stay fail-closed until the queue is empty",
                 outcome.repaired
             ));
             Ok(())
         }
-        Ok(_) => Ok(()),
+        Ok(Some(_)) => Ok(()),
         Err(error) if require_complete => Err(CliError::fatal(format!(
             "cannot run this operation while durable local object-index repair is pending: {error}"
         ))
@@ -3566,6 +3583,63 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    /// M-WAIT W5: with the generation lock busy, the read-only preflight
+    /// skips the bounded replay silently — no warning, no error.
+    #[tokio::test]
+    #[serial(env)]
+    async fn preflight_replay_skips_busy_generation_lock_without_warning() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let storage = tempfile::tempdir().expect("create storage dir");
+            let db_path = storage.path().join(crate::utils::util::DATABASE);
+            let db_conn = db::create_database(
+                db_path
+                    .to_str()
+                    .expect("temporary database path should be UTF-8"),
+            )
+            .await
+            .expect("create database");
+            ConfigKv::set_with_conn(&db_conn, "libra.repoid", "cli-skip-repo", false)
+                .await
+                .expect("set repo id");
+
+            // Hold the generation lock with a raw flock; the preflight must skip
+            // without waiting and without warning.
+            let lock_dir = storage.path().join("object-index-repair-locks");
+            std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+            let lock_path = lock_dir.join("object-index-repair-generation.lock");
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open generation lock file");
+            // SAFETY: flock on an owned descriptor held until the end of the test.
+            assert_eq!(
+                unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+
+            let warnings_before = crate::utils::output::pending_warning_messages().len();
+            repair_pending_object_index_updates_before_command(storage.path(), false)
+                .await
+                .expect("busy preflight must succeed");
+            assert_eq!(
+                crate::utils::output::pending_warning_messages().len(),
+                warnings_before,
+                "a busy-lock skip must not emit a replay warning"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // The raw-flock reproduction is unix-only; the skip semantics are
+            // covered cross-platform by `client_storage::tests::nonblocking_preflight_skips_busy_generation_lock`.
+        }
+    }
 
     /// §C.9: what the CLI actually maps, asserted by CALLING the mapper.
     ///
