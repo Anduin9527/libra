@@ -65,7 +65,7 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 | `skill list` | `skill search` 的别名（同过滤项） |
 | `skill registry` | 展示各 agent 的 curated 可发现 skill 注册表（`--provider <slug>` 限定；公开 SkillDiscoverer 面） |
 | `clean` | 清理已停止会话的临时 checkpoint（prune 遇到进行中的 checkpoint 写入、traces 引用可达但无 catalog 行的提交、或仍有耐久 object-index repair 待处理时 fail-closed 拒绝；同时删除因此不可达的 `object_index` 行） |
-| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致 |
+| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致。只读的 `legacy_code_residue` 字段（人读为「Frozen Code residue」行）报告冷冻的 Code 时代路径 `.libra/sessions/code/`、`.libra/code/` 与 `libra/intent` ref 是否仍存在；它不会删除或改写该状态，清理另由 plan-20260920 ADR-RC-04 / DEFER-RC-02 承接 |
 | `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |
 | `rpc list` | 列出 `PATH` 上发现的 `libra-agent-*` 二进制（含 trusted/quarantined 状态）；需先开启 external-agents 开关 |
 | `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`）。provider-exporter slug `opencode` 则改为固定 provider 自身的 CLI 二进制——只从已注册受信目录解析、绝不扫描 `$PATH`——供沙箱化 export bridge 使用；该形式无需 external-agents opt-in |
