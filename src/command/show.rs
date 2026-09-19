@@ -26,7 +26,8 @@ use crate::{
         log::{
             ChangeType,
             config::{configured_date, configured_pretty, resolve_cli_date},
-            generate_diff, get_changed_files_for_commit, parse_pretty_format,
+            generate_diff, get_changed_files_for_commit,
+            get_changed_files_for_commit_matching_pathspec, parse_pretty_format,
         },
     },
     common_utils::parse_commit_msg,
@@ -42,7 +43,9 @@ use crate::{
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
-        path, util,
+        path,
+        pathspec::PathspecSet,
+        util,
     },
 };
 
@@ -472,9 +475,12 @@ async fn show_commit(
 
     // Render patch-style details when requested.
     if !args.no_patch {
-        let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+        let paths = show_effective_paths(&commit, &args.pathspec).await?;
 
-        if args.patch_with_stat {
+        // `FIX-AD-01`: a pathspec that matches no changed path renders no
+        // diff/stat block — an empty `paths` otherwise means "no filter".
+        if !args.pathspec.is_empty() && paths.is_empty() {
+        } else if args.patch_with_stat {
             // `--patch-with-stat` (Git's `-p --stat`): the diffstat block followed
             // by the full patch.
             let diffstat = show_diffstat(&commit, paths.clone()).await?;
@@ -680,6 +686,25 @@ fn build_raw_lines(
     out
 }
 
+/// `FIX-AD-01`: the concrete changed paths a `show` pathspec list selects for
+/// `commit`. Wildcard / `:(magic)` specs expand through the shared pathspec
+/// engine; plain specs keep their prefix behavior. An empty pathspec list
+/// returns no filters (the renderers treat that as "all").
+async fn show_effective_paths(commit: &Commit, raw: &[String]) -> CliResult<Vec<PathBuf>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workdir = util::working_dir();
+    let current_dir = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!("failed to resolve current directory: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let set = PathspecSet::from_workdir(raw, &current_dir, &workdir)
+        .map_err(|error| CliError::command_usage(format!("invalid pathspec: {error}")))?;
+    let changed = get_changed_files_for_commit_matching_pathspec(commit, &set).await?;
+    Ok(changed.into_iter().map(|change| change.path).collect())
+}
+
 async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<()> {
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
@@ -688,7 +713,7 @@ async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> Cl
         return Ok(());
     }
 
-    let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+    let paths = show_effective_paths(&commit, &args.pathspec).await?;
     if args.stat || args.name_only || args.name_status || args.raw {
         // --stat / --name-only / --name-status / --raw human paths only need
         // tree-level file lists, not blob contents.  Use the same function so

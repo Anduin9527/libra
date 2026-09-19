@@ -1327,3 +1327,36 @@ fn test_show_literal_pathspecs_global() {
     assert!(text.contains("*.txt"), "{text}");
     assert!(!text.contains("x.txt"), "{text}");
 }
+
+/// FIX-AD-01: `show -- <pathspec>` filters through the shared pathspec engine,
+/// so a glob covers `x.txt` as well as the literal `*.txt` (Git parity).
+#[test]
+fn test_show_pathspec_glob_filters_stat() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    std::fs::write(p.join("notes.md"), "md\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "x.txt", "*.txt", "notes.md"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "paths", "--no-verify"], p),
+        "commit",
+    );
+
+    // Glob: the stat covers both `*.txt` and `x.txt`, never `notes.md`.
+    let glob = run_libra_command(&["show", "--stat", "HEAD", "--", "*.txt"], p);
+    assert_cli_success(&glob, "show glob");
+    let text = String::from_utf8_lossy(&glob.stdout);
+    assert!(text.contains("x.txt"), "x.txt matched by the glob: {text}");
+    assert!(text.contains("*.txt"), "*.txt matched: {text}");
+    assert!(!text.contains("notes.md"), "notes.md excluded: {text}");
+
+    // A spec matching nothing renders no diffstat at all.
+    let none = run_libra_command(&["show", "--stat", "HEAD", "--", "nope.rs"], p);
+    assert_cli_success(&none, "show non-matching");
+    let text = String::from_utf8_lossy(&none.stdout);
+    assert!(!text.contains("file changed"), "no diffstat: {text}");
+}
