@@ -62,61 +62,6 @@ jobs:
       - name: Check Rustdoc intra-doc links
         run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features
 
-  web-check:
-    name: compat-web-check
-    runs-on: [self-hosted]
-
-    env:
-      CARGO_TERM_COLOR: always
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.10.0 --activate
-
-      # Rust-oriented jobs skip the web build for speed. This dedicated job
-      # validates the Next.js source, generates a fresh static export, and
-      # compiles it into `WebAssets`; the generated directory is deliberately
-      # not version-controlled. Per docs/improvement/web.md Phase 5
-      # verification.
-      - name: Install web dependencies
-        run: pnpm --dir web install --frozen-lockfile
-
-      - name: Lint web
-        run: pnpm --dir web lint
-
-      - name: Test web
-        run: pnpm --dir web test
-
-      - name: Build web (static export → web/out/)
-        run: pnpm --dir web build
-
-      - name: Verify generated static export lifecycle
-        shell: bash
-        run: |
-          test -f web/out/index.html
-          if git ls-files --error-unmatch -- web/out >/dev/null 2>&1; then
-            echo "web/out is generated build output and must not be tracked." >&2
-            exit 1
-          fi
-          git check-ignore -q web/out/index.html
-
-      - name: Check generated export embeds into the Rust binary
-        env:
-          LIBRA_SKIP_WEB_BUILD: "1"
-        run: cargo check --lib
-
   owner-liveness-macos:
     # plan-20260714 W1 (§C.9): the operation claim decides whether a control
     # action's owner is dead by proving it — boot id + PID namespace on Linux,
@@ -309,14 +254,9 @@ jobs:
 
       # REMOVED 2026-08-31 — the "Run Code UI automation scenarios" step is
       # dropped because `libra code` TUI support was removed upstream; the
-      # PTY/TUI-driven scenario targets (code_ui_scenarios, harness_self_test,
-      # lease/SSE/state matrices, ...) no longer describe product behavior.
-      # The compatibility guard still inventories these disabled targets:
-      #   --test code_codex_default_web_test
-      #   --test ai_code_ui_headless_test
-      #   --test code_codex_runtime_test
-      # The test files remain in the repo for local reference; restore this
-      # step from git history if a Code UI surface returns.
+      # PTY/TUI-driven scenario targets and their harness were removed with
+      # plan-20260920 RC-23/RC-30. Restore this step from git history if a
+      # Code UI surface returns.
 
       # lore.md 1.7: the OTLP wire test needs the feature compiled in
       # (required-features excludes it from the default `cargo test --all`).
