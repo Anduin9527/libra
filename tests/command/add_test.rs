@@ -102,13 +102,20 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
     .expect_err("marker registration failure must be returned");
 
     assert_eq!(error.stable_code(), StableErrorCode::IoWriteFailed);
-    // ADR-OI-04 batch publication: the failure surfaces from the batch flush
-    // with the retry-safe wording (OI-05 refines this message further).
+    // ADR-OI-05 item 2: the single-prefix canonical message explains that the
+    // payloads are safe, nothing was staged, and a direct retry is enough.
+    let message = error.to_string();
     assert!(
-        error
-            .to_string()
-            .contains("failed to register its cloud object-index repair marker"),
-        "unexpected error: {error}"
+        message.contains("object payloads were stored safely"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("no paths were staged"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("retry the command directly"),
+        "unexpected error: {message}"
     );
 
     fs::remove_file(test_dir.path().join(".libra/object-index-repair"))

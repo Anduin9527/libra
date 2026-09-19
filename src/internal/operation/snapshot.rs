@@ -90,9 +90,14 @@ pub enum SnapshotError {
     Scan(#[from] ScanError),
     #[error("snapshot object write failed: {0}")]
     Object(String),
+    #[error("{message}")]
+    MarkerBatchFlush {
+        stored_objects: usize,
+        message: String,
+    },
     #[error("snapshot manifest is invalid: {0}")]
     View(#[from] super::view::ViewError),
-    #[error("state facet capture failed: {0}")]
+    #[error("state facet error: {0}")]
     Facet(#[from] FacetError),
     #[error("index metadata could not be read: {0}")]
     Index(String),
@@ -294,9 +299,13 @@ impl WorkspaceSnapshotter {
         let result = self.capture_inner().await;
         match result {
             Ok(outcome) => {
-                storage
-                    .end_object_index_batch()
-                    .map_err(|error| SnapshotError::Object(error.to_string()))?;
+                let stored_objects = storage.pending_object_index_batch_count();
+                storage.end_object_index_batch().map_err(|error| {
+                    SnapshotError::MarkerBatchFlush {
+                        stored_objects,
+                        message: error.to_string(),
+                    }
+                })?;
                 Ok(outcome)
             }
             Err(error) => {

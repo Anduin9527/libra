@@ -808,6 +808,20 @@ fn now_millis() -> i64 {
 }
 
 fn snapshot_error_to_operation(error: SnapshotError) -> OperationError {
+    // ADR-OI-05 item 3: marker-registration failures carry the stored-object
+    // count and the unchanged staging state in the error envelope details.
+    if let SnapshotError::MarkerBatchFlush {
+        stored_objects,
+        message,
+    } = error
+    {
+        return OperationError::Cli(
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+                .with_detail("stored_objects", stored_objects as u64)
+                .with_detail("staged", 0usize),
+        );
+    }
     let detail = error.to_string();
     let lower = detail.to_ascii_lowercase();
     if lower.contains("failed to load tree object") || lower.contains("existing tree object") {
@@ -818,10 +832,12 @@ fn snapshot_error_to_operation(error: SnapshotError) -> OperationError {
     }
     if lower.contains("failed to register its cloud object-index repair marker")
         || lower.contains("failed to store object")
+        || lower.contains("cloud object-index repair markers could not be registered")
     {
+        // ADR-OI-05 item 2/4: the storage layer already carries the single-
+        // prefix canonical message; surface it unchanged with the IO code.
         return OperationError::Cli(
-            CliError::fatal(format!("failed to store object: {detail}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed),
+            CliError::fatal(detail).with_stable_code(StableErrorCode::IoWriteFailed),
         );
     }
     if lower.contains("index") {

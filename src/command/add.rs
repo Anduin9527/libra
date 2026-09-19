@@ -223,7 +223,10 @@ pub enum AddError {
     /// Batch publication of cloud object-index repair markers failed after
     /// the payloads were stored (ADR-OI-04 / M-BATCH B2).
     #[error("failed to store object: {source}")]
-    ObjectIndexBatchFlush { source: io::Error },
+    ObjectIndexBatchFlush {
+        stored_objects: usize,
+        source: io::Error,
+    },
     /// Path bytes are not valid UTF-8 — Libra's index does not yet preserve
     /// non-UTF-8 paths verbatim.
     #[error("path '{path}' is not valid UTF-8")]
@@ -270,10 +273,18 @@ impl From<AddError> for CliError {
             AddError::RefreshFailed { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
-            AddError::CreateIndexEntry { .. }
-            | AddError::ObjectSave { .. }
-            | AddError::ObjectIndexBatchFlush { .. } => {
+            AddError::CreateIndexEntry { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+            }
+            AddError::ObjectSave { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+                .with_detail("stored_objects", 1usize)
+                .with_detail("staged", 0usize),
+            AddError::ObjectIndexBatchFlush { stored_objects, .. } => {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                    .with_detail("stored_objects", *stored_objects as u64)
+                    .with_detail("staged", 0usize)
             }
             AddError::InvalidPathEncoding { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -508,9 +519,14 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     util::objects_storage().begin_object_index_batch();
     let result = match run_add(&args).await {
         Ok(result) => {
-            util::objects_storage()
-                .end_object_index_batch()
-                .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
+            let batch_storage = util::objects_storage();
+            let stored_objects = batch_storage.pending_object_index_batch_count();
+            batch_storage.end_object_index_batch().map_err(|source| {
+                AddError::ObjectIndexBatchFlush {
+                    stored_objects,
+                    source,
+                }
+            })?;
             result
         }
         Err(error) => {
@@ -1110,9 +1126,14 @@ async fn run_add_patch(
             }
         }
     }
-    util::objects_storage()
+    let batch_storage = util::objects_storage();
+    let stored_objects = batch_storage.pending_object_index_batch_count();
+    batch_storage
         .flush_object_index_batch()
-        .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
+        .map_err(|source| AddError::ObjectIndexBatchFlush {
+            stored_objects,
+            source,
+        })?;
     index
         .save(index_path)
         .map_err(|source| AddError::IndexSave {
@@ -1231,9 +1252,14 @@ async fn run_add_resolved(
             }
         }
     }
-    util::objects_storage()
+    let batch_storage = util::objects_storage();
+    let stored_objects = batch_storage.pending_object_index_batch_count();
+    batch_storage
         .flush_object_index_batch()
-        .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
+        .map_err(|source| AddError::ObjectIndexBatchFlush {
+            stored_objects,
+            source,
+        })?;
 
     index
         .save(index_path)
@@ -1416,9 +1442,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         } else {
             let refreshed = do_refresh_files(&mut index, &tracked_modified, &workdir)?;
             add_output.refreshed = refreshed.iter().map(|f| f.display().to_string()).collect();
-            util::objects_storage()
-                .flush_object_index_batch()
-                .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
+            let batch_storage = util::objects_storage();
+            let stored_objects = batch_storage.pending_object_index_batch_count();
+            batch_storage.flush_object_index_batch().map_err(|source| {
+                AddError::ObjectIndexBatchFlush {
+                    stored_objects,
+                    source,
+                }
+            })?;
             index
                 .save(&index_path)
                 .map_err(|source| AddError::IndexSave {
@@ -1666,9 +1697,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         )?;
     }
 
-    util::objects_storage()
+    let batch_storage = util::objects_storage();
+    let stored_objects = batch_storage.pending_object_index_batch_count();
+    batch_storage
         .flush_object_index_batch()
-        .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
+        .map_err(|source| AddError::ObjectIndexBatchFlush {
+            stored_objects,
+            source,
+        })?;
     index
         .save(&index_path)
         .map_err(|source| AddError::IndexSave {

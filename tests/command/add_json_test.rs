@@ -526,3 +526,61 @@ fn json_pathspec_not_matched_returns_error() {
             .contains("nonexistent.rs")
     );
 }
+
+/// M-FAIL F3: when marker registration fails, the `--json` error envelope
+/// carries `stored_objects` (payloads written) and `staged: 0` (staging
+/// unchanged) alongside the stable `LBR-IO-002` code.
+#[test]
+fn json_add_marker_failure_details() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("marker-failure.txt"), "content").unwrap();
+    fs::write(
+        repo.path().join(".libra/object-index-repair"),
+        "conflicting non-directory",
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["--json", "add", "marker-failure.txt"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("expected JSON error envelope, got: {stderr}\nerror: {e}"));
+    assert_eq!(report["error_code"], "LBR-IO-002");
+    assert_eq!(report["exit_code"], 128);
+    let details = &report["details"];
+    assert!(
+        details["stored_objects"].as_u64().unwrap_or(0) >= 1,
+        "details must report stored payloads: {report}"
+    );
+    assert_eq!(details["staged"].as_u64(), Some(0), "{report}");
+    assert!(
+        report["message"]
+            .as_str()
+            .unwrap()
+            .contains("no paths were staged"),
+        "{report}"
+    );
+
+    // F4: after removing the injection, a direct retry succeeds without
+    // rewriting the payloads and stages the file.
+    fs::remove_file(repo.path().join(".libra/object-index-repair")).unwrap();
+    let retried = run_libra_command(&["--json", "add", "marker-failure.txt"], repo.path());
+    assert_eq!(
+        retried.status.code(),
+        Some(0),
+        "retry must succeed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let ok: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&retried.stdout).trim())
+            .expect("retry JSON envelope");
+    assert_eq!(ok["ok"], true);
+    assert_eq!(ok["data"]["added"][0], "marker-failure.txt");
+}
