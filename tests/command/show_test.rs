@@ -327,6 +327,7 @@ async fn test_show_non_quiet_uses_forced_pager() {
         patch_with_stat: false,
         summary: false,
         pathspec: vec![],
+        pathspec_separator: false,
     };
 
     let err = execute_safe(args, &OutputConfig::default())
@@ -387,6 +388,7 @@ async fn test_show_quiet_still_validates_patch_generation() {
         patch_with_stat: false,
         summary: false,
         pathspec: vec![],
+        pathspec_separator: false,
     };
     let output = OutputConfig {
         quiet: true,
@@ -448,6 +450,7 @@ async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
         patch_with_stat: false,
         summary: false,
         pathspec: vec![],
+        pathspec_separator: false,
     };
     let output = OutputConfig {
         quiet: true,
@@ -918,6 +921,7 @@ async fn test_show_execute_safe_bad_ref_returns_cli_error() {
         patch_with_stat: false,
         summary: false,
         pathspec: vec![],
+        pathspec_separator: false,
     };
     let result = execute_safe(args, &OutputConfig::default()).await;
     assert!(result.is_err(), "execute_safe should fail for bad ref");
@@ -970,6 +974,7 @@ async fn test_show_execute_safe_bad_rev_path_returns_cli_error() {
         patch_with_stat: false,
         summary: false,
         pathspec: vec![],
+        pathspec_separator: false,
     };
     let result = execute_safe(args, &OutputConfig::default()).await;
     assert!(result.is_err(), "execute_safe should fail for bad rev:path");
@@ -1359,4 +1364,41 @@ fn test_show_pathspec_glob_filters_stat() {
     assert_cli_success(&none, "show non-matching");
     let text = String::from_utf8_lossy(&none.stdout);
     assert!(!text.contains("file changed"), "no diffstat: {text}");
+}
+
+/// FIX-AD-01: `show -- <pathspec>` with no revision means `HEAD` limited to the
+/// pathspec (Git parity); without `--`, an unresolvable token stays a bad
+/// revision.
+#[test]
+fn test_show_separator_pathspec_implies_head() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "paths", "--no-verify"], p),
+        "commit",
+    );
+
+    // `--` + glob pathspec, no revision: HEAD is implied.
+    let out = run_libra_command(&["show", "--stat", "--", "*.txt"], p);
+    assert_cli_success(&out, "show -- pathspec");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("x.txt") && text.contains("*.txt"), "{text}");
+    assert!(text.contains("files changed"), "{text}");
+
+    // Without `--`, an unresolvable token stays a bad revision.
+    let bad = run_libra_command(&["show", "--stat", "not-a-rev"], p);
+    assert_eq!(
+        bad.status.code(),
+        Some(129),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("bad revision"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
 }

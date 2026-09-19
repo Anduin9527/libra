@@ -63,6 +63,11 @@ EXAMPLES:
     libra show --abbrev-commit HEAD         Abbreviate the commit hash in the header
     libra --json show HEAD                  Structured JSON output for agents";
 
+/// Hidden `--`-separator sentinel injected by `cli` (`FIX-AD-01`): tells `show`
+/// that everything after `--` is a pathspec, so a bare pathspec with no
+/// revision still means `HEAD <pathspec>` (Git parity).
+pub(crate) const SHOW_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-show-pathspec-separator";
+
 /// Shows commits, tags, trees, or blobs.
 #[derive(Parser, Debug)]
 #[command(after_help = SHOW_EXAMPLES)]
@@ -158,6 +163,11 @@ pub struct ShowArgs {
     /// Limit output to matching paths.
     #[clap(value_name = "PATHS", num_args = 0..)]
     pub pathspec: Vec<String>,
+
+    /// Internal sentinel injected by `cli` when the user wrote `--`
+    /// (`FIX-AD-01`): a leading pathspec with no revision then means `HEAD`.
+    #[clap(long = SHOW_PATHSPEC_SEPARATOR_FLAG, hide = true)]
+    pub pathspec_separator: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +295,17 @@ pub async fn execute(args: ShowArgs) {
 /// `<rev>:<path>`) and prints its contents with diff formatting.
 pub async fn execute_safe(mut args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::from(ShowError::NotInRepo))?;
+
+    // `FIX-AD-01`: `show -- <pathspec>` with no revision means `HEAD` limited to
+    // that pathspec (Git parity). clap routes the first positional to `object`,
+    // so shift it into the pathspec list once the `--` sentinel confirms the
+    // separator was used.
+    if args.pathspec_separator && args.pathspec.is_empty() {
+        if let Some(object) = args.object.take() {
+            args.pathspec.push(object);
+        }
+        args.object = Some("HEAD".to_string());
+    }
 
     if let Some(date) = args.date.take() {
         args.date = Some(resolve_cli_date(&date)?);

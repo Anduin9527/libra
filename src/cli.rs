@@ -1109,6 +1109,30 @@ fn rewrite_reset_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<s
     out
 }
 
+/// `FIX-AD-01`: inject the hidden pathspec-separator sentinel for `show` when
+/// the user wrote `--`, so a bare pathspec with no revision means `HEAD`
+/// (Git parity). Arity-free: it only adds a flag right after the subcommand.
+fn rewrite_show_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let Some((show_index, _from_double_dash)) = find_subcommand_index(&args) else {
+        return args;
+    };
+    if !matches!(args.get(show_index), Some(name) if name == "show") {
+        return args;
+    }
+    let has_separator = args.iter().skip(show_index + 1).any(|arg| arg == "--");
+    if !has_separator {
+        return args;
+    }
+    let mut out = Vec::with_capacity(args.len() + 1);
+    out.extend(args.iter().take(show_index + 1).cloned());
+    out.push(std::ffi::OsString::from(format!(
+        "--{}",
+        command::show::SHOW_PATHSPEC_SEPARATOR_FLAG
+    )));
+    out.extend(args.iter().skip(show_index + 1).cloned());
+    out
+}
+
 fn reset_has_positional_target_before_separator(
     args: &[std::ffi::OsString],
     start: usize,
@@ -2903,6 +2927,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
+    let argv = rewrite_show_pathspec_separator_args(argv);
     // §B.4.3 (R0-4): rewrite the status/st argument slice so Git's raw
     // `--find-renames` grammar survives clap and the three rename spellings
     // obey true last-one-wins via the occurrence list.
