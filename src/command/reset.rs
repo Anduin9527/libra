@@ -1160,6 +1160,56 @@ async fn reset_pathspecs(
             return Err(ResetError::PathspecOutsideWorkdir(pathspec.clone()));
         }
 
+        // `FIX-AD-01`: a wildcard / `:(magic)` spec expands to every matching
+        // index path (restore what the target has, drop what only the current
+        // index has); a plain spec keeps the exact-path contract below.
+        if pathspec_needs_engine(pathspec) {
+            let set = reset_pathspec_set(std::slice::from_ref(pathspec))?;
+            let mut matched_any = false;
+            for entry_path in target_index.tracked_files() {
+                if !set.matches_path(&entry_path) {
+                    continue;
+                }
+                let Some(path_str) = entry_path.to_str() else {
+                    continue;
+                };
+                let Some(target_entry) = target_index.get(path_str, 0) else {
+                    continue;
+                };
+                let blob: git_internal::internal::object::blob::Blob =
+                    load_object(&target_entry.hash).map_err(|e| {
+                        object_load_error("blob", target_entry.hash.to_string(), e.to_string())
+                    })?;
+                let mut entry = IndexEntry::new_from_blob(
+                    path_str.to_string(),
+                    target_entry.hash,
+                    blob.data.len() as u32,
+                );
+                entry.mode = target_entry.mode;
+                index.add(entry);
+                changed = true;
+                matched_any = true;
+                changed_paths.push(path_str.to_string());
+            }
+            let to_remove: Vec<String> = index
+                .tracked_files()
+                .iter()
+                .filter(|entry_path| set.matches_path(entry_path))
+                .filter_map(|entry_path| entry_path.to_str().map(ToString::to_string))
+                .filter(|path_str| target_index.get(path_str, 0).is_none())
+                .collect();
+            for path_str in to_remove {
+                index.remove(&path_str, 0);
+                changed = true;
+                matched_any = true;
+                changed_paths.push(path_str);
+            }
+            if !matched_any {
+                return Err(ResetError::PathspecNotMatched(pathspec.clone()));
+            }
+            continue;
+        }
+
         let relative_path = util::workdir_to_current(PathBuf::from(pathspec));
         let path_str = relative_path.to_str().ok_or_else(|| {
             ResetError::InvalidPathspecEncoding(relative_path.display().to_string())
@@ -1204,6 +1254,22 @@ async fn reset_pathspecs(
 /// OOM / DoS from a pathological input. Matches `libra add`'s limit so both
 /// commands share one ceiling.
 const MAX_PATHSPEC_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// `FIX-AD-01`: whether a raw spec uses the shared engine's wildcard / magic
+/// forms (and therefore needs expansion rather than an exact-path lookup).
+fn pathspec_needs_engine(raw: &str) -> bool {
+    raw.starts_with(':') || raw.contains(['*', '?', '['])
+}
+
+/// `FIX-AD-01`: build a shared-engine pathspec set for `reset`.
+fn reset_pathspec_set(raw: &[String]) -> Result<PathspecSet, ResetError> {
+    let workdir = util::working_dir();
+    let current_dir = std::env::current_dir().map_err(|error| {
+        ResetError::PathspecOutsideWorkdir(format!("failed to resolve current directory: {error}"))
+    })?;
+    PathspecSet::from_workdir(raw, &current_dir, &workdir)
+        .map_err(|error| ResetError::PathspecNotMatched(error.to_string()))
+}
 
 /// Resolve the pathspecs the reset should operate on.
 ///
