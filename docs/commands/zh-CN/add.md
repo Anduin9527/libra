@@ -107,6 +107,10 @@ libra add --ignore-errors src/
 因此含空格或引号的路径可正确传入；未加引号的行按字面使用。引号格式错误（未闭合、闭合引号后有多余
 字节、未知转义）为致命 `LBR-IO-001`（exit 128），零写入。NUL 模式不解码。
 
+`--pathspec-from-file` 不能与 `-p`/`--patch`、`--edit`、`--interactive` 或命令行 pathspec 参数共用
+（Git 的 `cannot be used together` 契约）：每种组合都是用法错误（`LBR-CLI-002`，exit 129）、零写入。
+（`--interactive` 保留其自身的 declined-flag 拒绝：exit 128 + `LBR-UNSUPPORTED-001`。）
+
 ```bash
 libra add --pathspec-from-file paths.txt
 printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-

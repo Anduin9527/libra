@@ -1106,11 +1106,12 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
     fs::write("file1.txt", "one\n").unwrap();
     fs::write("file2.txt", "two\n").unwrap();
     fs::write("file3.txt", "three\n").unwrap();
-    // file1 via the file list, file3 via the CLI pathspec; file2 in neither.
+    // Only file1 is listed; file2/file3 stay unstaged. (ADR-PSF-03: a
+    // command-line pathspec cannot be combined with `--pathspec-from-file`.)
     fs::write("paths.txt", "file1.txt\n").unwrap();
 
     add::execute(AddArgs {
-        pathspec: vec![String::from("file3.txt")],
+        pathspec: vec![],
         all: false,
         update: false,
         refresh: false,
@@ -1136,11 +1137,8 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
         staged("file1.txt"),
         "file1.txt (from file list) should be staged"
     );
-    assert!(
-        staged("file3.txt"),
-        "file3.txt (from CLI pathspec) should be staged"
-    );
     assert!(!staged("file2.txt"), "file2.txt should NOT be staged");
+    assert!(!staged("file3.txt"), "file3.txt should NOT be staged");
 }
 
 /// `--pathspec-from-file` with `--pathspec-file-nul` reads a NUL-separated list.
@@ -3691,5 +3689,78 @@ fn test_add_pathspec_from_file_cquote() {
         String::from_utf8_lossy(&after.stdout),
         before_out,
         "malformed quoting must write nothing"
+    );
+}
+
+/// PSF-03 (plan-20260918) / M-PSF P8/P9: `--pathspec-from-file` refuses an
+/// interactive patch mode or command-line pathspecs with 129 + `LBR-CLI-002`,
+/// before any write.
+#[test]
+fn test_add_pathspec_from_file_rejects_interactive() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("a.txt"), "a\n").unwrap();
+    fs::write(p.join("list.txt"), "a.txt\n").unwrap();
+
+    // `-p/--patch` is mutually exclusive.
+    let patch = run_libra_command(&["add", "--pathspec-from-file=list.txt", "-p"], p);
+    assert_eq!(
+        patch.status.code(),
+        Some(129),
+        "{}",
+        String::from_utf8_lossy(&patch.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&patch.stderr);
+    assert!(stderr.contains("cannot be used together"), "{stderr}");
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+
+    // Command-line pathspecs are mutually exclusive, with Git's wording.
+    let positional = run_libra_command(&["add", "--pathspec-from-file=list.txt", "a.txt"], p);
+    assert_eq!(
+        positional.status.code(),
+        Some(129),
+        "{}",
+        String::from_utf8_lossy(&positional.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&positional.stderr);
+    assert!(
+        stderr.contains("'--pathspec-from-file' and pathspec arguments cannot be used together"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+
+    // `--edit` is unknown for `add`, so clap rejects it as a usage error (129).
+    let edit = run_libra_command(&["add", "--pathspec-from-file=list.txt", "--edit"], p);
+    assert_eq!(
+        edit.status.code(),
+        Some(129),
+        "{}",
+        String::from_utf8_lossy(&edit.stderr)
+    );
+
+    // `--interactive` keeps its own declined-flag refusal (ADR-PSF-03 item 3).
+    let interactive = run_libra_command(
+        &["add", "--pathspec-from-file=list.txt", "--interactive"],
+        p,
+    );
+    assert_eq!(
+        interactive.status.code(),
+        Some(128),
+        "the declined-interactive refusal fires first: {}",
+        String::from_utf8_lossy(&interactive.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&interactive.stderr).contains("not supported"),
+        "{}",
+        String::from_utf8_lossy(&interactive.stderr)
+    );
+
+    // Every rejected combination left the index untouched.
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "rejected combinations must write nothing"
     );
 }

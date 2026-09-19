@@ -150,6 +150,12 @@ or quotes survive; an unquoted line is used verbatim. Malformed quoting
 (unterminated, trailing bytes after the closing quote, or an unknown escape) is a
 fatal `LBR-IO-001` error (exit 128) with zero writes. NUL mode never decodes.
 
+`--pathspec-from-file` cannot be combined with `-p`/`--patch`, `--edit`,
+`--interactive`, or command-line pathspec arguments (Git's
+`cannot be used together` contract): each combination is a usage error
+(`LBR-CLI-002`, exit 129) that writes nothing. (`--interactive` keeps its own
+declined-flag refusal, exit 128 + `LBR-UNSUPPORTED-001`.)
+
 ```bash
 libra add --pathspec-from-file paths.txt
 printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-

@@ -490,6 +490,24 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     let verbose = args.verbose;
     let dry_run = args.dry_run;
 
+    // ADR-PSF-03: `--pathspec-from-file` cannot be combined with an interactive
+    // mode or with command-line pathspec arguments — Git refuses both with
+    // `cannot be used together` before any write. (`--edit`/`--interactive`
+    // keep their own declined-flag refusal, which fires at parse time before
+    // this gate.)
+    if args.pathspec_from_file.is_some() {
+        if args.patch {
+            return Err(CliError::command_usage(
+                "options '--pathspec-from-file' and '-p/--patch' cannot be used together",
+            ));
+        }
+        if !args.pathspec.is_empty() {
+            return Err(CliError::command_usage(
+                "'--pathspec-from-file' and pathspec arguments cannot be used together",
+            ));
+        }
+    }
+
     // If --pathspec-from-file is specified, read and merge pathspecs.
     if let Some(file) = args.pathspec_from_file.take() {
         // ADR-PSF-01: the value `-` reads the list from stdin (never a worktree
