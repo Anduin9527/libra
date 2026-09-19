@@ -620,10 +620,13 @@ fn read_pathspec_stdin() -> CliResult<Vec<u8>> {
     Ok(data)
 }
 
-/// Decode a `--pathspec-from-file` payload (ADR-PSF-01 items 2-3): NUL mode
-/// splits on `0` and keeps every byte, otherwise lines split on `\n` with one
-/// trailing `\r` stripped. Empty entries are dropped; a non-UTF-8 entry is a
-/// hard `LBR-IO-001` failure rather than a silent skip.
+/// Decode a `--pathspec-from-file` payload (ADR-PSF-01/02): NUL mode splits on
+/// `0` and keeps every byte; otherwise lines split on `\n` with one trailing
+/// `\r` stripped and one C-style quoted line decoded (Git's `unquote_c_style`).
+/// Empty entries are dropped; a non-UTF-8 entry or malformed quoting is a hard
+/// `LBR-IO-001` failure rather than a silent skip. The quote decoding is the
+/// shared [`crate::utils::text::decode_c_quoted`] helper — no second state
+/// machine lives here.
 fn parse_pathspec_file(data: &[u8], nul: bool) -> CliResult<Vec<String>> {
     let separator: u8 = if nul { 0 } else { b'\n' };
     let mut pathspecs = Vec::new();
@@ -640,6 +643,23 @@ fn parse_pathspec_file(data: &[u8], nul: bool) -> CliResult<Vec<String>> {
             CliError::fatal("pathspec list contains a non-UTF-8 entry".to_string())
                 .with_stable_code(StableErrorCode::IoReadFailed)
         })?;
+        // ADR-PSF-02: only newline mode decodes C-style quoting; NUL mode keeps
+        // every byte verbatim.
+        if !nul {
+            match crate::utils::text::decode_c_quoted(text) {
+                Ok(Some(decoded)) => {
+                    pathspecs.push(decoded);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(CliError::fatal(format!(
+                        "line is badly quoted in --pathspec-from-file: {reason}: {text}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed));
+                }
+            }
+        }
         pathspecs.push(text.to_string());
     }
     Ok(pathspecs)
@@ -2792,5 +2812,18 @@ mod test {
 
         // An empty payload yields no pathspecs (falls through to the gate).
         assert!(parse_pathspec_file(b"", false).unwrap().is_empty());
+
+        // PSF-02: newline mode decodes one C-style quoted line.
+        let quoted = parse_pathspec_file(b"\"qu\\\"ote.txt\"\n", false).unwrap();
+        assert_eq!(quoted, vec!["qu\"ote.txt".to_string()]);
+        let spaced = parse_pathspec_file(b"\"we ird.txt\"\n", false).unwrap();
+        assert_eq!(spaced, vec!["we ird.txt".to_string()]);
+
+        // NUL mode keeps quoting verbatim (no C-quote decoding).
+        let nul_quoted = parse_pathspec_file(b"\"a.txt\"\0", true).unwrap();
+        assert_eq!(nul_quoted, vec!["\"a.txt\"".to_string()]);
+
+        // Unterminated quoting is a hard failure.
+        assert!(parse_pathspec_file(b"\"we ird.txt\n", false).is_err());
     }
 }

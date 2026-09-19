@@ -103,6 +103,10 @@ libra add --ignore-errors src/
 内容非 UTF-8 或文件无法读取时为致命 `LBR-IO-001`（exit 128），零写入。空列表按用法错误处理
 （`nothing specified, nothing added`，exit 129）——Git 把空列表视为零操作，属有意差异。
 
+换行模式下，以 `"` 开头的行按 Git C-style 引号字符串解码（`\n`、`\t`、`\"`、`\\`、八进制转义等），
+因此含空格或引号的路径可正确传入；未加引号的行按字面使用。引号格式错误（未闭合、闭合引号后有多余
+字节、未知转义）为致命 `LBR-IO-001`（exit 128），零写入。NUL 模式不解码。
+
 ```bash
 libra add --pathspec-from-file paths.txt
 printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-

@@ -3644,3 +3644,52 @@ fn test_add_pathspec_from_file_stdin_and_delimiters() {
     );
     assert!(String::from_utf8_lossy(&bad.stderr).contains("LBR-IO-001"));
 }
+
+/// PSF-02 (plan-20260918) / M-PSF P6/P7: non-NUL `--pathspec-from-file`
+/// decodes C-style quoted lines; an unterminated quote fails closed with a
+/// from-file diagnostic and zero writes.
+#[test]
+fn test_add_pathspec_from_file_cquote() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("qu\"ote.txt"), "q\n").unwrap();
+    fs::write(p.join("we ird.txt"), "w\n").unwrap();
+
+    // P6: C-quoted lines decode to the real file names.
+    let out = run_libra_command_with_stdin(
+        &["add", "--pathspec-from-file=-"],
+        p,
+        "\"qu\\\"ote.txt\"\n\"we ird.txt\"\n",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let index_bytes = fs::read(p.join(".libra/index")).unwrap();
+    let staged = |needle: &[u8]| index_bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(staged(b"qu\"ote.txt"), "the quoted name must be staged");
+    assert!(staged(b"we ird.txt"), "the spaced name must be staged");
+
+    // P7: an unterminated quote is 128 with a from-file diagnostic, zero writes.
+    let before = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    let before_out = String::from_utf8_lossy(&before.stdout).to_string();
+    let bad = run_libra_command_with_stdin(&["add", "--pathspec-from-file=-"], p, "\"we ird.txt\n");
+    assert_eq!(
+        bad.status.code(),
+        Some(128),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(stderr.contains("badly quoted"), "{stderr}");
+    assert!(stderr.contains("--pathspec-from-file"), "{stderr}");
+    let after = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout),
+        before_out,
+        "malformed quoting must write nothing"
+    );
+}

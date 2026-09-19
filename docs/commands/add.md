@@ -144,6 +144,12 @@ A payload that is not valid UTF-8, or a file that cannot be read, is a fatal
 (`nothing specified, nothing added`, exit 129); Git accepts an empty list as a
 no-op, an intentional difference.
 
+In newline mode a line that starts with `"` is decoded as one Git C-style quoted
+string (`\n`, `\t`, `\"`, `\\`, octal escapes, …), so paths containing spaces
+or quotes survive; an unquoted line is used verbatim. Malformed quoting
+(unterminated, trailing bytes after the closing quote, or an unknown escape) is a
+fatal `LBR-IO-001` error (exit 128) with zero writes. NUL mode never decodes.
+
 ```bash
 libra add --pathspec-from-file paths.txt
 printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-
