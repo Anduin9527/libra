@@ -276,8 +276,17 @@ Ignored files produce a warning on `stderr`:
 ```text
 warning: the following paths are ignored by configured ignore rules:
 ignored.log
-Hint: use '-f' to force staging of ignored files
+Hint: use -f if you really want to add them.
 ```
+
+When some paths were staged (or reported by a dry-run) **and** other explicit
+pathspecs were ignored, `add` finishes the whole operation — staging, output,
+warnings and automation events included — and then exits `1`, like Git.
+When *every* path was ignored and nothing else was staged, `add` fails with
+`LBR-ADD-001` and exits `128` instead (intentional difference from Git's 1).
+`--json` keeps the regular data envelope on stdout (with the ignored paths in
+`data.ignored`) and exits `1`; the exit code `1` also wins over
+`--exit-code-on-warning`'s `9`.
 
 `--quiet` suppresses all `stdout` output but preserves `stderr` warnings.
 
@@ -441,7 +450,7 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
 | Failed to save index | `LBR-IO-002` | 128 | "check disk space and file permissions" |
 | Refresh failed | `LBR-IO-001` | 128 | -- |
 | Entry creation failed | `LBR-IO-002` | 128 | -- |
-| Object or durable index-marker write failed | `LBR-IO-002` | 128 | Check storage permissions and retry; the error is returned without a panic. When the failure is a lock timeout, the message names the holder (its pid and purpose, e.g. `marker_publication`, `queued_update`, `replay`, `deletion_fence`) or says the holder could not be determined; wait for that process to finish and retry. Waiting uses a Git-style quadratic backoff and gives up after 10 seconds. Never delete the lock files under `.libra/object-index-repair-locks`: they exist only to arbitrate concurrent writers, do not block anything by themselves, and are released automatically when their owner exits. Read-only commands that replay pending cloud-index repair markers skip the replay (silently, without a warning) when the lock is busy and retry on the next command |
+| Object or durable index-marker write failed | `LBR-IO-002` | 128 | Check storage permissions and retry; the error is returned without a panic and the staging area is unchanged: the message says the object payloads were stored safely, no paths were staged, and a direct retry reuses the already-stored payloads without any lock-file cleanup. When the failure is a lock timeout, the message names the holder (its pid and purpose, e.g. `marker_publication`, `queued_update`, `replay`, `deletion_fence`) or says the holder could not be determined; wait for that process to finish and retry. Waiting uses a Git-style quadratic backoff and gives up after 10 seconds. Never delete the lock files under `.libra/object-index-repair-locks`: they exist only to arbitrate concurrent writers, do not block anything by themselves, and are released automatically when their owner exits. Read-only commands that replay pending cloud-index repair markers skip the replay (silently, without a warning) when the lock is busy and retry on the next command |
 | Paths staged but cloud index repair remains pending, with `--exit-code-on-warning` | `LBR-WARN-001` | 9 | Fix the reported database/marker error; the next repository command retries automatically |
 | Working directory error | `LBR-REPO-001` | 128 | "cannot determine the working tree" |
 | Status computation failed | `LBR-REPO-002` | 128 | -- |

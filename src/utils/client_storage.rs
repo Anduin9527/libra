@@ -841,6 +841,20 @@ fn with_object_index_batch_state<R>(
         }))
 }
 
+/// Canonical marker-registration failure message (ADR-OI-05 item 2): one
+/// prefix explaining that the payloads are safely stored, that no paths were
+/// staged, and that a direct retry reuses the payloads and needs no lock-file
+/// cleanup. Lock-timeout causes already carry the holder diagnostics from
+/// `describe_index_repair_lock_timeout` (ADR-OI-02).
+fn object_index_marker_registration_error(cause: io::Error) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "object payloads were stored safely, but their cloud object-index repair markers could not be registered: {cause}; no paths were staged — retry the command directly (the retry reuses the already-stored payloads and needs no lock-file cleanup)"
+        ),
+    )
+}
+
 /// Publish every accumulated marker for `key` under ONE generation lock, then
 /// enqueue the messages. On a publish failure the already-written markers stay
 /// on disk, the pending list is cleared, and the error propagates (M-BATCH
@@ -850,14 +864,8 @@ fn flush_pending_object_index_batch(key: &Path) -> io::Result<()> {
     if msgs.is_empty() {
         return Ok(());
     }
-    let marker_paths = persist_index_repair_marker_batch(&msgs).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "stored object payloads, but failed to register its cloud object-index repair marker: {error}"
-            ),
-        )
-    })?;
+    let marker_paths =
+        persist_index_repair_marker_batch(&msgs).map_err(object_index_marker_registration_error)?;
     for (mut msg, marker_path) in msgs.into_iter().zip(marker_paths) {
         msg.marker_path = Some(marker_path);
         enqueue_index_update(msg, "object index update");
@@ -1753,6 +1761,16 @@ impl ClientStorage {
         Ok(())
     }
 
+    /// Number of markers currently accumulated for this storage's repository
+    /// (ADR-OI-05 item 3: reported as `stored_objects` in the error envelope
+    /// when a batch flush fails).
+    pub(crate) fn pending_object_index_batch_count(&self) -> usize {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            return with_object_index_batch_state(&key, |state| state.pending.len());
+        }
+        0
+    }
+
     /// Run one top-level embedded CLI invocation with isolated background
     /// index failure and pending-work attribution. Tokio task locals do not
     /// leak into concurrent direct storage callers or independently spawned
@@ -2086,14 +2104,10 @@ impl ClientStorage {
                 flush_pending_object_index_batch(&db_path)?;
             } else if let Some(mut msg) = single_msg {
                 // Single-object path keeps its existing semantics (batch = 1).
-                msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "stored object {hash_str}, but failed to register its cloud object-index repair marker: {error}"
-                        ),
-                    )
-                })?);
+                msg.marker_path = Some(
+                    persist_index_repair_marker(&msg)
+                        .map_err(object_index_marker_registration_error)?,
+                );
                 enqueue_index_update(msg, "object index update");
             }
         }
@@ -2414,14 +2428,8 @@ pub(crate) fn enqueue_agent_blob_object_index_update(
         failure_counter: current_index_failure_counter(),
         pending_counter: current_index_pending_counter(),
     };
-    msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "agent object {o_id} was stored, but its durable cloud object-index repair marker could not be registered: {error}"
-            ),
-        )
-    })?);
+    msg.marker_path =
+        Some(persist_index_repair_marker(&msg).map_err(object_index_marker_registration_error)?);
     enqueue_index_update(msg, "agent blob object index update");
     Ok(())
 }
@@ -4826,7 +4834,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("durable cloud object-index repair marker could not be registered"),
+                .contains("cloud object-index repair markers could not be registered"),
             "unexpected error: {error}"
         );
     }
