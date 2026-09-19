@@ -1466,26 +1466,23 @@ async fn test_stash_push_pathspec_stashes_only_matched() {
 /// FIX-AD-01: a wildcard pathspec is expanded through the shared pathspec
 /// engine, so `*.txt` stashes the literal `*.txt` and `a.txt` (Git parity),
 /// while a non-matching path is left untouched.
-#[tokio::test]
-#[serial(cwd)]
-async fn test_stash_push_pathspec_glob_stashes_all_matches() {
-    let temp = tempdir().unwrap();
-    test::setup_with_new_libra_in(temp.path()).await;
-    let p = temp.path();
-    let _guard = ChangeDirGuard::new(p);
+#[test]
+fn test_stash_push_pathspec_glob_stashes_all_matches() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
 
     fs::write(p.join("*.txt"), "S0\n").unwrap();
     fs::write(p.join("a.txt"), "A0\n").unwrap();
     fs::write(p.join("notes.md"), "N0\n").unwrap();
-    assert!(
-        run_libra_command(&["add", "*.txt", "a.txt", "notes.md"], p)
-            .status
-            .success()
+    assert_cli_success(
+        &run_libra_command(&["add", "*.txt", "a.txt", "notes.md"], p),
+        "add",
     );
-    assert!(
-        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
-            .status
-            .success()
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
     );
 
     fs::write(p.join("*.txt"), "S1\n").unwrap();
