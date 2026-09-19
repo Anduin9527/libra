@@ -127,6 +127,14 @@ const INDEX_REPAIR_BATCH_SIZE: usize = 100;
 #[cfg(test)]
 const INDEX_REPAIR_BATCH_SIZE: usize = 2;
 
+/// Test-only counter of repository-wide generation lock acquisitions. The
+/// regression guard for issue #469 asserts that the queued consumer never
+/// takes this lock: holding it across SQLite retries would starve foreground
+/// marker publishers. Only `acquire_index_repair_generation_lock` increments
+/// it, and only in test builds.
+#[cfg(test)]
+static GENERATION_LOCK_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+
 struct PendingObjectIndexPage {
     updates: Vec<IndexUpdateMsg>,
     has_more: bool,
@@ -313,10 +321,13 @@ fn acquire_index_repair_lock(db_path: &Path, oid: &str) -> io::Result<ObjectInde
 }
 
 fn acquire_index_repair_generation_lock(db_path: &Path) -> io::Result<ObjectIndexRepairLock> {
-    acquire_index_repair_lock_file(
+    let lock = acquire_index_repair_lock_file(
         &index_repair_generation_lock_path(db_path)?,
         "repair-marker generation",
-    )
+    )?;
+    #[cfg(test)]
+    GENERATION_LOCK_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    Ok(lock)
 }
 
 #[cfg(unix)]
@@ -3605,7 +3616,7 @@ mod tests {
     /// from the process CWD. Regression guard for a bug where two repositories sharing
     /// a CWD could cross-pollinate their object indexes.
     #[tokio::test]
-    #[serial(cwd)]
+    #[serial(cwd, env)]
     async fn background_index_update_uses_storage_database_instead_of_cwd() {
         let workspace = tempdir().unwrap();
         let storage_path = workspace.path().join(".libra");
@@ -3774,7 +3785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn repair_queue_replays_bounded_pages_without_permanent_cap_failure() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -4151,6 +4162,58 @@ mod tests {
             0,
             "late work from the prior invocation leaked into the next warning scope"
         );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn queued_update_never_takes_generation_lock() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "guard-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        // The foreground publisher takes the generation lock exactly once to
+        // persist the durable repair marker before queueing.
+        let before = super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed);
+        let blob = Blob::from_content("generation lock guard payload");
+        client
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("store object and enqueue index update");
+        let after_put = super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed);
+        assert_eq!(
+            after_put,
+            before + 1,
+            "foreground marker publication must take exactly one generation lock"
+        );
+
+        ClientStorage::wait_for_background_tasks();
+
+        // The queued consumer must apply the update through the OID-shard lock
+        // only: no additional generation lock acquisition may have happened.
+        assert_eq!(
+            super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed),
+            after_put,
+            "queued consumer must never acquire the generation lock"
+        );
+        let row = object_index::Entity::find()
+            .filter(object_index::Column::OId.eq(blob.id.to_string()))
+            .filter(object_index::Column::RepoId.eq("guard-repo"))
+            .one(&db_conn)
+            .await
+            .expect("query repaired row");
+        assert!(row.is_some(), "the queued update must land in the index");
     }
 
     #[tokio::test]

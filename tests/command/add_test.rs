@@ -2125,3 +2125,93 @@ fn test_literal_pathspecs_global_add_matrix() {
         "L7 glob preview: {preview}"
     );
 }
+
+/// M-GUARD G1: with the background index consumer slowed (50ms per update),
+/// one `add` of 300 modified files still stages everything without a lock
+/// timeout and without a drain warning. The regression it guards (issue #469):
+/// the consumer used to hold the repository-wide generation lock while
+/// applying queued updates, starving foreground marker publishers.
+#[test]
+fn test_add_batch_survives_slow_index_consumer() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    for i in 0..300 {
+        fs::write(p.join(format!("f{i:03}.txt")), "base\n").unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], p), "stage base files");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base files",
+    );
+    for i in 0..300 {
+        fs::write(p.join(format!("f{i:03}.txt")), "modified\n").unwrap();
+    }
+
+    let out = run_libra_env(
+        &["add", "."],
+        p,
+        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "50")],
+    );
+    assert_cli_success(&out, "batch add with slow index consumer");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("timed out"),
+        "no lock timeout may be reported: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not drain"),
+        "the queued updates must drain within the child's budget: {stderr}"
+    );
+
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_cli_success(&staged, "list staged files");
+    let names = String::from_utf8_lossy(&staged.stdout);
+    assert_eq!(
+        names.lines().count(),
+        300,
+        "all 300 modified files must be staged: {names}"
+    );
+}
+
+/// M-GUARD G3: the issue's original shape — 132 stale zero-byte lock files
+/// (one generation lock plus 131 shard locks) — must not break a 33-file
+/// batch add. Lock files that merely exist (no live holder) never block.
+#[test]
+fn test_add_batch_with_stale_lock_files() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    let locks_dir = p.join(".libra").join("object-index-repair-locks");
+    fs::create_dir_all(&locks_dir).unwrap();
+    fs::write(locks_dir.join("object-index-repair-generation.lock"), b"").unwrap();
+    for i in 0..131u32 {
+        fs::write(locks_dir.join(format!("{i:04x}.lock")), b"").unwrap();
+    }
+    // `libra init` leaves an untracked `.libraignore`; commit it so the staged
+    // assertion below counts exactly the 33 new files.
+    assert_cli_success(
+        &run_libra_command(&["add", ".libraignore"], p),
+        "stage init ignore file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    for i in 0..33 {
+        fs::write(p.join(format!("g{i:02}.txt")), format!("content {i}\n")).unwrap();
+    }
+
+    let out = run_libra_command(&["add", "."], p);
+    assert_cli_success(&out, "batch add with 132 stale lock files");
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_cli_success(&staged, "list staged files");
+    let names = String::from_utf8_lossy(&staged.stdout);
+    assert_eq!(
+        names.lines().count(),
+        33,
+        "all 33 files must be staged: {names}"
+    );
+}
