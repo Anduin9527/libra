@@ -3472,3 +3472,99 @@ fn test_add_chmod_noop_cases_unchanged() {
     let bogus = run_libra_command(&["add", "--chmod=bogus", "reg"], p);
     assert_eq!(bogus.status.code(), Some(129), "invalid --chmod value");
 }
+
+/// CH-02 (plan-20260918): `add --chmod=+x` / `-x` with no pathspec is a
+/// successful no-op — exit 0, no index write, no object write, and no
+/// `chmod_rejected` in the JSON envelope. An invalid value is still a usage
+/// error.
+#[test]
+fn test_add_chmod_empty_pathspec_is_noop() {
+    fn object_file_count(root: &std::path::Path) -> usize {
+        let mut count = 0usize;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("tracked.txt"), "content\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "stage base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+
+    // Warm up once: `commit` leaves a few objects pending in the storage
+    // batch, which the next `add` invocation flushes. Settle that before taking
+    // the baseline so the assertion isolates the no-op behavior itself.
+    assert_cli_success(
+        &run_libra_command(&["add", "--chmod=+x"], p),
+        "warm-up no-op",
+    );
+
+    let objects_root = p.join(".libra/objects");
+    let objects_before = object_file_count(&objects_root);
+    let index_before = fs::read(p.join(".libra/index")).unwrap();
+
+    for args in [
+        vec!["add", "--chmod=+x"],
+        vec!["add", "--chmod=-x"],
+        vec!["add", "--chmod=+x", "--dry-run"],
+    ] {
+        let out = run_libra_command(&args, p);
+        assert!(
+            out.status.success(),
+            "{args:?} must be a no-op success: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    assert_eq!(
+        object_file_count(&objects_root),
+        objects_before,
+        "no object writes"
+    );
+    assert_eq!(
+        fs::read(p.join(".libra/index")).unwrap(),
+        index_before,
+        "no index writes"
+    );
+
+    // JSON: ok, and no `chmod_rejected` key for a no-op.
+    let json = run_libra_command(&["--json", "add", "--chmod=+x"], p);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let parsed = parse_json_stdout(&json);
+    assert_eq!(parsed["ok"], true);
+    assert!(
+        parsed["data"].get("chmod_rejected").is_none(),
+        "no chmod_rejected for a no-op: {parsed}"
+    );
+
+    // An invalid value without a pathspec stays a usage error.
+    let bogus = run_libra_command(&["add", "--chmod=bogus"], p);
+    assert_eq!(
+        bogus.status.code(),
+        Some(129),
+        "{}",
+        String::from_utf8_lossy(&bogus.stderr)
+    );
+}

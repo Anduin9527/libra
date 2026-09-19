@@ -164,6 +164,10 @@ exit 1 model shared with the ignored-path report.)
 
 An invalid value (anything other than `+x` / `-x`) is a usage error.
 
+With no pathspec (and none of `-A`, `-u`, `--refresh`, `--renormalize`,
+`--resolved`), `--chmod` is a successful no-op: `add` exits 0 without touching
+the index or object store — there is nothing to apply the mode to.
+
 ```bash
 libra add --chmod=+x scripts/build.sh
 libra add --chmod=-x notes.txt

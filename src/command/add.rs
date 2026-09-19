@@ -1380,6 +1380,23 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         None => None,
     };
 
+    // ADR-CH-05: `--chmod` with no pathspec (and no whole-tree selector) is a
+    // successful no-op — there is nothing to apply the mode to, and Git exits 0
+    // without writing. Short-circuit before the empty-pathspec usage gate below,
+    // which exists precisely because an empty spec would otherwise match the
+    // whole tree.
+    if args.pathspec.is_empty()
+        && args.chmod.is_some()
+        && !args.all
+        && !args.update
+        && !args.refresh
+        && !args.renormalize
+        && !args.resolved
+        && !args.patch
+    {
+        return Ok(AddOutput::empty(args.dry_run));
+    }
+
     // Resolve pathspecs. `--renormalize` implies `-u` (tracked-only), so it also
     // permits an empty pathspec (operate on the whole tracked set). `--resolved`
     // likewise does not require a pathspec: it operates on unmerged index paths.

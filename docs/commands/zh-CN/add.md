@@ -121,6 +121,9 @@ blob 内容不变；仅 mode 变化的路径也会被报告为 modified。
 
 非法取值（非 `+x` / `-x`）按用法错误处理。
 
+在没有 pathspec（也没有 `-A`、`-u`、`--refresh`、`--renormalize`、`--resolved`）时，`--chmod` 是成功的
+零操作：`add` exit 0，不写索引、不写对象——因为没有可施加 mode 的目标。
+
 ```bash
 libra add --chmod=+x scripts/build.sh
 libra add --chmod=-x notes.txt
