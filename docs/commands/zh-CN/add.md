@@ -365,7 +365,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | 交互式 patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
 | 交互式选择 | `git add -i` / `--interactive` | N/A | N/A（使用 `libra code` Web Code UI） |
 | 暂存前编辑 diff | `git add -e` / `--edit` | N/A | N/A |
-| 仅 chmod | `git add --chmod=+x` | N/A | N/A |
+| 仅 chmod | `git add --chmod=+x` | `libra add --chmod=+x`（非普通索引条目会被拒绝并以 exit 1 结束） | N/A |
 | Sparse checkout 路径 | `git add --sparse` | N/A | N/A |
 | Ignore 文件 | `.gitignore` | N/A（jj 使用 `.gitignore`） | `.gitignore` + `.libraignore` |
 | 结构化 JSON 输出 | N/A | N/A | `--json` / `--machine` |

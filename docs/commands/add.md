@@ -457,7 +457,7 @@ overrides.
 | Interactive patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
 | Interactive select | `git add -i` / `--interactive` | N/A | N/A |
 | Edit diff before staging | `git add -e` / `--edit` | N/A | N/A |
-| Chmod only | `git add --chmod=+x` | N/A | N/A |
+| Chmod only | `git add --chmod=+x` | `libra add --chmod=+x` (non-regular index entries are refused with exit 1) | N/A |
 | Sparse checkout paths | `git add --sparse` | N/A | N/A |
 | Ignore file | `.gitignore` | N/A (jj uses `.gitignore`) | `.gitignore` + `.libraignore` |
 | Structured JSON output | N/A | N/A | `--json` / `--machine` |
