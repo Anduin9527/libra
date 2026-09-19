@@ -2215,3 +2215,107 @@ fn test_add_batch_with_stale_lock_files() {
         "all 33 files must be staged: {names}"
     );
 }
+
+/// M-DIAG D1 (R2' shape): when another live process holds the generation
+/// lock, `add` times out with a diagnostic that names the holder (pid and
+/// purpose) and explains that lock files must not be deleted.
+#[test]
+fn test_add_lock_timeout_names_foreign_holder() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("held.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "held.txt"], p), "stage base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("held.txt"), "modified\n").unwrap();
+
+    let gen_lock = p
+        .join(".libra")
+        .join("object-index-repair-locks")
+        .join("object-index-repair-generation.lock");
+    let mut helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "command::add_test::test_add_foreign_lock_holder_helper",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("LIBRA_TEST_ADD_LOCK_HOLD_PATH", &gen_lock)
+        .spawn()
+        .expect("spawn foreign lock holder helper");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while fs::read_to_string(&gen_lock).map_or(true, |c| !c.contains("marker_publication")) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "helper never wrote holder metadata"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let out = run_libra_command(&["add", "held.txt"], p);
+    assert!(
+        !out.status.success(),
+        "add must fail while the foreign holder holds the generation lock"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("another live Libra process (pid"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("marker_publication"), "{stderr}");
+    assert!(
+        stderr.contains("must not be deleted"),
+        "the D4 lock-file note must be present: {stderr}"
+    );
+
+    let _ = helper.kill();
+    let _ = helper.wait();
+}
+
+/// Helper process for `test_add_lock_timeout_names_foreign_holder`: holds the
+/// generation lock with `marker_publication` metadata until killed. Regular
+/// test runs return immediately (no env var set).
+#[test]
+fn test_add_foreign_lock_holder_helper() {
+    let Ok(path) = std::env::var("LIBRA_TEST_ADD_LOCK_HOLD_PATH") else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::{io::Write, os::fd::AsRawFd};
+
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // SAFETY: flock on an owned descriptor held until the process is killed.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, 0, "integration test helper flock must succeed");
+        let metadata = format!(
+            "{{\"pid\":{},\"purpose\":\"marker_publication\",\"started_at_ms\":{},\"invocation\":\"helper\"}}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        file.set_len(0).unwrap();
+        file.write_all(metadata.as_bytes()).unwrap();
+        file.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+    #[cfg(not(unix))]
+    {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}

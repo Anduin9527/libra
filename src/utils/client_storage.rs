@@ -20,14 +20,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -110,6 +110,9 @@ const INDEX_REPAIR_GENERATION_LOCK: &str = "object-index-repair-generation.lock"
 const INDEX_REPAIR_LOCK_SHARD_HEX_LEN: usize = 4;
 const INDEX_REPAIR_MARKER_SCHEMA_VERSION: u8 = 1;
 const INDEX_REPAIR_MARKER_READ_CAP: u64 = 16 * 1024;
+/// Upper bound for the one-line holder metadata read on lock timeout.
+/// Anything larger is treated as undetermined (ADR-OI-02 item 2).
+const INDEX_REPAIR_LOCK_METADATA_READ_CAP: u64 = 1024;
 const INDEX_REPAIR_STAGING_SCAN_CAP: usize = 1_024;
 const INDEX_REPAIR_STAGING_REMOVE_CAP: usize = 256;
 const INDEX_REPAIR_STAGING_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -134,6 +137,17 @@ const INDEX_REPAIR_BATCH_SIZE: usize = 2;
 /// it, and only in test builds.
 #[cfg(test)]
 static GENERATION_LOCK_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Holder metadata written into a repair lock file right after acquisition.
+/// Diagnostic only: lock semantics come from the advisory flock, never from
+/// this payload (ADR-OI-02 item 4).
+#[derive(Debug, Deserialize, Serialize)]
+struct IndexRepairLockMetadata {
+    pid: u32,
+    purpose: String,
+    started_at_ms: u64,
+    invocation: String,
+}
 
 struct PendingObjectIndexPage {
     updates: Vec<IndexUpdateMsg>,
@@ -252,14 +266,19 @@ fn open_index_repair_lock_file(_path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(unix)]
-fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
     use std::os::fd::AsRawFd;
 
     let file = open_index_repair_lock_file(path)?;
     // SAFETY: flock operates on an owned descriptor and does not outlive it.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
-        return Ok(Some(ObjectIndexRepairLock { file }));
+        let mut lock = ObjectIndexRepairLock { file };
+        write_index_repair_lock_metadata(&mut lock, purpose);
+        return Ok(Some(lock));
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
@@ -269,9 +288,16 @@ fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIn
 }
 
 #[cfg(windows)]
-fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
     match open_index_repair_lock_file(path) {
-        Ok(file) => Ok(Some(ObjectIndexRepairLock { file })),
+        Ok(file) => {
+            let mut lock = ObjectIndexRepairLock { file };
+            write_index_repair_lock_metadata(&mut lock, purpose);
+            Ok(Some(lock))
+        }
         // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION mean another
         // process owns this zero-share handle.
         Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(None),
@@ -280,50 +306,151 @@ fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIn
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
-    open_index_repair_lock_file(path).map(|file| Some(ObjectIndexRepairLock { file }))
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
+    let mut lock = ObjectIndexRepairLock {
+        file: open_index_repair_lock_file(path)?,
+    };
+    write_index_repair_lock_metadata(&mut lock, purpose);
+    Ok(Some(lock))
+}
+
+/// Write the one-line holder metadata after a successful acquisition.
+/// A write failure never fails the acquisition (ADR-OI-02 item 1 / M-DIAG D6):
+/// the advisory flock is the lock, the payload is only a diagnostic hint.
+fn write_index_repair_lock_metadata(lock: &mut ObjectIndexRepairLock, purpose: &'static str) {
+    let metadata = IndexRepairLockMetadata {
+        pid: std::process::id(),
+        purpose: purpose.to_string(),
+        started_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        invocation: Uuid::new_v4().to_string(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&metadata) else {
+        tracing::debug!("failed to encode object-index repair lock metadata");
+        return;
+    };
+    let result: io::Result<()> = (|| {
+        lock.file.set_len(0)?;
+        lock.file.seek(std::io::SeekFrom::Start(0))?;
+        lock.file.write_all(&bytes)?;
+        lock.file.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::debug!("failed to write object-index repair lock metadata: {error}");
+    }
+}
+
+/// Read holder metadata for lock diagnostics, capped at 1 KiB (ADR-OI-02
+/// item 2). Returns `None` when the file is unreadable, empty, oversized, or
+/// not valid metadata — callers then fall back to the undetermined message.
+fn read_index_repair_lock_metadata(path: &Path) -> Option<IndexRepairLockMetadata> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(INDEX_REPAIR_LOCK_METADATA_READ_CAP + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > INDEX_REPAIR_LOCK_METADATA_READ_CAP {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Best-effort liveness probe for a lock holder pid. Signal 0 performs an
+/// existence check only; EPERM still means the process exists.
+fn repair_lock_holder_is_live(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill with signal 0 sends no signal and only probes the pid.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Build the lock-timeout diagnostic per ADR-OI-02 item 2 and M-DIAG D1–D4.
+fn describe_index_repair_lock_timeout(lock_path: &Path, identity: &str) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let holder_clause = match read_index_repair_lock_metadata(lock_path) {
+        Some(metadata) if metadata.pid == std::process::id() => format!(
+            "; the lock is held by this Libra process itself (purpose: {}, started {}s ago) — internal lock contention is a Libra defect, please report it at https://github.com/libra-tools/libra/issues",
+            metadata.purpose,
+            now_ms.saturating_sub(metadata.started_at_ms) / 1000
+        ),
+        Some(metadata) if repair_lock_holder_is_live(metadata.pid) => format!(
+            "; another live Libra process (pid {}, purpose: {}, started {}s ago) holds it — wait for that process to finish and retry",
+            metadata.pid,
+            metadata.purpose,
+            now_ms.saturating_sub(metadata.started_at_ms) / 1000
+        ),
+        _ => "; the lock holder could not be determined".to_string(),
+    };
+    format!(
+        "timed out waiting for object-index repair lock '{}' for {identity}{holder_clause}; the lock file itself does not block anything and must not be deleted — it is released automatically when its owner exits",
+        lock_path.display()
+    )
 }
 
 fn try_acquire_index_repair_lock(
     db_path: &Path,
     oid: &str,
+    purpose: &'static str,
 ) -> io::Result<Option<ObjectIndexRepairLock>> {
-    try_acquire_index_repair_lock_file(&index_repair_lock_path(db_path, oid)?)
+    try_acquire_index_repair_lock_file(&index_repair_lock_path(db_path, oid)?, purpose)
 }
 
 fn acquire_index_repair_lock_file(
     lock_path: &Path,
     identity: &str,
+    purpose: &'static str,
 ) -> io::Result<ObjectIndexRepairLock> {
     let started = Instant::now();
     loop {
-        if let Some(lock) = try_acquire_index_repair_lock_file(lock_path)? {
+        if let Some(lock) = try_acquire_index_repair_lock_file(lock_path, purpose)? {
             return Ok(lock);
         }
         if started.elapsed() >= INDEX_REPAIR_LOCK_WAIT_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!(
-                    "timed out waiting for object-index repair lock '{}' for {identity}; another Libra process may be stalled",
-                    lock_path.display()
-                ),
+                describe_index_repair_lock_timeout(lock_path, identity),
             ));
         }
         std::thread::sleep(INDEX_REPAIR_LOCK_RETRY_INTERVAL);
     }
 }
 
-fn acquire_index_repair_lock(db_path: &Path, oid: &str) -> io::Result<ObjectIndexRepairLock> {
+fn acquire_index_repair_lock(
+    db_path: &Path,
+    oid: &str,
+    purpose: &'static str,
+) -> io::Result<ObjectIndexRepairLock> {
     acquire_index_repair_lock_file(
         &index_repair_lock_path(db_path, oid)?,
         &format!("object {oid}"),
+        purpose,
     )
 }
 
-fn acquire_index_repair_generation_lock(db_path: &Path) -> io::Result<ObjectIndexRepairLock> {
+fn acquire_index_repair_generation_lock(
+    db_path: &Path,
+    purpose: &'static str,
+) -> io::Result<ObjectIndexRepairLock> {
     let lock = acquire_index_repair_lock_file(
         &index_repair_generation_lock_path(db_path)?,
         "repair-marker generation",
+        purpose,
     )?;
     #[cfg(test)]
     GENERATION_LOCK_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
@@ -373,7 +500,7 @@ pub(crate) async fn acquire_object_index_deletion_fence(
             ));
         }
 
-        let generation_lock = acquire_index_repair_generation_lock(&db_path)?;
+        let generation_lock = acquire_index_repair_generation_lock(&db_path, "deletion_fence")?;
         let marker_dir = db_path
             .parent()
             .ok_or_else(|| {
@@ -468,7 +595,8 @@ fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
     // with the same four-hex prefix, and repeated publication of the same
     // content-addressed marker is idempotent. Queued and replay consumers still
     // use the shard lock to arbitrate marker retirement.
-    let _generation_lock = acquire_index_repair_generation_lock(&msg.db_path)?;
+    let _generation_lock =
+        acquire_index_repair_generation_lock(&msg.db_path, "marker_publication")?;
     let marker = PendingObjectIndexUpdate {
         schema_version: INDEX_REPAIR_MARKER_SCHEMA_VERSION,
         o_id: msg.hash.clone(),
@@ -671,20 +799,22 @@ async fn apply_queued_index_update(msg: &IndexUpdateMsg) -> Result<(), String> {
     // fails closed, while retirement happens only after the row update commits.
     let db_path = msg.db_path.clone();
     let oid = msg.hash.clone();
-    let _ownership = tokio::task::spawn_blocking(move || acquire_index_repair_lock(&db_path, &oid))
-        .await
-        .map_err(|error| {
-            format!(
-                "object-index repair ownership task failed for {}: {error}",
-                msg.hash
-            )
-        })?
-        .map_err(|error| {
-            format!(
-                "failed to acquire object-index repair ownership for {}: {error}",
-                msg.hash
-            )
-        })?;
+    let _ownership = tokio::task::spawn_blocking(move || {
+        acquire_index_repair_lock(&db_path, &oid, "queued_update")
+    })
+    .await
+    .map_err(|error| {
+        format!(
+            "object-index repair ownership task failed for {}: {error}",
+            msg.hash
+        )
+    })?
+    .map_err(|error| {
+        format!(
+            "failed to acquire object-index repair ownership for {}: {error}",
+            msg.hash
+        )
+    })?;
 
     match fs::symlink_metadata(marker_path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
@@ -2637,7 +2767,7 @@ fn load_pending_object_index_updates(
     db_path: &Path,
     expected_oid_len: usize,
 ) -> io::Result<PendingObjectIndexPage> {
-    let generation_lock = acquire_index_repair_generation_lock(db_path)?;
+    let generation_lock = acquire_index_repair_generation_lock(db_path, "replay")?;
     scavenge_index_repair_staging(db_path)?;
     let marker_dir = db_path
         .parent()
@@ -2737,7 +2867,7 @@ fn load_pending_object_index_updates(
         let marker_lock = if let Some(lock) = held_locks.get(&lock_shard) {
             Arc::clone(lock)
         } else {
-            let Some(lock) = try_acquire_index_repair_lock(db_path, oid)? else {
+            let Some(lock) = try_acquire_index_repair_lock(db_path, oid, "replay")? else {
                 // A queued writer or another replay owns this marker. Leave it
                 // for a later bounded page rather than blocking an async CLI
                 // preflight.
@@ -3199,7 +3329,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        ClientStorage, ObjectReadFailure, acquire_index_repair_lock,
+        ClientStorage, ObjectIndexRepairLock, ObjectReadFailure, acquire_index_repair_lock,
         remove_object_index_rows_with_conn, resolve_env_sync, update_object_index,
         update_object_index_once,
     };
@@ -3311,21 +3441,212 @@ mod tests {
         let storage = tempdir().expect("create storage directory");
         let db_path = storage.path().join("libra.db");
         let oid = "a".repeat(40);
-        let _held = acquire_index_repair_lock(&db_path, &oid).expect("acquire first repair lock");
+        let _held = acquire_index_repair_lock(&db_path, &oid, "queued_update")
+            .expect("acquire first repair lock");
 
         let started = Instant::now();
-        let error = match acquire_index_repair_lock(&db_path, &oid) {
+        let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
             Ok(_) => panic!("a competing repair lock must time out"),
             Err(error) => error,
         };
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() >= super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT);
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("another Libra process may be stalled")
+            message.contains("timed out waiting for object-index repair lock"),
+            "{message}"
         );
+        // The holder is this very process: the diagnostic must say so (M-DIAG
+        // D2) and must include the D4 note about never deleting lock files.
+        assert!(
+            message.contains("held by this Libra process itself"),
+            "{message}"
+        );
+        assert!(message.contains("must not be deleted"), "{message}");
+    }
+
+    #[test]
+    fn lock_timeout_reports_live_foreign_holder() {
+        #[cfg(unix)]
+        {
+            let storage = tempdir().expect("create storage directory");
+            let db_path = storage.path().join("libra.db");
+            let oid = "f".repeat(40);
+            let lock_path = super::index_repair_lock_path(&db_path, &oid).expect("lock path");
+
+            // Hold the shard lock from a helper process so the metadata reports
+            // a genuinely foreign live pid (M-DIAG D1).
+            let helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("utils::client_storage::tests::lock_holder_helper_process")
+                .arg("--exact")
+                .env("LIBRA_TEST_LOCK_HOLD_PATH", &lock_path)
+                .spawn()
+                .expect("spawn lock holder helper");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while super::read_index_repair_lock_metadata(&lock_path).is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "helper never wrote holder metadata"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
+                Ok(_) => panic!("the foreign holder must make the acquisition time out"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let message = error.to_string();
+            assert!(
+                message.contains("another live Libra process (pid"),
+                "{message}"
+            );
+            assert!(message.contains("purpose: marker_publication"), "{message}");
+            assert!(
+                message.contains("wait for that process to finish"),
+                "{message}"
+            );
+            let _ = helper.wait_with_output();
+        }
+        #[cfg(not(unix))]
+        {
+            // The foreign-holder reproduction needs flock semantics; on
+            // Windows the D5 read-failure path is covered by
+            // `lock_metadata_read_failure_falls_back_to_undetermined`.
+        }
+    }
+
+    /// Helper invoked as its own process by `lock_timeout_reports_live_foreign_holder`.
+    /// Holds the shard lock named by LIBRA_TEST_LOCK_HOLD_PATH with realistic
+    /// `marker_publication`-style metadata until the process exits.
+    #[test]
+    fn lock_holder_helper_process() {
+        let Ok(lock_path) = std::env::var("LIBRA_TEST_LOCK_HOLD_PATH") else {
+            return; // regular test run: nothing to hold
+        };
+        let lock_path = PathBuf::from(lock_path);
+        #[cfg(unix)]
+        {
+            use std::{io::Write, os::fd::AsRawFd};
+
+            if let Some(parent) = lock_path.parent() {
+                fs::create_dir_all(parent).expect("create lock directory");
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open helper lock file");
+            // SAFETY: flock on an owned descriptor held until process exit.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(result, 0, "helper flock must succeed");
+            let metadata = format!(
+                "{{\"pid\":{},\"purpose\":\"marker_publication\",\"started_at_ms\":{},\"invocation\":\"helper\"}}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            file.set_len(0).expect("truncate helper lock file");
+            file.write_all(metadata.as_bytes())
+                .expect("write helper metadata");
+            file.flush().expect("flush helper metadata");
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock_path;
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn lock_timeout_without_metadata_is_undetermined() {
+        #[cfg(unix)]
+        {
+            let storage = tempdir().expect("create storage directory");
+            let db_path = storage.path().join("libra.db");
+            let oid = "b".repeat(40);
+            let lock_path = super::index_repair_lock_path(&db_path, &oid).expect("lock path");
+
+            // Hold the lock with a raw flock and NO metadata payload: the
+            // timeout diagnostic must not claim anything about the holder
+            // (M-DIAG D3).
+            let _raw_holder = {
+                use std::os::fd::AsRawFd;
+                if let Some(parent) = lock_path.parent() {
+                    fs::create_dir_all(parent).expect("create lock directory");
+                }
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .expect("open raw lock file");
+                // SAFETY: flock on an owned descriptor held until the end of the test.
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                assert_eq!(result, 0, "raw flock must succeed");
+                file
+            };
+
+            let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
+                Ok(_) => panic!("the raw holder must make the acquisition time out"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let message = error.to_string();
+            assert!(
+                message.contains("the lock holder could not be determined"),
+                "{message}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // Raw flock reproduction is unix-only; non-unix read-failure
+            // coverage lives in `lock_metadata_read_failure_falls_back_to_undetermined`.
+        }
+    }
+
+    #[test]
+    fn lock_metadata_write_failure_does_not_fail_acquire() {
+        // A read-only handle cannot be truncated or written; the metadata write
+        // must degrade to a debug log without failing the acquisition (M-DIAG
+        // D6).
+        let dir = tempdir().expect("create metadata failure directory");
+        let path = dir.path().join("lock");
+        fs::write(&path, b"").expect("seed lock file");
+        let file = fs::File::open(&path).expect("open lock file read-only");
+        let mut lock = ObjectIndexRepairLock { file };
+        super::write_index_repair_lock_metadata(&mut lock, "marker_publication");
+        assert_eq!(
+            fs::read(&path).expect("read lock file"),
+            b"",
+            "a failed metadata write must leave the lock file unchanged"
+        );
+    }
+
+    #[test]
+    fn lock_metadata_read_failure_falls_back_to_undetermined() {
+        // Unreadable metadata (missing file, empty payload, invalid JSON, or
+        // oversized content) must all resolve to the undetermined clause.
+        // Windows zero-share handles hit the same open-failure branch (D5).
+        let dir = tempdir().expect("create read failure directory");
+        assert!(super::read_index_repair_lock_metadata(&dir.path().join("missing")).is_none());
+        let empty = dir.path().join("empty");
+        fs::write(&empty, b"").expect("write empty lock file");
+        assert!(super::read_index_repair_lock_metadata(&empty).is_none());
+        let invalid = dir.path().join("invalid");
+        fs::write(&invalid, b"not json").expect("write invalid lock file");
+        assert!(super::read_index_repair_lock_metadata(&invalid).is_none());
+        let oversized = dir.path().join("oversized");
+        fs::write(&oversized, vec![b'x'; 2048]).expect("write oversized lock file");
+        assert!(super::read_index_repair_lock_metadata(&oversized).is_none());
     }
 
     #[test]
@@ -3334,9 +3655,9 @@ mod tests {
         let db_path = storage.path().join("libra.db");
         let first_oid = format!("aa{}", "1".repeat(38));
         let second_oid = format!("aa{}", "2".repeat(38));
-        let _first = acquire_index_repair_lock(&db_path, &first_oid)
+        let _first = acquire_index_repair_lock(&db_path, &first_oid, "queued_update")
             .expect("acquire first object-index repair shard");
-        let _second = acquire_index_repair_lock(&db_path, &second_oid)
+        let _second = acquire_index_repair_lock(&db_path, &second_oid, "queued_update")
             .expect("objects in different shards must use independent repair locks");
     }
 
@@ -3346,7 +3667,7 @@ mod tests {
         let db_path = storage.path().join("libra.db");
         let held_oid = format!("abcd{}", "1".repeat(36));
         let published_oid = format!("abcd{}", "2".repeat(36));
-        let _held = acquire_index_repair_lock(&db_path, &held_oid)
+        let _held = acquire_index_repair_lock(&db_path, &held_oid, "queued_update")
             .expect("acquire unrelated object-index repair shard");
 
         let marker_path = super::persist_index_repair_marker(&super::IndexUpdateMsg {

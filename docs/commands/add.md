@@ -441,7 +441,7 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
 | Failed to save index | `LBR-IO-002` | 128 | "check disk space and file permissions" |
 | Refresh failed | `LBR-IO-001` | 128 | -- |
 | Entry creation failed | `LBR-IO-002` | 128 | -- |
-| Object or durable index-marker write failed | `LBR-IO-002` | 128 | Check storage permissions and retry; the error is returned without a panic |
+| Object or durable index-marker write failed | `LBR-IO-002` | 128 | Check storage permissions and retry; the error is returned without a panic. When the failure is a lock timeout, the message names the holder (its pid and purpose, e.g. `marker_publication`, `queued_update`, `replay`, `deletion_fence`) or says the holder could not be determined; wait for that process to finish and retry. Never delete the lock files under `.libra/object-index-repair-locks`: they exist only to arbitrate concurrent writers, do not block anything by themselves, and are released automatically when their owner exits |
 | Paths staged but cloud index repair remains pending, with `--exit-code-on-warning` | `LBR-WARN-001` | 9 | Fix the reported database/marker error; the next repository command retries automatically |
 | Working directory error | `LBR-REPO-001` | 128 | "cannot determine the working tree" |
 | Status computation failed | `LBR-REPO-002` | 128 | -- |

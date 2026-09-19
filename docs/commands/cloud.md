@@ -553,4 +553,4 @@ Note: Neither Git nor jj have a built-in cloud backup command. They rely on push
 | `LBR-IO-002` | Hash mismatch on restored object |
 | `LBR-IO-002` | Failed to save restored object to local storage |
 | `LBR-IO-002` | Metadata sync/restore failure |
-| `LBR-IO-002` | Durable local object-index repair marker could not be replayed before a cloud operation |
+| `LBR-IO-002` | Durable local object-index repair marker could not be replayed before a cloud operation; when the cause is a lock timeout, the message names the lock holder (pid and purpose) or says the holder could not be determined — wait for that process and retry, and never delete lock files under `.libra/object-index-repair-locks` |

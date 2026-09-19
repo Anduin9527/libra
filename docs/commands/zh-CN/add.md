@@ -366,7 +366,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | 无法保存索引 | `LBR-IO-002` | 128 | "check disk space and file permissions" |
 | Refresh 失败 | `LBR-IO-001` | 128 | -- |
 | 条目创建失败 | `LBR-IO-002` | 128 | -- |
-| 对象或持久索引 marker 写入失败 | `LBR-IO-002` | 128 | 检查存储权限后重试；错误会正常返回，不会 panic |
+| 对象或持久索引 marker 写入失败 | `LBR-IO-002` | 128 | 检查存储权限后重试；错误会正常返回，不会 panic。若失败形态为锁超时，错误信息会指出持有者（其 pid 与用途，如 `marker_publication`、`queued_update`、`replay`、`deletion_fence`）或说明无法判定持有者；等待该进程结束后重试即可。不要删除 `.libra/object-index-repair-locks` 下的锁文件：它们只用于仲裁并发写入，本身不会阻塞任何操作，且会在持有进程退出时自动释放 |
 | 路径已暂存但云索引修复仍待处理，且使用 `--exit-code-on-warning` | `LBR-WARN-001` | 9 | 修复警告中的数据库/marker 问题；下一条仓库命令会自动重试 |
 | 工作目录错误 | `LBR-REPO-001` | 128 | "cannot determine the working tree" |
 | 状态计算失败 | `LBR-REPO-002` | 128 | -- |
