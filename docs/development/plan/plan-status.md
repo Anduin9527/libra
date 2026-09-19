@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-19（下次更新时替换）。
+> **当前快照：** 2026-09-20（下次更新时替换）。
 
 ---
 
@@ -40,7 +40,7 @@
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度） | **已收口** | NP-00..05 全部 `complete` |
 | [`plan-20260825.md`](plan-20260825.md) | B（Code provider / RT-01 后续） | **已收口** | TA 系列全部落地；发布面按用户 2026-08-30 豁免闭合 |
 | [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | **已收口** | DF-01..09 全部 `done/complete`；v0.22.0 已发布 |
-| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03 Operation Log v2） | 实施中 | OL-01..12、CH-01..04 `done/complete`；**OL-13/14/15 `pending`** |
+| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03 Operation Log v2） | 实施中 | OL-01..13、CH-01..04 `done/complete`；**OL-14/15 `pending`**（OL-14 依赖已拆除的 `web/`，须重评估） |
 | [`plan-20260821.md`](plan-20260821.md) | A（UP-01） | **已收口** | 客户端与 CI 全部落地；closeout `00bc815`；DEFER-02..06 残留 |
 | [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02 Memory） | 实施中 | **M2-01 `in-progress`**；M2-02..M2-15 全部 `pending`（M2-15 为发布点） |
 | [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | **已收口** | LB-01..07 全部 `done/complete`；protocol v1 20-method 全实现 |
@@ -133,8 +133,8 @@
 | 卡 | 状态 |
 |---|---|
 | OL-01..OL-12、CH-01..CH-04 | `done/complete` |
-| OL-13 多 worktree Operation heads 与 reconcile | `pending` |
-| OL-14 Operation/Change Web 只读图 | `pending` |
+| OL-13 多 worktree Operation heads 与 reconcile | `done/complete`（v0.23.0，`9da06b4`） |
+| OL-14 Operation/Change Web 只读图 | `pending`（依赖 `web/`，该树已随 plan-20260920 拆除，须重评估） |
 | OL-15 移除 v1 operation 代码/表/命令 | `pending` |
 
 ### 3.5 plan-20260903（merge）与 plan-20260729（CT-01）
@@ -154,8 +154,6 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 - **下一步（OI-04 完成后）：** `plan-20260918` → `OI-05`（marker 注册失败错误契约）。开工前必须按 G-10 / DEP-AD-12 与 `plan-20260904` CX-30 做 `src/cli.rs` 三态串行核对（CX-30 `pending` 且 `src/cli.rs` clean 才放行）。
 - **OI-05 之后的串行发布窗口：** IA-01 → … → WT-07（见 3.1），AU 卡不 bump 不发布。
 
-- **OI-05 之后的串行发布窗口：** IA-01 → … → WT-07（见 3.1），AU 卡不 bump 不发布。
-
 ---
 
 ## 四·零、零依赖可立即启动的任务卡（入度为零）
@@ -164,7 +162,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 | 计划 | 入口卡 | 卡要做什么（简述） | 内部前置 | 计划级 review 门 | 外部/跨计划门控 | 可立即开工 |
 |---|---|---|---|---|---|---|
-| [`plan-20260822`](plan-20260822.md) | OL-13 | 多 worktree 的 Operation heads 与 reconcile | OL-11（已 `done/complete`） | 已过（计划实施中） | 无 | ✅ |
+| [`plan-20260822`](plan-20260822.md) | OL-14（OL-13 已 `done`；OL-14 依赖已拆除的 `web/`，开工前须重评估） | Operation/Change Web 只读图 | OL-13（已 `done/complete`） | 已过（计划实施中） | `web/` 已随 plan-20260920 拆除——须先按移除/重排重评估 | ⚠️ 须重评估 |
 | [`plan-20260919`](plan-20260919.md) | GCX-02 | legacy 全局 config DB 首次使用自动迁移（锁+快照+校验+原子提交） | GCX-01（已 `done/complete`） | 已过（GCX-01 已发布 v0.23.1） | DEP-GCX-02：与 plan-20260918 串行写 `COMPATIBILITY.md`/网站页 | ⚠️ 需核 DEP-GCX-02 写集 clean |
 | [`plan-20260919`](plan-20260919.md) | GCX-04 | 用户级 hooks 文件路径对齐 XDG（macOS 只读回退） | GCX-01（已 `done`） | 已过 | DEP-GCX-01（网站 `cf` 分支）；发布队列 GCX-02→GCX-03→GCX-04 | ⚠️ 受发布队列与 DEP-GCX-01 |
 | [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal` 0.9.0 并引入 `object_format` 事实源 | 无 | **双评审已 PASS**（Grok R2 / Claude R40 / Codex R40） | 外部无；开工需 `cp .env.test.example .env.test` | ✅ |
@@ -192,7 +190,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 > 说明：✅ = 无任何门控，可立即开工；⚠️ = 内部无前置但仍有外部/跨计划 `DEP-*` 或发布队列约束；❌ = 计划级 review 门未过（多数 issue 计划尚未 Codex review），按模板 ER-05 / GC-01 **禁止**标 `in-progress`。
 >
-> **一致结论：当前真正「零依赖且未被门控」可立即开工的是 `plan-20260822` OL-13 与 `plan-20260907` B3-00。** 其中 OL-13 属于已在实施中的计划（沿既有链继续）；B3-00 是未启动计划中第一个双评审已 PASS 且外部无前置的卡——它是 plan-20260913（FL Media）依赖链的最上游，优先启动它可同时解锁 9/13。
+> **一致结论：当前真正「零依赖且未被门控」可立即开工的是 `plan-20260907` B3-00。** 它是未启动计划中第一个双评审已 PASS 且外部无前置的卡——优先启动它可同时解锁 plan-20260913（FL Media）依赖链。`plan-20260822` OL-13 已于 2026-09-20 补记账为 `done/complete`（实现随 `9da06b4`/v0.23.0 发布）；其后续 OL-14 因依赖已拆除的 `web/` 须重评估，OL-15 依赖 OL-14。
 
 ---
 
