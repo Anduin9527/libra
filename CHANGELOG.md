@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.23.2] — 2026-09-20
+
+### Completed: internal Code executor removal and dead-code cleanup
+
+Finalizes the plan-20260920 teardown started in 0.23.0. No public surface
+changed in this release — the breaking surface removal shipped in 0.23.0.
+
+- Removed the Code UI / AgentRuntime executor compile SCC and its leftovers
+  (~223k lines): `web`, `orchestrator`, `runtime`, `mcp`, `codex`, `agent`,
+  `goal*`, `context_budget`, `projection`, `tools`, `usage`, `providers`,
+  `prompt`, `intentspec`, `node_adapter`, `libra_vcs`, `workspace_snapshot`,
+  `generated_artifacts`, and the non-SCC `client` / `commands` / `skills` /
+  `capability_package` / `package` modules. The binary no longer links any
+  Code-era executor.
+- `libra agent doctor` gains a read-only `legacy_code_residue` diagnostic
+  (`.libra/sessions/code`, `.libra/code`, `refs/libra/intent`); frozen
+  `ai_*` / `agent_usage_stats` tables stay untouched (ADR-RC-04).
+- Removed the Code UI test infrastructure: the `test-provider` feature, the
+  `web-check` CI job, the SSE-soak and model-generation nightly workflows,
+  and the `code_ui_*` / harness scenario targets.
+- Swept dead code left by the removal: fault-injection seams, zero-caller
+  legacy config/vault APIs, orphaned test fixtures and stale Code-era docs.
+- Long-lived docs, tracing pages, error-code references, and the plan index
+  now reflect the removal; `tests/INDEX.md` rows restored for kept targets.
+
+## [0.23.1] — 2026-09-19
+
+### Changed: global configuration moved to the XDG config directory
+
+Global config (`config.db`, vault unseal key, global hooks) now lives under
+`<XDG_CONFIG_HOME or ~/.config>/libra` on all platforms (macOS included). An
+existing `~/.libra/config.db` is migrated automatically on first use and kept
+as a backup; `LIBRA_HOME` (`bin/`, `env`, `upgrade/`) is unchanged.
+
 ## [0.23.0] — 2026-09-19
 
 ### Removed: public Code, graph, usage, and Publish surfaces
