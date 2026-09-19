@@ -12,8 +12,9 @@
 - Deleted the `web/` Next.js tree (39k files) and the release workflow's
   Node/pnpm steps. Release version surfaces are now three: `Cargo.toml`,
   `install.sh`, `install.ps1` (`compat_version_surface_sync` updated).
-- Restored the accidentally orphaned `show_ref_exists_test` /
-  `show_ref_verify_test` command tests.
+  The long-orphaned `show_ref_exists` / `show_ref_verify` command tests were
+  removed with the Code-era test files (their assertions predate current
+  `show-ref` behavior).
 
 ### Fixed: Windows release build
 
