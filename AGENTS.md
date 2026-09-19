@@ -95,7 +95,7 @@ Do not dismiss an issue only because:
 
 ## Build, Test, and Development Commands
 - `cargo +nightly fmt --all` then `cargo clippy --all-targets --all-features -- -D warnings` keep formatting and linting aligned (`rustfmt.toml` sets `group_imports = "StdExternalCrate"` and `imports_granularity = "Crate"`). **CI enforces `-D warnings`; all clippy warnings must be resolved before committing.**
-- `cargo build` or `cargo check` for quick compile checks; `cargo run -- <cmd>` exercises the CLI (for example, `cargo run -- status` in a temp repo). Set `LIBRA_SKIP_WEB_BUILD=1` to skip the Next.js export inside `build.rs` during iteration.
+- `cargo build` or `cargo check` for quick compile checks; `cargo run -- <cmd>` exercises the CLI (for example, `cargo run -- status` in a temp repo). There is no web build to skip (the Next.js embed was removed in 0.23.x).
 - `cargo test --all` runs the default L1 suite (the acceptance gate). Filter with `cargo test --test command_test <module>` (e.g. `add_test`) or any other top-level `--test <target>` from `tests/INDEX.md`. CI runs the same suite as `cargo nextest run --all --no-fail-fast --retries 2` (pinned `cargo-nextest 0.9.143`; groups from the generated `.config/nextest.toml`). Integration cases rely on temp dirs; mark `#[serial(<lane>)]` if they mutate shared state.
 - Feature-gated layers (see `tests/INDEX.md` waves; CI job `compat-offline-core` runs the default-feature suite with L2/L3 secrets injected — step "Run tests (L1 + L2 + L3)"; `required-features` targets are excluded — plus dedicated `otlp` / `keyring` / `test-upgrade` steps; `compat-network-remotes` runs L2):
   - `--features test-network` for Wave 3 (`network_remotes_test`) — no secrets needed.
@@ -126,11 +126,11 @@ Do not dismiss an issue only because:
 ## Commit & Pull Request Guidelines
 - History uses short, typed summaries with optional scope and PR reference, e.g., `feat(status): support porcelain v2 (#82)` or `fix(push): record tracking reflog (#81)`.
 - Commits must carry the DCO trailer and be signed: `libra commit -s -m "feat(...): ..."` (`-s`/`--signoff` adds `Signed-off-by`; GPG signing is applied by the repository vault key by default via `vault.signing` / `commit.gpgSign` — `libra commit` exposes no `-S`, only `--no-gpg-sign`). This checkout has no `.git/`, so `git commit` does not apply here.
-- PRs should state intent, linked issues, and tests run (`cargo +nightly fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all`, plus any relevant `--features test-*` runs); include repro steps or sample CLI output when touching user-visible behavior. If web/worker code changed, include the matching `pnpm --dir web ...` or `pnpm --dir worker ...` verification.
+- PRs should state intent, linked issues, and tests run (`cargo +nightly fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all`, plus any relevant `--features test-*` runs); include repro steps or sample CLI output when touching user-visible behavior.
 - Keep changes small and cohesive; update README/CLI docs when adding flags or altering compatibility tables.
 
 ## Workspace Notes
-- This repository is managed as a single Rust package plus `web/`; this checkout is a Libra repository (`.libra/`, no `.git/`), so all version-control operations go through `libra` commands — raw `git` does not work here.
+- This repository is a single Rust package; this checkout is a Libra repository (`.libra/`, no `.git/`), so all version-control operations go through `libra` commands — raw `git` does not work here.
 - Prefer this command flow for changes: `libra status` -> inspect diff -> `libra add` -> `libra commit -a -s -m "<scope>: ..."` -> `libra push origin <branch>`.
 - When a user requests version operations or release copy steps, follow the `libra` command workflow instead of `git` commands.
 

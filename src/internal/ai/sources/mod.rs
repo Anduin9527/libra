@@ -1,5 +1,5 @@
 //! KEEP source-resolution helpers used by hooks, sandbox, skills, and
-//! commands. RC-23 deleted SourcePool / MCP / OpenAPI / config loaders
+//! commands. RC-23 deleted SourcePool / OpenAPI / config loaders
 //! (`use tools` is forbidden here).
 
 pub mod resolver;

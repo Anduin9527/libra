@@ -28,7 +28,7 @@
 pub enum ConfigConsumerKind {
     /// Sandbox / hooks / approval-adjacent security configuration.
     Security,
-    /// Agents, automations, prompt rules/contexts, skills, commands, MCP config.
+    /// Agents, automations, prompt rules/contexts, skills, commands.
     Extension,
 }
 
@@ -97,10 +97,9 @@ pub struct ConfigSurface {
 /// The §C.4.1.1 registry. Rows mirror plan-20260714 lines 2268/2272/2274.
 pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
     ConfigSurface {
-        surface: "code/provider/MCP configuration ([mcp] sources included; \
-                  [approval] is security-sensitive — W4-06 treats the whole \
-                  file as Security so overlays cannot wholesale weaken approval; \
-                  W4-11/W4-12 section-merge MCP vs approval)",
+        surface: "code/provider configuration ([approval] is security-sensitive — W4-06 treats the whole \
+                  file as Security so overlays cannot wholesale weaken approval;
+                  W4-11/W4-12 section-merge approval)",
         location: "config.toml",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
@@ -784,7 +783,7 @@ mod tests {
         assert_eq!(
             by_location("config.toml").resolution,
             ReadResolution::UnifiedResolver,
-            "W4-11 [approval]/[mcp] in config.toml use the unified resolver"
+            "W4-11 [approval] in config.toml uses the unified resolver"
         );
         let location = "automations.toml";
         assert_eq!(

@@ -199,7 +199,7 @@ pub enum AgentSubcommand {
     /// Repository-scoped JSON-RPC 2.0 NDJSON ingress for the DeepSeek
     /// Harness plugin (plan-20260818 LB-01). This is the ONLY standard
     /// inbound write transport for Harness; it is not `libra code --control`
-    /// and not an MCP server.
+    /// and is a plain JSON-RPC 2.0 NDJSON transport.
     #[command(about = "Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)")]
     Bridge(bridge::BridgeArgs),
 }

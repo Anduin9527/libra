@@ -33,9 +33,9 @@ For scripted / agent use every command accepts the global `--json` (or `--json=n
 
 Libra is an **AI agent–native version control system** written in Rust. It partially implements a Git client with full on-disk format compatibility (`objects`, `index`, `pack`, `pack-index`) while using SQLite for transactional metadata (`config`, `HEAD`, `refs`). It is designed for monorepo/trunk-based development with tiered cloud storage (S3/R2) and a Cloudflare D1/R2 backup path.
 
-The former `libra code` Web Code UI (MCP and automation-control session surfaces) and the top-level `libra graph` / `libra usage` / `libra publish` surfaces were removed in the 0.23.0 breaking release; external-agent capture is `libra agent`, read-only `review` / `investigate`, `sandbox` and `automation` remain, and repository backup is `libra cloud`. The Git surface is governed by a four-tier compatibility matrix (`supported` / `partial` / `unsupported` / `intentionally-different`) tracked in [`COMPATIBILITY.md`](COMPATIBILITY.md); AI-only commands (`automation`, `sandbox`, `agent`, `review`, `investigate`, `cloud`) are explicitly Libra-only extensions.
+The former `libra code` Web Code UI and the top-level `libra graph` / `libra usage` / `libra publish` surfaces were removed in the 0.23.0 breaking release; external-agent capture is `libra agent`, read-only `review` / `investigate`, `sandbox` and `automation` remain, and repository backup is `libra cloud`. The Git surface is governed by a four-tier compatibility matrix (`supported` / `partial` / `unsupported` / `intentionally-different`) tracked in [`COMPATIBILITY.md`](COMPATIBILITY.md); AI-only commands (`automation`, `sandbox`, `agent`, `review`, `investigate`, `cloud`) are explicitly Libra-only extensions.
 
-The repository also contains a Next.js frontend under `web/`; the default `cargo build` no longer embeds a Next.js export (`WebAssets` and its `build.rs` embed were removed in 0.23.x), and the former Publish Cloudflare Worker (`worker/`) was removed in the same release.
+The default `cargo build` embeds no Next.js export (`WebAssets` and its `build.rs` embed were removed in 0.23.x); the `web/` frontend tree and the former Publish Cloudflare Worker (`worker/`) were both fully removed in 0.23.x.
 
 Self-upgrade and release signing: `libra upgrade` updates an official script install over the Ed25519-signed stable channel (`src/internal/upgrade/`, `docs/auto-upgrade.md`, `docs/development/internal/release-signing-auto-upgrade.md`). The `upgrade.mode` switch lives in `{LIBRA_HOME}/upgrade/settings.json`, never in SQLite. The public trust table in `src/internal/upgrade/trusted_keys.rs`, the pinned key constants in `install.sh` / `install.ps1`, and the ceremony record line in `docs/development/internal/release-signing-auto-upgrade.md` are asserted equal by a unit test — a key change must update all four files together.
 
@@ -53,9 +53,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Dependencies compile at opt-level 2 in dev profile (TA-05: kills the 5-17s
 # opt-0 RSA keygen in every `libra init --vault`); first build after checkout
 # recompiles deps once (+10-20 min), behavior unchanged.
-# Quick compile check (skip the Next.js web build for speed)
-LIBRA_SKIP_WEB_BUILD=1 cargo check
-LIBRA_SKIP_WEB_BUILD=1 cargo build
+# Quick compile check
+cargo check
+cargo build
 
 # Run full test suite (L1 only by default; L2/L3 auto-skip when env vars are unset)
 cargo test --all
@@ -75,7 +75,7 @@ cargo nextest run --all
 
 # .cargo/config.toml sets RUST_MIN_STACK=16 MiB for every cargo-launched process
 # (debug test binaries overflow the 2 MiB default); the CLI itself runs on a
-# 32 MiB thread (src/main.rs). CI uses Node 22 with corepack pnpm@11.10.0 for web/.
+# 32 MiB thread (src/main.rs).
 
 # Run specific tests (tests/command/*.rs compile into the single `command_test` binary)
 cargo test command::init_test
@@ -85,8 +85,6 @@ cargo test --test command_test add_test
 # Run the CLI
 cargo run -- <command>          # e.g. cargo run -- status
 
-# Build the embedded web frontend (normally driven by build.rs)
-pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 ```
 
 ### Cargo Features
@@ -274,10 +272,6 @@ Bootstrap files: `sql/sqlite_20260309_init.sql` (core + AI baseline) and `sql/sq
 The following are baked-in constants (no env-var override) — listed
 here so contributors do not waste time trying to set them at runtime:
 
-- `LIBRA_VCS_TIMEOUT_SECONDS` (`src/internal/ai/mcp/resource.rs:86`) —
-  MCP-side AI-VCS tool timeout, currently fixed at 120 s.
-- `LIBRA_VCS_DEFAULT_APPROVAL_SCOPE` (`src/internal/ai/sources/mcp.rs:28`)
-  — default approval scope for `run_libra_vcs`, currently `interactive`.
 - `LIBRA_ISSUES_URL` (`src/utils/error.rs:59`) — canonical GitHub
   issues URL appended to internal-invariant error hints.
 

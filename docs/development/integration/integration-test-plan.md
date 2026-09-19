@@ -191,7 +191,6 @@ set -a; source .env.test; set +a
 | `src/internal/ai/providers/**` | 2 | + 4 |
 | `src/internal/ai/tools/**` | 2 | — |
 | `src/internal/ai/intentspec/**`、`workflow_objects.rs` | 2 | + 4 |
-| `src/internal/ai/mcp/**` | 2 | — |
 | `src/internal/protocol/**`、`src/git_protocol.rs` | 1 | + 3 |
 | `src/utils/client_storage.rs`、`src/utils/d1_client.rs` | 1 | + 5 |
 | `src/internal/model/**`、`sql/*.sql` | 1, 2 | — |
@@ -235,7 +234,6 @@ Code UI / `test-provider` 矩阵已随 plan-20260920 RC-23 删除。留下未知
 ```bash
 cargo test --test code_cli_dispatch_test -- --test-threads=1
 cargo test --test code_provider_resolution_test -- --test-threads=1
-cargo test --test e2e_mcp_flow -- --test-threads=1
 cargo test --test ai_session_jsonl_test -- --test-threads=1
 cargo test --test ai_hardening_contract_test -- --test-threads=1
 cargo test --test ai_command_safety_test -- --test-threads=1

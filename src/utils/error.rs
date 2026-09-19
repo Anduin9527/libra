@@ -1653,8 +1653,6 @@ fn is_network_unavailable_error(lower: &str) -> bool {
             "connection closed unexpectedly",
             "connection reset by peer",
             "remote end hung up unexpectedly",
-            "failed to start mcp server",
-            "failed to start web server",
         ],
     )
 }

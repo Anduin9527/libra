@@ -2069,7 +2069,7 @@ fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
     // are already covered by mechanisms that predate this lock:
     //
     // * VCS mutations from an agent go through `run_libra_vcs`, which spawns
-    //   `libra` as a SUBPROCESS (`internal/ai/mcp/resource.rs`) — the child
+    //   `libra` as a SUBPROCESS — the child
     //   takes the shared hold like any other command;
     // * an agent-run directory without a manifest fails the GC root walk
     //   closed at any age, so the objectize → finalize window of a review or

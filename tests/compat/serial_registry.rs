@@ -1909,17 +1909,17 @@ fn nextest_group_membership_ignores_timeout_only_overrides() {
     let fixture = r#"
 [[profile.default.overrides]]
 slow-timeout = { grace-period = '10s', terminate-after = 10, period = '120s' }
-filter = "binary(=e2e_mcp_flow) & (test(=test_e2e_mcp_flow) | test(=test_web_only_sigterm_releases_ports))"
+filter = "binary(=fixture_binary) & (test(=test_fixture_binary) | test(=test_web_only_sigterm_releases_ports))"
 
 [[profile.default.overrides]]
 test-group = "external"
 filter = 'test(/(^|::)external_case$/)'
 
 [[profile.default.overrides]]
-filter = "binary(=e2e_mcp_flow)"
+filter = "binary(=fixture_binary)"
 test-group = 'external'
 "#;
-    let expected = (vec!["external_case".into()], vec!["e2e_mcp_flow".into()]);
+    let expected = (vec!["external_case".into()], vec!["fixture_binary".into()]);
     assert_eq!(
         nextest_external_members(fixture).expect("valid fixture"),
         expected
@@ -1931,7 +1931,7 @@ test-group = 'external'
         "a changed member must remain visible to the bidirectional guard"
     );
     let duplicate = format!(
-        "{fixture}\n[[profile.default.overrides]]\nfilter = 'binary(=e2e_mcp_flow)'\ntest-group = 'external'\n"
+        "{fixture}\n[[profile.default.overrides]]\nfilter = 'binary(=fixture_binary)'\ntest-group = 'external'\n"
     );
     assert_eq!(
         nextest_external_members(&duplicate)
@@ -1954,63 +1954,16 @@ test-group = 'external'
         fixture.replace("filter = 'test(/(^|::)external_case$/)'", "filter = 42"),
         fixture.replace("filter = 'test(/(^|::)external_case$/)'", ""),
         fixture.replace("test(/(^|::)external_case$/)", "test(=external_case)"),
-        fixture.replace("binary(=e2e_mcp_flow)\"", "binary(=e2e_mcp_flow) | all()\""),
+        fixture.replace(
+            "binary(=fixture_binary)\"",
+            "binary(=fixture_binary) | all()\"",
+        ),
     ] {
         assert!(
             nextest_external_members(&invalid).is_err(),
             "must reject invalid external membership: {invalid}"
         );
     }
-}
-
-#[test]
-fn nextest_mcp_tests_have_twenty_minute_timeout() {
-    let committed = std::fs::read_to_string(repo_root().join(".config/nextest.toml"))
-        .expect("read .config/nextest.toml");
-    let config: toml::Value = toml::from_str(&committed).expect("valid nextest TOML");
-    let expected: toml::Value = toml::from_str(r#"
-filter = 'binary(=e2e_mcp_flow) & (test(=test_e2e_mcp_flow) | test(=test_web_only_sigterm_releases_ports))'
-slow-timeout = { period = "120s", terminate-after = 10, grace-period = "10s" }
-"#).expect("valid expected policy");
-
-    // Inspect the whole tree, not just the known override: a new profile,
-    // default, or second override must not silently widen timeouts or retries.
-    fn collect_policy_tables<'a>(value: &'a toml::Value, tables: &mut Vec<&'a toml::Value>) {
-        match value {
-            toml::Value::Table(table) => {
-                if table
-                    .keys()
-                    .any(|key| key.contains("timeout") || key == "retries")
-                {
-                    tables.push(value);
-                }
-                for child in table.values() {
-                    collect_policy_tables(child, tables);
-                }
-            }
-            toml::Value::Array(entries) => {
-                for entry in entries {
-                    collect_policy_tables(entry, tables);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut policies = Vec::new();
-    collect_policy_tables(&config, &mut policies);
-    assert_eq!(
-        policies,
-        vec![&expected],
-        "only the exact two-case MCP time policy is allowed; no retries or timeout-as-pass settings"
-    );
-    let overrides = config["profile"]["default"]["overrides"]
-        .as_array()
-        .expect("default overrides array");
-    assert_eq!(
-        overrides.iter().filter(|entry| *entry == &expected).count(),
-        1,
-        "the sole policy must be a default-profile override, inherited by other profiles"
-    );
 }
 
 /// plan-20260827 NP-01 (ADR-NP-01): `.config/nextest.toml` is a generated

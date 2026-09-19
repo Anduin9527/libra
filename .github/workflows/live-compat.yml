@@ -27,7 +27,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
 
     steps:
       - name: Checkout repository
@@ -69,7 +68,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
 
     steps:
       - name: Checkout repository

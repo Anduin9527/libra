@@ -8,7 +8,7 @@
 //! fresh `tempdir()` and either an empty repo or `create_committed_repo()`
 //! which lays down `base.txt` plus an initial commit so subsequent staging
 //! can produce `modified`/`refreshed` rows. Schema regressions here are
-//! breaking changes for downstream consumers (CI parsers, AI agents, MCP).
+//! breaking changes for downstream consumers (CI parsers, AI agents).
 
 use std::fs;
 

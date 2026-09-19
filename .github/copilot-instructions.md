@@ -89,13 +89,13 @@ Do not assume the older multi-crate `engine/`, `delta/`, `transport/`, or
 
 ## Build and test commands
 
-Use `LIBRA_SKIP_WEB_BUILD=1` for Rust-only iteration when the embedded Code UI is
-not the subject of the change.
+Rust-only iteration needs no web build (the Next.js embed was removed in
+0.23.x).
 
 ```bash
 cargo +nightly fmt --all --check
-LIBRA_SKIP_WEB_BUILD=1 cargo clippy --all-targets --all-features -- -D warnings
-LIBRA_SKIP_WEB_BUILD=1 cargo test --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
 cargo run -- <cmd>
 ```
 
@@ -166,13 +166,10 @@ pnpm --dir web test
 
 ## Frontend and Worker guidance
 
-- `build.rs` generates `web/out/`, which `src/command/web_assets.rs` embeds with `rust-embed`; setting
-  `LIBRA_SKIP_WEB_BUILD=1` writes a stub output for Rust-only builds. When
-  changing `web/`, run the real `pnpm --dir web build`; `web/out/` is generated
-  and ignored, so never add its static export to a commit.
-- The `web/` UI is an operational Code UI, not a marketing landing page. Favor
-  dense, predictable controls and existing components in `web/src/components/`.
-- The `worker/` app serves publish snapshots from D1/R2. Validate request input,
+- The `web/` frontend and the Publish `worker/` were removed in the 0.23.x
+  releases (plan-20260920); there is no web build, static export, or Worker to
+  maintain.
+- Validate request input,
   preserve redaction and access checks, and keep wire types synchronized with the
   Rust publish pipeline.
 
