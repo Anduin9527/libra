@@ -132,8 +132,10 @@ libra add --renormalize src/
 
 ### `--ignore-missing`
 
-在 `--dry-run` 下，对没有匹配 add 候选的 pathspec 跳过而非报错（会向 stderr 打印警告）。与 Git 一致：
-`--ignore-missing` 需要配合 `--dry-run`。只命中 ignored 文件的 pathspec 仍按 ignored-path warning 报告。
+在 `--dry-run` 下，对没有匹配 add 候选的 pathspec 按 ignore 规则（`.libraignore`、`.gitignore`）分类：
+命中 ignore 规则的路径跟其它 ignored 路径一样报告，并使 `add` 以 1 退出（若它是唯一 pathspec，
+则仍走 `LBR-ADD-001` / 退出码 128 契约）；未命中 ignore 的路径则跳过并在 stderr 打印警告。与 Git
+一致：`--ignore-missing` 需要配合 `--dry-run`。
 
 ```bash
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt

@@ -140,8 +140,10 @@ pub struct AddArgs {
     #[clap(long)]
     pub renormalize: bool,
 
-    /// Under `--dry-run`, silently skip pathspecs that match no file instead of
-    /// failing. Mirrors Git's `add --ignore-missing`, which requires `--dry-run`.
+    /// Under `--dry-run`, classify pathspecs that match no add candidate against
+    /// the configured ignore rules: ignored patterns are reported and make the
+    /// run exit non-zero; others are skipped with a warning. Mirrors Git's
+    /// `add --ignore-missing`, which requires `--dry-run`.
     #[clap(long = "ignore-missing", requires = "dry_run")]
     pub ignore_missing: bool,
 
@@ -985,6 +987,7 @@ async fn run_add_patch(
         &Changes::default(),
         &index,
         false,
+        false,
         true,
         false,
     )?;
@@ -1422,6 +1425,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         &ignored_changes,
         &index,
         args.ignore_missing,
+        args.force,
         args.update,
         args.update && args.ignore_errors,
     )?;
@@ -2069,6 +2073,9 @@ fn write_err(e: io::Error) -> CliError {
 ///   tracked files in the index, and ignored changes.
 /// - Pathspecs that match only an ignored entry are returned in
 ///   [`ValidatedPathspecs::ignored`] so they can be reported as warnings.
+/// - Under `ignore_missing` (and not `force`), a spec that matches nothing is
+///   classified against the configured ignore rules: ignored → `ignored`
+///   (reported, non-zero via the caller), otherwise → `missing` (skip warning).
 ///
 /// Boundary conditions:
 /// - Returns [`AddError::PathOutsideRepo`] for any pathspec resolving outside
@@ -2084,6 +2091,7 @@ fn validate_pathspecs(
     ignored_changes: &Changes,
     index: &Index,
     ignore_missing: bool,
+    force: bool,
     update_known_only: bool,
     ignore_unknown_pathspecs: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
@@ -2118,6 +2126,25 @@ fn validate_pathspecs(
                 continue;
             }
             if ignore_missing {
+                // ADR-IA-03: a spec that matched nothing is classified against
+                // the configured ignore rules (unless `--force`, which skips the
+                // ignore check, mirroring Git). Ignored → reported and, via the
+                // caller's exit-1 decision, non-zero; otherwise it stays a
+                // skipped-warning `missing` spec.
+                if !force
+                    && pathspecs.positive_spec_match_path(raw).is_some_and(
+                        |(match_path, _icase)| {
+                            crate::utils::ignore::should_ignore(
+                                Path::new(match_path),
+                                crate::utils::ignore::IgnorePolicy::Respect,
+                                index,
+                            )
+                        },
+                    )
+                {
+                    ignored.push(raw.to_string());
+                    continue;
+                }
                 missing.push(raw.to_string());
                 continue;
             }

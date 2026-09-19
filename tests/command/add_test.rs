@@ -2824,3 +2824,286 @@ async fn test_add_ignored_dispatch_before_exit_one() {
         "POST_ADD must be dispatched before the non-zero return: {rows:?}"
     );
 }
+
+/// TC-0004 / M-MISS M1: `--dry-run --ignore-missing` classifies a non-existent
+/// but ignored pathspec as ignored (exit 1) while leaving the index untouched.
+#[test]
+fn test_add_dry_run_ignore_missing_ignored_path_tc0004() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\nignored-file\n").unwrap();
+    fs::write(p.join("track-this"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "track-this"], p), "stage base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("track-this"), "modified\n").unwrap();
+
+    let out = run_libra_command(
+        &[
+            "add",
+            "-n",
+            "--ignore-missing",
+            "track-this",
+            "ignored-file",
+        ],
+        p,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "ignored missing pathspec must exit 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_cli_success(&staged, "list staged files");
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "dry-run must leave the index unchanged"
+    );
+}
+
+/// TC-0005 / M-MISS M1: stdout reports the addable path, stderr's ignored block
+/// lists the ignored pathspec, and no `did not match any files` skip line leaks.
+#[test]
+fn test_add_dry_run_ignore_missing_output_tc0005() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\nignored-file\n").unwrap();
+    fs::write(p.join("track-this"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "track-this"], p), "stage base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("track-this"), "modified\n").unwrap();
+
+    let out = run_libra_command(
+        &[
+            "add",
+            "-n",
+            "--ignore-missing",
+            "track-this",
+            "ignored-file",
+        ],
+        p,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("track-this"),
+        "stdout must report the addable path: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the following paths are ignored"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("ignored-file"),
+        "ignored block must list the ignored pathspec: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not match any files"),
+        "a spec classified as ignored must not surface a skip line: {stderr}"
+    );
+}
+
+/// M-MISS M2/M3/M8/M9/M11: rule source (`.libraignore` vs `.gitignore`),
+/// negation (`!keep.log`), literal magic, and wildcard pathspecs each classify
+/// a non-existent pathspec the same way Git does.
+#[test]
+fn test_add_ignore_missing_rule_matrix() {
+    let setup = |ignore: &str, gitignore: &str| {
+        let repo = tempdir().unwrap();
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        fs::write(p.join(".libraignore"), ignore).unwrap();
+        if !gitignore.is_empty() {
+            fs::write(p.join(".gitignore"), gitignore).unwrap();
+        }
+        fs::write(p.join("track-this"), "base\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "track-this"], p), "stage base");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "commit base",
+        );
+        fs::write(p.join("track-this"), "modified\n").unwrap();
+        repo
+    };
+
+    // M2: `*.log` matches a missing `x.log` -> ignored, exit 1.
+    {
+        let repo = setup("*.log\n", "");
+        let p = repo.path();
+        let out = run_libra_command(&["add", "-n", "--ignore-missing", "track-this", "x.log"], p);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("x.log"));
+    }
+
+    // M3: `!keep.log` negation makes the missing spec addable-or-skipped (not
+    // ignored) -> skip warning, exit 0.
+    {
+        let repo = setup("*.log\n!keep.log\n", "");
+        let p = repo.path();
+        let out = run_libra_command(
+            &["add", "-n", "--ignore-missing", "track-this", "keep.log"],
+            p,
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--ignore-missing"));
+    }
+
+    // M8: `.gitignore` source also classifies a missing spec as ignored.
+    {
+        let repo = setup("", "gi.txt\n");
+        let p = repo.path();
+        let out = run_libra_command(
+            &["add", "-n", "--ignore-missing", "track-this", "gi.txt"],
+            p,
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("gi.txt"));
+    }
+
+    // M9: `:(literal)x.log` strips magic and still matches `*.log`.
+    {
+        let repo = setup("*.log\n", "");
+        let p = repo.path();
+        let out = run_libra_command(
+            &[
+                "add",
+                "-n",
+                "--ignore-missing",
+                "track-this",
+                ":(literal)x.log",
+            ],
+            p,
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("x.log"));
+    }
+
+    // M11: a wildcard pathspec (`ign*`) with no ignore-rule match is skipped,
+    // not ignored -> exit 0.
+    {
+        let repo = setup("*.log\n", "");
+        let p = repo.path();
+        for spec in ["ign*", ":(glob)ign*"] {
+            let out = run_libra_command(&["add", "-n", "--ignore-missing", "track-this", spec], p);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{spec}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
+
+/// M-MISS M12/M13: `--force` skips the ignore classification; a mixed
+/// force-free batch still reports x.log/y.log as ignored while `nope` stays a
+/// skip warning.
+#[test]
+fn test_add_ignore_missing_force_and_mixed() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+    fs::write(p.join("track-this"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "track-this"], p), "stage base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("track-this"), "modified\n").unwrap();
+
+    // M12: with -f, x.log is NOT ignore-classified -> skip warning, exit 0.
+    let forced = run_libra_command(
+        &["add", "-f", "-n", "--ignore-missing", "track-this", "x.log"],
+        p,
+    );
+    assert_eq!(
+        forced.status.code(),
+        Some(0),
+        "force must skip ignore classification: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+
+    // M13: without -f, x.log/y.log are ignored; nope stays a skip warning.
+    let mixed = run_libra_command(
+        &[
+            "add",
+            "-n",
+            "--ignore-missing",
+            "track-this",
+            "x.log",
+            "y.log",
+            "nope",
+        ],
+        p,
+    );
+    assert_eq!(
+        mixed.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&mixed.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&mixed.stderr);
+    assert!(stderr.contains("x.log"), "{stderr}");
+    assert!(stderr.contains("y.log"), "{stderr}");
+    assert!(
+        stderr.contains("did not match any files"),
+        "un-ignored missing path keeps its skip warning: {stderr}"
+    );
+}
+
+/// M-MISS M14: only ignored missing pathspecs (nothing addable) collapse into
+/// the `LBR-ADD-001` / exit 128 contract.
+#[test]
+fn test_add_ignore_missing_only_ignored_is_add_001() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+    fs::create_dir_all(p.join("sub")).unwrap();
+    fs::write(p.join("sub/.libraignore"), "local.tmp\n").unwrap();
+
+    let out = run_libra_command(
+        &["add", "-n", "--ignore-missing", "local.tmp", "../x.log"],
+        &p.join("sub"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "only-ignored must be LBR-ADD-001/128: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

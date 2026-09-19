@@ -173,10 +173,12 @@ libra add --renormalize src/
 
 ### `--ignore-missing`
 
-Under `--dry-run`, skip pathspecs that match no add candidate instead of failing
-(a warning is printed to stderr). Mirrors Git: `--ignore-missing` requires
-`--dry-run`. Pathspecs that only match ignored files are still reported as
-ignored-path warnings.
+Under `--dry-run`, a pathspec that matches no add candidate is classified
+against the configured ignore rules (`.libraignore`, `.gitignore`): an ignored
+pattern is reported like other ignored paths and makes `add` exit 1 (unless it
+is the only pathspec, which keeps the `LBR-ADD-001` / exit 128 contract); a
+path that is not ignored is skipped with a warning on stderr. Mirrors Git:
+`--ignore-missing` requires `--dry-run`.
 
 ```bash
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
