@@ -102,10 +102,12 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
     .expect_err("marker registration failure must be returned");
 
     assert_eq!(error.stable_code(), StableErrorCode::IoWriteFailed);
+    // ADR-OI-04 batch publication: the failure surfaces from the batch flush
+    // with the retry-safe wording (OI-05 refines this message further).
     assert!(
         error
             .to_string()
-            .contains("failed to store object for 'marker-failure.txt'"),
+            .contains("failed to register its cloud object-index repair marker"),
         "unexpected error: {error}"
     );
 
@@ -840,6 +842,15 @@ async fn test_add_dry_run() {
     // Verify the file was not actually added to index
     let changes = changes_to_be_staged().unwrap();
     assert!(changes.new.iter().any(|x| x.to_str().unwrap() == file_path));
+    // M-BATCH B6: preview commands publish no durable repair markers.
+    assert!(
+        !test_dir
+            .path()
+            .join(".libra")
+            .join("object-index-repair")
+            .exists(),
+        "a dry-run must not publish object-index repair markers"
+    );
 }
 
 /// Scenario: in-process `add::execute` with no pathspec and no `--all`
@@ -2487,4 +2498,56 @@ fn test_status_loop_during_batch_add_emits_no_replay_warning() {
     let _ = helper.wait();
     let out = run_libra_command(&["add", "held.txt"], p);
     assert_cli_success(&out, "add succeeds after the holder released");
+}
+
+/// M-BATCH B1: a 3000-file batch `add` publishes markers in bounded batches —
+/// the generation lock acquisition count must stay at ⌈3000/256⌉ + a small
+/// constant, not one lock per object.
+#[test]
+fn test_add_3000_files_bounded_generation_lock_acquisitions() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    for i in 0..3000 {
+        fs::write(p.join(format!("f{i:04}.txt")), "base\n").unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], p), "stage base files");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base files",
+    );
+    for i in 0..3000 {
+        fs::write(p.join(format!("f{i:04}.txt")), "modified\n").unwrap();
+    }
+
+    let count_path = p.join("generation-lock-count.txt");
+    let out = spawn_libra_command_with_env(
+        &["add", "."],
+        p,
+        &[(
+            "LIBRA_TEST_OBJECT_INDEX_GENERATION_LOCK_COUNT_PATH",
+            count_path.to_str().unwrap(),
+        )],
+    )
+    .wait_with_output()
+    .expect("run libra add with the count hook");
+    assert_cli_success(&out, "3000-file batch add");
+    let count: usize = fs::read_to_string(&count_path)
+        .expect("count hook output")
+        .trim()
+        .parse()
+        .expect("count is a number");
+    assert!(
+        count > 1,
+        "batching must acquire more than one generation lock overall: {count}"
+    );
+    assert!(
+        count <= 32,
+        "3000 markers must publish in ≤ 32 generation locks, got {count}"
+    );
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_cli_success(&staged, "list staged files");
+    let names = String::from_utf8_lossy(&staged.stdout);
+    assert_eq!(names.lines().count(), 3000, "all 3000 files must be staged");
 }

@@ -3541,6 +3541,13 @@ impl BackgroundIndexDrainGuard {
 
     async fn finish(self) {
         const DRAIN_BUDGET: Duration = Duration::from_secs(60);
+        #[cfg(debug_assertions)]
+        if let Ok(path) = std::env::var("LIBRA_TEST_OBJECT_INDEX_GENERATION_LOCK_COUNT_PATH") {
+            // Debug-build test hook for M-BATCH B1: report how many repository-wide
+            // generation lock acquisitions this invocation made.
+            let count = utils::client_storage::generation_lock_acquisition_count();
+            let _ = std::fs::write(path, count.to_string());
+        }
         let drained = utils::client_storage::ClientStorage::wait_for_background_tasks_until(
             Instant::now() + DRAIN_BUDGET,
         )

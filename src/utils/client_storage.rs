@@ -18,7 +18,7 @@
 //! Search supports Git's revision navigation suffixes (`HEAD`, `~`, `^`).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -128,13 +128,17 @@ const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 3;
 const INDEX_REPAIR_BATCH_SIZE: usize = 100;
 #[cfg(test)]
 const INDEX_REPAIR_BATCH_SIZE: usize = 2;
+/// Markers published per generation-lock acquisition in batch mode
+/// (ADR-OI-04 item 1). Not configurable.
+const INDEX_REPAIR_MARKER_BATCH: usize = 256;
 
-/// Test-only counter of repository-wide generation lock acquisitions. The
+/// Debug-build counter of repository-wide generation lock acquisitions. The
 /// regression guard for issue #469 asserts that the queued consumer never
-/// takes this lock: holding it across SQLite retries would starve foreground
-/// marker publishers. Only `acquire_index_repair_generation_lock` increments
-/// it, and only in test builds.
-#[cfg(test)]
+/// takes this lock, and OI-04 (M-BATCH B1) asserts batch publication bounds
+/// via `LIBRA_TEST_OBJECT_INDEX_GENERATION_LOCK_COUNT_PATH`. Only
+/// `acquire_index_repair_generation_lock` increments it, and only in debug
+/// builds (release binaries carry zero cost).
+#[cfg(any(test, debug_assertions))]
 static GENERATION_LOCK_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Holder metadata written into a repair lock file right after acquisition.
@@ -465,9 +469,22 @@ fn acquire_index_repair_generation_lock(
         "repair-marker generation",
         purpose,
     )?;
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     GENERATION_LOCK_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
     Ok(lock)
+}
+
+/// Debug-build accessor for the generation lock acquisition counter (M-BATCH
+/// B1 integration hook and the issue #469 regression guard).
+#[cfg(debug_assertions)]
+pub(crate) fn generation_lock_acquisition_count() -> usize {
+    GENERATION_LOCK_ACQUISITIONS.load(Ordering::Relaxed)
+}
+
+/// Test-build accessor for the batched-publication counter (M-BATCH B1).
+#[cfg(test)]
+pub(crate) fn batched_marker_publication_count() -> usize {
+    BATCHED_MARKER_PUBLICATIONS.load(Ordering::Relaxed)
 }
 
 #[cfg(unix)]
@@ -598,7 +615,6 @@ fn index_repair_marker_path(db_path: &Path, oid: &str, object_type: &str) -> io:
 }
 
 fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
-    let marker_path = index_repair_marker_path(&msg.db_path, &msg.hash, &msg.obj_type)?;
     // Marker creation participates in a repository-wide generation fence.
     // Destructive cleanup holds this lock from its final marker revalidation
     // through the catalog transaction, so a new durable repair job cannot be
@@ -610,6 +626,13 @@ fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
     // use the shard lock to arbitrate marker retirement.
     let _generation_lock =
         acquire_index_repair_generation_lock(&msg.db_path, "marker_publication")?;
+    persist_index_repair_marker_under_lock(msg)
+}
+
+/// Write one durable repair marker; the caller must hold the generation lock
+/// (see [`persist_index_repair_marker`] and [`persist_index_repair_marker_batch`]).
+fn persist_index_repair_marker_under_lock(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
+    let marker_path = index_repair_marker_path(&msg.db_path, &msg.hash, &msg.obj_type)?;
     let marker = PendingObjectIndexUpdate {
         schema_version: INDEX_REPAIR_MARKER_SCHEMA_VERSION,
         o_id: msg.hash.clone(),
@@ -638,6 +661,32 @@ fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
     writer.write_all(&bytes)?;
     writer.persist(&marker_path)?;
     Ok(marker_path)
+}
+
+/// Persist a batch of durable repair markers under ONE generation lock
+/// (ADR-OI-04 item 1). On failure the markers written so far stay on disk and
+/// the error is returned (M-BATCH B2); callers must not enqueue anything for
+/// the failed batch — already-stored payloads can be re-registered later via
+/// [`ClientStorage::ensure_existing_object_index`].
+/// Debug-build counter of batch publications (ADR-OI-04 item 1). The B1 unit
+/// assertion uses this instead of the total generation-lock counter so
+/// parallel tests' single-marker publications cannot skew it.
+#[cfg(any(test, debug_assertions))]
+static BATCHED_MARKER_PUBLICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn persist_index_repair_marker_batch(msgs: &[IndexUpdateMsg]) -> io::Result<Vec<PathBuf>> {
+    if msgs.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(any(test, debug_assertions))]
+    BATCHED_MARKER_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+    let _generation_lock =
+        acquire_index_repair_generation_lock(&msgs[0].db_path, "marker_publication")?;
+    let mut paths = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        paths.push(persist_index_repair_marker_under_lock(msg)?);
+    }
+    Ok(paths)
 }
 
 fn retire_index_repair_marker(path: &Path) -> io::Result<()> {
@@ -759,6 +808,62 @@ static INDEX_UPDATE_CHANNELS: Lazy<IndexUpdateChannels> = Lazy::new(|| {
     RUNTIME.spawn(run_index_update_consumer(unscoped_rx));
     IndexUpdateChannels { scoped, unscoped }
 });
+
+// ADR-OI-04 batch accumulation, keyed by repository database path so that
+// concurrent operations on different repositories (and parallel tests) never
+// share a batch. While a batch is active for a key (depth > 0),
+// `enqueue_stored_object_index` defers marker publication into that key's
+// pending list. `end_object_index_batch` (or a full batch of
+// `INDEX_REPAIR_MARKER_BATCH` entries) publishes every marker under a single
+// generation lock and then enqueues the messages. Global (not thread-local)
+// because async commands may hop Tokio worker threads between accumulation
+// and flush; the CLI runs one invocation per repository at a time.
+struct ObjectIndexBatchState {
+    depth: u32,
+    pending: Vec<IndexUpdateMsg>,
+}
+
+static OBJECT_INDEX_BATCH_STATE: std::sync::Mutex<BTreeMap<PathBuf, ObjectIndexBatchState>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn with_object_index_batch_state<R>(
+    key: &Path,
+    f: impl FnOnce(&mut ObjectIndexBatchState) -> R,
+) -> R {
+    let mut states = OBJECT_INDEX_BATCH_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(states
+        .entry(key.to_path_buf())
+        .or_insert_with(|| ObjectIndexBatchState {
+            depth: 0,
+            pending: Vec::new(),
+        }))
+}
+
+/// Publish every accumulated marker for `key` under ONE generation lock, then
+/// enqueue the messages. On a publish failure the already-written markers stay
+/// on disk, the pending list is cleared, and the error propagates (M-BATCH
+/// B2); a later retry re-registers the payloads via `ensure_existing_object_index`.
+fn flush_pending_object_index_batch(key: &Path) -> io::Result<()> {
+    let msgs = with_object_index_batch_state(key, |state| std::mem::take(&mut state.pending));
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    let marker_paths = persist_index_repair_marker_batch(&msgs).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "stored object payloads, but failed to register its cloud object-index repair marker: {error}"
+            ),
+        )
+    })?;
+    for (mut msg, marker_path) in msgs.into_iter().zip(marker_paths) {
+        msg.marker_path = Some(marker_path);
+        enqueue_index_update(msg, "object index update");
+    }
+    Ok(())
+}
 
 async fn run_index_update_consumer(mut rx: Receiver<IndexUpdateMsg>) {
     while let Some(msg) = rx.recv().await {
@@ -1595,6 +1700,59 @@ impl ClientStorage {
         }
     }
 
+    /// Open an object-index publication batch (ADR-OI-04 item 1): while a
+    /// batch is active, `put`/`ensure_existing_object_index` accumulate their
+    /// markers instead of publishing per object; `end_object_index_batch`
+    /// publishes up to 256 markers per generation lock and then enqueues the
+    /// messages. Nested calls are depth-counted.
+    pub(crate) fn begin_object_index_batch(&self) {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_add(1)
+            });
+        }
+    }
+
+    /// Close the innermost publication batch; at depth 0 everything
+    /// accumulated is published and enqueued (ADR-OI-04 item 1).
+    pub(crate) fn end_object_index_batch(&self) -> io::Result<()> {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            let done = with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_sub(1);
+                state.depth == 0
+            });
+            if done {
+                return flush_pending_object_index_batch(&key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard the innermost publication batch without publishing. Used on
+    /// error paths: nothing was enqueued, so nothing durable is lost; the
+    /// stored payloads stay in place and a retry re-registers them via
+    /// [`Self::ensure_existing_object_index`].
+    pub(crate) fn abort_object_index_batch(&self) {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_sub(1);
+                if state.depth == 0 {
+                    state.pending.clear();
+                }
+            });
+        }
+    }
+
+    /// Publish accumulated markers without closing the batch. Called right
+    /// before an index write so durable markers never lag behind index
+    /// content (ADR-OI-04 item 3).
+    pub(crate) fn flush_object_index_batch(&self) -> io::Result<()> {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            return flush_pending_object_index_batch(&key);
+        }
+        Ok(())
+    }
+
     /// Run one top-level embedded CLI invocation with isolated background
     /// index failure and pending-work attribution. Tokio task locals do not
     /// leak into concurrent direct storage callers or independently spawned
@@ -1903,25 +2061,41 @@ impl ClientStorage {
         if let Some(db_path) = Self::index_db_path_from_base(&self.base_path)
             && db_path.exists()
         {
-            let mut msg = IndexUpdateMsg {
+            let msg = IndexUpdateMsg {
                 hash: hash_str.to_string(),
                 obj_type: type_str.to_string(),
                 size: data_len as i64,
-                db_path,
+                db_path: db_path.clone(),
                 marker_path: None,
                 _marker_lock: None,
                 failure_counter: current_index_failure_counter(),
                 pending_counter: current_index_pending_counter(),
             };
-            msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "stored object {hash_str}, but failed to register its cloud object-index repair marker: {error}"
-                    ),
-                )
-            })?);
-            enqueue_index_update(msg, "object index update");
+            let (batching, single_msg) = with_object_index_batch_state(&db_path, |state| {
+                if state.depth > 0 {
+                    // ADR-OI-04: accumulate, then publish up to 256 markers
+                    // under one generation lock. The batch is flushed by
+                    // `end_object_index_batch` (or automatically once it fills).
+                    state.pending.push(msg);
+                    (state.pending.len() >= INDEX_REPAIR_MARKER_BATCH, None)
+                } else {
+                    (false, Some(msg))
+                }
+            });
+            if batching {
+                flush_pending_object_index_batch(&db_path)?;
+            } else if let Some(mut msg) = single_msg {
+                // Single-object path keeps its existing semantics (batch = 1).
+                msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "stored object {hash_str}, but failed to register its cloud object-index repair marker: {error}"
+                        ),
+                    )
+                })?);
+                enqueue_index_update(msg, "object index update");
+            }
         }
 
         Ok(())
@@ -3746,6 +3920,135 @@ mod tests {
             super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT,
             Duration::from_millis(100)
         );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn batched_marker_publication_takes_generation_lock_per_batch() {
+        // M-BATCH B1: 300 markers publish under ⌈300/256⌉ = 2 generation locks.
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "batch-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        let before = super::BATCHED_MARKER_PUBLICATIONS.load(super::Ordering::Relaxed);
+        client.begin_object_index_batch();
+        for index in 0..300 {
+            let blob = Blob::from_content(&format!("batch payload {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object inside the batch");
+        }
+        client
+            .end_object_index_batch()
+            .expect("flush the final batch");
+        let delta = super::BATCHED_MARKER_PUBLICATIONS.load(super::Ordering::Relaxed) - before;
+        assert_eq!(
+            delta, 2,
+            "300 markers must publish in exactly 2 batch publications, got {delta}"
+        );
+        ClientStorage::wait_for_background_tasks();
+    }
+
+    #[test]
+    fn batch_failure_keeps_published_markers() {
+        // M-BATCH B2: when marker N fails, markers 1..N-1 already written stay
+        // on disk and the error propagates.
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let second_db = storage
+            .path()
+            .join("second")
+            .join(crate::utils::util::DATABASE);
+        let mk = |hash: &str, db: PathBuf| super::IndexUpdateMsg {
+            hash: hash.to_string(),
+            obj_type: "blob".to_string(),
+            size: 1,
+            db_path: db,
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let first_hash = format!("{:040x}", 1);
+        let second_hash = format!("{:040x}", 2);
+        // A directory squatting on the second marker path makes the atomic
+        // rename fail after the first marker was written.
+        let second_marker = super::index_repair_marker_path(&second_db, &second_hash, "blob")
+            .expect("second marker path");
+        fs::create_dir_all(second_marker.parent().expect("marker parent"))
+            .expect("create second marker parent");
+        fs::create_dir_all(&second_marker).expect("squat a directory on the marker path");
+
+        let msgs = vec![
+            mk(&first_hash, db_path.clone()),
+            mk(&second_hash, second_db),
+        ];
+        let result = super::persist_index_repair_marker_batch(&msgs);
+        assert!(result.is_err(), "the second marker must fail the batch");
+        let first_marker = super::index_repair_marker_path(&db_path, &first_hash, "blob")
+            .expect("first marker path");
+        assert!(
+            first_marker.is_file(),
+            "the already-written first marker must remain (B2)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn deletion_fence_waits_between_batches() {
+        // M-BATCH B3: after a full batch auto-flushes, the generation lock is
+        // free again before the next batch publishes.
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "fence-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        client.begin_object_index_batch();
+        for index in 0..300 {
+            let blob = Blob::from_content(&format!("fence payload {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object inside the batch");
+        }
+        // The first 256 markers flushed during the loop; the lock must be free
+        // for a deletion fence between batches.
+        let lock_path = super::index_repair_generation_lock_path(&db_path).expect("lock path");
+        let probe = super::try_acquire_index_repair_lock_file(&lock_path, "replay")
+            .expect("probe generation lock");
+        assert!(
+            probe.is_some(),
+            "the generation lock must be free between batches (B3)"
+        );
+        drop(probe);
+        client
+            .end_object_index_batch()
+            .expect("flush the final batch");
+        ClientStorage::wait_for_background_tasks();
     }
 
     #[tokio::test]

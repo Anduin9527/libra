@@ -220,6 +220,10 @@ pub enum AddError {
     /// cloud object index could not be registered.
     #[error("failed to store object for '{path}': {source}")]
     ObjectSave { path: PathBuf, source: io::Error },
+    /// Batch publication of cloud object-index repair markers failed after
+    /// the payloads were stored (ADR-OI-04 / M-BATCH B2).
+    #[error("failed to store object: {source}")]
+    ObjectIndexBatchFlush { source: io::Error },
     /// Path bytes are not valid UTF-8 — Libra's index does not yet preserve
     /// non-UTF-8 paths verbatim.
     #[error("path '{path}' is not valid UTF-8")]
@@ -266,7 +270,9 @@ impl From<AddError> for CliError {
             AddError::RefreshFailed { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
-            AddError::CreateIndexEntry { .. } | AddError::ObjectSave { .. } => {
+            AddError::CreateIndexEntry { .. }
+            | AddError::ObjectSave { .. }
+            | AddError::ObjectIndexBatchFlush { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
             AddError::InvalidPathEncoding { .. } => CliError::fatal(error.to_string())
@@ -496,7 +502,22 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
         return Err(patch_machine_mode_error(output, args.dry_run));
     }
 
-    let result = run_add(&args).await?;
+    // ADR-OI-04: accumulate marker publication for the whole staging pass.
+    // `run_add` flushes right before each index write so durable markers
+    // never lag behind index content; the end flush publishes any remainder.
+    util::objects_storage().begin_object_index_batch();
+    let result = match run_add(&args).await {
+        Ok(result) => {
+            util::objects_storage()
+                .end_object_index_batch()
+                .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
+            result
+        }
+        Err(error) => {
+            util::objects_storage().abort_object_index_batch();
+            return Err(error);
+        }
+    };
 
     if args.patch {
         if result.wrote_index() {
@@ -1089,6 +1110,9 @@ async fn run_add_patch(
             }
         }
     }
+    util::objects_storage()
+        .flush_object_index_batch()
+        .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
     index
         .save(index_path)
         .map_err(|source| AddError::IndexSave {
@@ -1207,6 +1231,9 @@ async fn run_add_resolved(
             }
         }
     }
+    util::objects_storage()
+        .flush_object_index_batch()
+        .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
 
     index
         .save(index_path)
@@ -1389,6 +1416,9 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         } else {
             let refreshed = do_refresh_files(&mut index, &tracked_modified, &workdir)?;
             add_output.refreshed = refreshed.iter().map(|f| f.display().to_string()).collect();
+            util::objects_storage()
+                .flush_object_index_batch()
+                .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
             index
                 .save(&index_path)
                 .map_err(|source| AddError::IndexSave {
@@ -1636,6 +1666,9 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         )?;
     }
 
+    util::objects_storage()
+        .flush_object_index_batch()
+        .map_err(|source| AddError::ObjectIndexBatchFlush { source })?;
     index
         .save(&index_path)
         .map_err(|source| AddError::IndexSave {
