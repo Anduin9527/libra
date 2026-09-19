@@ -98,10 +98,14 @@ libra add --ignore-errors src/
 
 ### `--pathspec-from-file <file>`
 
-从 `<file>` 读取 pathspec（每行一个），并与命令行 pathspec 合并。文件中的条目使用与位置 pathspec 相同的共享匹配器和 magic 形式。不支持用 `-` 表示 stdin；请传入真实路径。列表为 NUL 分隔时，配合 `--pathspec-file-nul` 使用。空行会被忽略。
+从 `<file>` 读取 pathspec（每行一个），并与命令行 pathspec 合并。文件中的条目使用与位置 pathspec 相同的共享匹配器和 magic 形式。值为 `-` 时从 stdin 读取（绝不打开工作树里字面名为 `-` 的文件）。换行模式按 `\n` 分割并去掉每行末尾的一个 `\r`，因此 CRLF 列表可用；空行会被忽略。列表为 NUL 分隔（例如其它工具的 `-z` 输出）时配合 `--pathspec-file-nul`——NUL 模式保留每个字节（含 CR）。
+
+内容非 UTF-8 或文件无法读取时为致命 `LBR-IO-001`（exit 128），零写入。空列表按用法错误处理
+（`nothing specified, nothing added`，exit 129）——Git 把空列表视为零操作，属有意差异。
 
 ```bash
 libra add --pathspec-from-file paths.txt
+printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-
 libra add --pathspec-from-file paths.bin --pathspec-file-nul
 ```
 

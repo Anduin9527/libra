@@ -21,7 +21,7 @@
 use std::{
     collections::BTreeSet,
     env,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -120,7 +120,8 @@ pub struct AddArgs {
     #[clap(long)]
     pub ignore_errors: bool,
 
-    /// Read pathspecs from a file (one per line, or NUL-separated with --pathspec-file-nul).
+    /// Read pathspecs from a file, one per line (or NUL-separated with
+    /// `--pathspec-file-nul`). Use `-` to read the list from stdin.
     #[clap(long = "pathspec-from-file", value_name = "FILE")]
     pub pathspec_from_file: Option<String>,
 
@@ -491,23 +492,18 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
 
     // If --pathspec-from-file is specified, read and merge pathspecs.
     if let Some(file) = args.pathspec_from_file.take() {
-        let data = std::fs::read(&file).map_err(|e| {
-            CliError::fatal(format!("cannot read pathspec file '{}': {}", file, e))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
-        let separator: u8 = if args.pathspec_file_nul { 0 } else { b'\n' };
-        let from_file: Vec<String> = data
-            .split(|b| *b == separator)
-            .filter_map(|s| {
-                let s = std::str::from_utf8(s).ok()?.trim();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
-                }
-            })
-            .collect();
-        args.pathspec.extend(from_file);
+        // ADR-PSF-01: the value `-` reads the list from stdin (never a worktree
+        // file literally named `-`); anything else is a file path.
+        let data = if file == PATHSPEC_FROM_FILE_STDIN {
+            read_pathspec_stdin()?
+        } else {
+            std::fs::read(&file).map_err(|e| {
+                CliError::fatal(format!("cannot read pathspec file '{}': {}", file, e))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+        };
+        args.pathspec
+            .extend(parse_pathspec_file(&data, args.pathspec_file_nul)?);
     }
 
     if (args.no_auto_advance || args.auto_advance) && !args.patch {
@@ -596,6 +592,57 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     }
 
     Ok(())
+}
+
+/// Git's `--pathspec-from-file` stdin sentinel and the bounded-stdin cap
+/// (ADR-PSF-01).
+const PATHSPEC_FROM_FILE_STDIN: &str = "-";
+const PATHSPEC_FROM_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a `--pathspec-from-file=-` list from stdin, bounded. Any failure is a
+/// hard `LBR-IO-001` error with zero writes (ADR-PSF-01 item 4).
+fn read_pathspec_stdin() -> CliResult<Vec<u8>> {
+    let mut data = Vec::new();
+    io::stdin()
+        .lock()
+        .take(PATHSPEC_FROM_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut data)
+        .map_err(|error| {
+            CliError::fatal(format!("cannot read pathspec list from stdin: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    if data.len() as u64 > PATHSPEC_FROM_FILE_MAX_BYTES {
+        return Err(CliError::fatal(format!(
+            "pathspec list from stdin exceeds {PATHSPEC_FROM_FILE_MAX_BYTES} bytes"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed));
+    }
+    Ok(data)
+}
+
+/// Decode a `--pathspec-from-file` payload (ADR-PSF-01 items 2-3): NUL mode
+/// splits on `0` and keeps every byte, otherwise lines split on `\n` with one
+/// trailing `\r` stripped. Empty entries are dropped; a non-UTF-8 entry is a
+/// hard `LBR-IO-001` failure rather than a silent skip.
+fn parse_pathspec_file(data: &[u8], nul: bool) -> CliResult<Vec<String>> {
+    let separator: u8 = if nul { 0 } else { b'\n' };
+    let mut pathspecs = Vec::new();
+    for raw in data.split(|byte| *byte == separator) {
+        let entry = if nul {
+            raw
+        } else {
+            raw.strip_suffix(b"\r").unwrap_or(raw)
+        };
+        if entry.is_empty() {
+            continue;
+        }
+        let text = std::str::from_utf8(entry).map_err(|_| {
+            CliError::fatal("pathspec list contains a non-UTF-8 entry".to_string())
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        pathspecs.push(text.to_string());
+    }
+    Ok(pathspecs)
 }
 
 const CONFLICT_MARKER_SIZE: usize = 7;
@@ -2715,5 +2762,35 @@ mod test {
         assert_eq!(index.get("link", 0).unwrap().mode, 0o120000);
         assert_eq!(index.get("gl", 0).unwrap().mode, 0o160000);
         assert_eq!(index.get("reg", 0).unwrap().mode, 0o100644);
+    }
+
+    /// PSF-01 (plan-20260918): `parse_pathspec_file` implements the delimiter
+    /// contract — LF mode strips one trailing CR, NUL mode keeps every byte,
+    /// blanks are dropped, and non-UTF-8 is a hard error.
+    #[test]
+    fn parse_pathspec_file_splits_and_strips_cr() {
+        let lf = parse_pathspec_file(b"a.txt\r\nb.txt\r\n", false).unwrap();
+        assert_eq!(lf, vec!["a.txt".to_string(), "b.txt".to_string()]);
+
+        // A CR that is not a line terminator is kept.
+        let inner_cr = parse_pathspec_file(b"a\rb\n", false).unwrap();
+        assert_eq!(inner_cr, vec!["a\rb".to_string()]);
+
+        // Blank lines are dropped.
+        let blanks = parse_pathspec_file(b"\n\na.txt\n\n", false).unwrap();
+        assert_eq!(blanks, vec!["a.txt".to_string()]);
+
+        // NUL mode splits on 0 and keeps CR bytes verbatim.
+        let nul = parse_pathspec_file(b"a.txt\r\n\0b.txt", true).unwrap();
+        assert_eq!(nul, vec!["a.txt\r\n".to_string(), "b.txt".to_string()]);
+
+        // Non-UTF-8 is a hard failure, never a silent skip.
+        assert!(
+            parse_pathspec_file(b"\xff\xfe", false).is_err(),
+            "non-UTF-8 must fail"
+        );
+
+        // An empty payload yields no pathspecs (falls through to the gate).
+        assert!(parse_pathspec_file(b"", false).unwrap().is_empty());
     }
 }

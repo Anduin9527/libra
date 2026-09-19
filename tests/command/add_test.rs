@@ -3568,3 +3568,79 @@ fn test_add_chmod_empty_pathspec_is_noop() {
         String::from_utf8_lossy(&bogus.stderr)
     );
 }
+
+/// PSF-01 (plan-20260918) / M-PSF P1/P4/P5/P10/P11: `--pathspec-from-file=-`
+/// reads stdin, the delimiter modes match Git, and every failure path stays
+/// zero-write with the documented exit code.
+#[test]
+fn test_add_pathspec_from_file_stdin_and_delimiters() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("a.txt"), "a\n").unwrap();
+    fs::write(p.join("b.txt"), "b\n").unwrap();
+    // A worktree file literally named `-`: stdin must win over it.
+    fs::write(p.join("-"), "b.txt\n").unwrap();
+
+    // P1: LF stdin stages a.txt and never opens the `-` file.
+    let p1 = run_libra_command_with_stdin(&["add", "--pathspec-from-file=-"], p, "a.txt\n");
+    assert!(
+        p1.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p1.stderr)
+    );
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    let staged_out = String::from_utf8_lossy(&staged.stdout).to_string();
+    assert!(staged_out.contains("a.txt"), "{staged_out}");
+    assert!(
+        !staged_out.contains("b.txt"),
+        "the `-` file must not be read: {staged_out}"
+    );
+
+    // P4: CRLF is accepted and the CR is stripped.
+    let p4 = run_libra_command_with_stdin(&["add", "--pathspec-from-file=-"], p, "b.txt\r\n");
+    assert!(
+        p4.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p4.stderr)
+    );
+
+    // P5: NUL mode keeps the CR, so the whole line is one unmatched path.
+    let p5 = run_libra_command_with_stdin(
+        &["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        p,
+        "a.txt\r\n",
+    );
+    assert_ne!(p5.status.code(), Some(0), "an unmatched CR path must fail");
+
+    // P10: an empty list falls through to the empty-pathspec usage error.
+    let p10 = run_libra_command_with_stdin(&["add", "--pathspec-from-file=-"], p, "");
+    assert_eq!(
+        p10.status.code(),
+        Some(129),
+        "{}",
+        String::from_utf8_lossy(&p10.stderr)
+    );
+
+    // P11: a missing file keeps its 128 + LBR-IO-001 contract.
+    let p11 = run_libra_command(&["add", "--pathspec-from-file=nope.list"], p);
+    assert_eq!(
+        p11.status.code(),
+        Some(128),
+        "{}",
+        String::from_utf8_lossy(&p11.stderr)
+    );
+    assert!(String::from_utf8_lossy(&p11.stderr).contains("LBR-IO-001"));
+
+    // Non-UTF-8 content is a hard 128 + LBR-IO-001, never a silent skip.
+    fs::write(p.join("bad.list"), b"\xff\xfe").unwrap();
+    let bad = run_libra_command(&["add", "--pathspec-from-file=bad.list"], p);
+    assert_eq!(
+        bad.status.code(),
+        Some(128),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("LBR-IO-001"));
+}

@@ -133,12 +133,20 @@ libra add --ignore-errors src/
 
 Read pathspecs from `<file>` (one per line) and merge them with any pathspecs given on
 the command line. Entries use the same shared pathspec matcher and magic forms as
-positional pathspecs. Use `-` is not supported; pass a real path. Pair with
-`--pathspec-file-nul` when the list is NUL-separated (e.g. produced by another tool's
-`-z` output). Empty lines are ignored.
+positional pathspecs. A value of `-` reads the list from stdin instead of opening a
+file (a worktree file literally named `-` is never read). Newline mode splits on `\n`
+and strips one trailing `\r` per line, so CRLF lists work; empty lines are ignored.
+Pair with `--pathspec-file-nul` when the list is NUL-separated (e.g. produced by
+another tool's `-z` output) — NUL mode keeps every byte, including a CR.
+
+A payload that is not valid UTF-8, or a file that cannot be read, is a fatal
+`LBR-IO-001` error (exit 128) with zero writes. An empty list is a usage error
+(`nothing specified, nothing added`, exit 129); Git accepts an empty list as a
+no-op, an intentional difference.
 
 ```bash
 libra add --pathspec-from-file paths.txt
+printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-
 libra add --pathspec-from-file paths.bin --pathspec-file-nul
 ```
 
