@@ -131,8 +131,8 @@ libra add --ignore-errors src/
 
 ### `--pathspec-from-file <file>`
 
-Read pathspecs from `<file>` (one per line) and merge them with any pathspecs given on
-the command line. Entries use the same shared pathspec matcher and magic forms as
+Read pathspecs from `<file>` (one per line); the command line must then carry no
+pathspec arguments. Entries use the same shared pathspec matcher and magic forms as
 positional pathspecs. A value of `-` reads the list from stdin instead of opening a
 file (a worktree file literally named `-` is never read). Newline mode splits on `\n`
 and strips one trailing `\r` per line, so CRLF lists work; empty lines are ignored.
@@ -153,8 +153,10 @@ fatal `LBR-IO-001` error (exit 128) with zero writes. NUL mode never decodes.
 `--pathspec-from-file` cannot be combined with `-p`/`--patch`, `--edit`,
 `--interactive`, or command-line pathspec arguments (Git's
 `cannot be used together` contract): each combination is a usage error
-(`LBR-CLI-002`, exit 129) that writes nothing. (`--interactive` keeps its own
-declined-flag refusal, exit 128 + `LBR-UNSUPPORTED-001`.)
+(`LBR-CLI-002`, exit 129) that writes nothing. (Git refuses the same combinations
+with exit 128; Libra's 129 is its usage-error code — an intentional difference.
+`--interactive` keeps its own declined-flag refusal, exit 128 +
+`LBR-UNSUPPORTED-001`.)
 
 ```bash
 libra add --pathspec-from-file paths.txt

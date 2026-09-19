@@ -121,7 +121,9 @@ pub struct AddArgs {
     pub ignore_errors: bool,
 
     /// Read pathspecs from a file, one per line (or NUL-separated with
-    /// `--pathspec-file-nul`). Use `-` to read the list from stdin.
+    /// `--pathspec-file-nul`). Use `-` to read the list from stdin. Cannot be
+    /// combined with `-p`/`--patch`, `-i`/`--interactive`, or pathspec
+    /// arguments.
     #[clap(long = "pathspec-from-file", value_name = "FILE")]
     pub pathspec_from_file: Option<String>,
 
