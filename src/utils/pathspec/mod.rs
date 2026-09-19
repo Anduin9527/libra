@@ -211,6 +211,11 @@ impl PathspecSet {
     /// spec, or `None` when no positive spec carries that raw spelling. Read-
     /// only: matching semantics are untouched. Used by `add --dry-run
     /// --ignore-missing` to classify unmatched pathspecs against ignore rules.
+    ///
+    /// Limitation: the ignore engine matches case-sensitively, so a caller that
+    /// forwards the path to `should_ignore` cannot honor the returned `icase`
+    /// flag (the M-MISS M10 row is therefore only asserted under
+    /// `core.ignorecase`).
     pub fn positive_spec_match_path(&self, raw: &str) -> Option<(&str, bool)> {
         self.specs
             .iter()

@@ -424,6 +424,7 @@ enum StagedAction {
 /// Result of [`validate_pathspecs`]: the canonicalised set of pathspecs that
 /// should drive staging, plus any pathspecs that only matched
 /// ignored entries (reported as warnings).
+#[derive(Debug)]
 struct ValidatedPathspecs {
     pathspecs: PathspecSet,
     ignored: Vec<String>,
@@ -2843,5 +2844,75 @@ mod test {
 
         // Unterminated quoting is a hard failure.
         assert!(parse_pathspec_file(b"\"we ird.txt\n", false).is_err());
+    }
+
+    /// IA-02 (ADR-IA-03): `validate_pathspecs` classifies an unmatched spec
+    /// against the ignore rules when `ignore_missing` is set, and `force`
+    /// skips that classification — unit-tested directly over the
+    /// `(ignore_missing, force)` combinations.
+    #[tokio::test]
+    #[serial_test::serial(cwd)]
+    async fn validate_pathspecs_classifies_ignored_missing() {
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        std::fs::write(repo.path().join(".libraignore"), "*.log\n").unwrap();
+
+        let index = Index::new();
+        let changes = Changes::default();
+        let ctx = || PathspecMatchContext {
+            workdir: repo.path(),
+            current_dir: repo.path(),
+            ignore_case: false,
+        };
+        let classify = |spec: &str, ignore_missing: bool, force: bool| {
+            validate_pathspecs(
+                &[spec.to_string()],
+                ctx(),
+                &changes,
+                &changes,
+                &index,
+                ignore_missing,
+                force,
+                false,
+                false,
+            )
+            .expect("validate_pathspecs")
+        };
+
+        // An ignored non-existent path lands in `ignored`.
+        let validated = classify("x.log", true, false);
+        assert_eq!(validated.ignored, vec!["x.log".to_string()]);
+        assert!(validated.missing.is_empty());
+
+        // An un-ignored non-existent path stays a `missing` skip.
+        let validated = classify("note.txt", true, false);
+        assert!(validated.ignored.is_empty());
+        assert_eq!(validated.missing, vec!["note.txt".to_string()]);
+
+        // `force` skips the ignore classification (Git parity).
+        let validated = classify("x.log", true, true);
+        assert!(validated.ignored.is_empty());
+        assert_eq!(validated.missing, vec!["x.log".to_string()]);
+
+        // Without `ignore_missing` an unmatched spec is a hard error.
+        let err = validate_pathspecs(
+            &["nope.txt".to_string()],
+            ctx(),
+            &changes,
+            &changes,
+            &index,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect_err("unmatched spec without ignore_missing must fail");
+        assert!(
+            matches!(err, AddError::PathspecNotMatched { .. }),
+            "{err:?}"
+        );
     }
 }

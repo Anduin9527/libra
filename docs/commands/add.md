@@ -501,6 +501,10 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
 - Libra's `add` is required before `commit`, matching Git's explicit staging model
 - `.gitignore` and `.libraignore` both use Git ignore syntax; `.libraignore`
   remains the Libra-specific override file when both exist in the same directory
+- An un-ignored missing pathspec still prints Libra's `--ignore-missing` skip
+  warning (Git is silent there)
+- With a directory pathspec, an already-existing ignored parent directory is not
+  additionally reported (Git also lists it)
 - LFS-tracked files are automatically converted to pointer files during staging
 - Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-i`/`--interactive`, D15 remainder). Use `libra add -p` or `libra add <pathspec>`.
 

@@ -406,6 +406,8 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 - jj 没有 `add` 命令；它自动跟踪所有工作树更改
 - Libra 的 `add` 是 `commit` 前必需步骤，匹配 Git 的显式暂存模型
 - `.gitignore` 与 `.libraignore` 都使用 Git ignore 模式语法；同目录内 `.libraignore` 可显式覆盖 `.gitignore`，导入和非 bare clone 仍会复制 `.gitignore` 规则，而不是删除或重命名原文件
+- 未被 ignore 的缺失 pathspec 仍会输出 Libra 的 `--ignore-missing` 跳过 warning（Git 此时静默）
+- 目录 pathspec 下，已存在的被忽略父目录不会被额外列出（Git 也会列出它）
 - LFS 跟踪文件会在暂存期间自动转换为指针文件
 - 其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-i`/`--interactive`，D15 剩余入口）。请用 `libra add -p` 或 `libra add <pathspec>`。
 
