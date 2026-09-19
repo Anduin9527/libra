@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.23.3] — 2026-09-20
+
+### Removed: MCP and the `web/` directory
+
+- Removed every remaining MCP trace: the unused `rmcp` / `rig-core`
+  dependencies, hardening MCP tool classifications, `ControlInfo.mcp_url`,
+  the `e2e_mcp_flow` test and nine unregistered Code-era test files, and all
+  MCP mentions in code, tests, and current-facing docs. `libra` has no MCP
+  server surface and none is planned (DEFER-RC-04 closed by user decision).
+- Deleted the `web/` Next.js tree (39k files) and the release workflow's
+  Node/pnpm steps. Release version surfaces are now three: `Cargo.toml`,
+  `install.sh`, `install.ps1` (`compat_version_surface_sync` updated).
+- Restored the accidentally orphaned `show_ref_exists_test` /
+  `show_ref_verify_test` command tests.
+
+### Fixed: Windows release build
+
+The v0.23.2 Windows build failed because `tokio::signal` was not enabled on
+Windows (previously inherited through a dependency that was removed). The
+`signal` tokio feature is now declared explicitly, so `libra agent review` /
+`investigate` / `service` compile on `x86_64-pc-windows-msvc`.
+
 ## [0.23.2] — 2026-09-20
 
 ### Completed: internal Code executor removal and dead-code cleanup
