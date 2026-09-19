@@ -150,10 +150,19 @@ Requires `--pathspec-from-file`; using it alone is a usage error.
 ### `--chmod=(+|-)x`
 
 Force the executable bit recorded in the index for the matched paths: `+x` records
-mode `100755`, `-x` records `100644`. The blob content is unchanged; only regular
-files are affected (symlinks and gitlinks are skipped). A path whose recorded mode
-actually changes is reported as modified, even when its content did not change. An
-invalid value (anything other than `+x` / `-x`) is a usage error.
+mode `100755`, `-x` records `100644`. The blob content is unchanged. A path whose
+recorded mode actually changes is reported as modified, even when its content did
+not change.
+
+Only regular files carry an executable bit. A matched symlink (`120000`) or
+gitlink (`160000`) is refused: the entry is left unchanged, an
+`error: cannot chmod +x '<path>'` line is printed to stderr for each refusal, and
+`add` exits 1 after the remaining paths have been processed normally. In `--json`
+mode the refusals appear as `chmod_rejected: [{"path", "flip"}]` on the envelope
+instead, with the same exit 1. (Git exits 255 here; Libra uses the process-level
+exit 1 model shared with the ignored-path report.)
+
+An invalid value (anything other than `+x` / `-x`) is a usage error.
 
 ```bash
 libra add --chmod=+x scripts/build.sh

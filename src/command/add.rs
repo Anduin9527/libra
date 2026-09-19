@@ -322,6 +322,16 @@ pub struct AddFailure {
     pub message: String,
 }
 
+/// One entry in [`AddOutput::chmod_rejected`]: a path whose index entry is not
+/// a regular file (symlink `120000` / gitlink `160000`), so `--chmod` cannot
+/// set or clear its executable bit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChmodRejection {
+    pub path: String,
+    /// The requested flip — `"+x"` or `"-x"`.
+    pub flip: String,
+}
+
 /// Structured result of a single `libra add` invocation.
 ///
 /// Built by [`run_add`] and consumed by [`render_add_output`] (text mode) or
@@ -346,6 +356,11 @@ pub struct AddOutput {
     /// payload so agent callers can see what was skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
+    /// Paths refused under `--chmod` because their index entry is not a
+    /// regular file (symlink/gitlink). Reported in text mode as
+    /// `error: cannot chmod …` lines and in JSON as `chmod_rejected`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chmod_rejected: Vec<ChmodRejection>,
     /// Whether this was a dry-run (no actual changes made)
     pub dry_run: bool,
 }
@@ -362,6 +377,7 @@ impl AddOutput {
             ignored: Vec::new(),
             failed: Vec::new(),
             missing: Vec::new(),
+            chmod_rejected: Vec::new(),
             dry_run,
         }
     }
@@ -553,6 +569,22 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     }
     if result.wrote_index() {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_ADD).await;
+    }
+
+    // ADR-CH-02: a `--chmod` refusal exits 1 after rendering, warning
+    // tracking, and event dispatch — the same "render then non-zero" model as
+    // the ignored report. Text mode prints one `error: cannot chmod …` line
+    // per refused path; JSON carries `chmod_rejected` on the envelope instead.
+    if !result.chmod_rejected.is_empty() {
+        if !output.is_json() {
+            for rejection in &result.chmod_rejected {
+                eprintln!(
+                    "error: cannot chmod {} '{}'",
+                    rejection.flip, rejection.path
+                );
+            }
+        }
+        return Err(CliError::silent_exit(1));
     }
 
     // ADR-IA-02 item 1 / M-EXIT E1-E2: a mixed ignored report exits 1 after
@@ -1741,10 +1773,17 @@ fn parse_chmod(value: &str) -> CliResult<u32> {
     }
 }
 
-/// Force the executable bit on every matched, tracked **regular** file. Symlinks
-/// and gitlinks are skipped (they have no executable bit). A path whose mode
-/// already matches is left untouched; a real change is reported as `modified`.
-/// In `dry_run` the index is not mutated, only the report.
+/// The `"(+|-)x"` spelling a `--chmod` target mode requests: `+x` sets the
+/// executable bit (`100755`), `-x` clears it (`100644`).
+fn chmod_flip(target_mode: u32) -> &'static str {
+    if target_mode & 0o111 != 0 { "+x" } else { "-x" }
+}
+
+/// Force the executable bit on every matched, tracked **regular** file.
+/// Symlinks and gitlinks carry no executable bit and are refused (recorded in
+/// [`AddOutput::chmod_rejected`]). A path whose mode already matches is left
+/// untouched; a real change is reported as `modified`. In `dry_run` the index
+/// is not mutated, only the report.
 fn apply_chmod(
     index: &mut Index,
     target_mode: u32,
@@ -1765,9 +1804,18 @@ fn apply_chmod(
         else {
             continue;
         };
-        // Only regular blobs carry an executable bit; a path already at the
-        // target mode needs no change.
-        if current_mode & 0o170000 != 0o100000 || current_mode == target_mode {
+        // Non-regular index entries (symlinks `120000`, gitlinks `160000`)
+        // carry no executable bit: record the refusal, leave the entry
+        // unchanged, and keep processing the remaining paths (ADR-CH-01).
+        if current_mode & 0o170000 != 0o100000 {
+            out.chmod_rejected.push(ChmodRejection {
+                path: file_str.to_string(),
+                flip: chmod_flip(target_mode).to_string(),
+            });
+            continue;
+        }
+        // A regular blob already at the target mode needs no change.
+        if current_mode == target_mode {
             continue;
         }
         let file_abs = workdir.join(file);
@@ -2592,5 +2640,63 @@ mod test {
         out.added.push("a.rs".to_string());
         assert_eq!(out.total_staged(), 1);
         assert!(!out.is_empty());
+    }
+
+    /// CH-01 (plan-20260918): `apply_chmod` refuses non-regular index entries
+    /// (symlink `120000`, gitlink `160000`) into `chmod_rejected` with the
+    /// requested flip, while a regular `100644` entry is still updated in the
+    /// report; a dry run leaves the index untouched.
+    #[tokio::test]
+    #[serial_test::serial(cwd)]
+    async fn apply_chmod_refuses_nonregular_entries() {
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        std::fs::write(repo.path().join("reg"), "reg\n").unwrap();
+
+        let mut index = Index::new();
+        for (name, mode) in [("link", 0o120000u32), ("gl", 0o160000), ("reg", 0o100644)] {
+            let mut entry = IndexEntry::new_from_blob(name.to_string(), ObjectHash::default(), 0);
+            entry.mode = mode;
+            index.add(entry);
+        }
+        let specs = PathspecSet::from_workdir(
+            &["link".to_string(), "gl".to_string(), "reg".to_string()],
+            repo.path(),
+            repo.path(),
+        )
+        .expect("pathspec compiles");
+        let mut out = AddOutput::empty(false);
+        apply_chmod(&mut index, 0o100755, &specs, true, &mut out).expect("apply_chmod");
+
+        let rejected: Vec<&str> = out.chmod_rejected.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            rejected.contains(&"link"),
+            "symlink must be refused: {rejected:?}"
+        );
+        assert!(
+            rejected.contains(&"gl"),
+            "gitlink must be refused: {rejected:?}"
+        );
+        assert!(
+            !rejected.contains(&"reg"),
+            "regular entry must not be refused: {rejected:?}"
+        );
+        assert!(
+            out.chmod_rejected.iter().all(|r| r.flip == "+x"),
+            "flip must reflect the request: {:?}",
+            out.chmod_rejected
+        );
+        assert!(
+            out.modified.contains(&"reg".to_string()),
+            "regular entry is updated in the report: {:?}",
+            out.modified
+        );
+        // Dry run: the refused entries keep their original modes in the index.
+        assert_eq!(index.get("link", 0).unwrap().mode, 0o120000);
+        assert_eq!(index.get("gl", 0).unwrap().mode, 0o160000);
+        assert_eq!(index.get("reg", 0).unwrap().mode, 0o100644);
     }
 }

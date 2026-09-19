@@ -112,8 +112,14 @@ libra add --pathspec-from-file paths.bin --pathspec-file-nul
 ### `--chmod=(+|-)x`
 
 强制设置命中路径在索引中记录的可执行位：`+x` 记为 mode `100755`，`-x` 记为 `100644`。
-blob 内容不变；只影响普通文件（符号链接与 gitlink 跳过）。仅 mode 变化的路径也会被报告为
-modified。非法取值（非 `+x` / `-x`）按用法错误处理。
+blob 内容不变；仅 mode 变化的路径也会被报告为 modified。
+
+只有普通文件才有可执行位。命中的符号链接（`120000`）或 gitlink（`160000`）会被拒绝：条目保持不变，
+每条拒绝向 stderr 输出一行 `error: cannot chmod +x '<path>'`，其余路径照常处理后 `add` 以 1 退出。
+`--json` 模式下改为在 envelope 上输出 `chmod_rejected: [{"path", "flip"}]`，退出码同为 1。
+（Git 此处退出 255；Libra 采用与 ignored-path 报告共用的进程级 exit 1 模型。）
+
+非法取值（非 `+x` / `-x`）按用法错误处理。
 
 ```bash
 libra add --chmod=+x scripts/build.sh

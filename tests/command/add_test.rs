@@ -3107,3 +3107,368 @@ fn test_add_ignore_missing_only_ignored_is_add_001() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// CH-01 (plan-20260918): `add --chmod` refuses non-regular index entries.
+// ---------------------------------------------------------------------------
+
+/// M-CHMOD R1-R3 / TC-0008: a symlink index entry has no executable bit, so
+/// `--chmod` refuses it (exit 1, `cannot chmod` on stderr) and the index is left
+/// unchanged — dry-run and real mode alike.
+#[cfg(unix)]
+#[test]
+fn test_add_chmod_rejects_nonregular_dry_run_tc0008() {
+    use std::os::unix::fs::symlink;
+
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    symlink("target", p.join("foo4")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "foo4"], p), "stage symlink");
+
+    let before = run_libra_command(&["ls-files", "-s", "foo4"], p);
+    assert_cli_success(&before, "ls-files before");
+    let before_out = String::from_utf8_lossy(&before.stdout).to_string();
+    assert!(
+        before_out.starts_with("120000"),
+        "fixture must be a symlink: {before_out}"
+    );
+
+    // R1/R2: dry-run refuses with a per-path, per-flip error and no index write.
+    for (mode_arg, flip) in [("--chmod=+x", "+x"), ("--chmod=-x", "-x")] {
+        let out = run_libra_command(&["add", mode_arg, "--dry-run", "foo4"], p);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{mode_arg}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("foo4"), "{stderr}");
+        assert!(stderr.contains(flip), "{stderr}");
+        assert!(stderr.contains("cannot chmod"), "{stderr}");
+    }
+
+    // R3: real mode refuses too and the entry stays 120000.
+    let real = run_libra_command(&["add", "--chmod=+x", "foo4"], p);
+    assert_eq!(
+        real.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&real.stderr).contains("cannot chmod +x"),
+        "{}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    let after = run_libra_command(&["ls-files", "-s", "foo4"], p);
+    assert_cli_success(&after, "ls-files after");
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout),
+        before_out,
+        "a refused entry must be unchanged"
+    );
+}
+
+/// M-CHMOD R4-R6: a refusal never blocks the regular files in the same
+/// pathspec — they still get the mode, while the symlink is reported.
+#[cfg(unix)]
+#[test]
+fn test_add_chmod_rejects_nonregular_but_updates_others() {
+    use std::os::unix::fs::symlink;
+
+    // Each row gets its own repo so an earlier mode flip cannot change a later
+    // row's expected candidate set (same convention as the M-EXIT flag matrix).
+    let setup = || {
+        let repo = tempdir().unwrap();
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        fs::write(p.join("reg"), "content\n").unwrap();
+        symlink("target", p.join("foo4")).unwrap();
+        fs::create_dir_all(p.join("dir")).unwrap();
+        fs::write(p.join("dir/a"), "a\n").unwrap();
+        symlink("target", p.join("dir/l")).unwrap();
+        for spec in ["reg", "foo4", "dir"] {
+            assert_cli_success(&run_libra_command(&["add", spec], p), "stage fixture");
+        }
+        repo
+    };
+
+    // R4: mixed regular + symlink in real mode.
+    {
+        let repo = setup();
+        let p = repo.path();
+        let out = run_libra_command(&["add", "--chmod=+x", "reg", "foo4"], p);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("foo4"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let reg = run_libra_command(&["ls-files", "-s", "reg"], p);
+        assert!(
+            String::from_utf8_lossy(&reg.stdout).starts_with("100755"),
+            "reg must become executable: {}",
+            String::from_utf8_lossy(&reg.stdout)
+        );
+    }
+
+    // R5: dry-run mixed reports `reg` and refuses `foo4`.
+    {
+        let repo = setup();
+        let p = repo.path();
+        let dry = run_libra_command(&["add", "--chmod=+x", "--dry-run", "reg", "foo4"], p);
+        assert_eq!(
+            dry.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&dry.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&dry.stdout).contains("reg"),
+            "{}",
+            String::from_utf8_lossy(&dry.stdout)
+        );
+    }
+
+    // R6: a directory pathspec updates the regular child and refuses the symlink.
+    {
+        let repo = setup();
+        let p = repo.path();
+        let dir = run_libra_command(&["add", "--chmod=+x", "dir"], p);
+        assert_eq!(
+            dir.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&dir.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&dir.stderr).contains("dir/l"),
+            "{}",
+            String::from_utf8_lossy(&dir.stderr)
+        );
+        let dir_a = run_libra_command(&["ls-files", "-s", "dir/a"], p);
+        assert!(
+            String::from_utf8_lossy(&dir_a.stdout).starts_with("100755"),
+            "dir/a must become executable: {}",
+            String::from_utf8_lossy(&dir_a.stdout)
+        );
+    }
+}
+
+/// M-CHMOD R7-R8: a typechange staged in the same command is judged by the
+/// post-staging index — dry-run leaves the unindexed link alone (exit 0), the
+/// real run stages the symlink and then refuses to chmod it (exit 1).
+#[cfg(unix)]
+#[test]
+fn test_add_chmod_staged_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    // R7: untracked symlink.
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    symlink("target", p.join("newlink")).unwrap();
+
+    let dry = run_libra_command(&["add", "--chmod=+x", "--dry-run", "newlink"], p);
+    assert_eq!(
+        dry.status.code(),
+        Some(0),
+        "dry-run must not judge an unindexed link: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let real = run_libra_command(&["add", "--chmod=+x", "newlink"], p);
+    assert_eq!(
+        real.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    let entry = run_libra_command(&["ls-files", "-s", "newlink"], p);
+    assert!(
+        String::from_utf8_lossy(&entry.stdout).starts_with("120000"),
+        "newlink must be staged as a symlink: {}",
+        String::from_utf8_lossy(&entry.stdout)
+    );
+
+    // R8: tracked regular file swapped for a symlink in the worktree.
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("swap"), "regular\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "swap"], p), "stage regular");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    fs::remove_file(p.join("swap")).unwrap();
+    symlink("target", p.join("swap")).unwrap();
+
+    let dry = run_libra_command(&["add", "--chmod=+x", "--dry-run", "swap"], p);
+    assert_eq!(
+        dry.status.code(),
+        Some(0),
+        "dry-run typechange is silent: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let real = run_libra_command(&["add", "--chmod=+x", "swap"], p);
+    assert_eq!(
+        real.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    let entry = run_libra_command(&["ls-files", "-s", "swap"], p);
+    assert!(
+        String::from_utf8_lossy(&entry.stdout).starts_with("120000"),
+        "swap must be staged as a symlink: {}",
+        String::from_utf8_lossy(&entry.stdout)
+    );
+}
+
+/// M-CHMOD R9: an index gitlink entry (mode 160000) is refused like a symlink.
+#[test]
+fn test_add_chmod_rejects_gitlink_entry() {
+    use git_internal::{
+        hash::ObjectHash,
+        internal::index::{Index, IndexEntry},
+    };
+
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+
+    let index_path = p.join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let mut entry = IndexEntry::new_from_blob("gl".to_string(), ObjectHash::default(), 0);
+    entry.mode = 0o160000;
+    index.add(entry);
+    index.save(&index_path).expect("save index");
+
+    let before = run_libra_command(&["ls-files", "-s", "gl"], p);
+    assert!(
+        String::from_utf8_lossy(&before.stdout).starts_with("160000"),
+        "fixture must be a gitlink: {}",
+        String::from_utf8_lossy(&before.stdout)
+    );
+
+    let out = run_libra_command(&["add", "--chmod=+x", "--dry-run", "gl"], p);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("gl"), "{stderr}");
+    assert!(stderr.contains("cannot chmod +x"), "{stderr}");
+}
+
+/// M-CHMOD R10: `--ignore-errors` does not suppress the refusal,
+/// `--quiet` keeps the stderr error line, and `--exit-code-on-warning` yields 1
+/// (not 9).
+#[cfg(unix)]
+#[test]
+fn test_add_chmod_rejection_flag_matrix() {
+    use std::os::unix::fs::symlink;
+
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("reg"), "content\n").unwrap();
+    symlink("target", p.join("foo4")).unwrap();
+    for spec in ["reg", "foo4"] {
+        assert_cli_success(&run_libra_command(&["add", spec], p), "stage fixture");
+    }
+
+    let ignored = run_libra_command(&["add", "--chmod=+x", "--ignore-errors", "reg", "foo4"], p);
+    assert_eq!(
+        ignored.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&ignored.stderr)
+    );
+    let reg = run_libra_command(&["ls-files", "-s", "reg"], p);
+    assert!(String::from_utf8_lossy(&reg.stdout).starts_with("100755"));
+
+    let quiet = run_libra_command(&["add", "--chmod=+x", "--dry-run", "--quiet", "foo4"], p);
+    assert_eq!(quiet.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&quiet.stderr).contains("cannot chmod +x"),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+
+    let warned = run_libra_command(
+        &[
+            "--exit-code-on-warning",
+            "add",
+            "--chmod=+x",
+            "--dry-run",
+            "foo4",
+        ],
+        p,
+    );
+    assert_eq!(
+        warned.status.code(),
+        Some(1),
+        "the refusal outranks the warning exit: {}",
+        String::from_utf8_lossy(&warned.stderr)
+    );
+}
+
+/// M-CHMOD R12: no-op and invalid-value forms keep their existing behavior.
+#[cfg(unix)]
+#[test]
+fn test_add_chmod_noop_cases_unchanged() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("exe"), "exe\n").unwrap();
+    fs::write(p.join("reg"), "reg\n").unwrap();
+    fs::write(p.join("gone"), "gone\n").unwrap();
+    for spec in ["exe", "reg", "gone"] {
+        assert_cli_success(&run_libra_command(&["add", spec], p), "stage fixture");
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+
+    // Make `exe` executable, then a second `+x` is a no-op.
+    assert_cli_success(
+        &run_libra_command(&["add", "--chmod=+x", "exe"], p),
+        "set exe +x",
+    );
+    assert_cli_success(
+        &run_libra_command(&["add", "--chmod=+x", "exe"], p),
+        "already-executable no-op",
+    );
+    // `-x` against an already-100644 entry is a no-op.
+    assert_cli_success(
+        &run_libra_command(&["add", "--chmod=-x", "--dry-run", "reg"], p),
+        "clear-bit no-op",
+    );
+    // A tracked path deleted from the worktree stages its deletion, no refusal.
+    fs::remove_file(p.join("gone")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "--chmod=+x", "gone"], p),
+        "deleted tracked path",
+    );
+    // An invalid value keeps the existing usage error.
+    let bogus = run_libra_command(&["add", "--chmod=bogus", "reg"], p);
+    assert_eq!(bogus.status.code(), Some(129), "invalid --chmod value");
+}
