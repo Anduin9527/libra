@@ -144,12 +144,25 @@
 
 RC-23/RC-30 removed the `libra code` Web harness, its deterministic
 hidden-provider test feature and the Code UI scenario targets (plan-20260920). The remaining Wave 2
-targets guard the removed public surface and the local agent capture:
+targets guard the removed public surface, the local agent capture, and the KEEP
+automation / session / safety contract suites:
 
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `code_cli_dispatch_test` | 2 | RC-13: `libra code` / `code-control` are unknown commands (migration hint names `libra agent`); aggregate `breaking_code_surface_migration` also pins unknown top-level `graph` and the leftover W5-08 `agent graph` interactive refusal | `src/cli.rs` |
 | `code_provider_resolution_test` | 2 | RC-16: `libra code` provider/boot flags are unknown commands, including `--resume` | `src/cli.rs` |
+| `e2e_mcp_flow` | 2 | RC-16: `libra code` / MCP `--stdio` / `--web-only` are unknown commands (refusal pin, no spawn) | `src/cli.rs` |
+| `ai_automation_test` | 2 | `.libra/automations.toml` rule execution | `src/internal/ai/automation/`, `src/command/automation.rs` |
+| `agent_capture_migration_test` | 2 | `agent_capture` / checkpoint-paging and W4 capture-workspace-scope migrations, including legacy bootstrap and guarded down→up compatibility via `MigrationRunner` | `src/internal/db.rs`, `sql/migrations/2026050303_agent_capture.sql`, `sql/migrations/2026080401_agent_capture_workspace_scope.sql` |
+| `ai_command_safety_test` | 2 | CEX-01 command safety contract tests | `src/internal/ai/command_safety.rs`, `src/internal/ai/hardening.rs` |
+| `ai_concurrency_lock_test` | 2 | Session-level advisory lock and CAS conflict tests | `src/internal/ai/session/` |
+| `ai_file_undo_test` | 2 | CEX-10 file-level undo contract tests | `src/internal/ai/session/file_history.rs` |
+| `ai_hardening_contract_test` | 2 | Phase E hardening contract tests | `src/internal/ai/hardening.rs` |
+| `ai_json_repair_test` | 2 | JSON repair and correction parser tests | `src/internal/ai/completion/` |
+| `ai_schema_migration_test` | 2 | Phase 0 schema migration tests for AI runtime contract tables | `src/internal/db.rs`, `sql/` |
+| `ai_session_jsonl_test` | 2 | Session JSONL sequence/dedup/gap recovery and command idempotency | `src/internal/ai/session/jsonl.rs` |
+| `local_client_test` | 2 | Local Git protocol client working directory restoration on error | `src/internal/protocol/` |
+| `redaction_contract_test` | 2 | Pin the RedactedBytes contract for transcript output | `src/internal/ai/session/` |
 
 The W2-03 session-journal anchors remain in
 `src/internal/ai/session/jsonl.rs`; the Code-UI-only anchors that lived in
