@@ -462,7 +462,8 @@ fn machine_add_is_single_line_json() {
 /// Scenario: when `add` receives a mix of staged and ignored paths, the
 /// envelope must still report `ok=true` with the staged file in `data.added`
 /// and the ignored file enumerated in `data.ignored`. Pins the partial-success
-/// contract.
+/// contract: ADR-IA-02 makes the mixed ignored form exit 1 (Git parity) while
+/// keeping the data envelope intact.
 #[test]
 fn json_partial_ignore_returns_ok_with_ignored_list() {
     let repo = tempdir().unwrap();
@@ -473,7 +474,12 @@ fn json_partial_ignore_returns_ok_with_ignored_list() {
     fs::write(repo.path().join("ignored.txt"), "ignored").unwrap();
 
     let output = run_libra_command(&["--json", "add", "good.txt", "ignored.txt"], repo.path());
-    assert_cli_success(&output, "partial ignore should succeed");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "mixed ignored add must exit 1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let parsed = parse_json_stdout(&output);
     assert_eq!(parsed["ok"], true);
@@ -583,4 +589,37 @@ fn json_add_marker_failure_details() {
             .expect("retry JSON envelope");
     assert_eq!(ok["ok"], true);
     assert_eq!(ok["data"]["added"][0], "marker-failure.txt");
+}
+
+/// M-EXIT E9: `--json` with a mixed ignored pathspec keeps the data envelope
+/// on stdout (no human block on stderr) and exits 1.
+#[test]
+fn json_mixed_ignored_emits_data_and_exits_one() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join(".libraignore"), "*.log\n").unwrap();
+    fs::write(repo.path().join("other.txt"), "untracked\n").unwrap();
+    fs::write(repo.path().join("top.log"), "ignored\n").unwrap();
+
+    let out = run_libra_command(
+        &["--json", "add", "-n", "other.txt", "top.log"],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = parse_json_stdout(&out);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["command"], "add");
+    let data = &envelope["data"];
+    assert_eq!(data["added"][0], "other.txt");
+    assert_eq!(data["ignored"][0], "top.log");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "JSON mode must keep stderr clean"
+    );
 }

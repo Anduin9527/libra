@@ -218,8 +218,10 @@ add 'src/lib.rs' (modified)
 ```text
 warning: the following paths are ignored by configured ignore rules:
 ignored.log
-Hint: use '-f' to force staging of ignored files
+Hint: use -f if you really want to add them.
 ```
+
+当部分路径已被暂存（或由 dry-run 报告）**且**另有显式 pathspec 被 ignore 时，`add` 会完成整个操作——暂存、输出、警告与 automation 事件——然后以 `1` 退出（与 Git 一致）。当**全部**路径都被 ignore 且没有其它暂存时，`add` 以 `LBR-ADD-001` / `128` 失败（与 Git 的 1 是有意差异）。`--json` 保持 stdout 的常规 data envelope（ignored 路径在 `data.ignored`），退出码为 `1`；退出码 `1` 优先于 `--exit-code-on-warning` 的 `9`。
 
 `--quiet` 会抑制所有 `stdout` 输出，但保留 `stderr` warnings。
 

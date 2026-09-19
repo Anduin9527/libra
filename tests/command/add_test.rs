@@ -2558,3 +2558,269 @@ fn test_add_3000_files_bounded_generation_lock_acquisitions() {
     let names = String::from_utf8_lossy(&staged.stdout);
     assert_eq!(names.lines().count(), 3000, "all 3000 files must be staged");
 }
+
+/// M-EXIT E1: with an ignored path in the mix, `add` stages the rest and
+/// exits 1 (after rendering and event dispatch).
+#[test]
+fn test_add_ignored_with_others_stages_others_and_fails() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+    fs::write(p.join("other.txt"), "untracked\n").unwrap();
+    fs::write(p.join("top.log"), "ignored\n").unwrap();
+
+    let out = run_libra_command(&["add", "other.txt", "top.log"], p);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "mixed ignored add must exit 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_cli_success(&staged, "list staged files");
+    let names = String::from_utf8_lossy(&staged.stdout);
+    assert!(names.contains("other.txt"), "{names}");
+    assert!(!names.contains("top.log"), "{names}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the following paths are ignored"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("top.log"), "{stderr}");
+}
+
+/// M-EXIT E2: dry-run with a mixed ignored pathspec exits 1 and reports the
+/// addable path without touching the index.
+#[test]
+fn test_add_dry_run_ignored_with_others_fails() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+    fs::write(p.join("other.txt"), "untracked\n").unwrap();
+    fs::write(p.join("top.log"), "ignored\n").unwrap();
+
+    let out = run_libra_command(&["add", "-n", "other.txt", "top.log"], p);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("other.txt"), "{stdout}");
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_cli_success(&staged, "list staged files");
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "dry-run must leave the index unchanged"
+    );
+}
+
+/// M-EXIT E4-E7: forms that must NOT flip to exit 1 (directory preview,
+/// whole-tree preview, -A/-u preview, forced preview).
+#[test]
+fn test_add_ignored_report_unaffected_forms() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\nbuild/\n").unwrap();
+    fs::create_dir_all(p.join("dir")).unwrap();
+    fs::write(p.join("dir/new.txt"), "untracked\n").unwrap();
+    fs::write(p.join("dir/inner.log"), "ignored\n").unwrap();
+    fs::write(p.join("track-this"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "track-this"], p), "stage base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("track-this"), "modified\n").unwrap();
+
+    for args in [
+        vec!["add", "-n", "dir"],
+        vec!["add", "-n", "."],
+        vec!["add", "-n", "-A"],
+        vec!["add", "-n", "-u"],
+        vec!["add", "-f", "-n", "dir", "dir/inner.log"],
+    ] {
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, &format!("{args:?} must stay exit 0"));
+    }
+}
+
+/// M-EXIT E8/E10/E11: --ignore-errors keeps exit 1; --exit-code-on-warning
+/// still exits 1 (not 9); running from a subdirectory reports the ignored
+/// path and exits 1. Each row uses its own repo so earlier stagings cannot
+/// change later rows' candidate sets.
+#[test]
+fn test_add_ignored_report_flags_matrix() {
+    // E8: --ignore-errors
+    {
+        let repo = tempdir().unwrap();
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+        fs::write(p.join("other.txt"), "untracked\n").unwrap();
+        fs::write(p.join("top.log"), "ignored\n").unwrap();
+        let out = run_libra_command(&["add", "--ignore-errors", "other.txt", "top.log"], p);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+        assert!(String::from_utf8_lossy(&staged.stdout).contains("other.txt"));
+    }
+
+    // E10: --exit-code-on-warning (dry-run keeps index untouched)
+    {
+        let repo = tempdir().unwrap();
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+        fs::write(p.join("other.txt"), "untracked\n").unwrap();
+        fs::write(p.join("top.log"), "ignored\n").unwrap();
+        let out = run_libra_command(
+            &[
+                "--exit-code-on-warning",
+                "add",
+                "-n",
+                "other.txt",
+                "top.log",
+            ],
+            p,
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "exit 1 must beat 9: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // E11: from sub/, mixed ignored path
+    {
+        let repo = tempdir().unwrap();
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+        fs::write(p.join("other.txt"), "untracked\n").unwrap();
+        fs::create_dir_all(p.join("sub")).unwrap();
+        fs::write(p.join("sub/.libraignore"), "local.tmp\n").unwrap();
+        fs::write(p.join("sub/local.tmp"), "ignored\n").unwrap();
+        let out = run_libra_command(&["add", "-n", "local.tmp", "../other.txt"], &p.join("sub"));
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("local.tmp"), "{stderr}");
+    }
+}
+
+/// M-IGN O1-O3: the human ignored block has the title, one path per line and
+/// the -f hint only (no restore --staged hint); --quiet suppresses stdout but
+/// keeps the stderr block and exit 1.
+#[test]
+fn test_add_ignored_block_hints_and_quiet() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join(".libraignore"), "*.log\n").unwrap();
+    fs::write(p.join("other.txt"), "untracked\n").unwrap();
+    fs::write(p.join("top.log"), "ignored\n").unwrap();
+
+    let out = run_libra_command(&["add", "-n", "other.txt", "top.log"], p);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: the following paths are ignored by configured ignore rules:"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Hint: use -f if you really want to add them."),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("libra restore --staged"),
+        "the stale restore hint must be gone: {stderr}"
+    );
+
+    let quiet = run_libra_command(&["add", "--quiet", "-n", "other.txt", "top.log"], p);
+    assert_eq!(quiet.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&quiet.stdout).trim().is_empty(),
+        "quiet must suppress stdout"
+    );
+    assert!(
+        String::from_utf8_lossy(&quiet.stderr).contains("the following paths are ignored"),
+        "quiet must keep the stderr block"
+    );
+}
+
+/// M-IGN O4: with a mixed ignored report and a real staging, the POST_ADD
+/// automation event is dispatched before the non-zero return.
+#[tokio::test]
+#[serial(cwd)]
+async fn test_add_ignored_dispatch_before_exit_one() {
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+    fs::write(
+        test_dir.path().join(".libra").join("automations.toml"),
+        r#"
+        [[rules]]
+        id = "index_summary"
+        trigger = { kind = "vcs", event = "post_add" }
+        action = { kind = "prompt", prompt = "summarize staged changes" }
+    "#,
+    )
+    .unwrap();
+    fs::write(".libraignore", "*.log\n").unwrap();
+    fs::write("other.txt", "content").unwrap();
+    fs::write("top.log", "ignored").unwrap();
+
+    let error = add::execute_safe(
+        AddArgs {
+            pathspec: vec!["other.txt".to_string(), "top.log".to_string()],
+            all: false,
+            update: false,
+            refresh: false,
+            force: false,
+            verbose: false,
+            dry_run: false,
+            ignore_errors: false,
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
+        },
+        &libra::utils::output::OutputConfig::default(),
+    )
+    .await
+    .expect_err("mixed ignored add must return the silent exit-1 error");
+    assert_eq!(error.exit_code(), 1, "{error}");
+
+    let db = get_db_conn_instance().await;
+    let rows = AutomationHistory::list_recent(&db, 10).await.unwrap();
+    assert!(
+        rows.iter().any(|row| row.rule_id == "index_summary"),
+        "POST_ADD must be dispatched before the non-zero return: {rows:?}"
+    );
+}

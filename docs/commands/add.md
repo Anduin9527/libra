@@ -276,8 +276,17 @@ Ignored files produce a warning on `stderr`:
 ```text
 warning: the following paths are ignored by configured ignore rules:
 ignored.log
-Hint: use '-f' to force staging of ignored files
+Hint: use -f if you really want to add them.
 ```
+
+When some paths were staged (or reported by a dry-run) **and** other explicit
+pathspecs were ignored, `add` finishes the whole operation — staging, output,
+warnings and automation events included — and then exits `1`, like Git.
+When *every* path was ignored and nothing else was staged, `add` fails with
+`LBR-ADD-001` and exits `128` instead (intentional difference from Git's 1).
+`--json` keeps the regular data envelope on stdout (with the ignored paths in
+`data.ignored`) and exits `1`; the exit code `1` also wins over
+`--exit-code-on-warning`'s `9`.
 
 `--quiet` suppresses all `stdout` output but preserves `stderr` warnings.
 

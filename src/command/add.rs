@@ -553,6 +553,14 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_ADD).await;
     }
 
+    // ADR-IA-02 item 1 / M-EXIT E1-E2: a mixed ignored report exits 1 after
+    // full rendering, warning tracking, and event dispatch (Git parity).
+    // "Only ignored" forms never reach this point: `check_ignored_only_error`
+    // returns `LBR-ADD-001` / 128 from `run_add` instead.
+    if !result.ignored.is_empty() {
+        return Err(CliError::silent_exit(1));
+    }
+
     Ok(())
 }
 
@@ -2024,7 +2032,6 @@ fn render_warnings_stderr(result: &AddOutput) {
         }
         eprintln!();
         eprintln!("Hint: use -f if you really want to add them.");
-        eprintln!("Hint: use 'libra restore --staged <file>' to unstage if needed");
     }
     if !result.failed.is_empty() {
         eprintln!(
