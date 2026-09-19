@@ -103,8 +103,11 @@ pub fn relative_date_at(now: i64, ts: i64) -> String {
 /// malformed one (missing closing quote, trailing bytes after it, a trailing
 /// backslash, an unsupported escape, or a non-UTF-8 result).
 ///
-/// Escape handling mirrors Git's `unquote_c_style`: `\a \b \f \n \r \t \v`,
-/// `\\`, `\"`, and up to three octal digits masked to a byte.
+/// Escape handling follows Git's `unquote_c_style` for the named escapes
+/// (`\a \b \f \n \r \t \v`, `\\`, `\"`) and for octal byte values, with two
+/// documented divergences: it accepts one to three octal digits (Git requires
+/// exactly three) and it rejects trailing bytes after the closing quote instead
+/// of ignoring them (PSF-02 review P2-1).
 pub fn decode_c_quoted(raw: &str) -> Result<Option<String>, String> {
     let bytes = raw.as_bytes();
     if bytes.first() != Some(&b'"') {
@@ -260,7 +263,8 @@ mod tests {
             decode_c_quoted("\"tab\\there\\n\""),
             Ok(Some("tab\there\n".to_string()))
         );
-        // Three octal digits decode and mask to one byte (Git parity).
+        // Three octal digits decode and mask to one byte; one-to-three digits
+        // are accepted (a documented divergence: Git requires exactly three).
         assert_eq!(
             decode_c_quoted("\"oct\\101l\""),
             Ok(Some("octAl".to_string()))
@@ -270,5 +274,16 @@ mod tests {
         assert!(decode_c_quoted("\"trailing\" junk").is_err());
         assert!(decode_c_quoted("\"bad\\q\"").is_err());
         assert!(decode_c_quoted("\"ends\\\"").is_err());
+
+        // A multi-byte UTF-8 name written as octal escapes — the shape
+        // `status`/`ls-files` emit under `core.quotePath` — decodes back.
+        assert_eq!(
+            decode_c_quoted("\"\\303\\251.txt\""),
+            Ok(Some("é.txt".to_string()))
+        );
+        // Round-trip against the forward `quote_pathname` helper
+        // (ADR-PSF-02 §2 makes them inverses).
+        let quoted = crate::command::status::quote_pathname(std::path::Path::new("é.txt"), true);
+        assert_eq!(decode_c_quoted(&quoted), Ok(Some("é.txt".to_string())));
     }
 }

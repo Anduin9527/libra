@@ -647,41 +647,61 @@ fn read_pathspec_stdin() -> CliResult<Vec<u8>> {
 /// shared [`crate::utils::text::decode_c_quoted`] helper — no second state
 /// machine lives here.
 fn parse_pathspec_file(data: &[u8], nul: bool) -> CliResult<Vec<String>> {
-    let separator: u8 = if nul { 0 } else { b'\n' };
     let mut pathspecs = Vec::new();
-    for raw in data.split(|byte| *byte == separator) {
-        let entry = if nul {
-            raw
-        } else {
-            raw.strip_suffix(b"\r").unwrap_or(raw)
-        };
-        if entry.is_empty() {
-            continue;
-        }
-        let text = std::str::from_utf8(entry).map_err(|_| {
-            CliError::fatal("pathspec list contains a non-UTF-8 entry".to_string())
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
-        // ADR-PSF-02: only newline mode decodes C-style quoting; NUL mode keeps
-        // every byte verbatim.
-        if !nul {
-            match crate::utils::text::decode_c_quoted(text) {
-                Ok(Some(decoded)) => {
-                    pathspecs.push(decoded);
-                    continue;
-                }
-                Ok(None) => {}
-                Err(reason) => {
-                    return Err(CliError::fatal(format!(
-                        "line is badly quoted in --pathspec-from-file: {reason}: {text}"
-                    ))
-                    .with_stable_code(StableErrorCode::IoReadFailed));
-                }
+    if nul {
+        // NUL mode: split on `0` and keep every byte (CR included).
+        for entry in data.split(|byte| *byte == 0) {
+            if let Some(text) = parse_pathspec_entry(entry, false)? {
+                pathspecs.push(text);
             }
         }
-        pathspecs.push(text.to_string());
+    } else {
+        // LF mode: one trailing CR is stripped only when it precedes the
+        // terminating LF — an unterminated final segment keeps its bytes
+        // verbatim (Git parity, PSF-01 review P1-1).
+        for raw in data.split_inclusive(|byte| *byte == b'\n') {
+            let entry = match raw.strip_suffix(b"\n") {
+                Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+                None => raw,
+            };
+            if let Some(text) = parse_pathspec_entry(entry, true)? {
+                pathspecs.push(text);
+            }
+        }
     }
     Ok(pathspecs)
+}
+
+/// Decode one `--pathspec-from-file` entry: drop empty entries, reject
+/// non-UTF-8, and (newline mode only) decode one C-style quoted line
+/// (ADR-PSF-02). An empty C-quoted string is dropped rather than becoming the
+/// whole-tree pathspec (PSF-02 review P1-1: fail closed, never stage
+/// everything).
+fn parse_pathspec_entry(entry: &[u8], decode_quotes: bool) -> CliResult<Option<String>> {
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(entry).map_err(|_| {
+        CliError::fatal("pathspec list contains a non-UTF-8 entry".to_string())
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    if !decode_quotes {
+        return Ok(Some(text.to_string()));
+    }
+    match crate::utils::text::decode_c_quoted(text) {
+        Ok(Some(decoded)) => {
+            if decoded.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(decoded))
+            }
+        }
+        Ok(None) => Ok(Some(text.to_string())),
+        Err(reason) => Err(CliError::fatal(format!(
+            "line is badly quoted in --pathspec-from-file: {reason}: {text}"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)),
+    }
 }
 
 const CONFLICT_MARKER_SIZE: usize = 7;
@@ -2844,6 +2864,21 @@ mod test {
 
         // Unterminated quoting is a hard failure.
         assert!(parse_pathspec_file(b"\"we ird.txt\n", false).is_err());
+
+        // PSF-01 review P1-1: a CR is stripped only when it precedes the
+        // terminating LF; an unterminated final segment keeps it.
+        assert_eq!(
+            parse_pathspec_file(b"a.txt\r", false).unwrap(),
+            vec!["a.txt\r".to_string()]
+        );
+        assert_eq!(
+            parse_pathspec_file(b"a.txt\n\r", false).unwrap(),
+            vec!["a.txt".to_string(), "\r".to_string()]
+        );
+
+        // PSF-02 review P1-1: an empty C-quoted string is dropped, never the
+        // whole-tree pathspec (fail closed).
+        assert!(parse_pathspec_file(b"\"\"\n", false).unwrap().is_empty());
     }
 
     /// IA-02 (ADR-IA-03): `validate_pathspecs` classifies an unmatched spec

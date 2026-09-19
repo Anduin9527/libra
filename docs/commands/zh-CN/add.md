@@ -408,6 +408,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 - `.gitignore` 与 `.libraignore` 都使用 Git ignore 模式语法；同目录内 `.libraignore` 可显式覆盖 `.gitignore`，导入和非 bare clone 仍会复制 `.gitignore` 规则，而不是删除或重命名原文件
 - 未被 ignore 的缺失 pathspec 仍会输出 Libra 的 `--ignore-missing` 跳过 warning（Git 此时静默）
 - 目录 pathspec 下，已存在的被忽略父目录不会被额外列出（Git 也会列出它）
+- C-quoted 的 `--pathspec-from-file` 行可接受 1–3 位八进制数字（Git 要求恰好三位），且会拒绝闭合引号之后的剩余字节（Git 忽略它们）
 - LFS 跟踪文件会在暂存期间自动转换为指针文件
 - 其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-i`/`--interactive`，D15 剩余入口）。请用 `libra add -p` 或 `libra add <pathspec>`。
 

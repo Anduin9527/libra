@@ -3641,6 +3641,25 @@ fn test_add_pathspec_from_file_stdin_and_delimiters() {
         String::from_utf8_lossy(&bad.stderr)
     );
     assert!(String::from_utf8_lossy(&bad.stderr).contains("LBR-IO-001"));
+
+    // P3 (PSF-01 review P1-2): `-u` combined with `--pathspec-from-file`.
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit fixture",
+    );
+    fs::write(p.join("a.txt"), "a2\n").unwrap();
+    let p3 = run_libra_command_with_stdin(&["add", "-u", "--pathspec-from-file=-"], p, "a.txt\n");
+    assert!(
+        p3.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p3.stderr)
+    );
+    let staged = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).contains("a.txt"),
+        "{}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
 }
 
 /// PSF-02 (plan-20260918) / M-PSF P6/P7: non-NUL `--pathspec-from-file`

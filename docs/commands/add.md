@@ -505,6 +505,9 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
   warning (Git is silent there)
 - With a directory pathspec, an already-existing ignored parent directory is not
   additionally reported (Git also lists it)
+- C-quoted `--pathspec-from-file` lines accept one to three octal digits (Git
+  requires exactly three) and reject trailing bytes after the closing quote
+  (Git ignores them)
 - LFS-tracked files are automatically converted to pointer files during staging
 - Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-i`/`--interactive`, D15 remainder). Use `libra add -p` or `libra add <pathspec>`.
 
