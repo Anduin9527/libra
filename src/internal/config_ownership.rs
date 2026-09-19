@@ -108,14 +108,6 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
-        surface: "agent definitions",
-        location: "agents.toml",
-        kind: SurfaceKind::File,
-        owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::UnifiedResolver,
-        consumer: ConfigConsumerKind::Extension,
-    },
-    ConfigSurface {
         surface: "sandbox policy (security: repository layer must never be \
                   weakened by an overlay)",
         location: "sandbox.toml",
@@ -143,58 +135,6 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
-        surface: "prompt rules (security-sensitive prompt policy; repository \
-                  layer must remain visible in linked worktrees)",
-        location: "rules",
-        kind: SurfaceKind::Directory,
-        owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::UnifiedResolver,
-        consumer: ConfigConsumerKind::Security,
-    },
-    ConfigSurface {
-        surface: "prompt contexts (security-sensitive prompt policy; repository \
-                  layer must remain visible in linked worktrees)",
-        location: "contexts",
-        kind: SurfaceKind::Directory,
-        owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::UnifiedResolver,
-        consumer: ConfigConsumerKind::Security,
-    },
-    ConfigSurface {
-        surface: "agent definitions directory",
-        location: "agents",
-        kind: SurfaceKind::Directory,
-        owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::UnifiedResolver,
-        consumer: ConfigConsumerKind::Extension,
-    },
-    ConfigSurface {
-        surface: "custom commands directory",
-        location: "commands",
-        kind: SurfaceKind::Directory,
-        owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::UnifiedResolver,
-        consumer: ConfigConsumerKind::Extension,
-    },
-    ConfigSurface {
-        surface: "skills directory",
-        location: "skills",
-        kind: SurfaceKind::Directory,
-        owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::UnifiedResolver,
-        consumer: ConfigConsumerKind::Extension,
-    },
-    ConfigSurface {
-        surface: "executable VCS hooks directory (plan line 2272: shared \
-                  repository semantics like Git hooks; does not migrate \
-                  with this Part)",
-        location: "hooks",
-        kind: SurfaceKind::Directory,
-        owner: ConfigOwner::Repository,
-        resolution: ReadResolution::CommonStorage,
-        consumer: ConfigConsumerKind::Security,
-    },
-    ConfigSurface {
         surface: "persisted Always approvals (repo-wide visibility is the \
                   intended semantic; W4 adds provenance columns)",
         location: "approved_permission",
@@ -217,15 +157,6 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Store,
         owner: ConfigOwner::RepositoryWithWorkspaceSessionScope,
         resolution: ReadResolution::RepositoryDatabase,
-        consumer: ConfigConsumerKind::Extension,
-    },
-    ConfigSurface {
-        surface: "publish worker-template manifest (init/status/deploy drift \
-                  gate reads ONE repository manifest)",
-        location: "publish/worker-template-manifest.json",
-        kind: SurfaceKind::File,
-        owner: ConfigOwner::Repository,
-        resolution: ReadResolution::CommonStorage,
         consumer: ConfigConsumerKind::Extension,
     },
 ];
@@ -377,34 +308,13 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
 /// namespaces and fails when a new one is missing here.
 pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
     (
-        "WORKSPACE_CONTEXT_CACHE",
-        "keyed by canonical workspace PathBuf — per-workdir, no cross-scope reuse",
-    ),
-    (
-        "HISTORY_APPEND_LOCK",
-        "a lock, not a cache: serializes history appends within one process",
-    ),
-    (
         "CLEANUP_HELPER_REAPER",
         "process-lifetime reaper thread handle; holds no repository state",
-    ),
-    (
-        "MACOS_FUSE_MOUNT_HANDSHAKE_LOCK",
-        "a lock, not a cache: serializes FUSE mount handshakes",
-    ),
-    (
-        "BODY",
-        "compiled regex/template constant; input-independent",
     ),
     (
         "DEFAULT_RULES",
         "compiled built-in redaction rule set; input-independent constant",
     ),
-    (
-        "OPTS",
-        "compiled parser options constant; input-independent",
-    ),
-    ("REG", "compiled regex constant; input-independent"),
     (
         "CURRENT_PROCESS_OWNER_IDENTITY",
         "process-lifetime own pid/starttime/boot_id identity for the session \
@@ -506,8 +416,6 @@ mod tests {
     const SCANNED_NAMESPACES: &[&str] = &[
         "src/internal/ai",
         "src/command/agent",
-        "src/command/code.rs",
-        "src/command/code_control.rs",
         "src/command/automation.rs",
     ];
 
@@ -816,8 +724,8 @@ mod tests {
         // Scanner SELF-TEST: a known live static must be visible — an empty
         // or broken scan must fail here, not silently pass the inventory.
         assert!(
-            statics.contains("WORKSPACE_CONTEXT_CACHE"),
-            "static scanner self-check failed: the known WORKSPACE_CONTEXT_CACHE \
+            statics.contains("CLEANUP_HELPER_REAPER"),
+            "static scanner self-check failed: the known CLEANUP_HELPER_REAPER \
              declaration was not found"
         );
         let cache_inventory: BTreeSet<&str> = CODE_AGENT_PROCESS_CACHES
@@ -878,45 +786,21 @@ mod tests {
             ReadResolution::UnifiedResolver,
             "W4-11 [approval]/[mcp] in config.toml use the unified resolver"
         );
+        let location = "automations.toml";
         assert_eq!(
-            by_location("rules").resolution,
+            by_location(location).resolution,
             ReadResolution::UnifiedResolver,
-            "W4-11 rules directory uses the unified resolver"
+            "W4-12 extension surface '{location}' uses the unified resolver"
         );
         assert_eq!(
-            by_location("contexts").resolution,
-            ReadResolution::UnifiedResolver,
-            "W4-11 contexts directory uses the unified resolver"
+            by_location(location).consumer,
+            ConfigConsumerKind::Extension,
+            "W4-12 must not reclassify '{location}' away from Extension"
         );
-        for location in [
-            "agents.toml",
-            "automations.toml",
-            "agents",
-            "commands",
-            "skills",
-        ] {
-            assert_eq!(
-                by_location(location).resolution,
-                ReadResolution::UnifiedResolver,
-                "W4-12 extension surface '{location}' uses the unified resolver"
-            );
-            assert_eq!(
-                by_location(location).consumer,
-                ConfigConsumerKind::Extension,
-                "W4-12 must not reclassify '{location}' away from Extension"
-            );
-        }
         assert_eq!(
             by_location("sandbox.toml").consumer,
             ConfigConsumerKind::Security,
             "W4-12 must not reclassify sandbox.toml away from Security"
-        );
-        assert_eq!(
-            by_location("publish/worker-template-manifest.json").resolution,
-            ReadResolution::CommonStorage,
-            "the publish manifest was routed through the common-storage \
-             resolver in W0 — regressing to a workdir join reopens the \
-             per-worktree manifest fork"
         );
     }
 }

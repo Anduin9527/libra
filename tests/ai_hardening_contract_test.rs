@@ -10,7 +10,7 @@
 //! **Layer:** L1 — pure unit tests, no I/O, no external services.
 
 use chrono::Utc;
-use libra::internal::ai::runtime::{
+use libra::internal::ai::hardening::{
     AuditEvent, AuditSink, InMemoryAuditSink, PrincipalContext, PrincipalRole, SecretRedactor,
     ToolBoundaryPolicy, ToolOperation, ToolOperationDetails,
 };
@@ -173,11 +173,11 @@ async fn audit_sink_records_redacted_policy_events() {
 mod cex_00_5 {
     use chrono::Utc;
     use libra::internal::ai::{
-        hooks::lifecycle::{LifecycleEvent, LifecycleEventKind},
-        runtime::{
+        hardening::{
             AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext,
             SecretRedactor, ToolBoundaryPolicy, ToolOperation,
         },
+        hooks::lifecycle::{LifecycleEvent, LifecycleEventKind},
     };
     use uuid::Uuid;
 
@@ -257,7 +257,7 @@ mod cex_00_5 {
     /// Without the redactor call in the default impl this test fails.
     #[tokio::test]
     async fn record_event_redacts_secrets_from_event_summary() {
-        use libra::internal::ai::runtime::Event;
+        use libra::internal::ai::event::Event;
         use uuid::Uuid;
 
         struct LeakyEvent;

@@ -217,6 +217,7 @@ where
 /// exact idempotent ACK, with a narrow hook between file and parent syncs for
 /// scoped durability tests. A prior atomic replacement can be observable even
 /// if its final directory sync reported failure.
+#[allow(dead_code)] // durability fault-injection hook; last callers were Code-era tests
 pub(crate) fn sync_file_and_parent_durably_with_pre_parent_sync_hook<F>(
     path: &Path,
     pre_parent_sync: F,

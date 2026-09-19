@@ -66,6 +66,7 @@ impl HookRunner {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn working_dir(&self) -> &Path {
         &self.working_dir
     }

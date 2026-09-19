@@ -237,12 +237,10 @@ fn serial_attrs_in_braces(text: &str, open: usize) -> usize {
 /// plan-20260824 DF-05).
 #[test]
 fn site_rows_point_at_real_attribute_sites() {
-    let mut sites = 0;
     for (key, _) in registry() {
         let Some(inner) = key.strip_prefix("<site:").and_then(|k| k.strip_suffix('>')) else {
             continue;
         };
-        sites += 1;
         assert!(
             !inner
                 .rsplit_once(':')
@@ -298,7 +296,9 @@ fn site_rows_point_at_real_attribute_sites() {
             panic!("site key {key}: neither :macro: nor :orphan# form");
         }
     }
-    assert!(sites > 0, "expected at least one macro-body site row");
+    // RC-23 deleted the Code UI matrix macros that used to supply every
+    // production `<site:…:macro:…>` row. Zero remaining sites is valid;
+    // the loop above still checks any future site key that reappears.
 }
 
 /// TA-03 standing invariant (ADR-TA-02): after the mechanical conversion,
@@ -2108,7 +2108,9 @@ fn nextest_groups_toml_matches_generator_and_registry() {
     // keyed with an external resource (fine, but deliberate) or a fail-closed
     // body was re-widened by hand (not fine).
     assert_eq!(toml_fns.len(), 10, "union fn member count drifted");
-    assert_eq!(toml_bins.len(), 7, "site host target count drifted");
+    // RC-23 deleted the seven Code UI matrix binaries that used to host
+    // pure-global macro site rows. The external group now has no binary filters.
+    assert_eq!(toml_bins.len(), 0, "site host target count drifted");
 }
 
 /// DEFER-NP-02 standing invariant: no `tests/**` attribute may carry the

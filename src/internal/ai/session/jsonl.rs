@@ -1,6 +1,10 @@
 //! Append-only JSONL session event storage.
 
-#[cfg(any(test, feature = "test-provider"))]
+// Code-era intent-revision / phase1 helpers stay so old `events.jsonl`
+// files still load. Their last in-tree callers were deleted with RC-23.
+#![allow(dead_code)]
+
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     cell::Cell,
@@ -3152,11 +3156,11 @@ pub struct SessionJsonlStore {
     /// Optional fan-out after a successful Code workflow append (SSE wire v2).
     /// Shared across clones so every writer of this session log publishes once.
     on_code_workflow_append: Option<CodeWorkflowAppendHook>,
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     test_faults: Arc<SessionJsonlTestFaults>,
 }
 
-#[cfg(any(test, feature = "test-provider"))]
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct SessionJsonlTestFaults {
     fail_next_combined_terminal_append: AtomicBool,
@@ -3205,7 +3209,7 @@ impl SessionJsonlStore {
             session_root,
             command_status_cache: Arc::new(Mutex::new(None)),
             on_code_workflow_append: None,
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             test_faults: Arc::new(SessionJsonlTestFaults::default()),
         }
     }
@@ -3213,14 +3217,14 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped combined-terminal append failure. Clones of
     /// this session store share the fault, while unrelated tests/sessions do
     /// not race through a process-global flag.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_combined_terminal_append_for_test(&self) {
         self.test_faults
             .fail_next_combined_terminal_append
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub(crate) fn take_combined_terminal_append_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_combined_terminal_append
@@ -3228,14 +3232,14 @@ impl SessionJsonlStore {
     }
 
     /// Arm one instance-scoped non-terminal response checkpoint failure.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_pending_interaction_checkpoint_for_test(&self) {
         self.test_faults
             .fail_next_pending_interaction_checkpoint
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub(crate) fn take_pending_interaction_checkpoint_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_pending_interaction_checkpoint
@@ -3245,14 +3249,14 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped fault after a complete JSONL row is written but
     /// before its durability sync. A retry must re-sync an exact existing row
     /// before acknowledging success.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_durable_sync_after_write_for_test(&self) {
         self.test_faults
             .fail_next_durable_sync_after_write
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     fn take_durable_sync_after_write_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_durable_sync_after_write
@@ -3262,14 +3266,14 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped failure for an explicit event-log re-sync.
     /// This is distinct from the post-write fault above so exact retry tests
     /// can prove that observing an existing row never bypasses fsync.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_events_log_resync_for_test(&self) {
         self.test_faults
             .fail_next_events_log_resync
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     fn take_events_log_resync_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_events_log_resync
@@ -3279,14 +3283,14 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped failure before the Phase 1 seed parent sync.
     /// The initial write reaches this point after replacement; an exact retry
     /// reaches it after re-syncing the visible seed file.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_phase1_seed_parent_sync_for_test(&self) {
         self.test_faults
             .fail_next_phase1_seed_parent_sync
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub(crate) fn take_phase1_seed_parent_sync_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_phase1_seed_parent_sync
@@ -3295,14 +3299,14 @@ impl SessionJsonlStore {
 
     /// Arm one instance-scoped failure after a Phase 1 start seed has been
     /// unlinked but before the containing directory is synced.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_phase1_seed_sync_after_remove_for_test(&self) {
         self.test_faults
             .fail_next_phase1_seed_sync_after_remove
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub(crate) fn take_phase1_seed_sync_after_remove_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_phase1_seed_sync_after_remove
@@ -3641,7 +3645,7 @@ impl SessionJsonlStore {
                 ),
             )
         })?;
-        #[cfg(any(test, feature = "test-provider"))]
+        #[cfg(test)]
         if self.take_events_log_resync_failure_for_test() {
             return Err(io::Error::other(
                 "injected failure while re-syncing the durable session event log",
@@ -3708,7 +3712,7 @@ impl SessionJsonlStore {
             )
         })?;
         if durable {
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             if self.take_durable_sync_after_write_failure_for_test() {
                 return Err(io::Error::other(
                     "injected failure after durable JSONL row write and before sync",
@@ -3785,7 +3789,7 @@ impl SessionJsonlStore {
             )
         })?;
         if durable {
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             if self.take_durable_sync_after_write_failure_for_test() {
                 return Err(io::Error::other(
                     "injected failure after durable JSONL batch write and before sync",
