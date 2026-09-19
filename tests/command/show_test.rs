@@ -1401,4 +1401,14 @@ fn test_show_separator_pathspec_implies_head() {
         "{}",
         String::from_utf8_lossy(&bad.stderr)
     );
+
+    // A trailing `--` carries no pathspec, so HEAD must stay the revision
+    // (FIX-AD-01 review P1-2).
+    let trailing = run_libra_command(&["show", "--stat", "HEAD", "--"], p);
+    assert_cli_success(&trailing, "show HEAD --");
+    let text = String::from_utf8_lossy(&trailing.stdout);
+    assert!(
+        text.contains("files changed"),
+        "the full stat must render: {text}"
+    );
 }

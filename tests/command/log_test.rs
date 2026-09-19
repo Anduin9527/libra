@@ -3493,6 +3493,14 @@ fn test_log_pathspec_globs_match_via_shared_engine() {
     let text = String::from_utf8_lossy(&literal.stdout);
     assert!(text.contains("star-commit"), "{text}");
     assert!(!text.contains("x-commit"), "{text}");
+
+    // `--stat` must render the engine-expanded paths too, not the raw prefix
+    // (FIX-AD-01 review P1-1).
+    let stat = run_libra_command(&["log", "--oneline", "--stat", "--", "*.txt"], p);
+    assert_cli_success(&stat, "log --stat glob");
+    let text = String::from_utf8_lossy(&stat.stdout);
+    assert!(text.contains("x.txt"), "the glob reaches --stat: {text}");
+    assert!(text.contains("*.txt"), "{text}");
 }
 
 #[test]

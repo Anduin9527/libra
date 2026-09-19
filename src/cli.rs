@@ -1123,6 +1123,12 @@ fn rewrite_show_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<st
     if !has_separator {
         return args;
     }
+    // A trailing `--` carries no pathspec, so the sentinel must not fire —
+    // otherwise `show HEAD --` would shift HEAD into the pathspec list
+    // (`FIX-AD-01` review P1-2).
+    if args.last().is_some_and(|arg| arg == "--") {
+        return args;
+    }
     let mut out = Vec::with_capacity(args.len() + 1);
     out.extend(args.iter().take(show_index + 1).cloned());
     out.push(std::ffi::OsString::from(format!(

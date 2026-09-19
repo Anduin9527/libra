@@ -2173,6 +2173,29 @@ fn test_reset_pathspec_glob_unstages_all_matches() {
     );
     assert!(!names.contains("*.txt"), "*.txt unstaged: {names}");
     assert!(names.contains("notes.md"), "notes.md untouched: {names}");
+
+    // `:(exclude)` pairs with the include spec — it must never form an
+    // exclude-only set that unstages the whole index (FIX-AD-01 review P0-1).
+    assert_cli_success(
+        &run_libra_command(&["add", "*.txt", "x.txt", "notes.md"], p),
+        "re-stage",
+    );
+    let out = run_libra_command(&["reset", "--", "*.txt", ":(exclude)x.txt"], p);
+    assert_cli_success(&out, "reset with an exclude spec");
+    let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    let names = String::from_utf8_lossy(&cached.stdout);
+    assert!(
+        !names.contains("*.txt"),
+        "*.txt reset by the include spec: {names}"
+    );
+    assert!(
+        names.contains("x.txt"),
+        "x.txt is excluded, so it stays staged: {names}"
+    );
+    assert!(
+        names.contains("notes.md"),
+        "a path the user did not name must stay staged: {names}"
+    );
 }
 
 /// A repo whose `feature` branch has a commit conflicting with `main`

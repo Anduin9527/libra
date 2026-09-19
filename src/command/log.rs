@@ -1953,10 +1953,19 @@ async fn select_log_commits(
             continue;
         }
 
+        // `FIX-AD-01` (review P1-1): the renderers must see the engine-expanded
+        // concrete paths, not the raw prefixes — otherwise `-p`/`--stat`/
+        // `--shortstat` would still filter the rendered diff literally.
+        let render_paths = match (filter.path_specs.as_ref(), cached_changes.as_ref()) {
+            (Some(set), Some(changes)) if !set.is_empty() => {
+                changes.iter().map(|change| change.path.clone()).collect()
+            }
+            _ => effective_path_filters.clone(),
+        };
         selected.push(SelectedLogCommit {
             commit,
             cached_changes,
-            path_filters: effective_path_filters,
+            path_filters: render_paths,
         });
     }
 
