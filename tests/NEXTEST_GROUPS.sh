@@ -83,11 +83,6 @@ emit() {
     printf '%s\n' "# Cargo features and env always travel with the command line."
     printf '\n%s\n%s\n' "[test-groups.external]" "max-threads = 1"
     printf '\n%s\n%s\n' "[profile.default.junit]" 'path = "junit.xml"'
-    printf '\n%s\n' "# test-provider scenario runs (base.yml provider section): overrides are"
-    printf '%s\n' "# inherited from profile.default. test-threads = 1 preserves the CI"
-    printf '%s\n' "# section's --test-threads=1 semantic verbatim: provider scenario tests"
-    printf '%s\n' "# are calibrated for single-threaded timing (lease-release sleeps)."
-    printf '\n%s\n%s\n%s\n' "[profile.test-provider]" "test-threads = 1" 'junit = { path = "junit.xml" }'
     printf '\n%s\n' "# MIG-R03: these two cases embed cargo build and may wait for its lock."
     printf '%s\n' "# Warn every 120s; terminate after 20 minutes, with 10s shutdown grace."
     printf '%s\n' "# Timeout-only: external-resource group membership remains registry-derived."

@@ -151,7 +151,7 @@ impl WorkspaceSnapshotter {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // constructed by tests to pin WorktreeIo-backed snapshot writes
     pub(crate) fn with_io(mut self, io: Arc<WorktreeIo>) -> Self {
         self.io = io;
         self

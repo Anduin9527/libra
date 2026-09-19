@@ -560,14 +560,6 @@ fn resolve_agent_kinds(agents: &[String]) -> CliResult<Vec<AgentKind>> {
     Ok(out)
 }
 
-/// Reserved refuse helper for future agent subcommands that need an explicit
-/// non-zero-exit refuse path. Currently unused (all subcommands are
-/// implemented); kept as a small seam rather than re-added ad hoc later.
-#[allow(dead_code)]
-fn refuse(message: &str) -> CliResult<()> {
-    Err(CliError::fatal(message.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

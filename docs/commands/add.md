@@ -411,7 +411,7 @@ overrides.
 | Ignore errors | `git add --ignore-errors` | N/A | `libra add --ignore-errors` |
 | Intent to add | `git add -N` / `--intent-to-add` | N/A | N/A (not implemented) |
 | Interactive patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
-| Interactive select | `git add -i` / `--interactive` | N/A | N/A (use the `libra code` Web Code UI) |
+| Interactive select | `git add -i` / `--interactive` | N/A | N/A |
 | Edit diff before staging | `git add -e` / `--edit` | N/A | N/A |
 | Chmod only | `git add --chmod=+x` | N/A | N/A |
 | Sparse checkout paths | `git add --sparse` | N/A | N/A |

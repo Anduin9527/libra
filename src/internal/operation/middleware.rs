@@ -238,37 +238,6 @@ pub(crate) mod test_hooks {
         POST_MUTATION_FAILURE.get_or_init(|| Mutex::new(None))
     }
 
-    #[allow(dead_code)] // fault-injection seam; last callers were Code-era tests
-    pub(crate) fn fail_next_lease_for_causal_context(causal_context_id: String) {
-        if let Ok(mut slot) = pre_lease_busy().lock() {
-            *slot = Some(causal_context_id);
-        }
-    }
-
-    #[allow(dead_code)] // fault-injection seam; last callers were Code-era tests
-    pub(crate) fn clear_pre_lease_busy() {
-        if let Ok(mut slot) = pre_lease_busy().lock() {
-            *slot = None;
-        }
-    }
-
-    #[allow(dead_code)] // fault-injection seam; last callers were Code-era tests
-    pub(crate) fn fail_after_mutation_for_causal_context(
-        causal_context_id: String,
-        reason: String,
-    ) {
-        if let Ok(mut slot) = post_mutation_failure().lock() {
-            *slot = Some((causal_context_id, reason));
-        }
-    }
-
-    #[allow(dead_code)] // fault-injection seam; last callers were Code-era tests
-    pub(crate) fn clear_post_mutation_failure() {
-        if let Ok(mut slot) = post_mutation_failure().lock() {
-            *slot = None;
-        }
-    }
-
     pub(super) fn take_pre_lease_busy(meta: &OperationMetaV2) -> Option<OperationError> {
         let causal_context_id = meta.causal_context_id.as_deref()?;
         let mut slot = pre_lease_busy().lock().ok()?;

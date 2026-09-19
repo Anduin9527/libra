@@ -1,6 +1,6 @@
 # `libra mcp` 独立命令拆分计划
 
-> Status: draft
+> Status: draft（2026-09-20 注：本拆分未落地，`libra mcp --stdio` 仍是 DEFER-RC-04 延后项；`libra code` 已于 0.23.0 拆除，旧入口的迁移提示指向 `libra agent`，不指向未实现的 `libra mcp`）
 > Last updated: 2026-06-23
 > Scope: 从 `libra code --stdio` / `--mcp-stdio` 中拆出 MCP protocol/tools/resources，形成独立 `libra mcp --stdio` 命令。Agent 外部调度仍走 WebSocket/Web API；MCP 不作为 Agent turn 控制面。
 

@@ -1160,7 +1160,7 @@ fn sort_commits_newest_first(commits: &mut [Commit], by_author_date: bool) {
 
 /// Parsed line-range specifier for `-L`.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // -L parsing validates the spec; range-aware filtering is a best-effort stub
 struct LineRange {
     start: usize,
     end: usize,

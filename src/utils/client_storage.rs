@@ -581,7 +581,7 @@ impl Drop for TaskGuard {
     }
 }
 
-#[allow(dead_code)] // paired with spawn_background_index_work; leftover after RC-23
+#[cfg_attr(not(test), allow(dead_code))] // consumed by the cfg(test) spawn-scope unit test
 fn register_pending_index_work(scope: &IndexWorkScope) -> TaskGuard {
     PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
     scope.pending.fetch_add(1, Ordering::Relaxed);
@@ -1460,7 +1460,7 @@ impl ClientStorage {
     /// the producer before spawning prevents the foreground drain from seeing
     /// a transient zero, and re-entering the captured scope keeps both pending
     /// work and terminal failures attributed to the command that created it.
-    #[allow(dead_code)] // leftover after RC-23 deleted Code-era index producers
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the cfg(test) spawn-scope unit test
     pub(crate) fn spawn_background_index_work<F>(future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,

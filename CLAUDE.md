@@ -97,7 +97,6 @@ pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 | `test-network` | Gate L2 tests requiring outbound network but no secrets |
 | `test-live-ai` | Gate L3 tests calling real LLM APIs |
 | `test-live-cloud` | Gate L3 tests hitting real D1/R2 endpoints |
-| `test-provider` | Deterministic hidden provider for local Code UI automation tests (requires `LIBRA_ENABLE_TEST_PROVIDER=1`) |
 | `test-live-agent` | plan-20260713 live agent gate: real local `claude`/`codex`/`opencode` CLI data on the dev acceptance machine (requires `LIBRA_RUN_LIVE_AGENT_GATE=1`; missing stores print skipped) |
 | `subagent-scaffold` | Schema-only sub-agent contract scaffold (CEX-S2-10, gated on CP-4 in production) |
 | `test-upgrade` | plan-20260714 §A.11 auto-upgrade test hooks (trust-root/endpoint injection; needs `LIBRA_TEST=1` at runtime; release builds must never enable it) |
@@ -287,9 +286,7 @@ here so contributors do not waste time trying to set them at runtime:
 - Live S3/R2 storage tests (`cloud_storage_backup_test`, `publish_live_test`) reuse the `LIBRA_STORAGE_*` / `LIBRA_D1_*` variables above and require `--features test-live-cloud` (`storage_r2_test` is L1 in-memory and needs no env vars); no separate `LIBRA_TEST_S3_*` variables are read by the suite (the names in `.env.test.example` are legacy)
 - `LIBRA_ENABLE_TEST_LIVE_CLOUD=1` + `LIBRA_PUBLISH_LIVE_WORKER_ORIGIN` (required), `LIBRA_PUBLISH_LIVE_CLONE_DOMAIN`, `LIBRA_PUBLISH_LIVE_SLUG`, `LIBRA_PUBLISH_LIVE_FILE_PATH` (optional) — `publish_live` deploy-smoke gate (`--features test-live-cloud`; values are also read from `.env.test`)
 - `LIBRA_TEST_MEGA_SERVER` — LFS protocol live-server gate; `MEGA_FASTCDC_READY_FILE` — connection file for the ignored `mega_fastcdc_http_interop` test (`--features fastcdc`); `LIBRA_BACKEND_CHECKOUT` — sibling `libra-backend` checkout for `upgrade_publish_contract_test` (default `../libra-backend`)
-- `LIBRA_ENABLE_TEST_PROVIDER` — activate the `test-provider` deterministic LLM for Code UI scenarios (required alongside `--features test-provider`)
 - `LIBRA_RUN_LIVE_AGENT_GATE=1` — `test-live-agent` gate (`agent_live_gate_test`; real local `claude` / `codex` / `opencode` stores); `LIBRA_RUN_LOCAL_AGENTS=1` — Wave 7 `agent_local_capture_smoke_test` (drives real local agent sessions; tuned by `LIBRA_LOCAL_AGENT_SET`)
-- `LIBRA_RUN_PERF=1` — Wave 6 `code_ui_perf_smoke_test` / SSE soak gate (`--features test-provider`; tuned by `LIBRA_PERF_CEILING_MS`, `LIBRA_SSE_SOAK_SECS`); `LIBRA_RUN_LIVE=1` — model-generation matrix live gate; `LIBRA_AI_LIVE_OLLAMA=1` + `OLLAMA_HOST` — `ai_ollama_live_gate_test`
 - `LIBRA_TEST_HOME` — test-only home-directory override; `LIBRA_TEST_LOG=1` (or `RUST_LOG`) — opt-in tracing output from the shared test helpers in `src/utils/test.rs` (quiet by default); `LIBRA_TEST=1` — test sentinel read by the binary (pager, maintenance lock, operation wrapper, `am` failpoints, debug-only `stash` / `status` seams, `test-upgrade` trust-root injection)
 
 ### SSH limits and host-classification boundaries

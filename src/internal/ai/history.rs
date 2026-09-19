@@ -964,7 +964,7 @@ async fn invoke_checkpoint_object_helper(
 /// `append` calls on the same manager are serialised via the SQLite-side
 /// CAS in [`Self::update_ref_if_matches`].
 pub struct HistoryManager {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))] // read by cfg(test) reachability/get_storage paths
     storage: Arc<dyn Storage + Send + Sync>,
     repo_path: PathBuf,
     db_conn: Arc<DatabaseConnection>,
