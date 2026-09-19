@@ -93,7 +93,7 @@ cargo run -- <command>          # e.g. cargo run -- status
 |---------|---------|
 | `worktree-fuse` | Enable Unix FUSE-backed worktree commands (Linux/macOS only) |
 | `test-network` | Gate L2 tests requiring outbound network but no secrets |
-| `test-live-ai` | Gate L3 tests calling real LLM APIs |
+| `test-live-ai` | Retired in 0.23.x: the Code-era live LLM targets were removed and no `[[test]]` target requires the feature |
 | `test-live-cloud` | Gate L3 tests hitting real D1/R2 endpoints |
 | `test-live-agent` | plan-20260713 live agent gate: real local `claude`/`codex`/`opencode` CLI data on the dev acceptance machine (requires `LIBRA_RUN_LIVE_AGENT_GATE=1`; missing stores print skipped) |
 | `subagent-scaffold` | Schema-only sub-agent contract scaffold (CEX-S2-10, gated on CP-4 in production) |
@@ -104,17 +104,16 @@ cargo run -- <command>          # e.g. cargo run -- status
 
 ### CI Pipeline (`.github/workflows/base.yml`)
 
-`base.yml` runs on `pull_request` only. All PRs must pass these jobs (display names below; the job ids are `format`, `clippy`, `web-check`, `redundancy`, `test`, `network-remotes`, `owner-liveness-macos`, `opencode-export-linux`). Jobs 1–6 run on the `[self-hosted]` runner pool, 7–8 on GitHub-hosted runners:
+`base.yml` runs on `pull_request` only. All PRs must pass these jobs (display names below; the job ids are `format`, `clippy`, `redundancy`, `test`, `network-remotes`, `owner-liveness-macos`, `opencode-export-linux`). Jobs 1–5 run on the `[self-hosted]` runner pool, 6 on `macos-latest`, 7 on `ubuntu-latest`:
 1. **compat-rustfmt** — `cargo +nightly fmt --all --check`
-2. **compat-clippy** — `cargo clippy --all-targets --all-features -- -D warnings` (with `LIBRA_SKIP_WEB_BUILD=1`), then `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features`
-3. **compat-web-check** — `pnpm --dir web lint` + test + build, followed by `cargo check --lib` against the generated `WebAssets`; `web/out/` is ignored build output
-4. **compat-redundancy** — directory-shape check on `third-party/rust/crates` (passes trivially when the directory is absent, as it is today)
-5. **compat-offline-core** — `cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact` + pinned `cargo nextest run --all --no-fail-fast --retries 2` (one process per test; external-resource mutual exclusion from the generated `.config/nextest.toml`) + `cargo test --doc` + the `otlp` (`otlp_telemetry`), `keyring` (`auth_keyring_backend`) and `test-upgrade` (`upgrade_auto_test`, `upgrade_publish_contract_test`, with `LIBRA_TEST=1`) feature sections on `cargo test`. The former `--features test-provider` Code UI scenario pass was removed on 2026-08-31 (`base.yml`, "REMOVED" comment); those targets are local-only now — run them with `LIBRA_ENABLE_TEST_PROVIDER=1 cargo nextest run --features test-provider --profile test-provider --test <target>` (the profile only pins `test-threads = 1`; features and env travel on the command line). Test steps run with `HOME` / `USERPROFILE` / `XDG_CONFIG_HOME` pointed at an isolated `libra-ci-home` and require `rg` (ripgrep) on `PATH`
-6. **compat-network-remotes** — `cargo test --features test-network --test network_remotes_test -- --test-threads=1`
-7. **compat-owner-liveness-macos** — `cargo test --lib -- claim_owner_tests --test-threads=1` on `macos-latest` (plan-20260714 W1 §C.9 claim-owner liveness proof)
-8. **opencode-export-linux** — on `ubuntu-latest`: installs bubblewrap, runs the `internal::ai::observed_agents::opencode_export` lib gates, then `cargo test --test agent_opencode_bridge_test` (fails if the bridge test reports `skipped`)
+2. **compat-clippy** — `cargo clippy --all-targets --all-features -- -D warnings`, then `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features`
+3. **compat-redundancy** — directory-shape check on `third-party/rust/crates` (passes trivially when the directory is absent, as it is today)
+4. **compat-offline-core** — `cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact` + pinned `cargo nextest run --all --no-fail-fast --retries 2` (one process per test; external-resource mutual exclusion from the generated `.config/nextest.toml`) + `cargo test --doc` + the `otlp` (`otlp_telemetry`), `keyring` (`auth_keyring_backend`) and `test-upgrade` (`upgrade_auto_test`, `upgrade_publish_contract_test`, with `LIBRA_TEST=1`) feature sections on `cargo test`. Test steps run with `HOME` / `USERPROFILE` / `XDG_CONFIG_HOME` pointed at an isolated `libra-ci-home` and require `rg` (ripgrep) on `PATH`
+5. **compat-network-remotes** — `cargo test --features test-network --test network_remotes_test -- --test-threads=1`
+6. **compat-owner-liveness-macos** — `cargo test --lib -- claim_owner_tests --test-threads=1` on `macos-latest` (plan-20260714 W1 §C.9 claim-owner liveness proof)
+7. **opencode-export-linux** — on `ubuntu-latest`: installs bubblewrap, runs the `internal::ai::observed_agents::opencode_export` lib gates, then `cargo test --test agent_opencode_bridge_test` (fails if the bridge test reports `skipped`)
 
-Additional workflows: `codeql.yml` (security analysis), `live-compat.yml` (scheduled / manual `compat-live-ai` + `compat-live-cloud`, not required checks), `code-ui-sse-soak-nightly.yml` (scheduled / manual Code UI SSE soak), `model-generation-nightly.yml` (nightly model-generation matrix), `release.yml` (release pipeline: runs on `v*` tags only, builds with `--features keyring`, uploads through the OIDC credential broker at `https://libra.tools` with no long-term R2 secrets — `compat_release_rclone_env_guard` — then requests the Ed25519-signed stable manifest).
+Additional workflows: `codeql.yml` (security analysis), `live-compat.yml` (scheduled / manual `compat-live-cloud`, not a required check), `release.yml` (release pipeline: runs on `v*` tags only, builds with `--features keyring`, uploads through the OIDC credential broker at `https://libra.tools` with no long-term R2 secrets — `compat_release_rclone_env_guard` — then requests the Ed25519-signed stable manifest).
 
 ## Test Layers
 
@@ -124,7 +123,7 @@ Libra tests are organised into three layers — `cargo test --all` runs L1 only;
 |-------|--------------|---------|
 | **L1 — Deterministic** | None (tempdir, in-memory stores, mock models) | `cargo test --all` |
 | **L2 — Network** | GitHub token for temporary repo creation | `LIBRA_TEST_GITHUB_TOKEN` + `LIBRA_TEST_GITHUB_NAMESPACE` |
-| **L3 — Live Services** | Real AI API keys (`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, …) or cloud credentials (`LIBRA_D1_*`, `LIBRA_STORAGE_*`) | Set the relevant env vars **and** build with `--features test-live-ai` / `--features test-live-cloud` (the live-AI targets are `required-features`-gated in `Cargo.toml`, so a bare `cargo test --all` never compiles them) |
+| **L3 — Live Services** | Real cloud credentials (`LIBRA_D1_*`, `LIBRA_STORAGE_*`) | Set the relevant env vars and run with `--features test-live-cloud`; the Wave 4 live-AI targets were retired in 0.23.x |
 
 Gate L2 / L3 tests with the small `env_is_present(name) -> bool` helper (see e.g. [`tests/cloud_storage_backup_test.rs:29`](tests/cloud_storage_backup_test.rs)) followed by an early `eprintln!("skipped (...)")` return when a required var is unset — missing vars print "skipped", never fail. Copy `.env.test.example` → `.env.test` and `source` it before running the full suite (the `export` prefix is required).
 
@@ -170,8 +169,8 @@ Gate L2 / L3 tests with the small `env_is_present(name) -> bool` helper (see e.g
 - **Isolation**: Use `tempfile::tempdir()` and `utils::test::ChangeDirGuard` to isolate state
 - **Serial execution**: Use keyed lanes — `#[serial(cwd)]`, `#[serial(env)]`, `#[serial(hash_kind)]`, or named external keys such as `cloud_live` / `workspace_failpoints` — for the process-wide resource a test really touches (plain unkeyed `#[serial]` serializes against every other unkeyed test). Every such annotation needs a matching row in `tests/SERIAL_REGISTRY.tsv`; the `compat_serial_registry` guard re-runs `tests/SERIAL_CLASSIFY.sh` and fails on drift. `.config/nextest.toml` is generated from the registry — rerun `sh tests/NEXTEST_GROUPS.sh` after touching it
 - **Async tests**: Use `#[tokio::test]` (or `flavor = "multi_thread"` when needed)
-- **Fixtures**: Keep small and local in `tests/data/` and `tests/fixtures/` (`tests/compat-ledger/` is the Git-compatibility evidence ledger, one row per migrated upstream scenario, schema-guarded by `compat_ledger_schema` — not a fixture directory); reuse helpers from `tests/command/mod.rs`, `tests/harness/` (headless Web / HTTP+SSE Code UI harness), and `tests/helpers/`
-- **Gating**: Use the `env_is_present(name)` helper pattern (see `tests/cloud_storage_backup_test.rs:29`) plus an early `eprintln!("skipped (set ...)")` return so missing vars print a skip notice and do not fail the test. Match the L1/L2/L3 layering and the matching `test-network` / `test-live-ai` / `test-live-cloud` Cargo features
+- **Fixtures**: Keep small and local in `tests/data/` and `tests/fixtures/` (`tests/compat-ledger/` is the Git-compatibility evidence ledger, one row per migrated upstream scenario, schema-guarded by `compat_ledger_schema` — not a fixture directory); reuse helpers from `tests/command/mod.rs`, `tests/harness/` (local agent-capture harness), and `tests/helpers/`
+- **Gating**: Use the `env_is_present(name)` helper pattern (see `tests/cloud_storage_backup_test.rs:29`) plus an early `eprintln!("skipped (set ...)")` return so missing vars print a skip notice and do not fail the test. Match the L1/L2/L3 layering and the matching `test-network` / `test-live-cloud` Cargo features (the `test-live-ai` layer was retired in 0.23.x)
 - **Coverage**: Pair new commands/options with at least one end-to-end test plus a focused unit test, and an entry in `COMPATIBILITY.md` if you change the Git surface. New `StableErrorCode` variants must also be added to `docs/error-codes.md` (the `compat_error_codes_doc_sync` test guard fails otherwise).
 
 ## Quality Acceptance Criteria (质量验收标准)
@@ -215,7 +214,7 @@ docs(readme): update provider table
 - Include repro steps or sample CLI output for user-visible changes
 - Keep changes small and cohesive
 - Update README/CLI docs when adding flags or altering behavior
-- Version bumps must update all four version faces together — `Cargo.toml`, `web/package.json`, `install.sh` `DEFAULT_VERSION`, `install.ps1` `$DefaultVersion` — or `compat_version_surface_sync` fails; never hand-edit `Cargo.lock`. Releases are cut by pushing a `v<version>` tag (`release.yml`)
+- Version bumps must update all three version faces together — `Cargo.toml`, `install.sh` `DEFAULT_VERSION`, `install.ps1` `$DefaultVersion` — or `compat_version_surface_sync` fails; never hand-edit `Cargo.lock`. Releases are cut by pushing a `v<version>` tag (`release.yml`)
 - Commit with `libra commit -s` (DCO `Signed-off-by` trailer). GPG signing comes from the repository vault key by default (`vault.signing` / `commit.gpgSign`); `libra commit` exposes no `-S`, only `--no-gpg-sign`
 
 ## Database Schema
@@ -229,17 +228,7 @@ Bootstrap files: `sql/sqlite_20260309_init.sql` (core + AI baseline) and `sql/sq
 ## Environment Variables
 
 ### AI Providers
-| Provider | API Key Env | Base URL Override |
-|----------|-------------|-------------------|
-| `gemini` | `GEMINI_API_KEY` | `--api-base` only (no env var) |
-| `openai` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` |
-| `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
-| `deepseek` | `DEEPSEEK_API_KEY` | `--api-base` only (no env var) |
-| `kimi` | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` |
-| `zhipu` | `ZHIPU_API_KEY` | `ZHIPU_BASE_URL` |
-| `ollama` | `OLLAMA_API_KEY` (only when the base URL host is `ollama.com`) | `OLLAMA_BASE_URL` or `--api-base`; also `OLLAMA_THINK` (`true`/`false`/`low`/`medium`/`high`/`auto`, default `false`) and `OLLAMA_COMPACT_TOOLS` (`1`/`true`/`yes`/`on`) |
-
-`BRAVE_SEARCH_API_KEY` — optional key for the agent `web_search` tool (resolved through the same env → vault lookup chain as provider keys).
+The internal LLM provider stack was removed with the Code runtime in 0.23.x, so no provider `*_API_KEY` / `*_BASE_URL` variable is read anymore; `libra review` / `libra investigate` drive external agent CLIs instead. The only remaining readers are secret-**redaction** patterns in `src/internal/ai/hardening.rs` / `src/internal/ai/observed_agents/redaction.rs`, which recognize names such as `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `MOONSHOT_API_KEY` only to scrub them from captured agent data.
 
 ### Cloud Storage (S3/R2)
 `LIBRA_STORAGE_TYPE`, `LIBRA_STORAGE_BUCKET`, `LIBRA_STORAGE_ENDPOINT`, `LIBRA_STORAGE_REGION`, `LIBRA_STORAGE_ACCESS_KEY`, `LIBRA_STORAGE_SECRET_KEY`, `LIBRA_STORAGE_THRESHOLD`, `LIBRA_STORAGE_CACHE_SIZE`, `LIBRA_STORAGE_ALLOW_HTTP` (set to `"true"` to permit non-TLS HTTP endpoints, useful for local/dev S3-compatible stores). Inspect the resolved tier/threshold/cache-budget with `libra cache info` (`--json`)
@@ -248,8 +237,6 @@ Bootstrap files: `sql/sqlite_20260309_init.sql` (core + AI baseline) and `sql/sq
 `LIBRA_D1_ACCOUNT_ID`, `LIBRA_D1_API_TOKEN`, `LIBRA_D1_DATABASE_ID`; `LIBRA_D1_API_BASE_URL` overrides the Cloudflare D1 API base URL for cloud `clone`
 
 ### Build & Runtime
-- `LIBRA_SKIP_WEB_BUILD=1` — skip the Next.js web build in `build.rs` (used by Rust-oriented CI jobs; `compat-web-check` generates the export explicitly before embedding it)
-- `LIBRA_PNPM` — pnpm executable `build.rs` uses for the web build (default `pnpm`, `pnpm.cmd` on Windows)
 - `LIBRA_LOG`, `RUST_LOG` — `tracing-subscriber` env filter
 - `LIBRA_LOG_FILE` — tracing sink path (append-mode by default; time-rolled when `LIBRA_LOG_ROTATION` is set)
 - `LIBRA_LOG_ROTATION` — rolling strategy for `LIBRA_LOG_FILE`: `never` (default) / `minutely` / `hourly` / `daily` (`tracing-appender`, time-split only — no old-file pruning); inspect via `libra logfile info`
@@ -277,8 +264,7 @@ here so contributors do not waste time trying to set them at runtime:
 
 ### Tests
 - `LIBRA_TEST_GITHUB_TOKEN`, `LIBRA_TEST_GITHUB_NAMESPACE` — L2 GitHub gate (creates/deletes a temporary `libra-test-*` repo); the `clone_test` GitHub scenarios additionally require `LIBRA_TEST_GITHUB_LIVE=1`
-- Live S3/R2 storage tests (`cloud_storage_backup_test`, `publish_live_test`) reuse the `LIBRA_STORAGE_*` / `LIBRA_D1_*` variables above and require `--features test-live-cloud` (`storage_r2_test` is L1 in-memory and needs no env vars); no separate `LIBRA_TEST_S3_*` variables are read by the suite (the names in `.env.test.example` are legacy)
-- `LIBRA_ENABLE_TEST_LIVE_CLOUD=1` + `LIBRA_PUBLISH_LIVE_WORKER_ORIGIN` (required), `LIBRA_PUBLISH_LIVE_CLONE_DOMAIN`, `LIBRA_PUBLISH_LIVE_SLUG`, `LIBRA_PUBLISH_LIVE_FILE_PATH` (optional) — `publish_live` deploy-smoke gate (`--features test-live-cloud`; values are also read from `.env.test`)
+- Live S3/R2 storage tests (`cloud_storage_backup_test`) reuse the `LIBRA_STORAGE_*` / `LIBRA_D1_*` variables above and require `--features test-live-cloud` (`storage_r2_test` is L1 in-memory and needs no env vars); no separate `LIBRA_TEST_S3_*` variables are read by the suite (the names in `.env.test.example` are legacy)
 - `LIBRA_TEST_MEGA_SERVER` — LFS protocol live-server gate; `MEGA_FASTCDC_READY_FILE` — connection file for the ignored `mega_fastcdc_http_interop` test (`--features fastcdc`); `LIBRA_BACKEND_CHECKOUT` — sibling `libra-backend` checkout for `upgrade_publish_contract_test` (default `../libra-backend`)
 - `LIBRA_RUN_LIVE_AGENT_GATE=1` — `test-live-agent` gate (`agent_live_gate_test`; real local `claude` / `codex` / `opencode` stores); `LIBRA_RUN_LOCAL_AGENTS=1` — Wave 7 `agent_local_capture_smoke_test` (drives real local agent sessions; tuned by `LIBRA_LOCAL_AGENT_SET`)
 - `LIBRA_TEST_HOME` — test-only home-directory override; `LIBRA_TEST_LOG=1` (or `RUST_LOG`) — opt-in tracing output from the shared test helpers in `src/utils/test.rs` (quiet by default); `LIBRA_TEST=1` — test sentinel read by the binary (pager, maintenance lock, operation wrapper, `am` failpoints, debug-only `stash` / `status` seams, `test-upgrade` trust-root injection)
