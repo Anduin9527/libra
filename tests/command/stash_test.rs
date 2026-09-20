@@ -54,6 +54,7 @@ async fn test_stash_push_no_changes() {
     // Create initial commit so HEAD exists
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
@@ -110,6 +111,7 @@ async fn test_stash_push_no_changes_json_output() {
 
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
@@ -167,6 +169,7 @@ async fn test_stash_push_and_pop() {
     // Create initial commit
     fs::write("base.txt", "base content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
@@ -255,6 +258,7 @@ async fn test_stash_push_and_pop_preserves_dotfiles() {
     fs::write(".config/tool.toml", "mode = \"base\"\n").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![".gitignore".to_string(), ".config/tool.toml".to_string()],
         all: false,
@@ -442,6 +446,7 @@ async fn test_stash_list() {
     // Create initial commit
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
@@ -574,6 +579,7 @@ async fn test_stash_drop() {
     // Create initial commit
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
@@ -646,6 +652,7 @@ async fn test_stash_drop_missing_reflog_returns_no_stash_found() {
 
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
@@ -714,6 +721,7 @@ async fn test_stash_json_output() {
     // Create initial commit
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,

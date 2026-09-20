@@ -770,3 +770,25 @@ fn json_add_sparse_paths_field() {
         "JSON mode must not print the human diagnostic"
     );
 }
+
+/// WT-05 (M-ITA-ADD N8, plan-20260918): `--json add -N` reports the recorded
+/// paths in `data.intent_to_add`.
+#[test]
+fn json_add_intent_to_add_field() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("new.txt"), "content\n").expect("write");
+    let output = run_libra_command(&["--json", "add", "-N", "new.txt"], root);
+    assert_cli_success(&output, "json add -N");
+    let parsed = parse_json_stdout(&output);
+    let intent = parsed["data"]["intent_to_add"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        intent.iter().any(|entry| entry.as_str() == Some("new.txt")),
+        "N8 JSON intent_to_add: {parsed}"
+    );
+}

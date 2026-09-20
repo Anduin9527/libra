@@ -22,6 +22,7 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) -> ChangeDirGuard {
     writeln!(f, "hello").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,

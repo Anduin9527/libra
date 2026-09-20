@@ -214,6 +214,7 @@ async fn test_changes_to_be_staged() {
     );
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(".")],
         all: true,
@@ -360,6 +361,7 @@ async fn test_status_porcelain() {
 
     // Add one file to the staging area
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -384,6 +386,7 @@ async fn test_status_porcelain() {
 
     // Add another file to the staging area and modify it
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
@@ -532,6 +535,7 @@ async fn test_status_short_format() {
 
     // Add one file to the staging area
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -556,6 +560,7 @@ async fn test_status_short_format() {
 
     // Add another file to the staging area and modify it
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
@@ -661,6 +666,7 @@ async fn test_status_porcelain_v2_basic() {
     let mut file1 = fs::File::create("file1.txt").unwrap();
     file1.write_all(b"content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -749,6 +755,7 @@ async fn test_status_porcelain_v2_branch_metadata_includes_upstream_counts() {
     fs::write("tracked.txt", "tracked\n").unwrap();
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec![String::from("tracked.txt")],
             all: false,
@@ -830,6 +837,7 @@ async fn test_status_porcelain_v2_untracked_files_no() {
     // tracked file
     fs::write("tracked.txt", "t").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("tracked.txt")],
         all: false,
@@ -898,6 +906,7 @@ async fn test_status_porcelain_v2_untracked_files_all() {
     // tracked file
     fs::write("tracked.txt", "t").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("tracked.txt")],
         all: false,
@@ -958,6 +967,7 @@ async fn test_status_untracked_files_no() {
     // tracked file
     fs::write("tracked.txt", "t").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("tracked.txt")],
         all: false,
@@ -1193,6 +1203,7 @@ async fn test_status_untracked_files_all() {
     // tracked file
     fs::write("tracked.txt", "t").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("tracked.txt")],
         all: false,
@@ -1287,6 +1298,7 @@ async fn test_status_mixed_changes() {
     file1.write_all(b"initial content").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("staged.txt")],
         all: false,
@@ -1361,6 +1373,7 @@ async fn test_status_deleted_files() {
     file.write_all(b"content to delete").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
@@ -1440,6 +1453,7 @@ async fn test_status_with_subdirectories() {
 
     // Stage some files
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("root_file.txt")],
         all: false,
@@ -1536,6 +1550,7 @@ async fn test_status_verbose_output() {
 
     // Stage the file
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("script.sh")],
         all: false,
@@ -1600,6 +1615,7 @@ async fn test_status_short_format_with_branch() {
 
     // Add one file to the staging area
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -1674,6 +1690,7 @@ async fn test_status_porcelain_format_with_branch() {
 
     // Add one file to the staging area
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -1748,6 +1765,7 @@ async fn test_status_show_stash_with_existing_stash() {
 
     // Add one file to the staging area
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -1781,6 +1799,7 @@ async fn test_status_show_stash_with_existing_stash() {
     file1.write_all(b"modified content").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -1910,6 +1929,7 @@ async fn test_status_show_stash_without_stash() {
 
     // Add one file to the staging area
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -1975,6 +1995,7 @@ async fn test_status_branch_detached_head() {
     file1.write_all(b"initial content").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
@@ -2007,6 +2028,7 @@ async fn test_status_branch_detached_head() {
     file2.write_all(b"second file").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
@@ -2088,6 +2110,7 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
     // Create and commit a file first
     fs::write("existing.txt", "existing content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("existing.txt")],
         all: false,
@@ -2114,6 +2137,7 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
     // Modify the existing file
     fs::write("existing.txt", "modified content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("existing.txt")],
         all: false,
@@ -2139,6 +2163,7 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
     // Create a new file (staged)
     fs::write("new_file.txt", "new content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("new_file.txt")],
         all: false,
@@ -2272,6 +2297,7 @@ async fn test_status_porcelain_v2_executable_file() {
 
     // Stage the executable file
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("script.sh")],
         all: false,
@@ -2346,6 +2372,7 @@ async fn test_status_porcelain_v2_deleted_file() {
     // Create, stage and commit a file
     fs::write("to_delete.txt", "content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("to_delete.txt")],
         all: false,
@@ -2444,6 +2471,7 @@ async fn test_status_after_add() {
 
     // Add the file
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
@@ -3096,6 +3124,7 @@ async fn test_status_short_branch_reports_up_to_date_with_fully_qualified_tracki
     fs::write("tracked.txt", "tracked\n").unwrap();
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec![String::from("tracked.txt")],
             all: false,

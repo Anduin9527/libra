@@ -100,6 +100,7 @@ async fn test_clean_force_keeps_tracked_files() {
     file.write_all(b"content").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("tracked.txt")],
         all: false,
@@ -172,6 +173,7 @@ async fn test_clean_force_respects_ignore_rules() {
 
     fs::write(".libraignore", "ignored.txt\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(".libraignore")],
         all: false,
@@ -222,6 +224,7 @@ async fn test_clean_force_multiple_untracked_with_tracked() {
     let mut tracked = fs::File::create("tracked.txt").unwrap();
     tracked.write_all(b"content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("tracked.txt")],
         all: false,
@@ -541,6 +544,7 @@ async fn test_clean_d_flag_keeps_dirs_with_tracked_files() {
     fs::create_dir_all("mixed_dir").unwrap();
     fs::write("mixed_dir/tracked.txt", "tracked").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from("mixed_dir/tracked.txt")],
         all: false,
@@ -593,6 +597,7 @@ async fn test_clean_x_flag_removes_ignored_files() {
     // Create .libraignore and ignored files
     fs::write(".libraignore", "ignored.txt\n*.log\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(".libraignore")],
         all: false,
@@ -645,6 +650,7 @@ async fn test_clean_x_flag_removes_only_ignored_files() {
     // Create .libraignore and ignored files
     fs::write(".libraignore", "ignored.txt\n*.log\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(".libraignore")],
         all: false,
@@ -798,6 +804,7 @@ async fn test_clean_dx_removes_ignored_directories() {
     // Create .libraignore with directory pattern
     fs::write(".libraignore", "ignored_dir/\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(".libraignore")],
         all: false,

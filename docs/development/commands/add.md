@@ -56,7 +56,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/add.md`。
 - Synopsis：`libra add [OPTIONS] [PATHSPEC...]`。
-- 公开参数/子命令包括：`[PATHSPEC...]`、`-A, --all`、`-u, --update`、`--refresh`、`-f, --force`、`-n, --dry-run`（`-n` 对齐 Git；`-d` 保留为 Libra 兼容短别名，经 `visible_short_alias`）、`-v, --verbose`、`--ignore-errors`、`--pathspec-from-file`、`--pathspec-file-nul`、`--chmod=(+|-)x`、`--renormalize`、`--ignore-missing`、`--resolved`、`--sparse`。
+- 公开参数/子命令包括：`[PATHSPEC...]`、`-A, --all`、`-u, --update`、`--refresh`、`-f, --force`、`-n, --dry-run`（`-n` 对齐 Git；`-d` 保留为 Libra 兼容短别名，经 `visible_short_alias`）、`-v, --verbose`、`--ignore-errors`、`--pathspec-from-file`、`--pathspec-file-nul`、`--chmod=(+|-)x`、`--renormalize`、`--ignore-missing`、`--resolved`、`--sparse`、`-N, --intent-to-add`（隐藏；展示面与公开由 WT-06/WT-07 承接）。
 - plan-20260708 P1-01 后，`add` 使用共享 pathspec engine：plain prefix、wildcard、`:(top)`/`:/`、`:(glob)`、`:(literal)`、`:(icase)`、`:(exclude)`、`:!`、`:^` 均由 `PathspecSet::from_workdir_with_default_icase` 编译；候选集统一通过 `matches_path` 过滤，未命中的正向规格由 `unmatched_positive_specs` 报错或在 `--dry-run --ignore-missing` 下进入 ignore 分类（命中 ignore 规则者改入 `ignored`，见 ADR-IA-03）或作为 `missing` 跳过；包含 wildcard metachar 的 pathspec 仍先匹配同名字面候选或目录前缀，再走 regex 匹配。
 - plan-20260708 P0-11 后，工作树 symlink 会按链接本身暂存：`gen_blob_from_file` 经 `read_worktree_blob_bytes` 读取 link target bytes，index mode 由 `IndexEntry::new_from_file` 记录为 `120000`，不会跟随目标文件；`--ignore-missing` 与路径分类使用 `symlink_metadata`，dangling symlink 仍视为存在路径。回归守卫：`compat_symlink_basic::add_symlink_stores_mode_and_target_blob`。
 
@@ -66,7 +66,7 @@ flowchart TD
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
 | 兼容矩阵说明 | sparse-checkout 标志不支持 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
-| 兼容差异项 | Intent to add | 原始对照：git add -N / --intent-to-add；相关参数/替代：不适用；当前说明：不适用 (未实现)。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
+| 兼容差异项 | Intent to add | 原始对照：git add -N / --intent-to-add；当前说明：实现中——写入面已落地（空 blob + index v3 `intent_to_add` 扩展位，已跟踪路径 no-op，未命中 pathspec 128 零写入），`-N` 暂时隐藏；展示面由 WT-06、写入面与公开由 WT-07 承接。回归：`add_test::test_add_intent_to_add_matrix`、`add_json_test::json_add_intent_to_add_field`、`add::test::intent_to_add_entry_shape`。 |
 | ✅ 已实现 | Interactive patch (`-p`/`--patch`) | 原始对照：git add -p / --patch。公开 `-p/--patch`、`--[no-]auto-advance`、`s` 拆分与 `e` 手工编辑。回归：`add_patch_test`。 |
 | ✅ 已实现 | `add -u` index-known pathspec | 原始对照：git add -u + `dir.c:report_path_error`；当前说明：`-u` 的可匹配候选为索引任意 stage 路径，未跟踪工作树文件在暂存前以 `LBR-CLI-003` 拒绝（`known to the index`）；glob 无匹配仍用 `did not match any files`；`--ignore-errors` 跳过该校验。回归：`add_test::test_add_update_untracked_pathspec_fails_atomically_matrix`。 |
 | ✅ 已实现 | Unmerged path staging | 原始对照：git `add_files_to_cache` / `remove_file_from_index`；当前说明：`add`/`-A`/`.`/`-u` 把仅有冲突 stage 的路径纳入候选，写入 stage 0 时删除 1–3，工作树缺失则删除全部 stage；普通 add 不检查冲突标记。回归：`add_test::test_add_resolves_unmerged_entries_matrix`。 |
@@ -86,3 +86,4 @@ flowchart TD
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 - 2026-09-20（plan issues/470 FM-04）：`check_file_status`/`stage_a_file` 将「仅 mode 变化」（`core.fileMode=true` 且普通文件 owner-execute 位与索引不同、内容未变）视为已修改并重写条目；`--dry-run` 预览同源。
+- 2026-09-20（plan-20260918 WT-05，`-N` 暂时隐藏）：新增 `-N/--intent-to-add`——按 pathspec 命中的未跟踪路径写入空 blob（`e69de29…`）+ 零 stat + index v3 `intent_to_add` 扩展位，已跟踪路径 no-op，未命中 pathspec 保持 128 零写入，`--dry-run` 只预览（`add: <path>`）；`AddOutput.intent_to_add` 承载 JSON 字段；真实暂存路径改用 `index_ext::update_preserving_file_mode_except_intent` 清除该位（ADR-SW-03），全部清除后索引回 v2。

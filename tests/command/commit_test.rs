@@ -67,6 +67,7 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
 
     test::ensure_file("identity.txt", Some("identity"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["identity.txt".into()],
         all: false,
@@ -250,6 +251,7 @@ async fn test_execute_commit() {
         test::ensure_file("bb/b.txt", Some("b"));
         test::ensure_file("bb/c.txt", Some("c"));
         let args = AddArgs {
+            intent_to_add: false,
             sparse: false,
             all: true,
             update: false,
@@ -353,6 +355,7 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["tracked.txt".into()],
         all: false,
@@ -437,6 +440,7 @@ async fn test_commit_with_all_flag_records_deletions() {
 
     test::ensure_file("keep.txt", Some("keep"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["keep.txt".into()],
         all: false,
@@ -546,6 +550,7 @@ async fn test_commit_sha256() {
     // Create and add a file
     test::ensure_file("a.txt", Some("hello sha256"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["a.txt".to_string()],
         all: false,
@@ -644,6 +649,7 @@ async fn test_commit_with_custom_author() {
     // Create a file and add it
     test::ensure_file("test.txt", Some("test content"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["test.txt".into()],
         all: false,
@@ -911,6 +917,7 @@ async fn test_commit_with_actual_changes() {
     std::fs::write(&test_file, "test content").unwrap();
 
     let add_args = add::AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["test.txt".to_string()],
         all: false,
@@ -1003,6 +1010,7 @@ async fn test_commit_signoff_persists_trailer() {
 
     test::ensure_file("signed.txt", Some("signed content"));
     add::execute(add::AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["signed.txt".into()],
         all: false,
@@ -1176,6 +1184,7 @@ async fn test_commit_without_identity_fails_by_default() {
 
     test::ensure_file("autodetect.txt", Some("content"));
     add::execute(add::AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["autodetect.txt".into()],
         all: false,
@@ -1267,6 +1276,7 @@ async fn test_commit_cleanup_strips_comments() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
@@ -1463,6 +1473,7 @@ async fn test_commit_trailer_appended() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
@@ -1506,6 +1517,7 @@ async fn test_commit_dry_run_does_not_create_commit() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
@@ -1550,6 +1562,7 @@ async fn test_commit_reuse_message() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
@@ -1581,6 +1594,7 @@ async fn test_commit_reuse_message() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
@@ -1626,6 +1640,7 @@ async fn test_commit_fixup_sets_subject() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
@@ -1655,6 +1670,7 @@ async fn test_commit_fixup_sets_subject() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,

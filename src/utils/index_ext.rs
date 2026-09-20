@@ -52,6 +52,24 @@ pub fn update_preserving_file_mode(index: &mut Index, mut entry: IndexEntry, fil
     update_preserving(index, entry, FlagPreservation::All);
 }
 
+/// [`update_preserving_file_mode`] for a caller that is writing the path's real
+/// content (WT-05, ADR-SW-03): the intent-to-add bit is cleared — once a path
+/// has tree content it is no longer intent-to-add — while skip-worktree (and
+/// the `core.fileMode=false` mode rule) keep their behavior.
+pub fn update_preserving_file_mode_except_intent(
+    index: &mut Index,
+    mut entry: IndexEntry,
+    file_mode: bool,
+) {
+    if !file_mode {
+        entry.mode = index
+            .get(&entry.name, entry.flags.stage)
+            .map(|existing| existing.mode)
+            .unwrap_or(0o100644);
+    }
+    update_preserving(index, entry, FlagPreservation::ExceptIntentToAdd);
+}
+
 /// Carry the `skip_worktree` bit from `previous` onto the entries of `rebuilt`
 /// by path (ADR-SW-03's rebuild rule: `intent_to_add` is NOT carried — once a
 /// path has tree content it is no longer intent-to-add). Used by the

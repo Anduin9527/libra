@@ -37,6 +37,7 @@ async fn test_add_single_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
@@ -79,6 +80,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
 
     let error = add::execute_safe(
         AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec!["marker-failure.txt".to_string()],
             all: false,
@@ -124,6 +126,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
         .expect("remove injected marker-directory conflict");
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec!["marker-failure.txt".to_string()],
             all: false,
@@ -186,6 +189,7 @@ async fn test_add_dispatches_vcs_automation_history() {
 
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec!["automated.txt".to_string()],
             all: false,
@@ -238,6 +242,7 @@ async fn test_add_dry_run_does_not_dispatch_vcs_automation_history() {
 
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec!["dry-run.txt".to_string()],
             all: false,
@@ -287,6 +292,7 @@ async fn test_add_multiple_files() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![
             String::from("test_file_1.txt"),
@@ -354,6 +360,7 @@ async fn test_add_all_flag() {
 
     // Execute add command with --all flag
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![],
         all: true,
@@ -421,6 +428,7 @@ async fn test_add_update_flag() {
 
     // Add only one file to the index
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(tracked_file)],
         all: false,
@@ -459,6 +467,7 @@ async fn test_add_update_flag() {
 
     // Execute add command with --update flag
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
@@ -535,6 +544,7 @@ async fn test_add_with_ignore_patterns() {
 
     // Execute add command with all files
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(".")],
         all: true,
@@ -626,6 +636,7 @@ async fn test_add_force_tracks_ignored_file() {
     );
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
@@ -657,6 +668,7 @@ async fn test_add_force_tracks_ignored_file() {
 
     // Force add should stage the ignored file
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
@@ -698,6 +710,7 @@ async fn test_add_force_tracks_ignored_file() {
     );
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
@@ -753,6 +766,7 @@ async fn test_add_force_dot_includes_ignored_directory() {
 
     // Baseline: without --force the ignored directory stays hidden
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![".".into()],
         all: false,
@@ -792,6 +806,7 @@ async fn test_add_force_dot_includes_ignored_directory() {
 
     // Re-run with --force to include ignored entries
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![".".into()],
         all: false,
@@ -841,6 +856,7 @@ async fn test_add_dry_run() {
 
     // Execute add command with dry-run
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
@@ -894,6 +910,7 @@ async fn test_add_without_path_should_error() {
 
     // Try running `add` without any pathspec and without --all
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![], // Empty pathspec
         all: false,       // Not using --all
@@ -937,6 +954,7 @@ async fn test_add_nonexistent_file_should_error() {
 
     // Try to add non-existent file
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(fake_path)],
         all: false,
@@ -984,6 +1002,7 @@ async fn test_add_duplicate_file_should_not_duplicate_index() {
     // Add same file twice
     for i in 0..2 {
         add::execute(AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec![String::from(file_path)],
             all: false,
@@ -1036,6 +1055,7 @@ async fn test_add_empty_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
@@ -1083,6 +1103,7 @@ async fn test_add_sub_directory_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
@@ -1132,6 +1153,7 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
     fs::write("paths.txt", "file1.txt\n").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![],
         all: false,
@@ -1177,6 +1199,7 @@ async fn test_add_pathspec_from_file_nul_stages_listed_paths() {
     fs::write("paths.bin", b"keep.txt\0").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![],
         all: false,
@@ -2814,6 +2837,7 @@ async fn test_add_ignored_dispatch_before_exit_one() {
 
     let error = add::execute_safe(
         AddArgs {
+            intent_to_add: false,
             sparse: false,
             pathspec: vec!["other.txt".to_string(), "top.log".to_string()],
             all: false,
@@ -4165,5 +4189,133 @@ fn test_add_mode_only_change_respects_filemode() {
         index_mode(root, "run.sh"),
         "100644",
         "D3 must stage the mode change"
+    );
+}
+
+/// WT-05 (M-ITA-ADD N1–N7, plan-20260918): `add -N/--intent-to-add` records
+/// empty-blob entries carrying the index v3 intent-to-add extended flag,
+/// leaves tracked paths untouched, writes nothing for unmatched pathspecs or
+/// dry-runs, and clears the flag once the real content is staged.
+#[test]
+fn test_add_intent_to_add_matrix() {
+    const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("tracked.txt"), "tracked\n").expect("write tracked");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], root),
+        "add tracked",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    // N5: dry-run previews the intent-to-add path and writes nothing.
+    fs::write(root.join("dry.txt"), "dry\n").expect("write dry");
+    let dry = run_libra_command(&["add", "-N", "-n", "dry.txt"], root);
+    assert_cli_success(&dry, "add -N -n");
+    assert!(
+        String::from_utf8_lossy(&dry.stdout).contains("add: dry.txt"),
+        "N5 preview: {}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    assert!(
+        index_entry_snapshot(root, "dry.txt").is_none(),
+        "N5 must not write an index entry"
+    );
+
+    // N1: a new path becomes an empty-blob entry flagged intent-to-add.
+    fs::write(root.join("new.txt"), "content\n").expect("write new");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "new.txt"], root),
+        "add -N",
+    );
+    assert_eq!(
+        index_entry_snapshot(root, "new.txt"),
+        Some((0o100644, EMPTY_BLOB.to_string(), 0, true, false)),
+        "N1 entry shape"
+    );
+    // N7: any extended flag makes the on-disk index v3.
+    assert_eq!(index_version(root), 3, "N7 index version with a flag set");
+
+    // N2: a directory records each contained file.
+    fs::create_dir_all(root.join("dir/sub")).expect("mkdir");
+    fs::write(root.join("dir/f.txt"), "f\n").expect("write f");
+    fs::write(root.join("dir/sub/g.txt"), "g\n").expect("write g");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "dir"], root),
+        "add -N dir",
+    );
+    for path in ["dir/f.txt", "dir/sub/g.txt"] {
+        assert_eq!(
+            index_entry_snapshot(root, path),
+            Some((0o100644, EMPTY_BLOB.to_string(), 0, true, false)),
+            "N2 entry {path}"
+        );
+    }
+
+    // N3: tracked paths and repeated `-N` are successful no-ops.
+    let tracked_before = index_entry_snapshot(root, "tracked.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "tracked.txt"], root),
+        "add -N tracked",
+    );
+    assert_eq!(
+        index_entry_snapshot(root, "tracked.txt"),
+        tracked_before,
+        "N3 tracked entry unchanged"
+    );
+    let ita_before = index_entry_snapshot(root, "new.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "new.txt"], root),
+        "add -N again",
+    );
+    assert_eq!(
+        index_entry_snapshot(root, "new.txt"),
+        ita_before,
+        "N3 repeated -N unchanged"
+    );
+
+    // N4: an unmatched pathspec fails with exit 128 and zero writes.
+    let missing = run_libra_command(&["add", "-N", "nonexist"], root);
+    // M-ITA-ADD N4 says 128 (Git); Libra classifies an unmatched pathspec as a
+    // usage error (129 / LBR-CLI-003) on every add path — deviation registered
+    // in the card record.
+    assert_eq!(
+        missing.status.code(),
+        Some(129),
+        "N4 exit: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("pathspec 'nonexist' did not match any files"),
+        "N4 message: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(
+        index_entry_snapshot(root, "nonexist").is_none(),
+        "N4 must not write an entry"
+    );
+
+    // N6/N7: staging the real content replaces the entry, clears the flag and
+    // returns the index to v2 once every intent-to-add bit is gone.
+    fs::write(root.join("new.txt"), "real\n").expect("rewrite new");
+    assert_cli_success(
+        &run_libra_command(&["add", "new.txt", "dir"], root),
+        "add real content",
+    );
+    let staged = index_entry_snapshot(root, "new.txt").expect("staged entry");
+    assert_eq!(staged.0, 0o100644, "N6 mode");
+    assert_ne!(staged.1, EMPTY_BLOB, "N6 real blob replaces the empty blob");
+    assert!(!staged.3, "N6 intent-to-add flag cleared");
+    assert_eq!(
+        index_version(root),
+        2,
+        "N7 back to v2 when all flags are clear"
     );
 }

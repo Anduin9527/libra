@@ -24,6 +24,7 @@ fn test_mv_cli_outside_repository_returns_fatal_128() {
 async fn stage_file(path: &str, content: &str) {
     test::ensure_file(path, Some(content));
     add::execute(AddArgs {
+        intent_to_add: false,
         sparse: false,
         pathspec: vec![path.to_string()],
         all: false,
