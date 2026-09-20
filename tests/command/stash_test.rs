@@ -2427,3 +2427,177 @@ fn test_stash_message_format_matrix() {
     );
     assert_no_signature_leak(&held_text, "S6 held");
 }
+
+/// WT-11 (M-IDX X1–X8, issues/476): default apply restages new files;
+/// `--index` restores both layers; `stash branch` uses `--index` semantics.
+#[test]
+fn test_stash_index_restoration_matrix() {
+    fn mixed_stash_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        init_repo_via_cli(&root);
+        configure_identity_via_cli(&root);
+        fs::write(root.join("a.txt"), "one\n").expect("write");
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "add a.txt");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "init", "--no-verify"], &root),
+            "commit",
+        );
+        fs::write(root.join("a.txt"), "staged\n").expect("stage a.txt");
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "stage a.txt");
+        fs::write(root.join("a.txt"), "worktree\n").expect("dirty a.txt");
+        fs::write(root.join("s.txt"), "new\n").expect("write s.txt");
+        assert_cli_success(&run_libra_command(&["add", "s.txt"], &root), "stage s.txt");
+        assert_cli_success(&run_libra_command(&["stash", "push"], &root), "stash");
+        (repo, root)
+    }
+
+    fn assert_status_contains(root: &Path, expected: &[&str], label: &str) {
+        let got = status_short(root);
+        for line in expected {
+            assert!(
+                got.lines().any(|actual| actual == *line),
+                "{label}: missing `{line}` in status:\n{got}"
+            );
+        }
+    }
+
+    // X1: default pop / apply restage only the new file.
+    let (_repo, root) = mixed_stash_repo();
+    assert_cli_success(&run_libra_command(&["stash", "pop"], &root), "X1 pop");
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).expect("a"),
+        "worktree\n"
+    );
+    assert_eq!(fs::read_to_string(root.join("s.txt")).expect("s"), "new\n");
+    assert_status_contains(&root, &[" M a.txt", "A  s.txt"], "X1 pop");
+
+    let (_repo, root) = mixed_stash_repo();
+    assert_cli_success(&run_libra_command(&["stash", "apply"], &root), "X1 apply");
+    assert_status_contains(&root, &[" M a.txt", "A  s.txt"], "X1 apply");
+
+    // X2: --index restores both layers (t3903:122).
+    let (_repo, root) = mixed_stash_repo();
+    assert_cli_success(
+        &run_libra_command(&["stash", "apply", "--index"], &root),
+        "X2 apply --index",
+    );
+    assert_status_contains(&root, &["MM a.txt", "A  s.txt"], "X2 apply");
+    let (_repo, root) = mixed_stash_repo();
+    assert_cli_success(
+        &run_libra_command(&["stash", "pop", "--index"], &root),
+        "X2 pop --index",
+    );
+    assert_status_contains(&root, &["MM a.txt", "A  s.txt"], "X2 pop");
+
+    // X3: a changed index refuses --index with no writes.
+    let (_repo, root) = mixed_stash_repo();
+    fs::write(root.join("a.txt"), "post\n").expect("post");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "X3 stage");
+    let before_a = fs::read_to_string(root.join("a.txt")).expect("a");
+    let before_index = fs::read(root.join(".libra/index")).expect("index");
+    let failed = run_libra_command(&["stash", "pop", "--index"], &root);
+    assert_eq!(failed.status.code(), Some(128), "X3 exit");
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("conflicts in index. Try without --index."),
+        "X3 message: {stderr}"
+    );
+    assert!(stderr.contains("LBR-CONFLICT-001"), "X3 code: {stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).expect("a after"),
+        before_a
+    );
+    assert!(!root.join("s.txt").exists(), "X3 must not write s.txt");
+    assert_eq!(
+        fs::read(root.join(".libra/index")).expect("index after"),
+        before_index
+    );
+    let listed = run_libra_command(&["stash", "list"], &root);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("stash@{0}"),
+        "X3 stash kept: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // X4: stash branch uses --index semantics (t3903:284).
+    let (_repo, root) = mixed_stash_repo();
+    assert_cli_success(
+        &run_libra_command(&["stash", "branch", "nb"], &root),
+        "X4 branch",
+    );
+    assert_status_contains(&root, &["MM a.txt", "A  s.txt"], "X4");
+
+    // X5: -q --index is silent on success (t3903:314, :339).
+    let (_repo, root) = mixed_stash_repo();
+    let quiet_apply = run_libra_command(&["--quiet", "stash", "apply", "--index"], &root);
+    assert_cli_success(&quiet_apply, "X5 apply -q");
+    assert!(
+        quiet_apply.stdout.is_empty() && quiet_apply.stderr.is_empty(),
+        "X5 apply quiet"
+    );
+    let (_repo, root) = mixed_stash_repo();
+    let quiet_pop = run_libra_command(&["--quiet", "stash", "pop", "--index"], &root);
+    assert_cli_success(&quiet_pop, "X5 pop -q");
+    assert!(
+        quiet_pop.stdout.is_empty() && quiet_pop.stderr.is_empty(),
+        "X5 pop quiet"
+    );
+
+    // X6: untracked parent still restores untracked files.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "X6 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "X6 commit",
+    );
+    fs::write(root.join("a.txt"), "two\n").expect("modify");
+    fs::write(root.join("u.txt"), "untracked\n").expect("untracked");
+    assert_cli_success(&run_libra_command(&["stash", "push", "-u"], root), "X6 -u");
+    assert_cli_success(
+        &run_libra_command(&["stash", "apply", "--index"], root),
+        "X6 apply",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("u.txt")).expect("u"),
+        "untracked\n"
+    );
+
+    // X7: stash branch with no stash / no name is zero-write (t3903:643, :672).
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "X7 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "X7 commit",
+    );
+    let no_stash = run_libra_command(&["stash", "branch", "nb"], root);
+    assert_eq!(no_stash.status.code(), Some(129), "X7 no stash");
+    let branches = run_libra_command(&["branch"], root);
+    assert!(
+        !String::from_utf8_lossy(&branches.stdout).contains("nb"),
+        "X7 must not create nb: {}",
+        String::from_utf8_lossy(&branches.stdout)
+    );
+    let no_name = run_libra_command(&["stash", "branch"], root);
+    assert_eq!(no_name.status.code(), Some(129), "X7 no name");
+
+    // X8: --json pop --index reports index_restored.
+    let (_repo, root) = mixed_stash_repo();
+    let json = run_libra_command(&["--json", "stash", "pop", "--index"], &root);
+    assert_cli_success(&json, "X8 json");
+    let parsed = parse_json_stdout(&json);
+    assert_eq!(parsed["data"]["action"], "pop", "X8 action");
+    assert_eq!(
+        parsed["data"]["index_restored"].as_bool(),
+        Some(true),
+        "X8 index_restored: {parsed}"
+    );
+}

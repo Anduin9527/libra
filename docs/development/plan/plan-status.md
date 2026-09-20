@@ -60,7 +60,7 @@
 | [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | 未启动 | IN-01..IN-12（12 卡） |
 | [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 未启动 | CL-01..CL-15（15 卡） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
-| [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33`（`done`/`remote-pending`）；WT-01/11 `pending`；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
+| [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34`（`done`/`remote-pending`）；WT-01 `pending`；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495 |
 | [`issues/478.md`](issues/478.md) | log/show/diff/grep/blame/notes/reflog 命令族 | 未启动 | LG-01..LG-25（25 卡） |
 | [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | 未启动 | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
@@ -138,9 +138,9 @@
 | WT-04 `rm` 拒绝分类 | `done`/`remote-pending` | v0.23.30 |
 | WT-08 裸 stash = push | `done`/`remote-pending` | v0.23.31 |
 | WT-09 stash push 预检顺序 | `done`/`remote-pending` | v0.23.32 |
-| **WT-10 消息格式** | **`done`/`remote-pending`（C 组落地中）** | **v0.23.33** |
+| WT-10 消息格式 | `done`/`remote-pending` | v0.23.33 |
+| **WT-11 `--index` 恢复** | **`done`/`remote-pending`（C 组落地中）** | **v0.23.34** |
 | WT-01 回归守卫 | `pending` | — |
-| WT-11 `--index` 恢复 | `pending`（依赖 WT-10） | — |
 | WT-03 init 默认 ignore | `pending`（DEP-WT-08 用户评审） | — |
 
 ### 3.4 plan-20260822（Operation Log v2）
@@ -165,8 +165,8 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `issues/476` → `WT-10`（stash 消息格式），`done`/`remote-pending`，版本面三处 `0.23.33`（C 组提交/tag/`gh release` 进行中）。
-- **下一步（WT-10 C/D 落地后）：** `issues/476` → `WT-11`（stash `--index` 恢复），然后 WT-01；WT-03 仍等 DEP-WT-08。
+- **当前正在执行：** `issues/476` → `WT-11`（stash `--index` 恢复），`done`/`remote-pending`，版本面三处 `0.23.34`（C 组提交/tag/`gh release` 进行中）。
+- **下一步（WT-11 C/D 落地后）：** `issues/476` → `WT-01`（回归守卫）；WT-03 仍等 DEP-WT-08。
 - **并行窗口（不在本执行指针）：** `plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `stash.rs` 写集。
 
 ---
@@ -193,7 +193,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`issues/473`](issues/473.md) | IN-01 / IN-03 / IN-02 | 空模板自引用防护 / 存储路径前置检测 / 换格式 reinit fail-closed | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/474`](issues/474.md) | CL-01 | fsck 断链检测与 shallow 豁免 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/475`](issues/475.md) | CF-02 / CF-01 | key/模式校验与退出码 / 带 value-pattern 的删除 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
-| [`issues/476`](issues/476.md) | WT-11 | stash `--index` 恢复 | WT-10（C 组落地中） | 用户 2026-09-20 覆盖：执行 Agent 自审 | DEP-WT-09 只约束 #476 关闭，不阻塞 WT-11 | ⚠️ WT-10 发布完成后开工 |
+| [`issues/476`](issues/476.md) | WT-01 | 回归守卫 | 无内部前置 | 用户 2026-09-20 覆盖：执行 Agent 自审 | 发布窗口排在 WT-11 之后 | ⚠️ WT-11 发布完成后开工 |
 | [`issues/478`](issues/478.md) | LG-01 | `log`/`rev-list` `--grep` 模式类型与匹配范围 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/479`](issues/479.md) | EC-01 | plumbing 退出码契约守卫 | 无 | 尚未 Codex review | DEP-PL-04：与 plan-20260918 `add.rs` 串行 | ❌ 禁止开工 |
 | [`issues/480`](issues/480.md) | HP-01 / HP-02 | `remote add` 默认 refspec 与 `--mirror` / `remote rename` 改写推送目标 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |

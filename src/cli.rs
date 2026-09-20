@@ -790,6 +790,11 @@ pub enum Stash {
     Pop {
         #[arg(help = "The stash to pop")]
         stash: Option<String>,
+        #[arg(
+            long = "index",
+            help = "Reinstate the stashed index as well as the working tree"
+        )]
+        index: bool,
     },
     #[command(about = "List the stashes that you currently have")]
     List,
@@ -797,6 +802,11 @@ pub enum Stash {
     Apply {
         #[arg(help = "The stash to apply")]
         stash: Option<String>,
+        #[arg(
+            long = "index",
+            help = "Reinstate the stashed index as well as the working tree"
+        )]
+        index: bool,
     },
     #[command(about = "Remove a single stashed state from the stash list")]
     Drop {

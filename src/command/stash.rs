@@ -82,6 +82,9 @@ pub(crate) enum StashError {
     #[error("merge conflict during stash apply:\n  {0}")]
     MergeConflict(String),
 
+    #[error("conflicts in index. Try without --index.")]
+    IndexConflict,
+
     #[error("a branch named '{0}' already exists")]
     BranchExists(String),
 
@@ -140,7 +143,7 @@ impl StashError {
             Self::NoStashFound => StableErrorCode::CliInvalidTarget,
             Self::InvalidStashRef(_) => StableErrorCode::CliInvalidArguments,
             Self::StashNotExist(_) => StableErrorCode::CliInvalidTarget,
-            Self::MergeConflict(_) => StableErrorCode::ConflictUnresolved,
+            Self::MergeConflict(_) | Self::IndexConflict => StableErrorCode::ConflictUnresolved,
             Self::BranchExists(_) => StableErrorCode::ConflictOperationBlocked,
             Self::BranchLookupFailed { .. } => StableErrorCode::IoReadFailed,
             Self::ClearRequiresForce => StableErrorCode::CliInvalidArguments,
@@ -181,6 +184,9 @@ impl From<StashError> for CliError {
             StashError::MergeConflict(_) => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint("resolve conflicts manually, then use 'libra add'"),
+            StashError::IndexConflict => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint("retry without --index, or restore the index to match HEAD first"),
             StashError::BranchExists(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("use a different branch name or delete the existing branch first"),
@@ -233,12 +239,16 @@ pub enum StashOutput {
         index: usize,
         stash_id: String,
         branch: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        index_restored: bool,
     },
     #[serde(rename = "apply")]
     Apply {
         index: usize,
         stash_id: String,
         branch: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        index_restored: bool,
     },
     #[serde(rename = "drop")]
     Drop { index: usize, stash_id: String },
@@ -269,6 +279,8 @@ pub enum StashOutput {
         stash_id: String,
         applied: bool,
         dropped: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        index_restored: bool,
     },
     #[serde(rename = "clear")]
     Clear { cleared_count: usize },
@@ -317,7 +329,9 @@ EXAMPLES:
     libra stash show stash@{1}        Inspect a specific stash entry
     libra stash branch hotfix         Branch off the latest stash and drop it
     libra stash apply                 Re-apply stash@{0} without dropping
+    libra stash apply --index         Re-apply stash@{0} and restore the index
     libra stash pop                   Apply stash@{0} and drop it
+    libra stash pop --index           Apply stash@{0}, restore the index, and drop it
     libra stash clear --force         Remove every stash entry";
 
 // ── Entry points ─────────────────────────────────────────────────────
@@ -399,9 +413,9 @@ async fn run_stash(stash_cmd: Stash, output: &OutputConfig) -> Result<StashOutpu
             })
             .await
         }
-        Stash::Pop { stash } => run_pop(stash).await,
+        Stash::Pop { stash, index } => run_pop(stash, index).await,
         Stash::List => run_list().await,
-        Stash::Apply { stash } => run_apply(stash).await,
+        Stash::Apply { stash, index } => run_apply(stash, index).await,
         Stash::Drop { stash } => run_drop(stash).await,
         Stash::Show {
             stash,
@@ -801,9 +815,9 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
 
     // Stash worktree tree = HEAD overlaid with each matched path's EFFECTIVE
     // change. An unstaged working-tree change wins; otherwise a staged-only
-    // change is folded in (Libra has no `stash apply --index`, so the worktree
-    // restore must carry staged selections too, else `pop` would silently drop
-    // them); otherwise the path stays at HEAD. This is what `pop` replays.
+    // change is folded in (default `pop` still does not restore staged
+    // modifications to already-tracked paths; `--index` does); otherwise the
+    // path stays at HEAD. This is what default `pop` replays.
     let mut worktree_map = head_map.clone();
     for path in &matched {
         let rel = PathBuf::from(path);
@@ -981,7 +995,7 @@ fn reset_pathspec_to_head(
     Ok(())
 }
 
-async fn run_pop(stash: Option<String>) -> Result<StashOutput, StashError> {
+async fn run_pop(stash: Option<String>, restore_index: bool) -> Result<StashOutput, StashError> {
     // Phase 1 (C.10): resolve ONCE — the entry's commit hash pins the apply
     // content, and its RAW REFLOG LINE is the unambiguous entry identity for
     // the later CAS delete (the same commit id can legitimately appear more
@@ -990,7 +1004,7 @@ async fn run_pop(stash: Option<String>) -> Result<StashOutput, StashError> {
     let (index, stash_id, raw_line) = resolve_stash_to_commit_hash(stash)?;
     let stash_commit_hash =
         ObjectHash::from_str(&stash_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    apply_stash_commit(&stash_commit_hash).await?;
+    apply_stash_commit_inner(&stash_commit_hash, restore_index).await?;
     let branch = match Head::current().await {
         Head::Branch(name) => name,
         Head::Detached(_) => "(no branch)".to_string(),
@@ -1011,6 +1025,7 @@ async fn run_pop(stash: Option<String>) -> Result<StashOutput, StashError> {
         index,
         stash_id,
         branch,
+        index_restored: restore_index,
     })
 }
 
@@ -1113,8 +1128,8 @@ async fn run_list() -> Result<StashOutput, StashError> {
     Ok(StashOutput::List { entries })
 }
 
-async fn run_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
-    do_apply(stash).await
+async fn run_apply(stash: Option<String>, restore_index: bool) -> Result<StashOutput, StashError> {
+    do_apply(stash, restore_index).await
 }
 
 async fn run_drop(stash: Option<String>) -> Result<StashOutput, StashError> {
@@ -1540,7 +1555,7 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
     }
 
     // Apply BY HASH (pinned to the resolved entry's content).
-    if let Err(apply_error) = apply_stash_commit(&stash_hash).await {
+    if let Err(apply_error) = apply_stash_commit_inner(&stash_hash, true).await {
         // Roll back the half-created state (new branch + switched HEAD). If
         // any step fails, the JOURNAL persists and the next stash invocation
         // finishes the rollback — the user is never left with a silent
@@ -1620,6 +1635,7 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
         stash_id: stash_id_str,
         applied,
         dropped,
+        index_restored: true,
     })
 }
 
@@ -1687,6 +1703,7 @@ fn render_stash_output(result: &StashOutput, output: &OutputConfig) -> CliResult
             index,
             stash_id,
             branch,
+            ..
         } => {
             println!("On branch {branch}");
             println!(
@@ -1776,11 +1793,11 @@ fn render_stash_output(result: &StashOutput, output: &OutputConfig) -> CliResult
 
 // ── Internal helpers ─────────────────────────────────────────────────
 
-async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
+async fn do_apply(stash: Option<String>, restore_index: bool) -> Result<StashOutput, StashError> {
     let (index, hash_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
     let stash_commit_hash =
         ObjectHash::from_str(&hash_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    apply_stash_commit(&stash_commit_hash).await?;
+    apply_stash_commit_inner(&stash_commit_hash, restore_index).await?;
 
     let branch = match Head::current().await {
         Head::Branch(name) => name,
@@ -1791,15 +1808,16 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
         index,
         stash_id: hash_str,
         branch,
+        index_restored: restore_index,
     })
 }
 
 /// Apply a stash COMMIT by OID — the three-way apply shared by
 /// `stash apply/pop` and the merge autostash finalizer (which holds a stash
 /// commit reachable only from its sidecar, never from refs/stash). All-or-
-/// nothing for the working tree: any conflict or collision fails BEFORE files
-/// are rewritten, leaving the current state intact. The current index is
-/// intentionally preserved by default.
+/// nothing: any conflict or collision fails BEFORE files are rewritten.
+/// Default apply re-stages only paths the stash index added; `--index` and
+/// held autostash three-way-merge the stash index onto the current index.
 pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashError> {
     apply_stash_commit_inner(hash, false).await
 }
@@ -1834,10 +1852,10 @@ async fn apply_stash_commit_inner(
     let stash_tree: Tree =
         load_object(&stash_commit.tree_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
     let untracked_tree = load_untracked_parent_tree(&stash_commit)?;
-    let stash_index_tree = if restore_index {
-        Some(load_stash_index_parent_tree(&stash_commit)?)
-    } else {
-        None
+    let stash_index_tree = match load_stash_index_parent_tree(&stash_commit) {
+        Ok(tree) => Some(tree),
+        Err(error) if restore_index => return Err(error),
+        Err(_) => None,
     };
 
     let workdir = &util::request_working_dir();
@@ -1855,14 +1873,18 @@ async fn apply_stash_commit_inner(
     let worktree_tree = create_tree_from_workdir(workdir, &git_dir, &current_index)
         .map_err(StashError::ReadObject)?;
 
-    let merged_tree = merge_trees(&base_tree, &worktree_tree, &stash_tree, &git_dir)
-        .map_err(StashError::MergeConflict)?;
-    let restored_index = if let Some(stash_index_tree) = stash_index_tree.as_ref() {
+    // `--index` merges the stash index first (Git `builtin/stash.c`): an
+    // index conflict must be reported before any worktree merge, and must
+    // write nothing.
+    let restored_index = if restore_index {
+        let stash_index_tree = stash_index_tree
+            .as_ref()
+            .ok_or_else(|| StashError::ReadObject("stash index parent is missing".into()))?;
         let current_index_tree = tree::create_tree_from_index(&current_index)
             .map_err(|error| StashError::WriteObject(error.to_string()))?;
         let merged_index_tree =
             merge_trees(&base_tree, &current_index_tree, stash_index_tree, &git_dir)
-                .map_err(StashError::MergeConflict)?;
+                .map_err(|_| StashError::IndexConflict)?;
         let mut restored = Index::new();
         rebuild_index_from_tree(&merged_index_tree, &mut restored, "")
             .map_err(StashError::IndexLoad)?;
@@ -1870,6 +1892,8 @@ async fn apply_stash_commit_inner(
     } else {
         None
     };
+    let merged_tree = merge_trees(&base_tree, &worktree_tree, &stash_tree, &git_dir)
+        .map_err(StashError::MergeConflict)?;
 
     let worktree_files = tree::get_tree_files_recursive(&worktree_tree, &git_dir, &PathBuf::new())
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1921,13 +1945,51 @@ async fn apply_stash_commit_inner(
         restored_index
             .save(&index_path)
             .map_err(|error| StashError::IndexSave(error.to_string()))?;
+    } else if let Some(stash_index_tree) = stash_index_tree.as_ref() {
+        // ADR-WT-09: default apply/pop keep already-tracked index entries at
+        // their current state, but re-stage paths the stash index added
+        // relative to the base commit (Git: new staged files come back as `A `).
+        let mut index = current_index;
+        stage_new_index_paths(&base_tree, stash_index_tree, &mut index, &git_dir, workdir)?;
+        index
+            .save(&index_path)
+            .map_err(|error| StashError::IndexSave(error.to_string()))?;
     }
 
-    // Git's default `stash apply/pop` restores changes to the working tree only.
-    // Keep the existing index intact unless the caller is restoring a held
-    // autostash, whose reset removed the staged layer as well. A future public
-    // `--index` mode can reuse that path explicitly.
+    Ok(())
+}
 
+/// Stage paths present in the stash index tree but absent from the stash base.
+/// Existing index entries are left untouched (default apply/pop).
+fn stage_new_index_paths(
+    base_tree: &Tree,
+    stash_index_tree: &Tree,
+    index: &mut Index,
+    git_dir: &Path,
+    workdir: &Path,
+) -> Result<(), StashError> {
+    let base_files = tree::get_tree_files_recursive(base_tree, git_dir, &PathBuf::new())
+        .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_index_files =
+        tree::get_tree_files_recursive(stash_index_tree, git_dir, &PathBuf::new())
+            .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    for (path, item) in stash_index_files {
+        if base_files.contains_key(&path) {
+            continue;
+        }
+        if index.tracked(&path, 0) {
+            continue;
+        }
+        let mut new_entry =
+            crate::command::verified_index_entry(Path::new(&path), item.id, workdir, None)
+                .map_err(|e| StashError::IndexSave(e.to_string()))?;
+        new_entry.mode = match item.mode {
+            TreeItemMode::BlobExecutable => 0o100755,
+            TreeItemMode::Link => 0o120000,
+            _ => 0o100644,
+        };
+        crate::utils::index_ext::update_preserving_flags(index, new_entry);
+    }
     Ok(())
 }
 
@@ -3595,6 +3657,10 @@ mod tests {
             "merge conflict during stash apply:\n  foo.txt",
         );
         assert_eq!(
+            StashError::IndexConflict.to_string(),
+            "conflicts in index. Try without --index.",
+        );
+        assert_eq!(
             StashError::BranchExists("feature".to_string()).to_string(),
             "a branch named 'feature' already exists",
         );
@@ -3689,6 +3755,10 @@ mod tests {
         );
         assert_eq!(
             StashError::MergeConflict("ignored".to_string()).stable_code(),
+            StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
+            StashError::IndexConflict.stable_code(),
             StableErrorCode::ConflictUnresolved,
         );
         assert_eq!(
