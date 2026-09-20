@@ -2,9 +2,11 @@
 //! No ambient HOME/configuration or external binary downloads are consulted.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
@@ -41,14 +43,38 @@ pub async fn connect(path: &Path, read_only: bool) -> DatabaseConnection {
 
 impl RepairFixture {
     pub fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let scratch_parent = if let Some(path) = env::var_os("LIBRA_TEST_SCRATCH_DIR") {
+            let path = PathBuf::from(path);
+            fs::create_dir_all(&path).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        } else {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(env::temp_dir)
+        };
+        let scratch_root = scratch_parent.join(".libra-test-scratch");
+        fs::create_dir_all(&scratch_root).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&scratch_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let temp = tempfile::tempdir_in(scratch_root).unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let home = root.join("home");
         fs::create_dir_all(home.join(".libra")).unwrap();
         fs::create_dir_all(home.join(".config")).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(home.join(".libra"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(home.join(".config"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let db = home.join(".libra/config.db");
         let system = root.join("system.db");
         fs::write(&db, b"").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
         runtime().block_on(async {
             let conn = connect(&db, false).await;
             conn.execute_unprepared(include_str!(
@@ -64,6 +90,8 @@ impl RepairFixture {
             conn.close().await.unwrap();
         });
         fs::write(&system, b"system database must remain untouched").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o600)).unwrap();
         Self {
             _temp: temp,
             root,

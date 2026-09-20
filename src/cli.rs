@@ -1571,7 +1571,7 @@ fn repair_invocation_refused_without_confirmation(
     ) {
         return !matches!(command, WorktreeSubcommand::Repair { yes: true, .. });
     }
-    !(*migrate_layout && *dry_run) && !*confirm
+    !(*confirm || *migrate_layout && *dry_run)
 }
 
 fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<CommandPreflight> {

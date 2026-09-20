@@ -59,7 +59,8 @@ fn temp_sibling_path(dest: &Path) -> PathBuf {
     ))
 }
 
-/// A same-directory staging file that becomes `dest` on [`finish`].
+/// A same-directory staging file that becomes `dest` on
+/// [`WorktreeFileWriter::finish`].
 ///
 /// The staging file is created with the mode-derived permissions so the rename
 /// publishes content and permissions in one step. Dropping an unfinished writer
