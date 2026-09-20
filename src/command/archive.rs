@@ -809,6 +809,7 @@ mod tests {
     use std::str::FromStr;
 
     use git_internal::internal::object::tree::TreeItem;
+    use serial_test::serial;
     use tempfile::tempdir;
 
     use super::*;
@@ -965,6 +966,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(cwd)]
     fn filter_entries_by_pathspecs_keeps_matching_files_and_dirs() {
         let repo = tempdir().expect("failed to create archive pathspec repository");
         tokio::runtime::Runtime::new()
@@ -1002,6 +1004,7 @@ mod tests {
     /// FIX-AD-01: `archive` pathspecs match through the shared pathspec engine —
     /// wildcards and `:(literal)` behave like Git, plain names still prefix-match.
     #[test]
+    #[serial(cwd)]
     fn filter_entries_by_pathspecs_supports_wildcards_and_magic() {
         let repo = tempdir().expect("failed to create archive pathspec repository");
         tokio::runtime::Runtime::new()
