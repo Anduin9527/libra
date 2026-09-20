@@ -1000,6 +1000,7 @@ async fn test_worktree_add_rejects_existing_non_empty_directory() {
 
     test::ensure_file("a.txt", Some("repo-version"));
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["a.txt".to_string()],
         all: false,
         update: false,
@@ -1098,6 +1099,7 @@ async fn test_worktree_add_rolls_back_link_on_restore_failure() {
 
     test::ensure_file("conflict/file.txt", Some("v1"));
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["conflict/file.txt".to_string()],
         all: false,
         update: false,
@@ -1167,6 +1169,7 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1372,6 +1375,7 @@ async fn test_worktree_add_does_not_reset_index() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1398,6 +1402,7 @@ async fn test_worktree_add_does_not_reset_index() {
 
     test::ensure_file("tracked.txt", Some("v2"));
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1451,6 +1456,7 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1476,6 +1482,7 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
 
     test::ensure_file("tracked.txt", Some("v2"));
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,

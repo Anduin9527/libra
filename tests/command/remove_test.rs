@@ -127,6 +127,7 @@ async fn test_remove_single_file() {
     let file_path = create_file("test_file.txt", "Test content");
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -212,6 +213,7 @@ async fn test_remove_cached() {
     let file_path = create_file("test_file.txt", "Test content");
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -278,6 +280,7 @@ async fn test_remove_directory_recursive() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_dir")],
         all: false,
         update: false,
@@ -376,6 +379,7 @@ async fn test_remove_directory_without_recursive() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_dir")],
         all: false,
         update: false,
@@ -473,6 +477,7 @@ async fn test_remove_modified_file() {
     let file_path = create_file("test_file.txt", "Initial content");
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -558,6 +563,7 @@ async fn test_remove_multiple_files() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -623,6 +629,7 @@ async fn test_remove_dry_run() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -697,6 +704,7 @@ async fn test_remove_dry_run_cached() {
     let file_path = create_file("test_file.txt", "Test content");
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -760,6 +768,7 @@ async fn test_remove_dry_run_recursive() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_dir")],
         all: false,
         update: false,
@@ -831,6 +840,7 @@ async fn test_remove_ignore_unmatch() {
 
     // Add file 1 to the index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("test_dir/file1.txt")],
         all: false,
         update: false,
@@ -892,6 +902,7 @@ async fn test_remove_pathspec_from_file_newline() {
 
     // Add all files to index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -946,6 +957,7 @@ async fn test_remove_pathspec_from_file_nul() {
 
     // Add all files to index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -1000,6 +1012,7 @@ async fn test_remove_pathspec_from_file_ignore_unmatch() {
     let file1 = create_file("file1.txt", "File 1 content");
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,

@@ -958,6 +958,7 @@ fn stage_mode_overrides(overrides: &[(String, u32)]) -> CliResult<()> {
 
 async fn stage_targets(targets: &[String]) -> CliResult<()> {
     let args = AddArgs {
+        sparse: false,
         pathspec: targets.to_vec(),
         all: false,
         update: false,

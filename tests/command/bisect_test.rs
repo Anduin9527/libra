@@ -92,6 +92,7 @@ async fn create_linear_commits(count: usize) -> Vec<String> {
         };
 
         add::execute(AddArgs {
+            sparse: false,
             pathspec,
             all: false,
             update: false,

@@ -78,6 +78,7 @@ fn write_file(root: &Path, name: &str, body: &str) {
 
 async fn stage(paths: &[&str]) {
     add::execute(AddArgs {
+        sparse: false,
         pathspec: paths.iter().map(|p| p.to_string()).collect(),
         all: false,
         update: false,

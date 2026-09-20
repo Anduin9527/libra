@@ -235,6 +235,7 @@ async fn test_basic_cherry_pick() {
     // --- 1. Create common ancestor commit (C1) ---
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -293,6 +294,7 @@ async fn test_basic_cherry_pick() {
     // Commit C2: First target to cherry-pick
     fs::write("feature_a.txt", "feature A").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["feature_a.txt".to_string()],
         all: false,
         update: false,
@@ -338,6 +340,7 @@ async fn test_basic_cherry_pick() {
     // Commit C3: Second target to cherry-pick
     fs::write("feature_b.txt", "feature B").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["feature_b.txt".to_string()],
         all: false,
         update: false,
@@ -494,6 +497,7 @@ async fn test_cherry_pick_with_commit() {
     // Create base commit
     fs::write("base.txt", "base content").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -548,6 +552,7 @@ async fn test_cherry_pick_with_commit() {
 
     fs::write("feature.txt", "feature content").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["feature.txt".to_string()],
         all: false,
         update: false,
@@ -659,6 +664,7 @@ async fn test_cherry_pick_multiple_commits() {
     // Create base commit
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -714,6 +720,7 @@ async fn test_cherry_pick_multiple_commits() {
     // Create first feature commit
     fs::write("file1.txt", "content1").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["file1.txt".to_string()],
         all: false,
         update: false,
@@ -754,6 +761,7 @@ async fn test_cherry_pick_multiple_commits() {
     // Create second feature commit
     fs::write("file2.txt", "content2").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["file2.txt".to_string()],
         all: false,
         update: false,
@@ -1024,6 +1032,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
     // base commit on main
     fs::write("base.txt", "base").unwrap();
     add::execute(add::AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".into()],
         all: false,
         update: false,
@@ -1077,6 +1086,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
     .await;
     fs::write("feature.txt", "feature").unwrap();
     add::execute(add::AddArgs {
+        sparse: false,
         pathspec: vec!["feature.txt".into()],
         all: false,
         update: false,
