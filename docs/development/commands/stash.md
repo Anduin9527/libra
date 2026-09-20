@@ -43,6 +43,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-09-20（issues/476 WT-09）：`run_push` 预检顺序改为「先初始提交、后改动」（对齐 Git `builtin/stash.c:1524-1537`）——无 HEAD 时即使树干净或只有未跟踪文件也返回 128 `LBR-REPO-003`；`execute_safe` 在全局 `--quiet` 且非 JSON 时把该失败改为 `CliError::silent_exit(128)`（仅退出码），`--json` 仍输出 error envelope。回归：`stash_test::test_stash_push_no_initial_commit_matrix`。
 - 2026-09-20（issues/476 WT-08）：新增 CLI 参数改写 `rewrite_bare_stash_args`（`src/cli.rs`）——省略子命令的 `libra stash` 与首参数以 `-` 开头（含 `--`）的形态插入 `push`；已知子命令保持不变；其它首 token 报用法错误 129，文案对齐 Git `subcommand wasn't specified; 'push' can't be assumed due to unexpected token '<tok>'`（git 2.55.0 实测 exit 128）。`STASH_EXAMPLES` 与 `stash --help`/命令页说明省略子命令的行为。回归：`cli::tests::bare_stash_rewrites_to_push`、`stash_test::test_bare_stash_is_push_matrix`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-06-06 `99ac8a43`（`feat(stash): add 'stash show -p/--patch' unified diff`）：该提交曾为 `stash show` 引入 `-p` / `--patch` 统一 diff；该能力一度从 HEAD 回退，现已重新实现 —— `Stash::Show` 新增 `patch: bool`，`run_show` 在 `-p` 下复用 `log::generate_diff(&stash_commit, …)`（stash commit 的第一父即 base，故等价于 `git stash show -p`），`StashOutput::Show` 增加加项 `patch: Option<String>`（`skip_serializing_if = "Option::is_none"`，无 `-p` 时 JSON 不含该字段）。与“还未实现的功能”表“✅ 已实现”一致。

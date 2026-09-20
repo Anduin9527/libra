@@ -360,7 +360,18 @@ pub async fn execute_safe(stash_cmd: Stash, output: &OutputConfig) -> CliResult<
     // stack mutation serializes on the stack lock, and pop/branch delete
     // their applied entry via the by-id CAS `do_drop`, so linked worktrees
     // run every subcommand (the former W0 guard is lifted).
-    let result = run_stash(stash_cmd, output).await.map_err(CliError::from)?;
+    let result = match run_stash(stash_cmd, output).await {
+        Ok(result) => result,
+        // ADR-WT-07 (WT-09): the no-initial-commit failure is expressed by the
+        // exit code alone under `--quiet`; `--json` still receives the error
+        // envelope so machine callers are not left blind.
+        Err(StashError::NoInitialCommit) if output.quiet && output.json_format.is_none() => {
+            return Err(
+                CliError::silent_exit(128).with_stable_code(StableErrorCode::RepoStateInvalid)
+            );
+        }
+        Err(error) => return Err(CliError::from(error)),
+    };
     render_stash_output(&result, output)
 }
 
@@ -428,15 +439,19 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
     let included_untracked_paths = collect_included_untracked_paths(&options)?;
 
+    // ADR-WT-07 (WT-09): the initial-commit precheck runs FIRST, matching Git
+    // `builtin/stash.c:1524-1537` — a repository without HEAD fails even when
+    // the tree looks clean or only untracked files are present.
+    let head_commit_hash = Head::current_commit()
+        .await
+        .ok_or(StashError::NoInitialCommit)?;
+
     if !has_changes().await && included_untracked_paths.is_empty() {
         return Ok(StashOutput::Noop {
             message: "No local changes to save".to_string(),
         });
     }
 
-    let head_commit_hash = Head::current_commit()
-        .await
-        .ok_or(StashError::NoInitialCommit)?;
     let head_commit_hash_str = head_commit_hash.to_string();
 
     // lore.md 2.4 / §C.11 W1: `stash push` turns the current index into a tree
@@ -3686,6 +3701,33 @@ mod tests {
         assert_eq!(
             StashError::Other("ignored".to_string()).stable_code(),
             StableErrorCode::InternalInvariant,
+        );
+    }
+
+    /// WT-09 (ADR-WT-07): `stash push` refuses a repository without HEAD
+    /// before it looks at the change set, and it writes nothing.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn push_without_initial_commit_fails_before_change_check() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        std::fs::write(tmp.path().join("untracked.txt"), "u\n").expect("write untracked");
+
+        let err = run_push(StashPushOptions::default())
+            .await
+            .expect_err("no HEAD must fail");
+        assert!(
+            matches!(err, StashError::NoInitialCommit),
+            "precheck must be NoInitialCommit, got {err:?}"
+        );
+        assert!(
+            !tmp.path().join(".libra/refs/stash").exists(),
+            "the failure is zero-write"
+        );
+        assert!(
+            tmp.path().join("untracked.txt").is_file(),
+            "untracked files stay put"
         );
     }
 

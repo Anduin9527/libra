@@ -2060,3 +2060,103 @@ fn test_bare_stash_is_push_matrix() {
         String::from_utf8_lossy(&refused.stderr)
     );
 }
+
+/// WT-09 (M-PRE P1–P5, issues/476): `stash push` checks the initial commit
+/// before the change set, and `-q` silences that failure's human error.
+#[test]
+fn test_stash_push_no_initial_commit_matrix() {
+    // P1: no initial commit + only untracked files -> the HEAD check fails.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    fs::write(root.join("untracked.txt"), "u\n").expect("write");
+    let failed = run_libra_command(&["stash", "push"], root);
+    assert_eq!(
+        failed.status.code(),
+        Some(128),
+        "P1 exit: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("you do not have the initial commit yet"),
+        "P1 wording: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("LBR-REPO-003"),
+        "P1 code: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(
+        !root.join(".libra/refs/stash").exists(),
+        "P1 must not create refs/stash"
+    );
+    assert!(
+        root.join("untracked.txt").is_file(),
+        "P1 must leave the untracked file in place"
+    );
+
+    // P2: no initial commit + a staged change -> the same failure.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    fs::write(root.join("staged.txt"), "s\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "staged.txt"], root), "add");
+    let failed = run_libra_command(&["stash", "push"], root);
+    assert_eq!(failed.status.code(), Some(128), "P2 exit");
+    assert!(
+        !root.join(".libra/refs/stash").exists(),
+        "P2 must not create refs/stash"
+    );
+    assert!(
+        root.join("staged.txt").is_file(),
+        "P2 must leave the staged file in place"
+    );
+
+    // P3/P4: `-q` prints nothing on the failure; a clean tree stays a no-op.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    fs::write(root.join("untracked.txt"), "u\n").expect("write");
+    let quiet = run_libra_command(&["--quiet", "stash", "push"], root);
+    assert_eq!(quiet.status.code(), Some(128), "P3 exit");
+    assert!(quiet.stdout.is_empty(), "P3 stdout must be empty");
+    assert!(quiet.stderr.is_empty(), "P3 stderr must be empty under -q");
+
+    // P5: the structured envelope still carries the failure under `--json`.
+    let json = run_libra_command(&["--json", "stash", "push"], root);
+    assert_eq!(json.status.code(), Some(128), "P5 exit");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stderr).expect("P5 error envelope");
+    assert_eq!(parsed["ok"], serde_json::json!(false), "P5 ok=false");
+    assert_eq!(parsed["error_code"], "LBR-REPO-003", "P5 code");
+    assert!(
+        parsed["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("initial commit"),
+        "P5 message: {parsed}"
+    );
+
+    // Regression: with an initial commit the ordinary paths still work.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    let clean = run_libra_command(&["stash", "push"], root);
+    assert_cli_success(&clean, "clean tree");
+    assert!(
+        String::from_utf8_lossy(&clean.stdout).contains("No local changes to save"),
+        "regression no-op: {}",
+        String::from_utf8_lossy(&clean.stdout)
+    );
+    let quiet_clean = run_libra_command(&["--quiet", "stash", "push"], root);
+    assert_cli_success(&quiet_clean, "P4 quiet no-op");
+    assert!(quiet_clean.stdout.is_empty(), "P4 stdout silent");
+}
