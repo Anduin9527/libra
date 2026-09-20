@@ -3904,3 +3904,93 @@ fn test_status_reports_mode_only_changes_matrix() {
         String::from_utf8_lossy(&short.stdout)
     );
 }
+
+/// WT-02 (M-RENAME M1–M6, issues/476): `status -M[<n>]` is the short form of
+/// `--find-renames[=<n>]`, and the last rename spelling on the command line
+/// wins across `-M`, `--find-renames`, `--renames`, and `--no-renames`.
+#[test]
+fn test_status_short_m_rename_threshold_matrix() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    let original: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    fs::write(root.join("r.txt"), original).expect("write r.txt");
+    assert_cli_success(&run_libra_command(&["add", "r.txt"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    // ~70% similarity: below a 90% threshold, above the 50% default.
+    let renamed: String = (1..=7)
+        .map(|i| format!("line {i}\n"))
+        .chain((1..=3).map(|i| format!("new {i}\n")))
+        .collect();
+    fs::write(root.join("r2.txt"), renamed).expect("write r2.txt");
+    fs::remove_file(root.join("r.txt")).expect("remove r.txt");
+    assert_cli_success(&run_libra_command(&["add", "-A"], root), "add -A");
+
+    let porcelain = |args: &[&str]| {
+        let out = run_libra_command(args, root);
+        assert_cli_success(&out, &format!("{args:?}"));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // M1: a bare `-M` detects at the default threshold.
+    let out = porcelain(&["status", "--porcelain", "-M"]);
+    assert!(out.contains("R  r.txt -> r2.txt"), "M1: {out}");
+
+    // M2: 90% is above the actual similarity, so the pair stays delete + add.
+    for args in [
+        &["status", "--porcelain", "-M90"][..],
+        &["status", "--porcelain", "-M90%"][..],
+    ] {
+        let out = porcelain(args);
+        assert!(
+            out.contains("D  r.txt") && out.contains("A  r2.txt"),
+            "M2 {args:?}: {out}"
+        );
+        assert!(!out.contains("->"), "M2 {args:?} must not detect: {out}");
+    }
+
+    // M3: 50% is below the similarity, so the rename is detected.
+    let out = porcelain(&["status", "--porcelain", "-M50%"]);
+    assert!(out.contains("R  r.txt -> r2.txt"), "M3: {out}");
+
+    // M4: the last spelling wins in argv order.
+    let out = porcelain(&["status", "--porcelain", "-M", "--no-renames"]);
+    assert!(
+        out.contains("D  r.txt") && !out.contains("->"),
+        "M4a (-M --no-renames): {out}"
+    );
+    let out = porcelain(&["status", "--porcelain", "--no-renames", "-M"]);
+    assert!(
+        out.contains("R  r.txt -> r2.txt"),
+        "M4b (--no-renames -M): {out}"
+    );
+
+    // M5: a non-numeric value is a usage error with no stdout.
+    let bad = run_libra_command(&["status", "--porcelain", "-Mabc"], root);
+    assert_eq!(
+        bad.status.code(),
+        Some(129),
+        "M5 exit: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(bad.stdout.is_empty(), "M5 stdout must stay empty");
+    // Registered deviation from the M-RENAME M5 text: `-M101` parses as Git's
+    // `0.101` (10.1%) and is accepted, exactly like `libra diff -M101` and git
+    // 2.55.0 (both re-measured 2026-09-20); the matrix's "129" does not
+    // reproduce on either CLI.
+    let accepted = run_libra_command(&["status", "--porcelain", "-M101"], root);
+    assert_cli_success(&accepted, "M5 -M101");
+    assert!(
+        String::from_utf8_lossy(&accepted.stdout).contains("R  r.txt -> r2.txt"),
+        "M5 -M101 detects at 10.1%"
+    );
+
+    // M6: porcelain v2 emits the rename record with its score.
+    let out = porcelain(&["status", "--porcelain=v2", "-M"]);
+    assert!(out.contains("2 R."), "M6 record: {out}");
+    assert!(out.contains("r2.txt\tr.txt"), "M6 paths: {out}");
+}
