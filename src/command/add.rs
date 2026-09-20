@@ -156,6 +156,13 @@ pub struct AddArgs {
     #[clap(long)]
     pub resolved: bool,
 
+    /// Allow updating entries that exist outside the sparse-checkout definition
+    /// (skip-worktree). Without it such pathspecs are reported and `add` exits
+    /// 1; with it the entry is staged and its skip-worktree bit is preserved.
+    /// Mirrors Git's `add --sparse`.
+    #[clap(long)]
+    pub sparse: bool,
+
     /// Interactively choose hunks to stage (`add -p`).
     #[clap(short = 'p', long = "patch")]
     pub patch: bool,
@@ -363,6 +370,10 @@ pub struct AddOutput {
     /// `error: cannot chmod …` lines and in JSON as `chmod_rejected`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chmod_rejected: Vec<ChmodRejection>,
+    /// Pathspecs that matched only skip-worktree (sparse-checkout) entries.
+    /// Reported as the sparse diagnostic and exit 1; `--sparse` opts out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sparse_paths: Vec<String>,
     /// Whether this was a dry-run (no actual changes made)
     pub dry_run: bool,
 }
@@ -380,6 +391,7 @@ impl AddOutput {
             failed: Vec::new(),
             missing: Vec::new(),
             chmod_rejected: Vec::new(),
+            sparse_paths: Vec::new(),
             dry_run,
         }
     }
@@ -433,6 +445,8 @@ struct ValidatedPathspecs {
     /// candidate (dry-run only). Reported as stderr warnings and the JSON
     /// payload.
     missing: Vec<String>,
+    /// Pathspecs that matched only skip-worktree entries (ADR-SW-04/05).
+    sparse: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -586,6 +600,25 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     }
     if result.wrote_index() {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_ADD).await;
+    }
+
+    // ADR-SW-05: sparse pathspecs exit 1 after rendering; text mode prints the
+    // header, each pathspec, and the hint, while JSON carries `sparse_paths`.
+    if !result.sparse_paths.is_empty() {
+        if !output.is_json() {
+            eprintln!(
+                "The following paths and/or pathspecs matched paths that exist outside of your \
+                 sparse-checkout definition, so will not be updated in the index:"
+            );
+            for path in &result.sparse_paths {
+                eprintln!("    {path}");
+            }
+            eprintln!("hint: use 'libra add --sparse <path>' to update such entries");
+            eprintln!(
+                "hint: or clear the skip-worktree bit with 'libra update-index --no-skip-worktree <path>'"
+            );
+        }
+        return Err(CliError::silent_exit(1));
     }
 
     // ADR-CH-02: a `--chmod` refusal exits 1 after rendering, warning
@@ -1130,6 +1163,7 @@ async fn run_add_patch(
         false,
         true,
         false,
+        args.sparse,
     )?;
     let mut files = visible_changes.modified;
     files.extend(visible_changes.deleted);
@@ -1585,6 +1619,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         args.force,
         args.update,
         args.update && args.ignore_errors,
+        args.sparse,
     )?;
 
     let mut add_output = AddOutput::empty(args.dry_run);
@@ -1598,6 +1633,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     }
     // Pathspecs skipped by `--ignore-missing` are surfaced as stderr warnings.
     add_output.missing = validated.missing.clone();
+    // Sparse pathspecs (skip-worktree only) are reported and exit 1 after
+    // rendering (ADR-SW-05).
+    {
+        let mut sparse = validated.sparse.clone();
+        sparse.sort();
+        sparse.dedup();
+        add_output.sparse_paths = sparse;
+    }
 
     // --- Refresh mode ---
     if args.refresh {
@@ -1649,6 +1692,37 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         for path in collect_unmerged_paths(&index) {
             let candidate = PathBuf::from(&path);
             if validated.pathspecs.matches_path(&candidate) && !files.contains(&candidate) {
+                files.push(candidate);
+            }
+        }
+    }
+    // ADR-SW-04/05: without `--sparse` a skip-worktree path is never staged
+    // or deleted; with `--sparse` a matched skip-worktree entry whose worktree
+    // file still exists and differs from the index is stageable (the index
+    // helper preserves the bit).
+    if !args.sparse {
+        files.retain(|path| {
+            path.to_str()
+                .and_then(|name| index.get(name, 0))
+                .is_none_or(|entry| !entry.flags.skip_worktree)
+        });
+    } else {
+        for entry in index.tracked_entries(0) {
+            if !entry.flags.skip_worktree {
+                continue;
+            }
+            let candidate = PathBuf::from(&entry.name);
+            if !validated.pathspecs.matches_path(&candidate) || files.contains(&candidate) {
+                continue;
+            }
+            let absolute = workdir.join(&candidate);
+            if absolute.symlink_metadata().is_err() {
+                continue;
+            }
+            let changed = index.is_modified(&entry.name, 0, &workdir)
+                || crate::command::calc_file_blob_hash(&absolute)
+                    .is_ok_and(|hash| !index.verify_hash(&entry.name, 0, &hash));
+            if changed {
                 files.push(candidate);
             }
         }
@@ -2033,7 +2107,7 @@ fn renormalize_entry(
 ///   some paths were ignored — those become warnings instead.
 /// - Stable code is [`StableErrorCode::AddNothingStaged`].
 fn check_ignored_only_error(output: AddOutput) -> CliResult<AddOutput> {
-    if !output.ignored.is_empty() && output.is_empty() {
+    if !output.ignored.is_empty() && output.is_empty() && output.sparse_paths.is_empty() {
         let mut message =
             String::from("the following paths are ignored by configured ignore rules:");
         for path in &output.ignored {
@@ -2265,6 +2339,7 @@ fn validate_pathspecs(
     force: bool,
     update_known_only: bool,
     ignore_unknown_pathspecs: bool,
+    sparse: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
     let pathspecs = PathspecSet::from_workdir_with_default_icase(
         raw_pathspecs,
@@ -2274,7 +2349,27 @@ fn validate_pathspecs(
     )
     .map_err(|source| AddError::Pathspec { source })?;
 
-    let index_known = index_paths_any_stage(index);
+    // ADR-SW-04/05 (SW-06): skip-worktree entries are sparse-checkout paths.
+    // Without `--sparse` they are not ordinary add candidates, and a pathspec
+    // matching only such entries becomes a sparse pathspec. With `--sparse` a
+    // skip-worktree entry is stageable while its worktree file exists; a
+    // deleted one falls through to the ordinary "did not match any files"
+    // error.
+    let skip_worktree_paths: std::collections::HashSet<PathBuf> = index
+        .tracked_entries(0)
+        .into_iter()
+        .filter(|entry| entry.flags.skip_worktree)
+        .map(|entry| PathBuf::from(&entry.name))
+        .collect();
+    let mut index_known = index_paths_any_stage(index);
+    if !sparse {
+        index_known.retain(|path| !skip_worktree_paths.contains(path));
+    } else {
+        index_known.retain(|path| {
+            !skip_worktree_paths.contains(path)
+                || pathspec_ctx.workdir.join(path).symlink_metadata().is_ok()
+        });
+    }
     let change_candidates = collect_change_candidates(visible_changes);
     let ignored_candidates = collect_change_candidates(ignored_changes);
     let selectable_candidates = if update_known_only {
@@ -2287,11 +2382,28 @@ fn validate_pathspecs(
 
     let mut ignored = Vec::new();
     let mut missing = Vec::new();
+    // A pathspec that matches a skip-worktree entry but nothing else is a
+    // sparse pathspec (matrix D1–D3, D6–D9). It is reported separately and
+    // never classified as ignored/missing.
+    let mut sparse_pathspecs = Vec::new();
+    if !sparse && !skip_worktree_paths.is_empty() {
+        let skip_candidates: Vec<PathBuf> = skip_worktree_paths.iter().cloned().collect();
+        let unmatched_without_skip = pathspecs.unmatched_positive_specs(&all_candidates);
+        let unmatched_with_skip = pathspecs.unmatched_positive_specs(&skip_candidates);
+        for raw in unmatched_without_skip {
+            if !unmatched_with_skip.contains(&raw) {
+                sparse_pathspecs.push(raw.to_string());
+            }
+        }
+    }
 
     let unmatched_selectable = pathspecs.unmatched_positive_specs(&selectable_candidates);
     if !unmatched_selectable.is_empty() {
         let unmatched_all = pathspecs.unmatched_positive_specs(&all_candidates);
         for raw in unmatched_selectable {
+            if sparse_pathspecs.iter().any(|spec| spec == raw) {
+                continue;
+            }
             if !unmatched_all.contains(&raw) {
                 ignored.push(raw.to_string());
                 continue;
@@ -2343,6 +2455,7 @@ fn validate_pathspecs(
         pathspecs,
         ignored,
         missing,
+        sparse: sparse_pathspecs,
     })
 }
 
@@ -2912,6 +3025,7 @@ mod test {
                 force,
                 false,
                 false,
+                false,
             )
             .expect("validate_pathspecs")
         };
@@ -2938,6 +3052,7 @@ mod test {
             &changes,
             &changes,
             &index,
+            false,
             false,
             false,
             false,

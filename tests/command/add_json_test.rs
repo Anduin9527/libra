@@ -14,7 +14,10 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{assert_cli_success, configure_identity_via_cli, init_repo_via_cli, run_libra_command};
+use super::{
+    assert_cli_success, configure_identity_via_cli, init_repo_via_cli, mark_skip_worktree,
+    run_libra_command,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -730,5 +733,40 @@ fn json_add_chmod_rejected_field_and_exit() {
     assert!(
         !stderr.contains("cannot chmod"),
         "JSON mode must not print human error lines: {stderr}"
+    );
+}
+
+/// SW-06 (M-ADVICE D9, plan-20260918): the JSON envelope carries
+/// `sparse_paths` for a skip-worktree pathspec and exits 1 with no human
+/// stderr diagnostic.
+#[test]
+fn json_add_sparse_paths_field() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("s"), "s\n").expect("write s");
+    assert_cli_success(&run_libra_command(&["add", "s"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree(root, "s");
+    fs::remove_file(root.join("s")).expect("remove s");
+
+    let output = run_libra_command(
+        &["--json", "add", "--dry-run", "--ignore-missing", "s"],
+        root,
+    );
+    assert_eq!(output.status.code(), Some(1), "exit 1");
+    let parsed = parse_json_stdout(&output);
+    assert_eq!(
+        parsed["data"]["sparse_paths"],
+        serde_json::json!(["s"]),
+        "sparse_paths: {parsed}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).trim().is_empty(),
+        "JSON mode must not print the human diagnostic"
     );
 }

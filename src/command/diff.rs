@@ -3411,14 +3411,16 @@ fn get_worktree_diff_files(index: &Index) -> Result<Vec<PathBuf>, DiffError> {
 fn get_index_side(
     index: &Index,
     policy: IgnorePolicy,
+    exclude_skip_worktree: bool,
 ) -> (Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>) {
     let entries = index
         .tracked_entries(0)
         .into_iter()
         // ADR-SW-04 item 1: a skip-worktree path is intentionally absent or
         // stale in the worktree and must not appear on the index side of a
-        // working-directory diff.
-        .filter(|entry| !entry.flags.skip_worktree)
+        // WORKING-DIRECTORY diff. A staged diff (`--cached`) still shows the
+        // index content, so the caller opts in explicitly.
+        .filter(|entry| !exclude_skip_worktree || !entry.flags.skip_worktree)
         .filter(|entry| !ignore::should_ignore(&PathBuf::from(&entry.name), policy, index));
     let mut blobs = Vec::new();
     let mut modes = HashMap::new();
@@ -3481,7 +3483,7 @@ async fn resolve_diff_side(
 
     if is_new {
         if staged {
-            let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
+            let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect, false);
             Ok(DiffSide {
                 label: "index".to_string(),
                 blobs,
@@ -3513,7 +3515,7 @@ async fn resolve_diff_side(
             }),
         }
     } else {
-        let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
+        let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect, true);
         Ok(DiffSide {
             label: "index".to_string(),
             blobs,

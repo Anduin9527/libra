@@ -236,6 +236,25 @@ libra add --resolved
 libra add --resolved path/to/file
 ```
 
+### `--sparse`
+
+Allow updating entries that exist outside the sparse-checkout definition
+(skip-worktree entries). Without it, a pathspec that matches only such an
+entry is reported on stderr — a header naming the sparse-checkout definition,
+each pathspec, and a hint — and `add` exits 1 without touching the index
+(`--dry-run`, `--ignore-missing`, `--renormalize`, and `--chmod` included).
+JSON carries `data.sparse_paths: [string]` and no human diagnostic.
+
+With `--sparse` the entry is stageable: a modified working-tree file is staged
+and the skip-worktree bit is preserved; a deleted working-tree file keeps the
+ordinary `pathspec '…' did not match any files` error. A pathspec that also
+matches a non-sparse entry gets no sparse diagnostic.
+
+```bash
+libra add --sparse path/to/sparse-file
+libra --json add --dry-run --ignore-missing path/to/sparse-file
+```
+
 ### `-p, --patch`
 
 Interactively stage hunks. For each hunk Libra prints the unified diff and

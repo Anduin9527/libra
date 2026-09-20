@@ -37,6 +37,7 @@ async fn test_add_single_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -78,6 +79,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
 
     let error = add::execute_safe(
         AddArgs {
+            sparse: false,
             pathspec: vec!["marker-failure.txt".to_string()],
             all: false,
             update: false,
@@ -122,6 +124,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
         .expect("remove injected marker-directory conflict");
     add::execute_safe(
         AddArgs {
+            sparse: false,
             pathspec: vec!["marker-failure.txt".to_string()],
             all: false,
             update: false,
@@ -183,6 +186,7 @@ async fn test_add_dispatches_vcs_automation_history() {
 
     add::execute_safe(
         AddArgs {
+            sparse: false,
             pathspec: vec!["automated.txt".to_string()],
             all: false,
             update: false,
@@ -234,6 +238,7 @@ async fn test_add_dry_run_does_not_dispatch_vcs_automation_history() {
 
     add::execute_safe(
         AddArgs {
+            sparse: false,
             pathspec: vec!["dry-run.txt".to_string()],
             all: false,
             update: false,
@@ -282,6 +287,7 @@ async fn test_add_multiple_files() {
 
     // Execute add command
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![
             String::from("test_file_1.txt"),
             String::from("test_file_2.txt"),
@@ -348,6 +354,7 @@ async fn test_add_all_flag() {
 
     // Execute add command with --all flag
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![],
         all: true,
         update: false,
@@ -414,6 +421,7 @@ async fn test_add_update_flag() {
 
     // Add only one file to the index
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(tracked_file)],
         all: false,
         update: false,
@@ -451,6 +459,7 @@ async fn test_add_update_flag() {
 
     // Execute add command with --update flag
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: true,
@@ -526,6 +535,7 @@ async fn test_add_with_ignore_patterns() {
 
     // Execute add command with all files
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: true,
         update: false,
@@ -616,6 +626,7 @@ async fn test_add_force_tracks_ignored_file() {
     );
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
         update: false,
@@ -646,6 +657,7 @@ async fn test_add_force_tracks_ignored_file() {
 
     // Force add should stage the ignored file
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
         update: false,
@@ -686,6 +698,7 @@ async fn test_add_force_tracks_ignored_file() {
     );
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
         update: false,
@@ -740,6 +753,7 @@ async fn test_add_force_dot_includes_ignored_directory() {
 
     // Baseline: without --force the ignored directory stays hidden
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![".".into()],
         all: false,
         update: false,
@@ -778,6 +792,7 @@ async fn test_add_force_dot_includes_ignored_directory() {
 
     // Re-run with --force to include ignored entries
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![".".into()],
         all: false,
         update: false,
@@ -826,6 +841,7 @@ async fn test_add_dry_run() {
 
     // Execute add command with dry-run
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -878,6 +894,7 @@ async fn test_add_without_path_should_error() {
 
     // Try running `add` without any pathspec and without --all
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![], // Empty pathspec
         all: false,       // Not using --all
         update: false,
@@ -920,6 +937,7 @@ async fn test_add_nonexistent_file_should_error() {
 
     // Try to add non-existent file
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(fake_path)],
         all: false,
         update: false,
@@ -966,6 +984,7 @@ async fn test_add_duplicate_file_should_not_duplicate_index() {
     // Add same file twice
     for i in 0..2 {
         add::execute(AddArgs {
+            sparse: false,
             pathspec: vec![String::from(file_path)],
             all: false,
             update: false,
@@ -1017,6 +1036,7 @@ async fn test_add_empty_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -1063,6 +1083,7 @@ async fn test_add_sub_directory_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -1111,6 +1132,7 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
     fs::write("paths.txt", "file1.txt\n").unwrap();
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![],
         all: false,
         update: false,
@@ -1155,6 +1177,7 @@ async fn test_add_pathspec_from_file_nul_stages_listed_paths() {
     fs::write("paths.bin", b"keep.txt\0").unwrap();
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![],
         all: false,
         update: false,
@@ -2791,6 +2814,7 @@ async fn test_add_ignored_dispatch_before_exit_one() {
 
     let error = add::execute_safe(
         AddArgs {
+            sparse: false,
             pathspec: vec!["other.txt".to_string(), "top.log".to_string()],
             all: false,
             update: false,
@@ -3781,5 +3805,192 @@ fn test_add_pathspec_from_file_rejects_interactive() {
     assert!(
         String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
         "rejected combinations must write nothing"
+    );
+}
+
+/// Set `skip_worktree` on a tracked path through the git-internal index API.
+fn mark_skip_worktree_for_add(repo: &std::path::Path, path: &str) {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+    let index_path = repo.join(".libra/index");
+    let mut index =
+        Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load index for marking");
+    let (hash, mode, size) = {
+        let entry = index.get(path, 0).expect("tracked path");
+        (entry.hash, entry.mode, entry.size)
+    };
+    let mut entry = IndexEntry::new_from_blob(path.to_string(), hash, size);
+    entry.mode = mode;
+    entry.flags.skip_worktree = true;
+    index.update(entry);
+    index
+        .save_with_hash_kind(HashKind::Sha1, &index_path)
+        .expect("save index");
+}
+
+fn skip_worktree_set_for_add(repo: &std::path::Path, path: &str) -> bool {
+    use git_internal::{hash::HashKind, internal::index::Index};
+    Index::load_with_hash_kind(HashKind::Sha1, repo.join(".libra/index"))
+        .expect("load index")
+        .get(path, 0)
+        .is_some_and(|entry| entry.flags.skip_worktree)
+}
+
+/// SW-06 (M-ADVICE D1–D5, D8–D9, plan-20260918): sparse pathspec diagnostics
+/// and the `--sparse` opt-in for a skip-worktree entry.
+#[test]
+fn test_add_sparse_path_advice_matrix() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("other"), "other\n").expect("write other");
+    fs::write(root.join("s"), "s\n").expect("write s");
+    assert_cli_success(&run_libra_command(&["add", "other", "s"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree_for_add(root, "s");
+    assert!(
+        skip_worktree_set_for_add(root, "s"),
+        "precondition: the skip-worktree bit must be set"
+    );
+
+    // D1: deleted skip-worktree file, --dry-run --ignore-missing.
+    fs::remove_file(root.join("s")).expect("remove s");
+    let d1 = run_libra_command(&["add", "--dry-run", "--ignore-missing", "s"], root);
+    assert_eq!(d1.status.code(), Some(1), "D1 exit 1: {d1:?}");
+    let stderr = String::from_utf8_lossy(&d1.stderr);
+    assert!(
+        stderr.contains("outside of your sparse-checkout definition") && stderr.contains('s'),
+        "D1 sparse diagnostic: {stderr}"
+    );
+    assert!(stderr.contains("hint:"), "D1 hint: {stderr}");
+    let staged = run_libra_command(&["diff", "--staged", "--", "s"], root);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "D1 index unchanged: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+
+    // D2: `add s` and `add --dry-run s` behave the same.
+    for args in [vec!["add", "s"], vec!["add", "--dry-run", "s"]] {
+        let out = run_libra_command(&args, root);
+        assert_eq!(out.status.code(), Some(1), "D2 {:?} exit 1", args);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("sparse-checkout"),
+            "D2 {:?} diagnostic",
+            args
+        );
+    }
+
+    // D3: modified skip-worktree file is not staged by a plain add.
+    fs::write(root.join("s"), "modified\n").expect("modify s");
+    let d3 = run_libra_command(&["add", "s"], root);
+    assert_eq!(d3.status.code(), Some(1), "D3 exit 1");
+    let staged = run_libra_command(&["diff", "--staged", "--", "s"], root);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "D3 must not stage the new content"
+    );
+
+    // D4: --sparse stages the new content and keeps the bit.
+    let d4 = run_libra_command(&["add", "--sparse", "s"], root);
+    assert_cli_success(&d4, "D4 add --sparse");
+    assert!(
+        skip_worktree_set_for_add(root, "s"),
+        "D4 the skip-worktree bit must survive"
+    );
+    let staged = run_libra_command(&["diff", "--staged", "--", "s"], root);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).contains("modified"),
+        "D4 must stage the new content: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+
+    // D5: --sparse with a deleted file reports the ordinary not-matched error.
+    fs::remove_file(root.join("s")).expect("remove s again");
+    let d5 = run_libra_command(&["add", "--sparse", "--dry-run", "s"], root);
+    assert_ne!(d5.status.code(), Some(0), "D5 must fail");
+    assert!(
+        String::from_utf8_lossy(&d5.stderr).contains("did not match any files"),
+        "D5 not-matched error: {}",
+        String::from_utf8_lossy(&d5.stderr)
+    );
+
+    // D8: --renormalize/--chmod on a skip-worktree path report sparse.
+    fs::write(root.join("s"), "renormalize-me\n").expect("rewrite s");
+    for args in [
+        vec!["add", "--renormalize", "s"],
+        vec!["add", "--chmod=+x", "s"],
+    ] {
+        let out = run_libra_command(&args, root);
+        assert_eq!(out.status.code(), Some(1), "D8 {:?} exit 1", args);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("sparse-checkout"),
+            "D8 {:?} diagnostic",
+            args
+        );
+    }
+
+    // D9: JSON carries `sparse_paths` and stays human-silent on stderr.
+    fs::remove_file(root.join("s")).ok();
+    let d9 = run_libra_command(
+        &["--json", "add", "--dry-run", "--ignore-missing", "s"],
+        root,
+    );
+    assert_eq!(d9.status.code(), Some(1), "D9 exit 1");
+    let parsed = parse_json_stdout(&d9);
+    assert_eq!(
+        parsed["data"]["sparse_paths"],
+        serde_json::json!(["s"]),
+        "D9 sparse_paths: {parsed}"
+    );
+    assert!(
+        String::from_utf8_lossy(&d9.stderr).trim().is_empty(),
+        "D9 JSON must not print the human diagnostic: {}",
+        String::from_utf8_lossy(&d9.stderr)
+    );
+}
+
+/// SW-06 (M-ADVICE D6/D7): a pathspec matching both a sparse and a dense entry
+/// gets no sparse diagnostic, and unrelated unmatched pathspecs keep their
+/// ordinary error.
+#[test]
+fn test_add_dense_and_sparse_pathspec_no_advice() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("s_entry"), "s\n").expect("write s_entry");
+    assert_cli_success(&run_libra_command(&["add", "s_entry"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree_for_add(root, "s_entry");
+    fs::write(root.join("dense_entry"), "dense\n").expect("write dense_entry");
+
+    let d6 = run_libra_command(&["add", "*_entry"], root);
+    assert_cli_success(&d6, "D6 add *_entry");
+    assert!(
+        !String::from_utf8_lossy(&d6.stderr).contains("sparse-checkout"),
+        "D6 must not emit the sparse diagnostic"
+    );
+    let staged = run_libra_command(&["diff", "--staged", "--name-only"], root);
+    let staged_text = String::from_utf8_lossy(&staged.stdout).to_string();
+    assert!(
+        staged_text.contains("dense_entry") && !staged_text.contains("s_entry"),
+        "D6 stages only the dense entry: {staged_text}"
+    );
+
+    let d7 = run_libra_command(&["add", "nonexistent"], root);
+    assert_ne!(d7.status.code(), Some(0), "D7 must fail");
+    assert!(
+        !String::from_utf8_lossy(&d7.stderr).contains("sparse-checkout"),
+        "D7 must not emit the sparse diagnostic"
     );
 }

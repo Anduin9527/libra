@@ -174,6 +174,17 @@ libra add --resolved
 libra add --resolved path/to/file
 ```
 
+### `--sparse`
+
+允许更新稀疏检出定义之外的条目（skip-worktree 条目）。未指定时，只命中这类条目的 pathspec 会在 stderr 报告稀疏诊断（头部 + 各 pathspec + hint）并以退出码 1 结束，索引不变（`--dry-run`、`--ignore-missing`、`--renormalize`、`--chmod` 同理）；JSON 输出 `data.sparse_paths: [string]` 且不打印人读诊断。
+
+指定 `--sparse` 后该条目可被暂存：工作树文件被修改时暂存新内容并保留 skip-worktree 位；工作树文件缺失时保持常规 `pathspec '…' did not match any files` 错误；同时命中非稀疏条目的 pathspec 不产生稀疏诊断。
+
+```bash
+libra add --sparse path/to/sparse-file
+libra --json add --dry-run --ignore-missing path/to/sparse-file
+```
+
 ### `-p, --patch`
 
 交互式逐个选择 hunk 暂存。每个 hunk 打印 unified diff，并提示
