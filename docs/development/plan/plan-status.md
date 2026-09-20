@@ -22,8 +22,9 @@
 |---|---|---|---|
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 已排期 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 `pending` |
-| [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭 |
-| [`plan-20260917.md`](plan-20260917.md)（含 `plan-20260917-sp00-spawn.md`） | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete` |
+| [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
+| [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；15 卡尚未执行 |
+| [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS，尚未开工 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 未启动 | FL-00..FL-07 全部 `pending`；前置 plan-20260907 未收口 |
 | [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | 未启动 | MB-06/09/12 已取消（`done`）；MB-01..05 `pending`；MB-07/08/10/11 `blocked` |
@@ -89,6 +90,7 @@
 | [`plan-20260913.md`](plan-20260913.md) | FL-00..FL-07 | **前置 plan-20260907 完整收口**（DEP-FL-04） |
 | [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；开工时按 ER-CAP-02 pin 重核 |
 | [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02→03→04 串行；写集与 plan-20260918 串行（DEP-GCX-02） |
+| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 剩余 DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted |
 | `issues/` 设计计划 | 见「计划一览」issues 表 | 各计划 Codex review `PASS` 前不得开工；`issues/476`/`479`/`483`/`490` 与 `plan-20260918` 写集串行（DEP-WT-09 / DEP-PL-04 / DEP-AD-06 / DEP-AD-07） |
 
 ---
