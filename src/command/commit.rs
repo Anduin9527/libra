@@ -3021,12 +3021,12 @@ fn auto_stage_tracked_changes(
                 }
             })?;
         }
-        index.update(
+        let entry =
             crate::command::verified_index_entry(&file, blob.id, &workdir, pre_read.as_ref())
                 .map_err(|e| {
                     CommitError::AutoStage(format!("failed to create index entry: {}", e))
-                })?,
-        );
+                })?;
+        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
         if let Some(path) = file.to_str() {
             for stage in 1..=3 {
                 index.remove(path, stage);

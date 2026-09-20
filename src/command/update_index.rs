@@ -126,7 +126,7 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
     // `--cacheinfo <mode>,<object>,<path>`: register entries directly.
     for spec in &args.cacheinfo {
         let entry = parse_cacheinfo(spec).map_err(usage)?;
-        index.update(entry);
+        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
         updated += 1;
     }
 
@@ -182,7 +182,7 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
 
         let absolute = resolve_within_worktree(path_str, &workdir).map_err(usage)?;
         let entry = stage_working_tree_path(path_str, &absolute, &workdir)?;
-        index.update(entry);
+        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
         updated += 1;
     }
 
