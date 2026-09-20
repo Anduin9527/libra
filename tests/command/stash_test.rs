@@ -2024,6 +2024,12 @@ fn test_bare_stash_is_push_matrix() {
         &run_libra_command(&["stash", "-m", "bare-msg"], &root),
         "B2 stash -m",
     );
+    let listed = run_libra_command(&["stash", "list"], &root);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("On main: bare-msg"),
+        "B2/WT-10 message: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
     let (_repo, root) = committed_repo();
     fs::write(root.join("untracked.txt"), "u\n").expect("write untracked");
     assert_cli_success(&run_libra_command(&["stash", "-u"], &root), "B3 stash -u");
@@ -2159,4 +2165,265 @@ fn test_stash_push_no_initial_commit_matrix() {
     let quiet_clean = run_libra_command(&["--quiet", "stash", "push"], root);
     assert_cli_success(&quiet_clean, "P4 quiet no-op");
     assert!(quiet_clean.stdout.is_empty(), "P4 stdout silent");
+}
+
+/// WT-10 (M-MSG S1–S6, issues/476): stash messages skip `gpgsig`, prefix `-m`,
+/// use `(no branch)` when detached, and keep reading unprefixed legacy entries.
+#[test]
+fn test_stash_message_format_matrix() {
+    fn head_abbrev7(root: &Path) -> String {
+        let out = run_libra_command(&["rev-parse", "HEAD"], root);
+        assert_cli_success(&out, "rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .chars()
+            .take(7)
+            .collect()
+    }
+
+    fn stash_list(root: &Path) -> String {
+        let out = run_libra_command(&["stash", "list"], root);
+        assert_cli_success(&out, "stash list");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn assert_no_signature_leak(text: &str, label: &str) {
+        assert!(
+            !text.contains("gpgsig") && !text.contains("BEGIN PGP SIGNATURE"),
+            "{label} leaked a signature header: {text}"
+        );
+    }
+
+    fn rewrite_stash_log_message(root: &Path, new_message: &str) {
+        let log_path = root.join(".libra/logs/refs/stash");
+        let log = fs::read_to_string(&log_path).expect("stash log");
+        let rewritten = log
+            .lines()
+            .map(|line| {
+                if let Some((meta, rest)) = line.split_once('\t') {
+                    if let Some((_, generation)) = rest.rsplit_once('\t')
+                        && generation.starts_with("gen=")
+                    {
+                        return format!("{meta}\t{new_message}\t{generation}");
+                    }
+                    format!("{meta}\t{new_message}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut body = rewritten;
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        fs::write(&log_path, body).expect("rewrite stash log");
+    }
+
+    // S1: vault-signed HEAD — subject is `init`, never the gpgsig header.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], root),
+        "S1 init",
+    );
+    configure_identity_via_cli(root);
+    assert_cli_success(
+        &run_libra_command(&["config", "generate-gpg-key"], root),
+        "S1 generate-gpg-key",
+    );
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "S1 add");
+    let signed = run_libra_command(&["--json", "commit", "-m", "init", "--no-verify"], root);
+    assert_cli_success(&signed, "S1 signed commit");
+    assert_eq!(
+        parse_json_stdout(&signed)["data"]["signed"].as_bool(),
+        Some(true),
+        "S1 HEAD must be signed"
+    );
+    let abbrev = head_abbrev7(root);
+    fs::write(root.join("a.txt"), "two\n").expect("modify");
+    let push = run_libra_command(&["stash", "push"], root);
+    assert_cli_success(&push, "S1 stash push");
+    let expected = format!("WIP on main: {abbrev} init");
+    let saved = format!("Saved working directory and index state {expected}");
+    let stdout = String::from_utf8_lossy(&push.stdout);
+    assert!(stdout.contains(&saved), "S1 push stdout: {stdout}");
+    assert_no_signature_leak(&stdout, "S1 push");
+    let listed = stash_list(root);
+    assert!(listed.contains(&expected), "S1 list: {listed}");
+    assert_no_signature_leak(&listed, "S1 list");
+
+    // S2: unsigned HEAD still uses the first subject line.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "S2 add");
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "init", "--no-verify", "--no-gpg-sign"],
+            root,
+        ),
+        "S2 unsigned commit",
+    );
+    let cat = run_libra_command(&["cat-file", "-p", "HEAD"], root);
+    assert!(
+        !String::from_utf8_lossy(&cat.stdout).contains("gpgsig"),
+        "S2 commit must be unsigned"
+    );
+    let abbrev = head_abbrev7(root);
+    fs::write(root.join("a.txt"), "two\n").expect("modify");
+    let push = run_libra_command(&["stash", "push"], root);
+    assert_cli_success(&push, "S2 stash push");
+    let expected = format!("WIP on main: {abbrev} init");
+    let stdout = String::from_utf8_lossy(&push.stdout);
+    assert!(stdout.contains(&expected), "S2 push stdout: {stdout}");
+    assert!(!expected.ends_with(' '), "S2 subject must be non-empty");
+
+    // S3: `-m` (ordinary and pathspec push) becomes `On <branch>: <msg>`.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "S3 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "S3 commit",
+    );
+    fs::write(root.join("a.txt"), "two\n").expect("modify");
+    let push = run_libra_command(&["stash", "push", "-m", "named"], root);
+    assert_cli_success(&push, "S3 -m");
+    let listed = stash_list(root);
+    assert!(listed.contains("On main: named"), "S3 list: {listed}");
+    fs::write(root.join("a.txt"), "three\n").expect("modify");
+    let pathspec = run_libra_command(&["stash", "push", "-m", "path-msg", "--", "a.txt"], root);
+    assert_cli_success(&pathspec, "S3 pathspec -m");
+    let listed = stash_list(root);
+    assert!(
+        listed.contains("On main: path-msg"),
+        "S3 pathspec list: {listed}"
+    );
+
+    // S4: detached HEAD uses Git's `(no branch)` label.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "S4 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "S4 commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--detach"], root),
+        "S4 detach",
+    );
+    let abbrev = head_abbrev7(root);
+    fs::write(root.join("a.txt"), "two\n").expect("modify");
+    let push = run_libra_command(&["stash", "push"], root);
+    assert_cli_success(&push, "S4 default");
+    let expected = format!("WIP on (no branch): {abbrev} init");
+    let listed = stash_list(root);
+    assert!(listed.contains(&expected), "S4 list: {listed}");
+    fs::write(root.join("a.txt"), "three\n").expect("modify");
+    let named = run_libra_command(&["stash", "push", "-m", "x"], root);
+    assert_cli_success(&named, "S4 -m");
+    let listed = stash_list(root);
+    assert!(
+        listed.contains("On (no branch): x"),
+        "S4 named list: {listed}"
+    );
+
+    // S5: a legacy unprefixed reflog message still lists / shows / applies.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("a.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], root), "S5 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "S5 commit",
+    );
+    fs::write(root.join("a.txt"), "legacy\n").expect("modify");
+    assert_cli_success(&run_libra_command(&["stash", "push"], root), "S5 push");
+    rewrite_stash_log_message(root, "legacy unprefixed message");
+    let listed = stash_list(root);
+    assert!(
+        listed.contains("legacy unprefixed message"),
+        "S5 list: {listed}"
+    );
+    assert_cli_success(&run_libra_command(&["stash", "show"], root), "S5 show");
+    assert_cli_success(&run_libra_command(&["stash", "apply"], root), "S5 apply");
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).expect("read"),
+        "legacy\n"
+    );
+    assert_cli_success(&run_libra_command(&["stash", "drop"], root), "S5 drop");
+
+    // S6: rebase/merge autostash uses the same helper (`On <branch>: autostash`).
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("shared.txt"), "ORIG\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], root), "S6 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], root),
+        "S6 base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], root),
+        "S6 branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], root),
+        "S6 checkout feature",
+    );
+    fs::write(root.join("shared.txt"), "FEATURE\n").expect("write");
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], root),
+        "S6 feature add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature", "--no-verify"], root),
+        "S6 feature commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "S6 checkout main",
+    );
+    fs::write(root.join("shared.txt"), "MAIN\n").expect("write");
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], root),
+        "S6 main add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main", "--no-verify"], root),
+        "S6 main commit",
+    );
+    fs::write(root.join("extra.txt"), "precious\n").expect("write extra");
+    assert_cli_success(
+        &run_libra_command(&["add", "extra.txt"], root),
+        "S6 dirty add",
+    );
+    let merge = run_libra_command(&["merge", "feature", "--autostash"], root);
+    assert_eq!(merge.status.code(), Some(128), "S6 conflict");
+    let sidecar: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join(".libra/merge-autostash.json")).expect("sidecar"),
+    )
+    .expect("sidecar json");
+    let oid = sidecar["stash_commit"].as_str().expect("held stash oid");
+    let held = run_libra_command(&["cat-file", "-p", oid], root);
+    assert_cli_success(&held, "S6 cat-file held stash");
+    let held_text = String::from_utf8_lossy(&held.stdout);
+    assert!(
+        held_text.contains("On main: autostash"),
+        "S6 held message: {held_text}"
+    );
+    assert_no_signature_leak(&held_text, "S6 held");
 }

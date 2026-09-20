@@ -39,6 +39,7 @@ use crate::{
         },
         status,
     },
+    common_utils::parse_commit_msg,
     internal::{
         branch::{Branch as InternalBranch, BranchStoreError},
         head::Head,
@@ -425,6 +426,46 @@ struct StashPushOptions {
     pathspec: Vec<String>,
 }
 
+/// Subject of a commit message for stash default text (ADR-WT-08 / WT-10).
+/// Uses [`parse_commit_msg`] so a vault `gpgsig` header is never the subject,
+/// then skips leading blank lines.
+fn stash_commit_subject(message: &str) -> String {
+    parse_commit_msg(message)
+        .0
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn stash_abbrev7(hash: &ObjectHash) -> String {
+    let rendered = hash.to_string();
+    rendered.get(..7).unwrap_or(rendered.as_str()).to_string()
+}
+
+async fn stash_branch_label() -> String {
+    match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "(no branch)".to_string(),
+    }
+}
+
+/// Shared stash-push message (ordinary push, pathspec push, autostash).
+/// `-m` / a supplied name becomes `On <branch>: <msg>`; the default is
+/// `WIP on <branch>: <abbrev7> <subject>`.
+fn format_stash_push_message(
+    branch: &str,
+    abbrev7: &str,
+    subject: &str,
+    custom: Option<&str>,
+) -> String {
+    match custom {
+        Some(message) => format!("On {branch}: {message}"),
+        None => format!("WIP on {branch}: {abbrev7} {subject}"),
+    }
+}
+
 async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> {
     // `stash push -- <pathspec>` stashes only the changes to the named paths and
     // leaves the rest of the working tree intact — a distinct, self-contained
@@ -452,8 +493,6 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         });
     }
 
-    let head_commit_hash_str = head_commit_hash.to_string();
-
     // lore.md 2.4 / §C.11 W1: `stash push` turns the current index into a tree
     // and publishes it through `refs/stash` — reachable history, so the same
     // guard as `commit` and `write-tree`.
@@ -469,29 +508,17 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         .map_err(|error| StashError::WriteObject(error.to_string()))?;
 
     let (author, committer) = util::create_signatures().await;
-    let (current_branch_name, head_commit_summary) = match Head::current().await {
-        Head::Branch(name) => {
-            let c: Commit = load_object(&head_commit_hash)
-                .map_err(|e| StashError::ReadObject(e.to_string()))?;
-            let summary = c.message.lines().next().unwrap_or("").to_string();
-            (name, summary)
-        }
-        Head::Detached(_) => {
-            let c: Commit = load_object(&head_commit_hash)
-                .map_err(|e| StashError::ReadObject(e.to_string()))?;
-            let summary = c.message.lines().next().unwrap_or("").to_string();
-            ("(no branch)".to_string(), summary)
-        }
-    };
-
-    let head_commit_short = head_commit_hash_str
-        .get(..7)
-        .unwrap_or(head_commit_hash_str.as_str());
-    let wip_message = format!(
-        "WIP on {}: {} {}",
-        current_branch_name, head_commit_short, head_commit_summary
+    let head_commit: Commit =
+        load_object(&head_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let current_branch_name = stash_branch_label().await;
+    let head_commit_summary = stash_commit_subject(&head_commit.message);
+    let head_commit_short = stash_abbrev7(&head_commit_hash);
+    let final_message = format_stash_push_message(
+        &current_branch_name,
+        &head_commit_short,
+        &head_commit_summary,
+        options.message.as_deref(),
     );
-    let final_message = options.message.unwrap_or(wip_message);
 
     let index_commit = Commit::new(
         author.clone(),
@@ -518,11 +545,9 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     let untracked_parent = if included_untracked_paths.is_empty() {
         None
     } else {
-        let short_head = head_commit_hash_str
-            .get(..7)
-            .unwrap_or(head_commit_hash_str.as_str());
-        let untracked_message =
-            format!("untracked files on {current_branch_name}: {short_head} {head_commit_summary}");
+        let untracked_message = format!(
+            "untracked files on {current_branch_name}: {head_commit_short} {head_commit_summary}"
+        );
         Some(create_untracked_parent_commit(
             workdir,
             &git_dir,
@@ -600,6 +625,14 @@ pub(crate) async fn create_held_stash_commit(
     let head_commit_hash = Head::current_commit()
         .await
         .ok_or(StashError::NoInitialCommit)?;
+    let head_commit: Commit =
+        load_object(&head_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let message = format_stash_push_message(
+        &stash_branch_label().await,
+        &stash_abbrev7(&head_commit_hash),
+        &stash_commit_subject(&head_commit.message),
+        Some(message),
+    );
     let index_tree =
         tree::create_tree_from_index(&index).map_err(|e| StashError::WriteObject(e.to_string()))?;
     let index_tree_data = index_tree
@@ -614,7 +647,7 @@ pub(crate) async fn create_held_stash_commit(
         committer.clone(),
         index_tree_hash,
         vec![head_commit_hash],
-        message,
+        &message,
     );
     let data = index_commit
         .to_data()
@@ -636,7 +669,7 @@ pub(crate) async fn create_held_stash_commit(
         committer,
         worktree_tree_hash,
         vec![head_commit_hash, index_commit_hash],
-        message,
+        &message,
     );
     let stash_commit_data = stash_commit
         .to_data()
@@ -838,19 +871,15 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
 
     // Stash metadata + commits.
     let (author, committer) = util::create_signatures().await;
-    let head_commit_hash_str = head_commit_hash.to_string();
-    let head_commit_short = head_commit_hash_str
-        .get(..7)
-        .unwrap_or(head_commit_hash_str.as_str());
-    let head_summary = head_commit.message.lines().next().unwrap_or("").to_string();
-    let branch_name = match Head::current().await {
-        Head::Branch(name) => name,
-        Head::Detached(_) => "(no branch)".to_string(),
-    };
-    let final_message = options
-        .message
-        .clone()
-        .unwrap_or_else(|| format!("WIP on {branch_name}: {head_commit_short} {head_summary}"));
+    let branch_name = stash_branch_label().await;
+    let head_summary = stash_commit_subject(&head_commit.message);
+    let head_commit_short = stash_abbrev7(&head_commit_hash);
+    let final_message = format_stash_push_message(
+        &branch_name,
+        &head_commit_short,
+        &head_summary,
+        options.message.as_deref(),
+    );
 
     let index_commit = Commit::new(
         author.clone(),
@@ -3728,6 +3757,34 @@ mod tests {
         assert!(
             tmp.path().join("untracked.txt").is_file(),
             "untracked files stay put"
+        );
+    }
+
+    #[test]
+    fn stash_commit_subject_skips_signature_headers_and_blank_lines() {
+        let sig = "-----BEGIN PGP SIGNATURE-----\nabcDEF123\n-----END PGP SIGNATURE-----";
+        let signed = format!("gpgsig {sig}\n\n\ninit\n\nbody\n");
+        assert_eq!(stash_commit_subject(&signed), "init");
+        assert_eq!(
+            stash_commit_subject("\n\nunsigned subject\n"),
+            "unsigned subject"
+        );
+        assert_eq!(stash_commit_subject(""), "");
+    }
+
+    #[test]
+    fn format_stash_push_message_prefixes_custom_and_default_wip() {
+        assert_eq!(
+            format_stash_push_message("main", "abc1234", "init", None),
+            "WIP on main: abc1234 init"
+        );
+        assert_eq!(
+            format_stash_push_message("main", "abc1234", "init", Some("named")),
+            "On main: named"
+        );
+        assert_eq!(
+            format_stash_push_message("(no branch)", "deadbee", "topic", Some("x")),
+            "On (no branch): x"
         );
     }
 

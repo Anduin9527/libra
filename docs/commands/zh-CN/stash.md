@@ -21,7 +21,7 @@ libra stash clear [--force]
 `libra stash` 省略子命令时（或无参数、或首参数为选项）等同 `libra stash push`；首个 token 既非已知子命令也不以 `-` 开头时按用法错误处理（文案对齐 Git：`subcommand wasn't specified; 'push' can't be assumed due to unexpected token '<tok>'`）。`libra stash` 将本地修改保存为新的 stash 条目，并把工作目录还原到与 HEAD 一致。默认情况下，`stash push` 只记录已跟踪文件的索引/工作区修改，并保留未跟踪文件。使用 `-u` / `--include-untracked` 可以包含可见未跟踪文件；使用 `-a` / `--all` 还会包含被忽略文件。传入 `-- <pathspec>...`（文件或目录路径，`.` 表示整棵树）可只 stash 这些路径的修改，工作树中其余改动原样保留（`-u`/`-a`/`-k` 不能与 pathspec 同用，否则 `LBR-CLI-002`）。之后可以用 `libra stash pop` 或 `libra stash apply` 恢复这些修改——恢复时是三方合并到当前工作树（而非 HEAD），因此期间对无关文件所做的未提交改动（包括 pathspec push 留下的那些路径）都会被保留。没有初始提交时，`stash push` 会先于改动检查以 `128` 失败（`LBR-REPO-003`、
 `you do not have the initial commit yet`）——即使工作树干净或只有未跟踪文件也会
 报错；全局 `--quiet` 下该失败不输出人读错误、只以退出码表达（`--json` 仍输出错误
-信封）。如果在干净工作树上运行 `stash push`，且没有请求纳入的未跟踪文件，命令会作为无操作成功退出，并报告没有可保存的本地更改。当 `core.filemode=true`（Unix 默认）时，仅 mode 变化（owner-execute 位不同、内容未变）也算本地修改：`stash push` 会保存它并把文件还原到 HEAD，`stash pop` 恢复保存的 mode；当 `core.filemode=false` 时该变化不构成 stash 候选。
+信封）。默认 stash 消息为 `WIP on <branch>: <abbrev7> <subject>`，其中 `<subject>` 是剥掉 vault `gpgsig` 头之后 HEAD 提交的首个非空行。`-m <message>`（以及 rebase/merge autostash）记为 `On <branch>: <message>`。分离 HEAD 用 `(no branch)` 代替分支名。旧版本无此前缀的 reflog 条目仍可 list / show / apply / pop。如果在干净工作树上运行 `stash push`，且没有请求纳入的未跟踪文件，命令会作为无操作成功退出，并报告没有可保存的本地更改。当 `core.filemode=true`（Unix 默认）时，仅 mode 变化（owner-execute 位不同、内容未变）也算本地修改：`stash push` 会保存它并把文件还原到 HEAD，`stash pop` 恢复保存的 mode；当 `core.filemode=false` 时该变化不构成 stash 候选。
 
 Stash 条目以特殊结构的提交对象存储在 `.libra/refs/stash` 下，并通过一个扁平文件列表跟踪 stash 栈。每个 stash 都捕获创建时的索引状态和工作树状态。
 
@@ -39,7 +39,7 @@ Stash 条目以特殊结构的提交对象存储在 `.libra/refs/stash` 下，�
 
 | 选项 | 短参数 | 长参数 | 说明 |
 |------|--------|--------|------|
-| Message | `-m` | `--message` | stash 条目的可选描述消息。省略时会生成默认的 "WIP on `<branch>`: `<short-hash>` ..." 消息。 |
+| Message | `-m` | `--message` | 可选描述消息，记为 `On <branch>: <message>`（分离 HEAD 用 `(no branch)`）。省略时默认为 `WIP on <branch>: <abbrev7> <subject>`，`<subject>` 取剥掉 vault `gpgsig` 头和前导空行后的 HEAD 提交主题。 |
 | Include untracked | `-u` | `--include-untracked` | 将可见未跟踪文件纳入 stash，并从工作区删除它们。被忽略文件会保留。 |
 | No include untracked | | `--no-include-untracked` | 不纳入未跟踪文件（默认），撤销先前的 `-u`/`--include-untracked`（最后出现者生效）。未跟踪文件默认排除，故单独使用时为 no-op。 |
 | Include all | `-a` | `--all` | 将可见未跟踪文件和被忽略文件都纳入 stash，并从工作区删除它们。 |
@@ -383,6 +383,10 @@ Dropped stash@{0} (abc1234...)
 ### 未跟踪和忽略文件如何存储
 
 `stash push -u` 和 `stash push -a` 使用第三个 stash parent 保存未跟踪/全部文件快照，与 Git 的对象拓扑保持一致。`stash apply` 和 `stash pop` 会把这些文件恢复为未跟踪的工作区文件。如果恢复时会覆盖本地已有文件，apply/pop 会失败并保留 stash 条目。
+
+### stash 消息怎么写
+
+`stash push`（含裸 `libra stash` 与 `stash push -- <pathspec>`）以及 rebase/merge autostash 共用一个消息 helper。默认是 `WIP on <branch>: <abbrev7> <subject>`。主题取自 HEAD 提交：先用 `parse_commit_msg` 剥掉 vault `gpgsig` 块，再取首个非空行——因此签名的 `init` 提交会显示为 `WIP on main: abc1234 init`，而不是 `WIP on main: abc1234 gpgsig -----BEGIN PGP SIGNATURE-----`。自定义 `-m` 与 autostash 名称 `autostash` 记为 `On <branch>: <message>`。分离 HEAD 用 `(no branch)`。旧版本无此前缀的 reflog 行保持原样，仍可 list / show / apply / pop。
 
 ### `--keep-index` 如何工作
 

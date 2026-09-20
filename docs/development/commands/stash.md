@@ -43,6 +43,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-09-21（issues/476 WT-10）：`stash push` / pathspec push / `create_held_stash_commit` 共用 `format_stash_push_message`——默认 `WIP on <branch>: <abbrev7> <subject>`（主题经 `parse_commit_msg` 剥掉 vault `gpgsig` 与前导空行），`-m` 与 autostash 名称为 `On <branch>: <msg>`，分离 HEAD 用 `(no branch)`。旧 reflog 条目不改写。回归：`stash_test::test_stash_message_format_matrix` 与 helper 单测。
 - 2026-09-20（issues/476 WT-09）：`run_push` 预检顺序改为「先初始提交、后改动」（对齐 Git `builtin/stash.c:1524-1537`）——无 HEAD 时即使树干净或只有未跟踪文件也返回 128 `LBR-REPO-003`；`execute_safe` 在全局 `--quiet` 且非 JSON 时把该失败改为 `CliError::silent_exit(128)`（仅退出码），`--json` 仍输出 error envelope。回归：`stash_test::test_stash_push_no_initial_commit_matrix`。
 - 2026-09-20（issues/476 WT-08）：新增 CLI 参数改写 `rewrite_bare_stash_args`（`src/cli.rs`）——省略子命令的 `libra stash` 与首参数以 `-` 开头（含 `--`）的形态插入 `push`；已知子命令保持不变；其它首 token 报用法错误 129，文案对齐 Git `subcommand wasn't specified; 'push' can't be assumed due to unexpected token '<tok>'`（git 2.55.0 实测 exit 128）。`STASH_EXAMPLES` 与 `stash --help`/命令页说明省略子命令的行为。回归：`cli::tests::bare_stash_rewrites_to_push`、`stash_test::test_bare_stash_is_push_matrix`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。

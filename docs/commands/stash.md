@@ -27,7 +27,12 @@ modifications to a new stash entry and reverts the working directory to match HE
 change check, so this failure is reported even when the tree is clean or only
 untracked files exist; under the global `--quiet` the human error is
 suppressed and only the exit code is returned (`--json` still emits the error
-envelope). If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
+envelope). Default stash messages are `WIP on <branch>: <abbrev7> <subject>`,
+where `<subject>` is the first non-empty line of the HEAD commit message after
+stripping a vault `gpgsig` header. `-m <message>` (and rebase/merge autostash)
+records `On <branch>: <message>`. Detached HEAD uses `(no branch)` in place of
+the branch name. Older stash reflog entries that lack these prefixes still
+list, show, apply, and pop. If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
 
 Stash entries are stored as specially-structured commit objects under `.libra/refs/stash`, with a flat-file list tracking the stash stack. Each stash captures both the index state and worktree state at the time of creation.
 
@@ -51,7 +56,7 @@ Save your local modifications to a new stash and clean the working directory.
 
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
-| Message | `-m` | `--message` | Optional descriptive message for the stash entry. If omitted, a default "WIP on `<branch>`: `<short-hash>` ..." message is generated. |
+| Message | `-m` | `--message` | Optional descriptive message, recorded as `On <branch>: <message>` (detached HEAD uses `(no branch)`). If omitted, the default is `WIP on <branch>: <abbrev7> <subject>`, where `<subject>` is the HEAD commit subject after stripping a vault `gpgsig` header and leading blank lines. |
 | Include untracked | `-u` | `--include-untracked` | Include visible untracked files in the stash and remove them from the worktree. Ignored files remain in place. |
 | No include untracked | | `--no-include-untracked` | Do not include untracked files (the default), countermanding an earlier `-u`/`--include-untracked` (last one wins). Untracked files are excluded by default, so on its own this is a no-op. |
 | Include all | `-a` | `--all` | Include visible untracked and ignored files in the stash, then remove them from the worktree. |
@@ -407,6 +412,10 @@ Default `stash pop` and `stash apply` restore tracked content to the working tre
 ### How `--keep-index` works
 
 `stash push --keep-index` stores the same stash metadata as a normal push, then writes the saved index back and restores the worktree to the index state. For a mixed file with both staged and unstaged edits, the staged content remains in the index and worktree, while the unstaged delta is saved in the stash.
+
+### How stash messages are formatted
+
+`stash push` (including a bare `libra stash` and `stash push -- <pathspec>`) and rebase/merge autostash share one message helper. The default is `WIP on <branch>: <abbrev7> <subject>`. The subject is taken from the HEAD commit after `parse_commit_msg` strips a vault `gpgsig` block, then the first non-empty line — so a signed `init` commit lists as `WIP on main: abc1234 init`, not `WIP on main: abc1234 gpgsig -----BEGIN PGP SIGNATURE-----`. A custom `-m` value and the autostash name `autostash` become `On <branch>: <message>`. Detached HEAD substitutes `(no branch)`. Existing reflog lines that predate these prefixes are left untouched and still list, show, apply, and pop.
 
 ### Why a curated subcommand model?
 
