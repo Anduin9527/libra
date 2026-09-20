@@ -4319,3 +4319,41 @@ fn test_add_intent_to_add_matrix() {
         "N7 back to v2 when all flags are clear"
     );
 }
+
+/// WT-01 (M-GUARD G8, issues/476): `add .` on a clean tree is a successful no-op.
+#[test]
+fn test_add_dot_on_clean_tree_guard() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+
+    let before = run_libra_command(&["ls-files", "-s"], root);
+    assert_cli_success(&before, "G8 ls-files before");
+    let status_before = run_libra_command(&["status", "--porcelain"], root);
+    assert_cli_success(&status_before, "G8 status before");
+    assert!(
+        String::from_utf8_lossy(&status_before.stdout)
+            .trim()
+            .is_empty(),
+        "G8 fixture must start clean: {}",
+        String::from_utf8_lossy(&status_before.stdout)
+    );
+
+    let add = run_libra_command(&["add", "."], root);
+    assert_eq!(add.status.code(), Some(0), "G8 add . exit");
+    assert_cli_success(&add, "G8 add .");
+
+    let after = run_libra_command(&["ls-files", "-s"], root);
+    assert_cli_success(&after, "G8 ls-files after");
+    assert_eq!(
+        after.stdout, before.stdout,
+        "G8 add . must not change the index"
+    );
+    let status_after = run_libra_command(&["status", "--porcelain"], root);
+    assert!(
+        String::from_utf8_lossy(&status_after.stdout)
+            .trim()
+            .is_empty(),
+        "G8 add . must leave the tree clean: {}",
+        String::from_utf8_lossy(&status_after.stdout)
+    );
+}

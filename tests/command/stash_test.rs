@@ -2601,3 +2601,97 @@ fn test_stash_index_restoration_matrix() {
         "X8 index_restored: {parsed}"
     );
 }
+
+/// WT-01 (M-GUARD G3–G6, issues/476): no-change / untracked-only / `-q` / `--all`.
+#[test]
+fn test_stash_no_change_untracked_only_and_quiet_guards() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+
+    let clean = run_libra_command(&["stash", "push"], root);
+    assert_cli_success(&clean, "G3 clean push");
+    assert!(
+        String::from_utf8_lossy(&clean.stdout).contains("No local changes to save"),
+        "G3 clean: {}",
+        String::from_utf8_lossy(&clean.stdout)
+    );
+    let list = run_libra_command(&["stash", "list"], root);
+    assert_cli_success(&list, "G3 list after clean");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).trim().is_empty(),
+        "G3 stash list must stay empty: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+
+    fs::write(root.join("only-untracked.txt"), "u\n").expect("untracked");
+    let untracked_only = run_libra_command(&["stash", "push"], root);
+    assert_cli_success(&untracked_only, "G3 untracked-only");
+    assert!(
+        String::from_utf8_lossy(&untracked_only.stdout).contains("No local changes to save"),
+        "G3 untracked-only: {}",
+        String::from_utf8_lossy(&untracked_only.stdout)
+    );
+    assert!(
+        root.join("only-untracked.txt").is_file(),
+        "G3 must leave the untracked file in place"
+    );
+    let list = run_libra_command(&["stash", "list"], root);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).trim().is_empty(),
+        "G3 still no stash: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+
+    let include = run_libra_command(&["stash", "push", "-u"], root);
+    assert_cli_success(&include, "G4 -u");
+    assert!(
+        !root.join("only-untracked.txt").exists(),
+        "G4 -u must remove the untracked file"
+    );
+    let list = run_libra_command(&["stash", "list"], root);
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).trim().is_empty(),
+        "G4 must create a stash: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+    assert_cli_success(&run_libra_command(&["stash", "drop"], root), "G4 drop");
+
+    fs::write(root.join("tracked.txt"), "modified\n").expect("dirty");
+    let quiet_ok = run_libra_command(&["stash", "push", "-q"], root);
+    assert_cli_success(&quiet_ok, "G5 -q success");
+    assert!(
+        quiet_ok.stdout.is_empty() && quiet_ok.stderr.is_empty(),
+        "G5 success must be silent: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&quiet_ok.stdout),
+        String::from_utf8_lossy(&quiet_ok.stderr)
+    );
+    let quiet_noop = run_libra_command(&["stash", "push", "-q"], root);
+    assert_cli_success(&quiet_noop, "G5 -q no-change");
+    assert!(
+        quiet_noop.stdout.is_empty() && quiet_noop.stderr.is_empty(),
+        "G5 no-change must be silent: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&quiet_noop.stdout),
+        String::from_utf8_lossy(&quiet_noop.stderr)
+    );
+    assert_cli_success(&run_libra_command(&["stash", "drop"], root), "G5 drop");
+
+    fs::write(root.join(".libraignore"), "ignored.log\n").expect("ignore");
+    fs::write(root.join("ignored.log"), "ignored\n").expect("ignored file");
+    fs::write(root.join("visible.txt"), "visible\n").expect("visible");
+    let all = run_libra_command(&["stash", "push", "--all"], root);
+    assert_cli_success(&all, "G6 --all");
+    assert!(
+        !root.join("ignored.log").exists(),
+        "G6 --all must remove the ignored file"
+    );
+    assert!(
+        !root.join("visible.txt").exists(),
+        "G6 --all must remove the visible untracked file"
+    );
+    let list = run_libra_command(&["stash", "list"], root);
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).trim().is_empty(),
+        "G6 must create a stash: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+}

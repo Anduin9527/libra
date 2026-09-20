@@ -3994,3 +3994,87 @@ fn test_status_short_m_rename_threshold_matrix() {
     assert!(out.contains("2 R."), "M6 record: {out}");
     assert!(out.contains("r2.txt\tr.txt"), "M6 paths: {out}");
 }
+
+/// WT-01 (M-GUARD G1–G2, issues/476): `-uall` lists nested untracked files
+/// and collapses a nested repository to `?? inner/`.
+#[test]
+fn test_status_uall_expands_nested_untracked_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::create_dir_all(root.join("dir/sub")).expect("dir/sub");
+    fs::create_dir_all(root.join("nested")).expect("nested");
+    fs::write(root.join("dir/file"), "f\n").expect("dir/file");
+    fs::write(root.join("dir/sub/g"), "g\n").expect("dir/sub/g");
+    fs::write(root.join("nested/x"), "x\n").expect("nested/x");
+
+    let files = ["dir/file", "dir/sub/g", "nested/x"];
+    let invocations: &[&[&str]] = &[
+        &["status", "-uall"],
+        &["status", "-s", "-uall"],
+        &["status", "--untracked-files=all"],
+        &["status", "--porcelain=v2", "-uall"],
+    ];
+    for args in invocations {
+        let out = run_libra_command(args, root);
+        assert_cli_success(&out, &format!("G1 {args:?}"));
+        let text = String::from_utf8_lossy(&out.stdout).replace('\\', "/");
+        for file in files {
+            assert!(text.contains(file), "G1 {args:?} must list {file}: {text}");
+        }
+        assert!(
+            !text.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed == "?? dir/" || trimmed == "? dir/" || trimmed.ends_with("\tdir/")
+            }),
+            "G1 {args:?} must expand dir/, not collapse it: {text}"
+        );
+    }
+
+    let short = run_libra_command(&["status", "-s", "-uall"], root);
+    let short_text = String::from_utf8_lossy(&short.stdout).replace('\\', "/");
+    for file in files {
+        assert!(
+            short_text
+                .lines()
+                .any(|line| line.trim() == format!("?? {file}")),
+            "G1 -s -uall porcelain: {file} in {short_text}"
+        );
+    }
+
+    let v2 = run_libra_command(&["status", "--porcelain=v2", "-uall"], root);
+    let v2_text = String::from_utf8_lossy(&v2.stdout).replace('\\', "/");
+    for file in files {
+        assert!(
+            v2_text
+                .lines()
+                .any(|line| line.trim() == format!("? {file}")),
+            "G1 porcelain v2: {file} in {v2_text}"
+        );
+    }
+
+    // G2: a nested Libra or Git repository is reported as the directory only.
+    let inner = root.join("inner");
+    fs::create_dir_all(&inner).expect("inner");
+    fs::write(inner.join("file.txt"), "nested-libra\n").expect("inner file");
+    assert_cli_success(&run_libra_command(&["init"], &inner), "G2 inner init");
+
+    let gitnest = root.join("gitnest");
+    fs::create_dir_all(gitnest.join(".git")).expect("gitnest/.git");
+    fs::write(gitnest.join("file.txt"), "nested-git\n").expect("gitnest file");
+
+    let nested = run_libra_command(&["status", "-s", "-uall"], root);
+    assert_cli_success(&nested, "G2 -s -uall");
+    let nested_text = String::from_utf8_lossy(&nested.stdout).replace('\\', "/");
+    assert!(
+        nested_text.lines().any(|line| line.trim() == "?? inner/"),
+        "G2 must report ?? inner/: {nested_text}"
+    );
+    assert!(
+        nested_text.lines().any(|line| line.trim() == "?? gitnest/"),
+        "G2 must report ?? gitnest/: {nested_text}"
+    );
+    assert!(
+        !nested_text.contains("inner/file.txt") && !nested_text.contains("gitnest/file.txt"),
+        "G2 must not expand a nested repository: {nested_text}"
+    );
+}

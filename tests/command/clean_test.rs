@@ -1016,3 +1016,52 @@ fn test_clean_short_exclude_alias() {
         "keep.log excluded by -e: {names:?}"
     );
 }
+
+/// WT-01 (M-GUARD G7, issues/476): issue-verified `clean -n` / `-nd` / `-fdx`.
+#[test]
+fn test_clean_issue476_verified_surface_guard() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("junk.txt"), "junk\n").expect("junk");
+    fs::create_dir_all(root.join("junkdir")).expect("junkdir");
+    fs::write(root.join("junkdir/inside.txt"), "in\n").expect("inside");
+
+    let dry = run_libra_command(&["clean", "-n"], root);
+    assert_cli_success(&dry, "G7 -n");
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_out.contains("Would remove junk.txt"),
+        "G7 -n: {dry_out}"
+    );
+    assert!(root.join("junk.txt").is_file(), "G7 -n keeps the file");
+
+    let dry_dir = run_libra_command(&["clean", "-nd"], root);
+    assert_cli_success(&dry_dir, "G7 -nd");
+    let dry_dir_out = String::from_utf8_lossy(&dry_dir.stdout);
+    assert!(
+        dry_dir_out.contains("Would remove junkdir"),
+        "G7 -nd: {dry_dir_out}"
+    );
+    assert!(
+        root.join("junkdir/inside.txt").is_file(),
+        "G7 -nd keeps the directory"
+    );
+
+    fs::write(root.join(".libraignore"), "ignored.log\n").expect("ignore");
+    fs::write(root.join("ignored.log"), "ignored\n").expect("ignored");
+    let force = run_libra_command(&["clean", "-fdx"], root);
+    assert_cli_success(&force, "G7 -fdx");
+    assert!(!root.join("junk.txt").exists(), "G7 -fdx removes junk.txt");
+    assert!(
+        !root.join("junkdir").exists(),
+        "G7 -fdx removes the untracked directory"
+    );
+    assert!(
+        !root.join("ignored.log").exists(),
+        "G7 -fdx removes the ignored file"
+    );
+    assert!(
+        root.join("tracked.txt").is_file(),
+        "G7 -fdx must keep tracked files"
+    );
+}
