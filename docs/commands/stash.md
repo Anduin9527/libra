@@ -5,6 +5,7 @@ Stash the changes in a dirty working directory away.
 ## Synopsis
 
 ```
+libra stash [-m <message>] [-u | -a] [-k | --keep-index] [-- <pathspec>...]
 libra stash push [-m <message>] [-u | -a] [-k | --keep-index] [-- <pathspec>...]
 libra stash pop [<stash>]
 libra stash list
@@ -17,7 +18,11 @@ libra stash clear [--force]
 
 ## Description
 
-`libra stash` saves your local modifications to a new stash entry and reverts the working directory to match HEAD. By default, `stash push` records tracked index/worktree changes and leaves untracked files alone. Use `-u` / `--include-untracked` to include visible untracked files, or `-a` / `--all` to include ignored files too. Pass `-- <pathspec>...` (file or directory paths; `.` selects the whole tree) to stash only the changes to those paths, leaving every other change in the working tree. A pathspec cannot be combined with `-u`/`-a`/`-k`. The modifications can be restored later with `libra stash pop` or `libra stash apply`, which replay the stash onto the CURRENT working tree (not HEAD) — so any unrelated uncommitted change you made in the meantime, including the paths a pathspec push left behind, is preserved. Default `apply` / `pop` leave the current index intact, so restored tracked changes appear as unstaged working-tree changes; Git's `--index` restore mode is not exposed yet. If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
+`libra stash` with no subcommand (or with options first) is exactly
+`libra stash push`; any other first token that is not a known subcommand is a
+usage error (`subcommand wasn't specified; 'push' can't be assumed due to
+unexpected token '<tok>'`, Git's wording). `libra stash` saves your local
+modifications to a new stash entry and reverts the working directory to match HEAD. By default, `stash push` records tracked index/worktree changes and leaves untracked files alone. Use `-u` / `--include-untracked` to include visible untracked files, or `-a` / `--all` to include ignored files too. Pass `-- <pathspec>...` (file or directory paths; `.` selects the whole tree) to stash only the changes to those paths, leaving every other change in the working tree. A pathspec cannot be combined with `-u`/`-a`/`-k`. The modifications can be restored later with `libra stash pop` or `libra stash apply`, which replay the stash onto the CURRENT working tree (not HEAD) — so any unrelated uncommitted change you made in the meantime, including the paths a pathspec push left behind, is preserved. Default `apply` / `pop` leave the current index intact, so restored tracked changes appear as unstaged working-tree changes; Git's `--index` restore mode is not exposed yet. If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
 
 Stash entries are stored as specially-structured commit objects under `.libra/refs/stash`, with a flat-file list tracking the stash stack. Each stash captures both the index state and worktree state at the time of creation.
 

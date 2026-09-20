@@ -305,6 +305,7 @@ fn is_false(value: &bool) -> bool {
 /// `--help` examples shown in `libra stash --help` output.
 pub const STASH_EXAMPLES: &str = "\
 EXAMPLES:
+    libra stash                       Same as 'libra stash push'
     libra stash push -m 'WIP'         Save current changes
     libra stash push -u               Include untracked files
     libra stash push -a               Include untracked and ignored files

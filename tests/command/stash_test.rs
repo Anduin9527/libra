@@ -1972,3 +1972,91 @@ fn test_stash_push_pop_mode_only_change() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// WT-08 (M-BARE B1–B6, issues/476): an omitted `stash` subcommand is
+/// `stash push`; an unexpected first token is a usage error.
+#[test]
+fn test_bare_stash_is_push_matrix() {
+    fn committed_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        init_repo_via_cli(&root);
+        configure_identity_via_cli(&root);
+        fs::write(root.join("a.txt"), "one\n").expect("write");
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "init", "--no-verify"], &root),
+            "commit",
+        );
+        (repo, root)
+    }
+
+    // B1: bare `stash` with a change saves a stash, like `stash push`.
+    let (_repo, root) = committed_repo();
+    fs::write(root.join("a.txt"), "two\n").expect("modify");
+    assert_cli_success(&run_libra_command(&["stash"], &root), "bare stash");
+    let list = run_libra_command(&["stash", "list"], &root);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("stash@{0}"),
+        "B1 created a stash: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).expect("reverted"),
+        "one\n",
+        "B1 reverts the worktree"
+    );
+
+    // B1 (no changes): bare `stash` is a successful no-op.
+    let (_repo, root) = committed_repo();
+    let noop = run_libra_command(&["stash"], &root);
+    assert_cli_success(&noop, "bare stash no changes");
+    assert!(
+        String::from_utf8_lossy(&noop.stdout).contains("No local changes to save"),
+        "B1 no-op: {}",
+        String::from_utf8_lossy(&noop.stdout)
+    );
+
+    // B2/B3: the push options parse without a subcommand.
+    let (_repo, root) = committed_repo();
+    fs::write(root.join("a.txt"), "three\n").expect("modify");
+    assert_cli_success(
+        &run_libra_command(&["stash", "-m", "bare-msg"], &root),
+        "B2 stash -m",
+    );
+    let (_repo, root) = committed_repo();
+    fs::write(root.join("untracked.txt"), "u\n").expect("write untracked");
+    assert_cli_success(&run_libra_command(&["stash", "-u"], &root), "B3 stash -u");
+    assert!(
+        !root.join("untracked.txt").exists(),
+        "B3 -u stashes the untracked file"
+    );
+    let (_repo, root) = committed_repo();
+    fs::write(root.join("a.txt"), "kept\n").expect("modify");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "stage");
+    assert_cli_success(&run_libra_command(&["stash", "-k"], &root), "B3 stash -k");
+
+    // B4: `stash -- <pathspec>` is `push -- <pathspec>`.
+    let (_repo, root) = committed_repo();
+    fs::write(root.join("a.txt"), "pathed\n").expect("modify");
+    assert_cli_success(&run_libra_command(&["stash", "--", "a.txt"], &root), "B4");
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).expect("reverted"),
+        "one\n"
+    );
+
+    // B5: an existing subcommand still works (regression).
+    let (_repo, root) = committed_repo();
+    assert_cli_success(&run_libra_command(&["stash", "list"], &root), "B5 list");
+
+    // B6: an unexpected first token is refused with Git's wording.
+    let (_repo, root) = committed_repo();
+    let refused = run_libra_command(&["stash", "foo"], &root);
+    assert_eq!(refused.status.code(), Some(129), "B6 exit");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("'push' can't be assumed due to unexpected token 'foo'"),
+        "B6 wording: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
