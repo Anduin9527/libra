@@ -1606,11 +1606,17 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     }
 
     let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+            ignore_case,
+            file_mode,
+        )
+        .map_err(|source| AddError::Status { source })?
     } else {
-        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+            ignore_case,
+            file_mode,
+        )
+        .map_err(|source| AddError::Status { source })?
     };
     if args.force {
         visible_changes.extend(ignored_changes.clone());
@@ -1812,7 +1818,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                 }
                 continue;
             }
-            let status = check_file_status(file, &index, &workdir)?;
+            let status = check_file_status(file, &index, &workdir, file_mode)?;
             match status {
                 FileStatus::New => add_output.added.push(path_str),
                 FileStatus::Modified => add_output.modified.push(path_str),
@@ -2610,7 +2616,8 @@ async fn stage_a_file(
         return Ok(StagedAction::Unchanged);
     }
 
-    let file_status = check_file_status(file, index, workdir)?;
+    let mode_dirty = mode_only_worktree_change(index, file_str, &file_abs, file_mode);
+    let file_status = check_file_status(file, index, workdir, file_mode)?;
     match file_status {
         FileStatus::New => {
             // Stat BEFORE reading: the entry's stat must describe the
@@ -2639,14 +2646,14 @@ async fn stage_a_file(
             let unmerged = path_has_conflict_stages(index, file_str);
             let missing_stage0 = !index.tracked(file_str, 0);
             let content_dirty = !missing_stage0 && index.is_modified(file_str, 0, workdir);
-            if unmerged || missing_stage0 || content_dirty {
+            if unmerged || missing_stage0 || content_dirty || mode_dirty {
                 let pre_read = file_abs.symlink_metadata().ok();
                 let blob =
                     gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
                         path: file.to_path_buf(),
                         source,
                     })?;
-                if missing_stage0 || !index.verify_hash(file_str, 0, &blob.id) {
+                if missing_stage0 || mode_dirty || !index.verify_hash(file_str, 0, &blob.id) {
                     blob.try_save().map_err(|source| AddError::ObjectSave {
                         path: file.to_path_buf(),
                         source,
@@ -2694,6 +2701,45 @@ enum FileStatus {
     NotFound,
 }
 
+/// Whether a tracked regular file differs from the index only in its
+/// owner-execute bit (ADR-FM-05). Only meaningful when `core.fileMode` is
+/// enabled.
+fn mode_only_worktree_change(
+    index: &Index,
+    file_str: &str,
+    file_abs: &Path,
+    file_mode: bool,
+) -> bool {
+    if !file_mode {
+        return false;
+    }
+    let Ok(metadata) = file_abs.symlink_metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    index.get(file_str, 0).is_some_and(|entry| {
+        entry.mode & 0o100000 == 0o100000
+            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+    })
+}
+
+/// Owner-execute bit of a worktree file (false on platforms without POSIX
+/// permission bits).
+fn worktree_exec_bit(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 /// Compute a [`FileStatus`] for `file` (relative to `workdir`) using the
 /// in-memory `index`.
 ///
@@ -2704,7 +2750,12 @@ enum FileStatus {
 ///
 /// Boundary conditions:
 /// - Returns [`AddError::InvalidPathEncoding`] when `file` is not UTF-8.
-fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileStatus, AddError> {
+fn check_file_status(
+    file: &Path,
+    index: &Index,
+    workdir: &Path,
+    file_mode: bool,
+) -> Result<FileStatus, AddError> {
     let file_str = file.to_str().ok_or_else(|| AddError::InvalidPathEncoding {
         path: file.to_path_buf(),
     })?;
@@ -2722,7 +2773,10 @@ fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileS
         } else {
             Ok(FileStatus::New)
         }
-    } else if unmerged || index.is_modified(file_str, 0, workdir) {
+    } else if unmerged
+        || index.is_modified(file_str, 0, workdir)
+        || mode_only_worktree_change(index, file_str, &file_abs, file_mode)
+    {
         Ok(FileStatus::Modified)
     } else {
         Ok(FileStatus::Unchanged)

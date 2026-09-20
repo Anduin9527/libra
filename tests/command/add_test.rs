@@ -4105,3 +4105,65 @@ fn test_add_honors_core_filemode_false_matrix() {
     let lower = run_libra_command(&["ls-files", "--stage"], root);
     assert_cli_success(&lower, "ls-files after lowercase config");
 }
+
+/// FM-04 (M-DET D3/D6, plan-20260918): a mode-only worktree change is staged
+/// by `add` when `core.fileMode` is enabled and ignored when it is false.
+#[cfg(unix)]
+#[test]
+fn test_add_mode_only_change_respects_filemode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn index_mode(root: &std::path::Path, path: &str) -> String {
+        let out = run_libra_command(&["ls-files", "--stage", path], root);
+        assert_cli_success(&out, "ls-files --stage");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    let run = root.join("run.sh");
+    fs::write(&run, "#!/bin/sh\n").expect("write");
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    assert_cli_success(&run_libra_command(&["add", "run.sh"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    // D6: fileMode=false — add keeps the recorded 100755.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], root),
+        "add with fileMode=false",
+    );
+    assert_eq!(
+        index_mode(root, "run.sh"),
+        "100755",
+        "D6 must keep the index mode"
+    );
+
+    // D3: fileMode=true — add stages the mode-only change.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "true"], root),
+        "enable fileMode",
+    );
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], root),
+        "add with fileMode=true",
+    );
+    assert_eq!(
+        index_mode(root, "run.sh"),
+        "100644",
+        "D3 must stage the mode change"
+    );
+}

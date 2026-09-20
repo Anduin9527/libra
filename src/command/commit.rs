@@ -2876,7 +2876,7 @@ fn auto_stage_tracked_changes(
     cache_preview_objects: bool,
     file_mode: bool,
 ) -> Result<bool, CommitError> {
-    let mut pending = status::changes_to_be_staged().map_err(|e| {
+    let mut pending = status::changes_to_be_staged_with_file_mode(file_mode).map_err(|e| {
         CommitError::AutoStage(format!("failed to determine working tree status: {e}"))
     })?;
     let index_path = path::index();

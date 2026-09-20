@@ -2338,12 +2338,23 @@ async fn has_changes() -> bool {
     }
 
     let workdir = util::request_working_dir();
+    // ADR-FM-05: a mode-only worktree change is a local modification.
+    let file_mode = crate::internal::config::core_file_mode()
+        .await
+        .unwrap_or(cfg!(unix));
     for entry in index.tracked_entries(0) {
         let file_path = workdir.join(&entry.name);
 
         let Ok(metadata) = fs::metadata(&file_path) else {
             return true;
         };
+        if file_mode
+            && metadata.is_file()
+            && entry.mode & 0o100000 == 0o100000
+            && (entry.mode & 0o111 != 0) != stash_worktree_exec_bit(&metadata)
+        {
+            return true;
+        }
 
         let mtime =
             Time::from_system_time(metadata.modified().unwrap_or(std::time::SystemTime::now()));
@@ -2366,6 +2377,21 @@ async fn has_changes() -> bool {
     }
 
     false
+}
+
+/// Owner-execute bit of a worktree file (false on platforms without POSIX
+/// permission bits).
+fn stash_worktree_exec_bit(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 fn has_stash() -> Result<bool, StashError> {

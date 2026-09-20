@@ -41,6 +41,14 @@ compares the stored link target bytes, and reports target changes as
 modifications instead of following the link or treating dangling symlinks as
 deleted.
 
+With `core.filemode=true` (the Unix default) a tracked regular file whose
+owner-execute bit differs from the index while its content is unchanged is a
+mode-only modification and is reported in every output format (short, long,
+porcelain v2, and JSON). With `core.filemode=false` mode-only differences are
+ignored; entry-type changes (for example a regular file replaced by a symlink)
+are always reported. An invalid `core.filemode` value fails `status` closed
+before any output.
+
 ### Display config defaults (`status.*`)
 
 When the corresponding CLI flag is absent, Libra honors these Git-compatible

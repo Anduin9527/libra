@@ -500,7 +500,7 @@ libra config unset --global code.defaultProvider
 
 ## `core.filemode` 键
 
-`core.filemode`（按大小写不敏感读取）决定 `add`、`update-index <path>` 与 `commit -a` 从工作树暂存时如何记录文件 mode。未设置时 Unix 默认为 `true`、其它平台为 `false`。为 `false` 时：重新暂存已有条目沿用索引中已记录的 mode，新路径记为 `100644`（工作树中的可执行文件不会被记为 `100755`）；`add --chmod=+x` 与 `update-index --cacheinfo` 携带显式 mode，不受影响。非法布尔值在任何索引写入前以 `bad boolean config value '<value>' for 'core.filemode'` 使 `add`/`status` fail-closed（与 `commit.verbose` 同一映射）。
+`core.filemode`（按大小写不敏感读取）决定 `add`、`update-index <path>` 与 `commit -a` 从工作树暂存时如何记录文件 mode。未设置时 Unix 默认为 `true`、其它平台为 `false`。为 `false` 时：重新暂存已有条目沿用索引中已记录的 mode，新路径记为 `100644`（工作树中的可执行文件不会被记为 `100755`）；`add --chmod=+x` 与 `update-index --cacheinfo` 携带显式 mode，不受影响。为 `true`（Unix 默认）时，仅 mode 变化（已跟踪普通文件的 owner-execute 位与索引不同、内容未变）会被 `status` 报告、被 `diff` 渲染、被 `add`/`commit -a`/`update-index <path>` 暂存，并被 `stash push` 视为本地修改；为 `false` 时这些命令忽略仅 mode 的差异，但条目类型变化（如普通文件被替换为符号链接）仍会显示。非法布尔值在任何索引写入前以 `bad boolean config value '<value>' for 'core.filemode'` 使 `add`/`status` fail-closed（与 `commit.verbose` 同一映射）。
 
 ```bash
 libra config set core.filemode false

@@ -17,7 +17,7 @@ libra stash clear [--force]
 
 ## 说明
 
-`libra stash` 将本地修改保存为新的 stash 条目，并把工作目录还原到与 HEAD 一致。默认情况下，`stash push` 只记录已跟踪文件的索引/工作区修改，并保留未跟踪文件。使用 `-u` / `--include-untracked` 可以包含可见未跟踪文件；使用 `-a` / `--all` 还会包含被忽略文件。传入 `-- <pathspec>...`（文件或目录路径，`.` 表示整棵树）可只 stash 这些路径的修改，工作树中其余改动原样保留（`-u`/`-a`/`-k` 不能与 pathspec 同用，否则 `LBR-CLI-002`）。之后可以用 `libra stash pop` 或 `libra stash apply` 恢复这些修改——恢复时是三方合并到当前工作树（而非 HEAD），因此期间对无关文件所做的未提交改动（包括 pathspec push 留下的那些路径）都会被保留。如果在干净工作树上运行 `stash push`，且没有请求纳入的未跟踪文件，命令会作为无操作成功退出，并报告没有可保存的本地更改。
+`libra stash` 将本地修改保存为新的 stash 条目，并把工作目录还原到与 HEAD 一致。默认情况下，`stash push` 只记录已跟踪文件的索引/工作区修改，并保留未跟踪文件。使用 `-u` / `--include-untracked` 可以包含可见未跟踪文件；使用 `-a` / `--all` 还会包含被忽略文件。传入 `-- <pathspec>...`（文件或目录路径，`.` 表示整棵树）可只 stash 这些路径的修改，工作树中其余改动原样保留（`-u`/`-a`/`-k` 不能与 pathspec 同用，否则 `LBR-CLI-002`）。之后可以用 `libra stash pop` 或 `libra stash apply` 恢复这些修改——恢复时是三方合并到当前工作树（而非 HEAD），因此期间对无关文件所做的未提交改动（包括 pathspec push 留下的那些路径）都会被保留。如果在干净工作树上运行 `stash push`，且没有请求纳入的未跟踪文件，命令会作为无操作成功退出，并报告没有可保存的本地更改。当 `core.filemode=true`（Unix 默认）时，仅 mode 变化（owner-execute 位不同、内容未变）也算本地修改：`stash push` 会保存它并把文件还原到 HEAD，`stash pop` 恢复保存的 mode；当 `core.filemode=false` 时该变化不构成 stash 候选。
 
 Stash 条目以特殊结构的提交对象存储在 `.libra/refs/stash` 下，并通过一个扁平文件列表跟踪 stash 栈。每个 stash 都捕获创建时的索引状态和工作树状态。
 

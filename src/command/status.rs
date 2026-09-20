@@ -1340,10 +1340,14 @@ async fn collect_status_data(
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
+    // ADR-FM-05 (FM-04): mode-only worktree changes are reported only when
+    // core.fileMode is enabled.
+    let file_mode = crate::internal::config::core_file_mode().await?;
     let worktree = status_untracked::collect_status_worktree_changes(
         args.untracked_files.unwrap_or(UntrackedFiles::Normal),
         args.ignored,
         ignore_case,
+        file_mode,
     )
     .map_err(CliError::from)?;
     let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
@@ -6525,8 +6529,12 @@ fn changes_to_be_staged_with_policy_and_ignore_case(
         path: index_path.clone(),
         source,
     })?;
-    let (mut visible, ignored) =
-        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)?;
+    let (mut visible, ignored) = changes_to_be_staged_split_with_index(
+        &workdir,
+        &index,
+        ignore_case,
+        default_core_file_mode(),
+    )?;
     match policy {
         IgnorePolicy::Respect => Ok(visible),
         IgnorePolicy::OnlyIgnored => Ok(ignored),
@@ -6546,13 +6554,60 @@ pub fn changes_to_be_staged_split_safe() -> Result<(Changes, Changes), StatusErr
 pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
     ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
+    changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+        ignore_case,
+        default_core_file_mode(),
+    )
+}
+
+/// [`changes_to_be_staged_split_safe_with_ignore_case`] with an explicit
+/// `core.fileMode` value (FM-04): the callers already resolved the config.
+pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+    ignore_case: bool,
+    file_mode: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
+    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case, file_mode)
+}
+
+/// `changes_to_be_staged` with an explicit `core.fileMode` value (FM-04).
+pub fn changes_to_be_staged_with_file_mode(file_mode: bool) -> Result<Changes, StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
+    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
+        path: index_path.clone(),
+        source,
+    })?;
+    let (visible, _) =
+        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case, file_mode)?;
+    Ok(visible)
+}
+
+/// Platform default for `core.fileMode` when the config value is not resolved
+/// by a command entry: Unix enables mode comparison, other platforms do not.
+fn default_core_file_mode() -> bool {
+    cfg!(unix)
+}
+
+/// Owner-execute bit of a worktree file (false on platforms without POSIX
+/// permission bits).
+fn worktree_exec_bit(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 /// Emit the one-time `core.sparseCheckout=true` unsupported warning.
@@ -6593,19 +6648,32 @@ fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError
 pub(crate) fn changes_to_be_staged_split_force_with_ignore_case(
     ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
+    changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+        ignore_case,
+        default_core_file_mode(),
+    )
+}
+
+/// [`changes_to_be_staged_split_force_with_ignore_case`] with an explicit
+/// `core.fileMode` value (FM-04).
+pub(crate) fn changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+    ignore_case: bool,
+    file_mode: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case)
+    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case, file_mode)
 }
 
 fn changes_to_be_staged_split_force_with_index(
     workdir: &PathBuf,
     index: &Index,
     ignore_case: bool,
+    file_mode: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
@@ -6644,16 +6712,30 @@ fn changes_to_be_staged_split_force_with_index(
             }
         }
         let file_abs = workdir.join(file);
-        if file_abs.symlink_metadata().is_err() {
-            visible.deleted.push(file.clone());
-        } else if index.is_modified(file_str, 0, workdir) {
-            let file_hash =
-                calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                    path: file_abs.clone(),
-                    source,
-                })?;
-            if !index.verify_hash(file_str, 0, &file_hash) {
-                visible.modified.push(file.clone());
+        match file_abs.symlink_metadata() {
+            Err(_) => visible.deleted.push(file.clone()),
+            Ok(metadata) => {
+                // ADR-FM-05: with core.fileMode=true a regular file whose owner
+                // execute bit differs from the index is a mode-only change.
+                let mode_only_change = file_mode
+                    && metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && index.get(file_str, 0).is_some_and(|entry| {
+                        entry.mode & 0o100000 == 0o100000
+                            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+                    });
+                if mode_only_change {
+                    visible.modified.push(file.clone());
+                } else if index.is_modified(file_str, 0, workdir) {
+                    let file_hash =
+                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
+                            path: file_abs.clone(),
+                            source,
+                        })?;
+                    if !index.verify_hash(file_str, 0, &file_hash) {
+                        visible.modified.push(file.clone());
+                    }
+                }
             }
         }
     }
@@ -6693,6 +6775,7 @@ fn changes_to_be_staged_split_with_index(
     workdir: &PathBuf,
     index: &Index,
     ignore_case: bool,
+    file_mode: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
@@ -6748,16 +6831,30 @@ fn changes_to_be_staged_split_with_index(
             }
         }
         let file_abs = workdir.join(file);
-        if file_abs.symlink_metadata().is_err() {
-            visible.deleted.push(file.clone());
-        } else if index.is_modified(file_str, 0, workdir) {
-            let file_hash =
-                calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                    path: file_abs.clone(),
-                    source,
-                })?;
-            if !index.verify_hash(file_str, 0, &file_hash) {
-                visible.modified.push(file.clone());
+        match file_abs.symlink_metadata() {
+            Err(_) => visible.deleted.push(file.clone()),
+            Ok(metadata) => {
+                // ADR-FM-05: with core.fileMode=true a regular file whose owner
+                // execute bit differs from the index is a mode-only change.
+                let mode_only_change = file_mode
+                    && metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && index.get(file_str, 0).is_some_and(|entry| {
+                        entry.mode & 0o100000 == 0o100000
+                            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+                    });
+                if mode_only_change {
+                    visible.modified.push(file.clone());
+                } else if index.is_modified(file_str, 0, workdir) {
+                    let file_hash =
+                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
+                            path: file_abs.clone(),
+                            source,
+                        })?;
+                    if !index.verify_hash(file_str, 0, &file_hash) {
+                        visible.modified.push(file.clone());
+                    }
+                }
             }
         }
     }

@@ -574,9 +574,16 @@ working tree. Unset, it defaults to `true` on Unix and `false` elsewhere. With
 `false`, re-staging an existing entry keeps the mode already recorded in the
 index and a new path is recorded as `100644` (an executable working-tree file
 does not become `100755`); `add --chmod=+x` and `update-index --cacheinfo`
-carry an explicit mode and are unaffected. An invalid boolean value fails
-`add`/`status` closed with `bad boolean config value '<value>' for
-'core.filemode'` before any index write, mirroring `commit.verbose`.
+carry an explicit mode and are unaffected. With `true` (the Unix default) a
+mode-only worktree change — a tracked regular file whose owner-execute bit
+differs from the index while its content is unchanged — is reported by
+`status`, rendered by `diff`, staged by `add`/`commit -a`/`update-index
+<path>`, and treated as a local modification by `stash push`; with `false`
+those commands ignore mode-only differences while entry-type changes (for
+example a regular file replaced by a symlink) stay visible. An invalid
+boolean value fails `add`/`status` closed with `bad boolean config value
+'<value>' for 'core.filemode'` before any index write, mirroring
+`commit.verbose`.
 
 ```bash
 libra config set core.filemode false

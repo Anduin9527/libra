@@ -54,6 +54,7 @@ async fn test_stash_push_no_changes() {
     // Create initial commit so HEAD exists
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -109,6 +110,7 @@ async fn test_stash_push_no_changes_json_output() {
 
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -165,6 +167,7 @@ async fn test_stash_push_and_pop() {
     // Create initial commit
     fs::write("base.txt", "base content").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -252,6 +255,7 @@ async fn test_stash_push_and_pop_preserves_dotfiles() {
     fs::write(".config/tool.toml", "mode = \"base\"\n").unwrap();
 
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec![".gitignore".to_string(), ".config/tool.toml".to_string()],
         all: false,
         update: false,
@@ -438,6 +442,7 @@ async fn test_stash_list() {
     // Create initial commit
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -569,6 +574,7 @@ async fn test_stash_drop() {
     // Create initial commit
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -640,6 +646,7 @@ async fn test_stash_drop_missing_reflog_returns_no_stash_found() {
 
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -707,6 +714,7 @@ async fn test_stash_json_output() {
     // Create initial commit
     fs::write("base.txt", "base").unwrap();
     add::execute(AddArgs {
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -1907,5 +1915,52 @@ fn test_stash_pop_materializes_executable_bit() {
             & 0o777,
         0o755,
         "stash pop must restore the execute bit"
+    );
+}
+
+/// FM-04 (M-DET D5, plan-20260918): a mode-only change is stashed and restored.
+#[cfg(unix)]
+#[test]
+fn test_stash_push_pop_mode_only_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    let run = root.join("run.sh");
+    fs::write(&run, "#!/bin/sh\n").expect("write run");
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod run");
+    assert_cli_success(&run_libra_command(&["add", "run.sh"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+    assert_cli_success(&run_libra_command(&["stash", "push"], root), "stash push");
+    assert_eq!(
+        fs::symlink_metadata(&run).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "push restores the HEAD executable"
+    );
+    assert_cli_success(&run_libra_command(&["stash", "pop"], root), "stash pop");
+    assert_eq!(
+        fs::symlink_metadata(&run).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "pop restores the stashed non-executable mode"
+    );
+
+    // D6: with core.fileMode=false a mode-only change is not a stash candidate.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    let out = run_libra_command(&["stash", "push"], root);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("No local changes to save"),
+        "D6 stash push: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
