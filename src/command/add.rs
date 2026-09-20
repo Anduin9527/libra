@@ -894,6 +894,7 @@ fn stage_resolved_path(
     index: &mut Index,
     workdir: &Path,
     storage_path: &Path,
+    file_mode: bool,
 ) -> Result<StagedAction, AddError> {
     let rel = Path::new(file);
     let file_abs = workdir.join(rel);
@@ -937,7 +938,7 @@ fn stage_resolved_path(
             for stage in 1..=3 {
                 index.remove(file, stage);
             }
-            crate::utils::index_ext::update_preserving_flags(index, entry);
+            crate::utils::index_ext::update_preserving_file_mode(index, entry, file_mode);
             Ok(StagedAction::Modified)
         }
     }
@@ -1328,6 +1329,7 @@ async fn run_add_patch(
     Ok(add_output)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_add_resolved(
     args: &AddArgs,
     workdir: &Path,
@@ -1336,6 +1338,7 @@ async fn run_add_resolved(
     layer_scope: &crate::internal::worktree_scope::WorktreeScope,
     pathspec_ctx: PathspecMatchContext<'_>,
     mut index: Index,
+    file_mode: bool,
 ) -> CliResult<AddOutput> {
     let pathspecs = PathspecSet::from_workdir_with_default_icase(
         &args.pathspec,
@@ -1420,7 +1423,7 @@ async fn run_add_resolved(
     }
 
     for file in &files {
-        match stage_resolved_path(file, &mut index, workdir, storage_path) {
+        match stage_resolved_path(file, &mut index, workdir, storage_path, file_mode) {
             Ok(action) => match action {
                 StagedAction::Modified => add_output.modified.push(file.clone()),
                 StagedAction::Removed => add_output.removed.push(file.clone()),
@@ -1493,6 +1496,10 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             AddError::Workdir { source }
         }
     })?;
+    // ADR-FM-04: `core.fileMode=false` keeps an existing entry's recorded mode
+    // and makes new paths plain 100644. Resolved once per invocation; an
+    // invalid value fails closed before any staging.
+    let file_mode = crate::internal::config::core_file_mode().await?;
     // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
     // ignore resolver skips layer-owned paths (a no-op with no layers).
     // W1 §C.4.1.1: the scope is derived from the CAPTURED workdir (not the
@@ -1593,6 +1600,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             &layer_scope,
             pathspec_ctx,
             index,
+            file_mode,
         )
         .await;
     }
@@ -1902,9 +1910,9 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // Stage each file (`--renormalize` force-rewrites instead of diffing).
     for file in &files {
         let staged = if args.renormalize {
-            renormalize_entry(file, &mut index, &workdir)
+            renormalize_entry(file, &mut index, &workdir, file_mode)
         } else {
-            stage_a_file(file, &mut index, &workdir, &storage_path).await
+            stage_a_file(file, &mut index, &workdir, &storage_path, file_mode).await
         };
         match staged {
             Ok(action) => {
@@ -2056,6 +2064,7 @@ fn renormalize_entry(
     file: &Path,
     index: &mut Index,
     workdir: &Path,
+    file_mode: bool,
 ) -> Result<StagedAction, AddError> {
     let file_str = file.to_str().ok_or_else(|| AddError::InvalidPathEncoding {
         path: file.to_path_buf(),
@@ -2090,7 +2099,7 @@ fn renormalize_entry(
             path: file.to_path_buf(),
             source,
         })?;
-    crate::utils::index_ext::update_preserving_flags(index, entry);
+    crate::utils::index_ext::update_preserving_file_mode(index, entry, file_mode);
     Ok(StagedAction::Modified)
 }
 
@@ -2575,6 +2584,7 @@ async fn stage_a_file(
     index: &mut Index,
     workdir: &Path,
     storage_path: &Path,
+    file_mode: bool,
 ) -> Result<StagedAction, AddError> {
     let file_abs = workdir.join(file);
     if !util::is_sub_path(&file_abs, workdir) {
@@ -2621,7 +2631,7 @@ async fn stage_a_file(
                         path: file.to_path_buf(),
                         source,
                     })?;
-            crate::utils::index_ext::update_preserving_flags(index, entry);
+            crate::utils::index_ext::update_preserving_file_mode(index, entry, file_mode);
             clear_conflict_stages(index, file_str);
             Ok(StagedAction::Added)
         }
@@ -2651,7 +2661,7 @@ async fn stage_a_file(
                         path: file.to_path_buf(),
                         source,
                     })?;
-                    crate::utils::index_ext::update_preserving_flags(index, entry);
+                    crate::utils::index_ext::update_preserving_file_mode(index, entry, file_mode);
                 }
                 clear_conflict_stages(index, file_str);
                 return Ok(StagedAction::Modified);

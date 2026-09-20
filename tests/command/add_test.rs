@@ -3994,3 +3994,114 @@ fn test_add_dense_and_sparse_pathspec_no_advice() {
         "D7 must not emit the sparse diagnostic"
     );
 }
+
+/// FM-03 (M-CFG K1–K4, K6, plan issues/470): `core.fileMode=false` makes new
+/// files plain `100644`, keeps an existing entry's mode, leaves `--chmod`
+/// unaffected, and an invalid value fails add/status closed.
+#[cfg(unix)]
+#[test]
+fn test_add_honors_core_filemode_false_matrix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn index_mode(root: &std::path::Path, path: &str) -> String {
+        let out = run_libra_command(&["ls-files", "--stage", path], root);
+        assert_cli_success(&out, "ls-files --stage");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    // K1: `init` wrote core.filemode=true (the canonical lower-case key).
+    let get = run_libra_command(&["config", "get", "core.filemode"], root);
+    assert_eq!(
+        String::from_utf8_lossy(&get.stdout).trim(),
+        "true",
+        "K1 init must record core.fileMode=true"
+    );
+
+    // K2: new executable file under fileMode=false is recorded 100644.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    let exe = root.join("new-exe");
+    fs::write(&exe, "#!/bin/sh\n").expect("write exe");
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod exe");
+    assert_cli_success(&run_libra_command(&["add", "new-exe"], root), "K2 add");
+    assert_eq!(index_mode(root, "new-exe"), "100644", "K2 new file");
+
+    // K3: an existing 100755 entry keeps its mode when re-staged with false.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "true"], root),
+        "reenable fileMode",
+    );
+    let tool = root.join("tool.sh");
+    fs::write(&tool, "#!/bin/sh\necho v1\n").expect("write tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    assert_cli_success(&run_libra_command(&["add", "tool.sh"], root), "stage tool");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "exec", "--no-verify"], root),
+        "commit tool",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode again",
+    );
+    fs::write(&tool, "#!/bin/sh\necho v2\n").expect("rewrite tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(&run_libra_command(&["add", "tool.sh"], root), "K3 add");
+    assert_eq!(
+        index_mode(root, "tool.sh"),
+        "100755",
+        "K3 existing mode must be kept"
+    );
+
+    // K4: --chmod still applies explicitly.
+    let chmod_new = root.join("chmod-new");
+    fs::write(&chmod_new, "#!/bin/sh\n").expect("write chmod-new");
+    assert_cli_success(
+        &run_libra_command(&["add", "--chmod=+x", "chmod-new"], root),
+        "K4 add --chmod",
+    );
+    assert_eq!(index_mode(root, "chmod-new"), "100755", "K4 --chmod");
+
+    // K6: invalid value fails add and status closed with the exact message.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "notabool"], root),
+        "set invalid",
+    );
+    fs::write(root.join("another.txt"), "x\n").expect("write another");
+    let add = run_libra_command(&["add", "another.txt"], root);
+    assert_ne!(add.status.code(), Some(0), "K6 add must fail");
+    assert!(
+        String::from_utf8_lossy(&add.stderr)
+            .contains("bad boolean config value 'notabool' for 'core.filemode'"),
+        "K6 add message: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let status = run_libra_command(&["status"], root);
+    assert_ne!(status.status.code(), Some(0), "K6 status must fail");
+    assert!(
+        String::from_utf8_lossy(&status.stderr)
+            .contains("bad boolean config value 'notabool' for 'core.filemode'"),
+        "K6 status message: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // Lower-case key spelling is honored (`core.filemode`).
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.filemode", "false"], root),
+        "set lowercase key",
+    );
+    // `config unset` the camel-case key so the lower-case one is the only value.
+    let _ = run_libra_command(&["config", "unset", "core.fileMode"], root);
+    let lower = run_libra_command(&["ls-files", "--stage"], root);
+    assert_cli_success(&lower, "ls-files after lowercase config");
+}

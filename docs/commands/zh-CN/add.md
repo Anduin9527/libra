@@ -124,6 +124,8 @@ libra add --pathspec-from-file paths.bin --pathspec-file-nul
 
 ### `--chmod=(+|-)x`
 
+暂存的文件 mode 同样遵循 `core.filemode`：为 `false` 时重新暂存已有条目沿用其已记录 mode、新路径记为 `100644`；`--chmod`（与 `update-index --cacheinfo`）仍按显式 mode 生效。非法的 `core.filemode` 值会在任何写入前使 `add` fail-closed。
+
 强制设置命中路径在索引中记录的可执行位：`+x` 记为 mode `100755`，`-x` 记为 `100644`。
 blob 内容不变；仅 mode 变化的路径也会被报告为 modified。
 

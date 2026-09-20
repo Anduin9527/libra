@@ -2661,6 +2661,9 @@ pub(crate) async fn execute_safe_with_resolution(
     // Fail closed on invalid `status.*` config before any mode runs or any
     // output is produced; CLI flags keep precedence inside the resolver.
     let mut extras = apply_status_config_defaults(&mut args).await?;
+    // ADR-FM-04 K6: an invalid `core.fileMode` fails status closed (no output,
+    // zero writes) with the commit.verbose mapping.
+    let _ = crate::internal::config::core_file_mode().await?;
     crate::command::status::warn_sparse_checkout_unsupported_once().await;
 
     if let Some(resolution) = resolution {

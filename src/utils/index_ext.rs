@@ -39,6 +39,19 @@ pub fn update_preserving_flags(index: &mut Index, entry: IndexEntry) {
     update_preserving(index, entry, FlagPreservation::All);
 }
 
+/// [`update_preserving`] for a worktree-staged entry under `core.fileMode=false`
+/// (ADR-FM-04): the caller's worktree-derived mode is ignored — an existing
+/// entry keeps its recorded mode and a new path becomes a plain `100644`.
+pub fn update_preserving_file_mode(index: &mut Index, mut entry: IndexEntry, file_mode: bool) {
+    if !file_mode {
+        entry.mode = index
+            .get(&entry.name, entry.flags.stage)
+            .map(|existing| existing.mode)
+            .unwrap_or(0o100644);
+    }
+    update_preserving(index, entry, FlagPreservation::All);
+}
+
 /// Carry the `skip_worktree` bit from `previous` onto the entries of `rebuilt`
 /// by path (ADR-SW-03's rebuild rule: `intent_to_add` is NOT carried — once a
 /// path has tree content it is no longer intent-to-add). Used by the

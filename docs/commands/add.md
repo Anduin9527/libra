@@ -171,6 +171,11 @@ Requires `--pathspec-from-file`; using it alone is a usage error.
 
 ### `--chmod=(+|-)x`
 
+Staged file modes also honor `core.filemode`: when it is `false`, re-staging
+an existing entry keeps its recorded mode and a new path is recorded as
+`100644`; `--chmod` (and `update-index --cacheinfo`) still apply the explicit
+mode. An invalid `core.filemode` value fails `add` closed before any write.
+
 Force the executable bit recorded in the index for the matched paths: `+x` records
 mode `100755`, `-x` records `100644`. The blob content is unchanged. A path whose
 recorded mode actually changes is reported as modified, even when its content did
