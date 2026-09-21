@@ -49,10 +49,12 @@ EXAMPLES:
     libra mega2 browser --server https://mega2.example.com --ref v1.2  List one commit or tag
     libra mega2 browser --server http://127.0.0.1:8080 --json          Exactly one fetch, JSON schema
     libra --machine mega2 browser --server https://mega2.example.com   NDJSON for automation
-    libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token  Create with a token file
+    libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token  Create/delete/move with a token file
 
 Keys (interactive mode): Up/Down or k/j select, Enter opens a directory,
-Backspace or h goes to the parent, + creates a directory, r reloads, q quits.
+Backspace or h goes to the parent, + creates a directory, d deletes the
+selected directory (after a confirmation line), m moves it, R renames it
+(same parent), r reloads, q quits.
 
 Write token precedence: --token-file, then LIBRA_MEGA2_TOKEN, then --token
 (warned: --token is visible in shell history). Tokens are never echoed.";

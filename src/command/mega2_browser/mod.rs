@@ -20,7 +20,11 @@ use crate::{
     internal::protocol::{
         mega2_auth::Mega2Token,
         mega2_entry::{Mega2EntryClient, validate_entry_name},
-        mega2_tree::{ContentType, Listing, MAX_CACHE_ENTRIES, MAX_NAME_BYTES, Mega2TreeSession},
+        mega2_mutate::Mega2MutateClient,
+        mega2_tree::{
+            ContentType, Listing, MAX_CACHE_ENTRIES, MAX_NAME_BYTES, Mega2TreeSession,
+            normalize_path,
+        },
     },
     utils::error::{CliError, CliResult, StableErrorCode},
 };
@@ -36,6 +40,12 @@ pub enum Key {
     Reload,
     /// `+`: start the create-directory editor.
     Create,
+    /// `d`: ask to delete the selected directory.
+    Delete,
+    /// `m`: start the move editor for the selected directory.
+    Move,
+    /// `R`: start the same-parent rename editor (distinct from `r` reload).
+    Rename,
     /// Lone `Esc`: cancel the active editor (or quit when idle).
     Cancel,
     Quit,
@@ -52,8 +62,35 @@ pub enum ActionResult {
         parent: String,
         name: String,
     },
+    /// Run one confirmed remote directory deletion, then reload once.
+    DeleteDirectory {
+        parent: String,
+        name: String,
+    },
+    /// Run one confirmed remote move/rename, then reload once.
+    MoveDirectory {
+        from_parent: String,
+        from_name: String,
+        to_parent: String,
+        to_name: String,
+    },
     Continue,
     Quit,
+}
+
+/// The single active modal editor. Only one may be open at a time; input is
+/// sanitized (printable, bounded) and validated before any request can be
+/// planned. `Esc` always closes the editor without touching the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Editor {
+    /// `+`: create a directory under the current path.
+    CreateDir(String),
+    /// `d`: confirmation line for deleting the selected directory.
+    ConfirmDelete(String),
+    /// `m`: move the selected directory under an edited destination parent.
+    MoveDir { name: String, input: String },
+    /// `R`: rename the selected directory (same parent, edited name).
+    RenameDir { name: String, input: String },
 }
 
 /// Browser state: the only local truth is the canonical current path.
@@ -66,8 +103,8 @@ pub struct BrowserState {
     pub history: Vec<String>,
     pub status: Option<String>,
     pub running: bool,
-    /// Active single-line create-directory editor (sanitized input only).
-    pub prompt: Option<String>,
+    /// The single active modal editor, if any (sanitized input only).
+    pub editor: Option<Editor>,
 }
 
 impl BrowserState {
@@ -82,7 +119,7 @@ impl BrowserState {
             history: Vec::new(),
             status: None,
             running: true,
-            prompt: None,
+            editor: None,
         })
     }
 
@@ -121,48 +158,133 @@ impl BrowserState {
         )
     }
 
-    /// Handles one key while the create editor is open. Input is sanitized on
-    /// entry (printable characters only, bounded length) and validated with
-    /// the MB-04 rules before any request can be planned.
-    fn handle_prompt_key(&mut self, key: Key) -> ActionResult {
-        match key {
-            Key::Enter => {
-                let name = self.prompt.take().unwrap_or_default();
-                match validate_entry_name(&name) {
+    /// The selected entry's name when it is a directory.
+    fn selected_directory_name(&self) -> Option<String> {
+        match self.entries.get(self.selection) {
+            Some((name, ContentType::Directory)) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Handles one key while an editor is open. Input is sanitized on entry
+    /// (printable characters only, bounded length) and validated with the
+    /// MB-04/MB-07 rules before any request can be planned.
+    fn handle_editor_key(&mut self, key: Key) -> ActionResult {
+        let Some(editor) = self.editor.take() else {
+            return ActionResult::Continue;
+        };
+        match editor {
+            Editor::CreateDir(mut input) => match key {
+                Key::Enter => match validate_entry_name(&input) {
                     Ok(()) => ActionResult::CreateDirectory {
                         parent: self.path.clone(),
-                        name,
+                        name: input,
                     },
                     Err(err) => {
                         self.status = Some(err.message().to_string());
-                        // Keep the editor open so the user can fix the name.
-                        self.prompt = Some(name);
+                        self.editor = Some(Editor::CreateDir(input));
                         ActionResult::Continue
                     }
+                },
+                Key::Backspace => {
+                    input.pop();
+                    self.editor = Some(Editor::CreateDir(input));
+                    ActionResult::Continue
                 }
-            }
-            Key::Backspace => {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    prompt.pop();
+                Key::Cancel | Key::Quit => {
+                    self.status = Some("create cancelled".to_string());
+                    ActionResult::Continue
                 }
-                ActionResult::Continue
-            }
-            // Esc (and `q`) close the editor without touching the network.
-            Key::Cancel | Key::Quit => {
-                self.prompt = None;
-                self.status = Some("create cancelled".to_string());
-                ActionResult::Continue
-            }
-            Key::Other(ch) => {
-                if let Some(prompt) = self.prompt.as_mut()
-                    && !ch.is_control()
-                    && prompt.len() + ch.len_utf8() <= MAX_NAME_BYTES
-                {
-                    prompt.push(ch);
+                Key::Other(ch) => {
+                    push_bounded(&mut input, ch);
+                    self.editor = Some(Editor::CreateDir(input));
+                    ActionResult::Continue
                 }
-                ActionResult::Continue
-            }
-            Key::Up | Key::Down | Key::Home | Key::Reload | Key::Create => ActionResult::Continue,
+                _ => {
+                    self.editor = Some(Editor::CreateDir(input));
+                    ActionResult::Continue
+                }
+            },
+            Editor::ConfirmDelete(name) => match key {
+                Key::Enter | Key::Other('y') | Key::Other('Y') => ActionResult::DeleteDirectory {
+                    parent: self.path.clone(),
+                    name,
+                },
+                Key::Cancel | Key::Quit | Key::Other('n') | Key::Other('N') => {
+                    self.status = Some("delete cancelled".to_string());
+                    ActionResult::Continue
+                }
+                _ => {
+                    self.editor = Some(Editor::ConfirmDelete(name));
+                    ActionResult::Continue
+                }
+            },
+            Editor::MoveDir { name, mut input } => match key {
+                Key::Enter => match normalize_path(&input) {
+                    Ok(parent) => ActionResult::MoveDirectory {
+                        from_parent: self.path.clone(),
+                        from_name: name.clone(),
+                        to_parent: parent,
+                        to_name: name,
+                    },
+                    Err(err) => {
+                        self.status = Some(err.message().to_string());
+                        self.editor = Some(Editor::MoveDir { name, input });
+                        ActionResult::Continue
+                    }
+                },
+                Key::Backspace => {
+                    input.pop();
+                    self.editor = Some(Editor::MoveDir { name, input });
+                    ActionResult::Continue
+                }
+                Key::Cancel | Key::Quit => {
+                    self.status = Some("move cancelled".to_string());
+                    ActionResult::Continue
+                }
+                Key::Other(ch) => {
+                    push_bounded(&mut input, ch);
+                    self.editor = Some(Editor::MoveDir { name, input });
+                    ActionResult::Continue
+                }
+                _ => {
+                    self.editor = Some(Editor::MoveDir { name, input });
+                    ActionResult::Continue
+                }
+            },
+            Editor::RenameDir { name, mut input } => match key {
+                Key::Enter => match validate_entry_name(&input) {
+                    Ok(()) => ActionResult::MoveDirectory {
+                        from_parent: self.path.clone(),
+                        from_name: name,
+                        to_parent: self.path.clone(),
+                        to_name: input,
+                    },
+                    Err(err) => {
+                        self.status = Some(err.message().to_string());
+                        self.editor = Some(Editor::RenameDir { name, input });
+                        ActionResult::Continue
+                    }
+                },
+                Key::Backspace => {
+                    input.pop();
+                    self.editor = Some(Editor::RenameDir { name, input });
+                    ActionResult::Continue
+                }
+                Key::Cancel | Key::Quit => {
+                    self.status = Some("rename cancelled".to_string());
+                    ActionResult::Continue
+                }
+                Key::Other(ch) => {
+                    push_bounded(&mut input, ch);
+                    self.editor = Some(Editor::RenameDir { name, input });
+                    ActionResult::Continue
+                }
+                _ => {
+                    self.editor = Some(Editor::RenameDir { name, input });
+                    ActionResult::Continue
+                }
+            },
         }
     }
 
@@ -180,8 +302,8 @@ impl BrowserState {
 
     /// Handles one key against the state; the caller performs `FetchCurrent`.
     pub fn handle_key(&mut self, key: Key) -> ActionResult {
-        if self.prompt.is_some() {
-            return self.handle_prompt_key(key);
+        if self.editor.is_some() {
+            return self.handle_editor_key(key);
         }
         match key {
             Key::Up => {
@@ -235,8 +357,51 @@ impl BrowserState {
                         "select a directory (or no entry) to create a directory here".to_string(),
                     );
                 } else {
-                    self.prompt = Some(String::new());
+                    self.editor = Some(Editor::CreateDir(String::new()));
                     self.status = None;
+                }
+                ActionResult::Continue
+            }
+            Key::Delete => {
+                match self.selected_directory_name() {
+                    Some(name) => {
+                        self.editor = Some(Editor::ConfirmDelete(name));
+                        self.status = None;
+                    }
+                    None => {
+                        self.status =
+                            Some("select a directory to delete (files are inert)".to_string());
+                    }
+                }
+                ActionResult::Continue
+            }
+            Key::Move => {
+                match self.selected_directory_name() {
+                    Some(name) => {
+                        self.editor = Some(Editor::MoveDir {
+                            name,
+                            input: self.path.clone(),
+                        });
+                        self.status = None;
+                    }
+                    None => {
+                        self.status = Some("select a directory to move".to_string());
+                    }
+                }
+                ActionResult::Continue
+            }
+            Key::Rename => {
+                match self.selected_directory_name() {
+                    Some(name) => {
+                        self.editor = Some(Editor::RenameDir {
+                            name: name.clone(),
+                            input: name,
+                        });
+                        self.status = None;
+                    }
+                    None => {
+                        self.status = Some("select a directory to rename".to_string());
+                    }
                 }
                 ActionResult::Continue
             }
@@ -246,6 +411,13 @@ impl BrowserState {
             }
             Key::Other(_) => ActionResult::Continue,
         }
+    }
+}
+
+/// Appends one printable character while staying within the shared name bound.
+fn push_bounded(input: &mut String, ch: char) {
+    if !ch.is_control() && input.len() + ch.len_utf8() <= MAX_NAME_BYTES {
+        input.push(ch);
     }
 }
 
@@ -260,8 +432,11 @@ pub fn parse_key(byte: u8, sequence: &[u8]) -> Key {
         b'\r' | b'\n' => Key::Enter,
         127 | 8 => Key::Backspace,
         b'q' | b'Q' => Key::Quit,
-        b'r' | b'R' => Key::Reload,
+        b'r' => Key::Reload,
+        b'R' => Key::Rename,
         b'+' => Key::Create,
+        b'd' => Key::Delete,
+        b'm' => Key::Move,
         b'h' | b'H' => Key::Home,
         b'k' | b'K' => Key::Up,
         b'j' | b'J' => Key::Down,
@@ -300,13 +475,40 @@ pub fn render(state: &BrowserState, server: &str) -> String {
         out.push_str(&format!("{marker} {kind}  {}\r\n", sanitize(name)));
     }
     out.push_str("──────────────────────────────────────────────\r\n");
-    if let Some(prompt) = state.prompt.as_deref() {
-        out.push_str(&format!("new directory: {}\r\n", sanitize(prompt)));
-        out.push_str("Enter create · Esc cancel\r\n");
-        out.push_str("──────────────────────────────────────────────\r\n");
+    match state.editor.as_ref() {
+        Some(Editor::CreateDir(input)) => {
+            out.push_str(&format!("new directory: {}\r\n", sanitize(input)));
+            out.push_str("Enter create · Esc cancel\r\n");
+        }
+        Some(Editor::ConfirmDelete(name)) => {
+            out.push_str(&format!(
+                "delete '{}'? Enter/y confirm · Esc cancel\r\n",
+                sanitize(name)
+            ));
+        }
+        Some(Editor::MoveDir { name, input }) => {
+            out.push_str(&format!(
+                "move '{}' to parent: {}\r\n",
+                sanitize(name),
+                sanitize(input)
+            ));
+            out.push_str("Enter move · Esc cancel\r\n");
+        }
+        Some(Editor::RenameDir { name, input }) => {
+            out.push_str(&format!(
+                "rename '{}' to: {}\r\n",
+                sanitize(name),
+                sanitize(input)
+            ));
+            out.push_str("Enter rename · Esc cancel\r\n");
+        }
+        None => {}
+    }
+    if state.editor.is_some() {
+        out.push_str("-------------------------------\r\n");
     }
     let status = state.status.as_deref().unwrap_or(
-        "Up/Down select · Enter open · Backspace/h back · + new dir · r reload · q quit",
+        "Up/Down select · Enter open · + new dir · d delete · m move · R rename · r reload · q quit",
     );
     out.push_str(&sanitize(status));
     out.push_str("\r\n");
@@ -411,6 +613,42 @@ pub async fn perform_create(
     state.fetch_current().await
 }
 
+/// Runs one confirmed deletion: exactly one MB-07 POST, then exactly one MB-01
+/// reload on success. On failure the caller keeps the last safe listing.
+pub async fn perform_delete(
+    state: &mut BrowserState,
+    client: &Mega2MutateClient,
+    parent: &str,
+    name: &str,
+) -> CliResult<()> {
+    client
+        .delete_directory(parent, name, Some(ContentType::Directory))
+        .await?;
+    state.fetch_current().await
+}
+
+/// Runs one confirmed move/rename: exactly one MB-07 POST, then exactly one
+/// MB-01 reload on success.
+pub async fn perform_move(
+    state: &mut BrowserState,
+    client: &Mega2MutateClient,
+    from_parent: &str,
+    from_name: &str,
+    to_parent: &str,
+    to_name: &str,
+) -> CliResult<()> {
+    client
+        .move_entry(
+            from_parent,
+            from_name,
+            to_parent,
+            to_name,
+            Some(ContentType::Directory),
+        )
+        .await?;
+    state.fetch_current().await
+}
+
 /// Full interactive run: TTY check → terminal guard → event loop with exactly
 /// one fetch per navigation action and no background work.
 pub async fn run(
@@ -422,7 +660,8 @@ pub async fn run(
     ensure_tty()?;
     let session = Mega2TreeSession::new(server)?;
     let mut state = BrowserState::new(session, start_path, git_ref.map(str::to_string))?;
-    let entry_client = Mega2EntryClient::new(server, token)?;
+    let entry_client = Mega2EntryClient::new(server, token.clone())?;
+    let mutate_client = Mega2MutateClient::new(server, token)?;
     let mut guard = TerminalGuard::enter()?;
 
     state.fetch_current().await?;
@@ -461,6 +700,33 @@ pub async fn run(
                     {
                         // 401/403/duplicate/timeout: keep the last safe listing and a
                         // secret-free status line; raw mode is untouched.
+                        state.status = Some(format!("error: {}", e.message()));
+                    }
+                }
+                ActionResult::DeleteDirectory { parent, name } => {
+                    if let Err(e) = perform_delete(&mut state, &mutate_client, &parent, &name).await
+                    {
+                        // 401/403/missing/timeout: keep the last safe listing and a
+                        // secret-free status line; raw mode is untouched.
+                        state.status = Some(format!("error: {}", e.message()));
+                    }
+                }
+                ActionResult::MoveDirectory {
+                    from_parent,
+                    from_name,
+                    to_parent,
+                    to_name,
+                } => {
+                    if let Err(e) = perform_move(
+                        &mut state,
+                        &mutate_client,
+                        &from_parent,
+                        &from_name,
+                        &to_parent,
+                        &to_name,
+                    )
+                    .await
+                    {
                         state.status = Some(format!("error: {}", e.message()));
                     }
                 }

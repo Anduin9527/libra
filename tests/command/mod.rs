@@ -692,6 +692,7 @@ mod ls_tree_test;
 mod maintenance_test;
 mod mega2_browser_cli_test;
 mod mega2_browser_mkdir_test;
+mod mega2_browser_mutate_test;
 mod mega2_browser_tui_test;
 mod mega2_entry_transport_test;
 mod mega2_mutate_transport_test;

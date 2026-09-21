@@ -20,7 +20,7 @@ use std::{
 };
 
 use libra::{
-    command::mega2_browser::{ActionResult, BrowserState, Key, perform_create},
+    command::mega2_browser::{ActionResult, BrowserState, Editor, Key, perform_create},
     internal::protocol::{
         mega2_auth::Mega2Token,
         mega2_entry::Mega2EntryClient,
@@ -145,10 +145,10 @@ fn plus_requires_a_non_file_selection() {
 
     // Empty listing: creating is allowed (parent is the current path).
     assert_eq!(state.handle_key(Key::Create), ActionResult::Continue);
-    assert!(state.prompt.is_some());
+    assert!(matches!(state.editor, Some(Editor::CreateDir(_))));
 
     // A file selection blocks creation with an explanatory status.
-    state.prompt = None;
+    state.editor = None;
     state.status = None;
     state.entries = vec![
         ("sub".to_string(), ContentType::Directory),
@@ -157,7 +157,7 @@ fn plus_requires_a_non_file_selection() {
     state.selection = 1; // readme.txt
     assert_eq!(state.handle_key(Key::Create), ActionResult::Continue);
     assert!(
-        state.prompt.is_none(),
+        state.editor.is_none(),
         "file selection must not open the editor"
     );
     assert!(
@@ -173,7 +173,7 @@ fn plus_requires_a_non_file_selection() {
     // A directory selection opens the editor.
     state.selection = 0;
     assert_eq!(state.handle_key(Key::Create), ActionResult::Continue);
-    assert!(state.prompt.is_some());
+    assert!(matches!(state.editor, Some(Editor::CreateDir(_))));
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn esc_cancels_without_any_pending_create() {
     type_text(&mut state, "draft");
 
     assert_eq!(state.handle_key(Key::Cancel), ActionResult::Continue);
-    assert!(state.prompt.is_none(), "editor closed");
+    assert!(state.editor.is_none(), "editor closed");
     assert_eq!(state.status.as_deref(), Some("create cancelled"));
     assert_eq!(
         server.requests(),
@@ -199,20 +199,20 @@ fn hostile_names_are_refused_before_any_post() {
     let mut state = state_with(&server);
 
     for bad in ["a/b", "..", "\\x"] {
-        state.prompt = Some(String::new());
+        state.editor = Some(Editor::CreateDir(String::new()));
         state.status = None;
         type_text(&mut state, bad);
         let action = state.handle_key(Key::Enter);
         assert_eq!(action, ActionResult::Continue, "no create for {bad:?}");
-        assert!(state.prompt.is_some(), "editor stays open for {bad:?}");
+        assert!(state.editor.is_some(), "editor stays open for {bad:?}");
         assert!(state.status.is_some(), "status explains {bad:?}");
     }
 
     // Control characters never reach the editor (or the renderer).
-    state.prompt = Some(String::new());
+    state.editor = Some(Editor::CreateDir(String::new()));
     state.handle_key(Key::Other('\u{1b}'));
     state.handle_key(Key::Other('\u{7}'));
-    assert_eq!(state.prompt.as_deref(), Some(""));
+    assert!(matches!(state.editor, Some(Editor::CreateDir(ref input)) if input.is_empty()));
 
     assert_eq!(server.requests(), 0, "no request before confirmation");
 }

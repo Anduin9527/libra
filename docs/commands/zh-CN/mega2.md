@@ -45,6 +45,9 @@ libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|-
 | `Enter` | 进入选中的目录（对子路径发一次请求） |
 | `Backspace` 或 `h` | 返回上级目录（不会高于 `/`） |
 | `+` | 在当前目录建立子目录（见下） |
+| `d` | 删除选中目录（需要额外确认行；文件为惰性） |
+| `m` | 将选中目录移动到编辑后的目标父路径 |
+| `R` | 原地重命名选中目录（同层移动；`r` 仍是重新加载） |
 | `r` | 重新加载当前列表 |
 | `q`（或 `Ctrl-C`、`Esc`） | 退出 |
 
@@ -93,6 +96,17 @@ raw mode，TUI 也永不要求你在备用屏幕上输入原始 token。
 `--token`（会留在 shell history，建议用前两者）。token 相关 flag 仅在交互模式有
 效，与 `--json`/`--machine` 同时使用会被拒绝，机器模式永不 POST。
 
+### 删除、移动与改名（`d`、`m`、`R`，仅交互模式）
+
+`d` 在删除选中目录前要求额外的确认行；`m` 把选中目录移动到编辑后的目标父路径；
+`R` 原地重命名（即同层移动）。这三个键对文件一律惰性；`Esc` 取消任何编辑器且不
+发请求；敌意目标（`..`、分隔符、非 rooted 路径）在 POST 前即被拒绝。
+
+每次确认的变更执行**一次** `POST /api/v1/delete-entry` 或
+`POST /api/v1/move-entry`，成功后恰好重新加载一次列表。成功会清除状态行；
+失败（401/403、源不存在、目标重名、超时）保留最后一次安全列表并显示不含秘密的
+状态行，终端保持完好。没有多选、没有递归：每次操作只针对一个选中目录。
+
 ## 选项
 
 | 选项 | 说明 |
@@ -120,8 +134,9 @@ raw mode，TUI 也永不要求你在备用屏幕上输入原始 token。
 ## 限制与边界
 
 - 每次导航/刷新一个请求；无递归、无预取、无后台任务、无跨进程缓存。
-- 浏览只读且匿名。确认 `+` 后最多一次 `create-entry` POST 加一次重载 GET；本命令
-  不含删除、移动或 tag 面。
+- 浏览只读且匿名。确认 `+` 后最多一次 `create-entry` POST 加一次重载 GET；
+  `d`/`m`/`R` 同样各加一次 `delete-entry`/`move-entry` POST 加一次重载 GET；本命令
+  不含递归或多选操作。
 - 不持久化任何配置或凭据；不写磁盘。
 
 ## 示例
@@ -136,7 +151,7 @@ libra mega2 browser --server https://mega2.example.com src/pkg
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
 
-# 交互建目录：在 TUI 中按 +，可配 --token-file
+# 交互建/删/移/改名：在 TUI 中按 +、d、m 或 R，可配 --token-file
 libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token
 
 # 单次请求 + JSON envelope（无需 TTY，可在仓库外运行）

@@ -56,6 +56,9 @@ state machine with no recursion and no background prefetch:
 | `Enter` | Open the selected directory (one fetch of the child path) |
 | `Backspace` or `h` | Go to the parent directory (never above `/`) |
 | `+` | Create a directory here (see below) |
+| `d` | Delete the selected directory (extra confirmation line; files are inert) |
+| `m` | Move the selected directory under an edited destination parent |
+| `R` | Rename the selected directory (same parent; `r` still reloads) |
 | `r` | Reload the current listing |
 | `q` (or `Ctrl-C`, `Esc`) | Quit |
 
@@ -111,6 +114,21 @@ then the `LIBRA_MEGA2_TOKEN` environment variable, then `--token` (visible in
 shell history — prefer the first two). Token flags are TUI-only: combining
 them with `--json`/`--machine` is refused, and machine mode never POSTs.
 
+### Deleting, moving and renaming (`d`, `m`, `R`, interactive only)
+
+`d` asks for an extra confirmation line before deleting the selected
+directory; `m` moves it under an edited destination parent path; `R` renames
+it in place (the same-parent form of the move operation). Files are inert for
+all three keys, `Esc` cancels every editor without any request, and hostile
+destinations (`..`, separators, unrooted paths) are refused before the POST.
+
+Each confirmed mutation performs **one** `POST /api/v1/delete-entry` or
+`POST /api/v1/move-entry` followed by **one** listing reload. Success clears
+the status; failures (401/403, missing source, duplicate destination,
+timeout) keep the last safe listing and show a secret-free status line while
+the terminal stays intact. There is no multi-select and no recursion: one
+selected directory per operation.
+
 ## Options
 
 | Option | Description |
@@ -141,8 +159,9 @@ paths.
 - One request per navigation/reload; no recursion, no prefetch, no background
   task, no cache that outlives the process.
 - Browse is read-only and anonymous. A confirmed `+` adds at most one
-  `create-entry` POST plus one reload GET; no deletion, move or tag surface
-exists in this command.
+  `create-entry` POST plus one reload GET; `d`/`m`/`R` likewise add one
+  `delete-entry`/`move-entry` POST plus one reload GET. No recursive or
+  multi-selection operation exists in this command.
 - No configuration or credential persistence: nothing written to disk.
 
 ## Examples
@@ -157,7 +176,7 @@ libra mega2 browser --server https://mega2.example.com src/pkg
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
 
-# Create directories interactively with a write token (press + in the TUI)
+# Create, delete, move or rename directories interactively (press +, d, m or R)
 libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token
 
 # Exactly one fetch, JSON envelope (works without a TTY, outside any repository)
