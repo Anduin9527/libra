@@ -44,6 +44,7 @@ libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|-
 | `↑`/`↓` 或 `k`/`j` | 移动选择 |
 | `Enter` | 进入选中的目录（对子路径发一次请求） |
 | `Backspace` 或 `h` | 返回上级目录（不会高于 `/`） |
+| `+` | 在当前目录建立子目录（见下） |
 | `r` | 重新加载当前列表 |
 | `q`（或 `Ctrl-C`、`Esc`） | 退出 |
 
@@ -75,6 +76,23 @@ scheme/host/port origin。
 
 `--quiet` 若不配合机器输出模式会被拒绝：抑制 stdout 会破坏交互渲染与机器消费。
 
+### 建目录（`+`，仅交互模式）
+
+按 `+` 打开单行名称编辑器，在当前路径下建立子目录（位于根目录时发送的
+parent 即 `/`）。若当前选中项是**文件**，编辑器拒绝打开（选择项必须是目录或空白
+区域）。按 `Enter` 会先用与 wire 相同的规则校验名称（拒绝 `/`、`\`、`.`、`..`、
+NUL 与控制字符），通过后才发送**一次** `POST /api/v1/create-entry`
+（`is_directory=true`、`skip_build=true`、无 `content`）；按 `Esc` 直接取消，完全不发
+请求。
+
+确认建立后恰好重新加载一次当前列表。失败情形（401/403、重名、超时、响应格式
+错误）会保留屏幕上最后一次安全列表，并显示**不含秘密**的状态行；终端不会停留在
+raw mode，TUI 也永不要求你在备用屏幕上输入原始 token。
+
+写入 token 的解析优先级：`--token-file <path>` → 环境变量 `LIBRA_MEGA2_TOKEN` →
+`--token`（会留在 shell history，建议用前两者）。token 相关 flag 仅在交互模式有
+效，与 `--json`/`--machine` 同时使用会被拒绝，机器模式永不 POST。
+
 ## 选项
 
 | 选项 | 说明 |
@@ -82,6 +100,8 @@ scheme/host/port origin。
 | `--server <BASE-URL>` | Mega2 服务端 base URL（必填）。HTTPS，或 loopback HTTP。 |
 | `[PATH]` | 要列出的 rooted 目录路径；默认 `/`。 |
 | `--ref <COMMIT-OR-TAG>` | 可选的 commit 或 tag。 |
+| `--token-file <PATH>` | 仅交互模式：从文件读取写入 token（优先级最高）。 |
+| `--token <TOKEN>` | 仅交互模式：内联写入 token（优先级最低；会留在 shell history）。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
 | `--machine` | 全局标志：严格 NDJSON 机器模式，供自动化使用。 |
 
@@ -100,7 +120,8 @@ scheme/host/port origin。
 ## 限制与边界
 
 - 每次导航/刷新一个请求；无递归、无预取、无后台任务、无跨进程缓存。
-- 浏览只读且匿名；本命令**不**包含建目录、删除、移动或 tag。
+- 浏览只读且匿名。确认 `+` 后最多一次 `create-entry` POST 加一次重载 GET；本命令
+  不含删除、移动或 tag 面。
 - 不持久化任何配置或凭据；不写磁盘。
 
 ## 示例
@@ -114,6 +135,9 @@ libra mega2 browser --server https://mega2.example.com src/pkg
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
+
+# 交互建目录：在 TUI 中按 +，可配 --token-file
+libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token
 
 # 单次请求 + JSON envelope（无需 TTY，可在仓库外运行）
 libra --json mega2 browser --server https://mega2.example.com

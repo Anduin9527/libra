@@ -2010,6 +2010,13 @@ async fn operation_class_for_command(
     {
         return MutationClass::LibraStateMutation;
     }
+    // `mega2 browser` keeps `CommandScope::ReadOnly` (it reads no repository
+    // state and works outside a repository) but can create remote directories
+    // through the mega2 API once the TUI confirms. Classify the external write
+    // explicitly before the generic scope mapping.
+    if matches!(command, Commands::Mega2(_)) {
+        return MutationClass::ExternalOrUnknown;
+    }
     // `commit --dry-run` and `commit --porcelain` are previews: the command
     // deliberately uses ephemeral blob/cache state and promises not to
     // publish an operation or durable snapshot of its own.

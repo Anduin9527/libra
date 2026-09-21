@@ -23,15 +23,17 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands::Mega2`；`command_preflight` 归类为
   `CommandPreflight::none()`（不打开仓库数据库/对象存储），`command_scope` 归类为
-  `CommandScope::ReadOnly`，因此 `operation_class_for_command` 得到
-  `MutationClass::ReadOnly`。命令可在仓库外、任意目录中运行。
+  `CommandScope::ReadOnly`，但 `operation_class_for_command` 在通用映射之前显式早退
+  为 `MutationClass::ExternalOrUnknown`：命令可在仓库外运行，唯一可被修改的是远端
+  状态（MB-05 的 `create-entry`）。
 - 源码分层：
   - CLI/参数与输出：`src/command/mega2.rs`（`Mega2Args`、`Mega2Subcommand::Browser`、
     `BrowserArgs`、`execute_safe`、机器 payload `BrowserData`/`BrowserItem`）。
   - 交互状态机与终端生命周期：`src/command/mega2_browser/`（`BrowserState`、
-    `Key`/`parse_key`、`render`、`sanitize`、`ensure_tty`/`tty_required`、`run`；
-    Unix 采用 `terminal_unix.rs` 的 termios RAII guard，Windows 采用
-    `terminal_windows.rs` 的 windows-sys console guard）。
+    `Key`/`parse_key`、`render`、`sanitize`、`ensure_tty`/`tty_required`、`run`、
+    `perform_create`；Unix 采用 `terminal_unix.rs` 的 termios RAII guard，Windows
+    采用 `terminal_windows.rs` 的 windows-sys console guard）。MB-05 增加 `+` 键的
+    单行编辑器（输入即消毒、长度受 `MAX_NAME_BYTES` 限制，`Esc` 取消零网络）。
   - 有界传输与 wire 校验：`src/internal/protocol/mega2_tree.rs`（URL/path/name
     校验、`Mega2TreeClient`/`Mega2TreeSession`、`ListingCache`、上限常量）。
 - 执行路径：
@@ -39,7 +41,11 @@
   2. `output.is_json()` 为真 → `Mega2TreeSession::new` + `fetch`（恰好一个请求）→
      `emit_json_data("mega2 browser", …)` 输出 `{ ok, command, data }`；
   3. 否则 `mega2_browser::run`：`ensure_tty` → 终端 guard → 首屏 fetch → 事件循环
-     （每个导航动作恰好一个请求）→ 退出时强制还原终端。
+     （每个导航动作恰好一个请求）→ 退出时强制还原终端；`+` 确认后经 MB-04
+     `perform_create` 发一次 POST 并重载一次。
+  4. Token 解析（ADR-MB-03）只在交互路径发生：`--token-file` →
+     `LIBRA_MEGA2_TOKEN` → `--token`；与 `--json`/`--machine` 组合会以
+     `StableErrorCode::CliInvalidArguments` 拒绝（机器模式永不 POST）。
   4. `--quiet` 与交互模式组合被视为不相容调用（会破坏交互/机器消费），以
      `StableErrorCode::CliInvalidArguments` 拒绝并给出 `--machine` 提示。
 - 输出与错误：所有失败映射为稳定 `LBR-*` 码（用法 `LBR-CLI-002`、网络
@@ -68,7 +74,10 @@ flowchart TD
 - 集成（真实二进制 + loopback mock）：`cargo test --test command_test
   mega2_browser_cli` 覆盖默认值、`--ref`/path 查询编码、JSON 与 NDJSON schema、
   非 TTY 拒绝且零请求、URL 四类拒绝、HTTP 500 与坏 schema（无响应体泄漏）、
-  仓库外零本地写入、help 面（仅 `browser`，无 mkdir）。
+  仓库外零本地写入、help 面（仅 `browser`，无 mkdir）；`mega2_browser_mkdir` 覆盖
+  `+` 编辑器（文件选择拒绝、`Esc` 零网络、敌意名称不发 POST）、成功路径
+  （1 POST + 1 重载 GET）、401/400/403/409 保持最后安全列表且无 token/响应体泄漏、
+  token flag 与 `--json` 互斥。
 - 架构守衛：`compat_agent_architecture_guard` 保证不引入
   ratatui/crossterm/`internal::tui`；`compat_matrix_alignment` 保证
   `COMPATIBILITY.md` / `docs/development/commands/README.md` 与 CLI 同步；
@@ -76,7 +85,8 @@ flowchart TD
 
 ## 边界与延后
 
-- 不读 blob、不递归、不带 token、不持久化配置；不修改 mega2。
+- 不读 blob、不递归、不带 token（GET）、不持久化配置；不修改 mega2。
 - 终端渲染不引入第三方 TUI 依赖（G-05）。
-- 建目录、目录删除/移动/tag 属后续卡；本命令的 `--json` 永远是「一次 GET」，
-  不会因后续卡变成写入面。
+- 目录删除/移动/tag 属后续卡（MB-07/08、MB-10/11）；本命令的 `--json` 永远是
+  「一次 GET」，不会因后续卡变成写入面；建目录只作为 TUI 键存在，没有
+  `mega2 mkdir` 子命令。

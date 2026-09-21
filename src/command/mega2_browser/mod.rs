@@ -17,7 +17,11 @@ use libc::{STDIN_FILENO, STDOUT_FILENO};
 
 use self::terminal::TerminalGuard;
 use crate::{
-    internal::protocol::mega2_tree::{ContentType, Listing, MAX_CACHE_ENTRIES, Mega2TreeSession},
+    internal::protocol::{
+        mega2_auth::Mega2Token,
+        mega2_entry::{Mega2EntryClient, validate_entry_name},
+        mega2_tree::{ContentType, Listing, MAX_CACHE_ENTRIES, MAX_NAME_BYTES, Mega2TreeSession},
+    },
     utils::error::{CliError, CliResult, StableErrorCode},
 };
 
@@ -30,15 +34,24 @@ pub enum Key {
     Backspace,
     Home,
     Reload,
+    /// `+`: start the create-directory editor.
+    Create,
+    /// Lone `Esc`: cancel the active editor (or quit when idle).
+    Cancel,
     Quit,
     Other(char),
 }
 
 /// What the event loop must do after a key is handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionResult {
     /// Fetch the current path (enter/back/reload), exactly one request.
     FetchCurrent,
+    /// Run one confirmed remote directory creation, then reload once.
+    CreateDirectory {
+        parent: String,
+        name: String,
+    },
     Continue,
     Quit,
 }
@@ -53,6 +66,8 @@ pub struct BrowserState {
     pub history: Vec<String>,
     pub status: Option<String>,
     pub running: bool,
+    /// Active single-line create-directory editor (sanitized input only).
+    pub prompt: Option<String>,
 }
 
 impl BrowserState {
@@ -67,6 +82,7 @@ impl BrowserState {
             history: Vec::new(),
             status: None,
             running: true,
+            prompt: None,
         })
     }
 
@@ -97,6 +113,59 @@ impl BrowserState {
         Ok(())
     }
 
+    /// Whether the current selection blocks creating (a file is selected).
+    fn selection_blocks_create(&self) -> bool {
+        matches!(
+            self.entries.get(self.selection),
+            Some((_, ContentType::File))
+        )
+    }
+
+    /// Handles one key while the create editor is open. Input is sanitized on
+    /// entry (printable characters only, bounded length) and validated with
+    /// the MB-04 rules before any request can be planned.
+    fn handle_prompt_key(&mut self, key: Key) -> ActionResult {
+        match key {
+            Key::Enter => {
+                let name = self.prompt.take().unwrap_or_default();
+                match validate_entry_name(&name) {
+                    Ok(()) => ActionResult::CreateDirectory {
+                        parent: self.path.clone(),
+                        name,
+                    },
+                    Err(err) => {
+                        self.status = Some(err.message().to_string());
+                        // Keep the editor open so the user can fix the name.
+                        self.prompt = Some(name);
+                        ActionResult::Continue
+                    }
+                }
+            }
+            Key::Backspace => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.pop();
+                }
+                ActionResult::Continue
+            }
+            // Esc (and `q`) close the editor without touching the network.
+            Key::Cancel | Key::Quit => {
+                self.prompt = None;
+                self.status = Some("create cancelled".to_string());
+                ActionResult::Continue
+            }
+            Key::Other(ch) => {
+                if let Some(prompt) = self.prompt.as_mut()
+                    && !ch.is_control()
+                    && prompt.len() + ch.len_utf8() <= MAX_NAME_BYTES
+                {
+                    prompt.push(ch);
+                }
+                ActionResult::Continue
+            }
+            Key::Up | Key::Down | Key::Home | Key::Reload | Key::Create => ActionResult::Continue,
+        }
+    }
+
     fn apply_listing(&mut self, listing: Listing) {
         self.entries = listing
             .entries
@@ -111,6 +180,9 @@ impl BrowserState {
 
     /// Handles one key against the state; the caller performs `FetchCurrent`.
     pub fn handle_key(&mut self, key: Key) -> ActionResult {
+        if self.prompt.is_some() {
+            return self.handle_prompt_key(key);
+        }
         match key {
             Key::Up => {
                 if self.selection > 0 {
@@ -157,7 +229,18 @@ impl BrowserState {
                 }
             }
             Key::Reload => ActionResult::FetchCurrent,
-            Key::Quit => {
+            Key::Create => {
+                if self.selection_blocks_create() {
+                    self.status = Some(
+                        "select a directory (or no entry) to create a directory here".to_string(),
+                    );
+                } else {
+                    self.prompt = Some(String::new());
+                    self.status = None;
+                }
+                ActionResult::Continue
+            }
+            Key::Cancel | Key::Quit => {
                 self.running = false;
                 ActionResult::Quit
             }
@@ -178,6 +261,7 @@ pub fn parse_key(byte: u8, sequence: &[u8]) -> Key {
         127 | 8 => Key::Backspace,
         b'q' | b'Q' => Key::Quit,
         b'r' | b'R' => Key::Reload,
+        b'+' => Key::Create,
         b'h' | b'H' => Key::Home,
         b'k' | b'K' => Key::Up,
         b'j' | b'J' => Key::Down,
@@ -216,10 +300,14 @@ pub fn render(state: &BrowserState, server: &str) -> String {
         out.push_str(&format!("{marker} {kind}  {}\r\n", sanitize(name)));
     }
     out.push_str("──────────────────────────────────────────────\r\n");
-    let status = state
-        .status
-        .as_deref()
-        .unwrap_or("Up/Down select · Enter open · Backspace/h back · r reload · q quit");
+    if let Some(prompt) = state.prompt.as_deref() {
+        out.push_str(&format!("new directory: {}\r\n", sanitize(prompt)));
+        out.push_str("Enter create · Esc cancel\r\n");
+        out.push_str("──────────────────────────────────────────────\r\n");
+    }
+    let status = state.status.as_deref().unwrap_or(
+        "Up/Down select · Enter open · Backspace/h back · + new dir · r reload · q quit",
+    );
     out.push_str(&sanitize(status));
     out.push_str("\r\n");
     out
@@ -298,7 +386,7 @@ pub fn read_key(stdin: &mut io::Stdin) -> io::Result<Key> {
         // SAFETY: pollfd points to one valid descriptor entry.
         let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
         if ready <= 0 {
-            return Ok(Key::Quit); // lone Esc
+            return Ok(Key::Cancel); // lone Esc cancels an editor / quits when idle
         }
     }
     let mut seq = [0u8; 2];
@@ -311,12 +399,30 @@ pub fn read_key(stdin: &mut io::Stdin) -> io::Result<Key> {
     Ok(parse_key(byte[0], &padded))
 }
 
+/// Runs one confirmed creation: exactly one MB-04 POST, then exactly one MB-01
+/// reload on success. On failure the caller keeps the last safe listing.
+pub async fn perform_create(
+    state: &mut BrowserState,
+    client: &Mega2EntryClient,
+    parent: &str,
+    name: &str,
+) -> CliResult<()> {
+    client.create_directory(parent, name).await?;
+    state.fetch_current().await
+}
+
 /// Full interactive run: TTY check → terminal guard → event loop with exactly
 /// one fetch per navigation action and no background work.
-pub async fn run(server: &str, start_path: &str, git_ref: Option<&str>) -> CliResult<()> {
+pub async fn run(
+    server: &str,
+    start_path: &str,
+    git_ref: Option<&str>,
+    token: Option<Mega2Token>,
+) -> CliResult<()> {
     ensure_tty()?;
     let session = Mega2TreeSession::new(server)?;
     let mut state = BrowserState::new(session, start_path, git_ref.map(str::to_string))?;
+    let entry_client = Mega2EntryClient::new(server, token)?;
     let mut guard = TerminalGuard::enter()?;
 
     state.fetch_current().await?;
@@ -347,6 +453,14 @@ pub async fn run(server: &str, start_path: &str, git_ref: Option<&str>) -> CliRe
                 ActionResult::FetchCurrent => {
                     if let Err(e) = state.fetch_current().await {
                         // Keep the last safe listing; show a secret-free status.
+                        state.status = Some(format!("error: {}", e.message()));
+                    }
+                }
+                ActionResult::CreateDirectory { parent, name } => {
+                    if let Err(e) = perform_create(&mut state, &entry_client, &parent, &name).await
+                    {
+                        // 401/403/duplicate/timeout: keep the last safe listing and a
+                        // secret-free status line; raw mode is untouched.
                         state.status = Some(format!("error: {}", e.message()));
                     }
                 }

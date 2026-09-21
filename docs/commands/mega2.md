@@ -55,6 +55,7 @@ state machine with no recursion and no background prefetch:
 | `↑`/`↓` or `k`/`j` | Move the selection |
 | `Enter` | Open the selected directory (one fetch of the child path) |
 | `Backspace` or `h` | Go to the parent directory (never above `/`) |
+| `+` | Create a directory here (see below) |
 | `r` | Reload the current listing |
 | `q` (or `Ctrl-C`, `Esc`) | Quit |
 
@@ -89,6 +90,27 @@ the standard Libra JSON envelope:
 `--quiet` without a machine output mode is rejected: suppressing stdout would
 break both interactive rendering and machine consumers.
 
+### Creating a directory (`+`, interactive only)
+
+Press `+` to open a single-line name editor for a new subdirectory of the
+current path (at the root the parent sent is `/`). While a **file** is
+selected the editor refuses to open — selection must be a directory or an
+empty area. `Enter` validates the name with the same rules used for the wire
+(`/`, `\`, `.`, `..`, NUL and control characters are refused) and only then
+performs **one** `POST /api/v1/create-entry` with `is_directory=true`,
+`skip_build=true` and no `content`; `Esc` cancels with no network at all.
+
+A confirmed creation reloads the current listing exactly once. Failures
+(401/403, duplicate name, timeout, malformed response) keep the last safe
+listing on screen and show a secret-free status line; the terminal is never
+left in raw mode and the TUI never asks you to type a raw token on the
+alternate screen.
+
+Write tokens are read, in order of precedence, from `--token-file <path>`,
+then the `LIBRA_MEGA2_TOKEN` environment variable, then `--token` (visible in
+shell history — prefer the first two). Token flags are TUI-only: combining
+them with `--json`/`--machine` is refused, and machine mode never POSTs.
+
 ## Options
 
 | Option | Description |
@@ -96,6 +118,8 @@ break both interactive rendering and machine consumers.
 | `--server <BASE-URL>` | Mega2 server base URL (required). HTTPS, or loopback HTTP. |
 | `[PATH]` | Rooted directory path to list; defaults to `/`. |
 | `--ref <COMMIT-OR-TAG>` | Optional commit or tag to list. |
+| `--token-file <PATH>` | Interactive only: read the write token from a file (highest precedence). |
+| `--token <TOKEN>` | Interactive only: inline write token (lowest precedence; visible in shell history). |
 | `--json[=<FORMAT>]` | Global flag: one fetch, JSON envelope (`pretty`/`compact`/`ndjson`). |
 | `--machine` | Global flag: strict NDJSON machine mode for automation. |
 
@@ -116,8 +140,9 @@ paths.
 
 - One request per navigation/reload; no recursion, no prefetch, no background
   task, no cache that outlives the process.
-- Browse is read-only and anonymous. Directory creation, deletion, moves and
-  tags are **not** part of this command.
+- Browse is read-only and anonymous. A confirmed `+` adds at most one
+  `create-entry` POST plus one reload GET; no deletion, move or tag surface
+exists in this command.
 - No configuration or credential persistence: nothing written to disk.
 
 ## Examples
@@ -131,6 +156,9 @@ libra mega2 browser --server https://mega2.example.com src/pkg
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
+
+# Create directories interactively with a write token (press + in the TUI)
+libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token
 
 # Exactly one fetch, JSON envelope (works without a TTY, outside any repository)
 libra --json mega2 browser --server https://mega2.example.com

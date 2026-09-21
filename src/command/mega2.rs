@@ -14,12 +14,15 @@
 //! - `--json`/`--machine`: exactly one MB-01 fetch whose validated listing is
 //!   rendered through the shared JSON envelope.
 
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::{
-    internal::protocol::mega2_tree::{
-        ContentType, Listing, Mega2TreeSession, normalize_path, validate_server_url,
+    internal::protocol::{
+        mega2_auth::resolve_token_from_process,
+        mega2_tree::{ContentType, Listing, Mega2TreeSession, normalize_path, validate_server_url},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -46,9 +49,13 @@ EXAMPLES:
     libra mega2 browser --server https://mega2.example.com --ref v1.2  List one commit or tag
     libra mega2 browser --server http://127.0.0.1:8080 --json          Exactly one fetch, JSON schema
     libra --machine mega2 browser --server https://mega2.example.com   NDJSON for automation
+    libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token  Create with a token file
 
 Keys (interactive mode): Up/Down or k/j select, Enter opens a directory,
-Backspace or h goes to the parent, r reloads, q quits.";
+Backspace or h goes to the parent, + creates a directory, r reloads, q quits.
+
+Write token precedence: --token-file, then LIBRA_MEGA2_TOKEN, then --token
+(warned: --token is visible in shell history). Tokens are never echoed.";
 
 /// `libra mega2 <subcommand>`; the parent exposes exactly one child.
 #[derive(Args, Debug)]
@@ -81,6 +88,14 @@ pub struct BrowserArgs {
     /// Optional commit or tag to list instead of the server default branch
     #[arg(long = "ref", value_name = "COMMIT-OR-TAG")]
     pub git_ref: Option<String>,
+
+    /// Read the write token from this file (highest precedence)
+    #[arg(long = "token-file", value_name = "PATH")]
+    pub token_file: Option<PathBuf>,
+
+    /// Write token inline (lowest precedence; visible in shell history — prefer --token-file)
+    #[arg(long = "token", value_name = "TOKEN")]
+    pub token: Option<String>,
 }
 
 /// One validated listing entry in the documented machine schema.
@@ -161,6 +176,16 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
     let git_ref = args.git_ref.as_deref();
 
     if output.is_json() {
+        // Machine mode is one GET and never writes: token flags are TUI-only.
+        if args.token_file.is_some() || args.token.is_some() {
+            return Err(CliError::fatal(
+                "mega2 browser: --token/--token-file are TUI-only and cannot be combined with --json/--machine",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint(
+                "remove the token flags, or drop --json/--machine to create directories interactively",
+            ));
+        }
         // One fetch, one documented payload; no TTY required.
         let mut session = Mega2TreeSession::new(&server)?;
         let listing = session.fetch(&path, git_ref).await?;
@@ -176,7 +201,11 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
         .with_hint("run `libra --machine mega2 browser --server <base-url>` for NDJSON output"));
     }
 
-    crate::command::mega2_browser::run(&server, &path, git_ref).await
+    // ADR-MB-03 precedence: --token-file → LIBRA_MEGA2_TOKEN → --token.
+    let (token, _source) =
+        resolve_token_from_process(args.token_file.as_deref(), args.token.as_deref())?;
+
+    crate::command::mega2_browser::run(&server, &path, git_ref, token).await
 }
 
 #[cfg(test)]
