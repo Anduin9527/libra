@@ -4,7 +4,7 @@
 use std::io::{self, Write};
 
 use windows_sys::Win32::{
-    Foundation::INVALID_HANDLE_VALUE,
+    Foundation::{HANDLE, INVALID_HANDLE_VALUE},
     System::Console::{self, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode},
 };
 
@@ -15,7 +15,7 @@ const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l\x1b[?25h";
 
 /// Console-mode + alternate-screen guard for Windows.
 pub struct WindowsTerminalGuard {
-    handle: Console::HANDLE,
+    handle: HANDLE,
     saved_mode: u32,
     restored: bool,
 }
@@ -84,10 +84,9 @@ impl WindowsTerminalGuard {
             }
             // SAFETY: handle is the console input handle we entered with; saved_mode
             // is the mode captured before entering.
-            if unsafe { SetConsoleMode(self.handle, self.saved_mode) } == 0 {
-                if first_error.is_none() {
-                    first_error = Some(io::Error::last_os_error());
-                }
+            if unsafe { SetConsoleMode(self.handle, self.saved_mode) } == 0 && first_error.is_none()
+            {
+                first_error = Some(io::Error::last_os_error());
             }
         }
         match first_error {
