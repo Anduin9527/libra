@@ -20,6 +20,7 @@ pub mod git_client; // to support git server protocol (git://) over TCP
 pub mod https_client;
 pub mod lfs_client;
 pub mod local_client;
+pub mod mega2_tree; // plan-20260912: bounded mega2 /api/v1/tree listing client
 pub mod ssh_client; // to support SSH transport (ssh:// and git@host:path)
 
 pub trait ProtocolClient {
