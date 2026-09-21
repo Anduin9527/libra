@@ -1,0 +1,98 @@
+# plan-20260819 R30-r08 review — Claude
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-21T15:10:29+08:00
+d19a01c8553259910550b9c98562ea930d9837f7fd6795f5aa65d7bb0849f891  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r08.md
+
+我已完整核对计划、模板 v2.8、`plan-status.md` 与仓库事实（只读，未修改任何文件）。
+
+# R30-r08 计划评审（Claude，只读）
+
+**被审对象**（`git rev-parse HEAD` = `45ad1f7f2`，worktree `/run/media/genedna/data/libra-main`）
+
+| 文件 | 行数 | SHA-256 |
+|---|---|---|
+| `docs/development/plan/plan-20260819.md` | 2732 | `d19a01c8553259910550b9c98562ea930d9837f7fd6795f5aa65d7bb0849f891` |
+| `docs/development/plan/plan-template.md` | 709（`v2.8`） | `e59f0d50dd8c0592ddaeb2104d0e72e5656eb9716e7a060db947cc6063ad82b5` |
+| `docs/development/plan/plan-status.md` | 291 | `5a29768b086c382f6497c6c6db96f1bd007a7051b18b24ccc6b5f28629ebcfd8` |
+
+前两者与 `r30-r08-sha256.txt` 逐字节一致。**排除项：** 未访问 `/run/media/genedna/data/libra-pr456` 与 `../libra-backend`（沙箱外，已由 `DEP-M2-SRC-01` / ER-06a 登记）；#456 事实按计划自述 + `gh` 证据链核对结构一致性。
+
+---
+
+## 一、r07 findings 关闭核对
+
+**Codex r07（2×P1 + 5×P2）**
+
+| 条目 | 结论 | 核对证据 |
+|---|---|---|
+| P1-1 入口语义统一为 envelope | **部分关闭** | `grep -n 'MemoryRecordEnvelopeV1'` → `:46/:505/:506/:507/:526/:582/:942/:958/:977/:981/:1236/:1913/:1926/:1930/:2255/:2272/:2274/:2724` 全部已统一；**但 §0.3 `:45`（bridge 路径）仍写「host…提交 `TerminalObservationV1`（root kind/id、terminal status/time、source ref OID、principal、code anchor）」**，另 `:2539`、`:2564` 仍以 `TerminalObservationV1` 标注触发集合 → **P1-1** |
+| P1-2 REL-M2-01 no-release 成员 | **关闭** | `:693`「**独立发版成员**：…；**no-release 参与卡（C/D 继承 M2-15）**：M2-16D,M2-16E」；`:699`/`:701` 同步「每张会发版卡」「独立发版成员卡」 |
+| P2-1 envelope/fingerprint 首建归属 | **部分关闭** | §0.4 `:64` 已写「`evidence.rs` 首建 `TerminalObservationV1`/`TerminalEvidenceRefV1`/`MemoryRecordEnvelopeV1`/`TerminalObservationFingerprintV1`」；M2-01 AC4 `:1236` 已列入；**但 M2-07 的 AC（`:1855-1862`）与写集（`:1879`）未具名首建、schema-version 拒绝策略与 golden fixture 归属** → 并入 **P1-2** |
+| P2-2 M2-05 `prod-files=14` | **关闭** | `:1766` `prod-files=14; scope=L-exception:EX-M2-03`，与审计表 `:776`（`4/14`）、`EX-M2-03` `:762`、`Files likely touched` `:1744` 一致 |
+| P2-3 审计表末行断行 + 空行 | **未关闭** | `:793` 为 M2-15 表行、`:794` 为 `**Verification 新增标记：**`，**两行之间无空行**（`Read` 逐行核对）。GFM 在表格后遇非空非块级行仍并入表体 → **P2-1** |
+| P2-4 `Dependencies` 前空行 | **关闭** | `:903→:904`（M2-16B）、`:976→:977`（M2-16C）、`:1113→:1114`（M2-16D1）均有前导空行 |
+| P2-5 「DSH/」自相矛盾 | **关闭** | `:506`「**bridge host 當前僅 `deepseek-harness`**…其餘 host（Codex/Claude 等）走嵌入 API」 |
+
+**Claude r07（2×P1 + 12×P2）**
+
+- **P1-1（DSH 阻塞闭环）关闭**：`:684` 失败策略改「**非阻塞**…M2-16C 不保持 `blocked`」；`:2723` 24 卡集合含 M2-16C 且不再受 DSH 门控；`:2724` bridge E2E 条件化；`:34`「Host-driven 可選 host 面」、`:45`「可選 host 面」；`:977` deps 标「非阻塞」。
+- **P1-2（机械字段）关闭**：`:1766` `prod-files=14`；`:2324` `writeset=serialized-at-M2-16C`（与审计表 `:784` 一致）。
+- **P2 12 条**：1 部分关闭（`:46` ✓，`:45` 残留 → P1-1）、2 关闭、**3 未关闭**（→ P2-1）、4 关闭、5 关闭（DAG `:666` `M208 --> M216C`）、6 关闭（`:631` 触发收窄为「新增 `#[serial(...)]` 或改動 `.config/nextest.toml`」）、7 关闭（`:981` 含 `docs/development/commands/agent.md`；仓库侧 `docs/development/commands/agent.md:129` 确有「Protocol v1: 20-method allowlist」）、8 关闭（AC8 `:1723` + VER `:1734` 均含 `cloud`；`docs/commands/cloud.md` 与 `zh-CN/cloud.md` 均存在）、9 关闭（M2-16C `:977`/`:1007`/`:789` 已补 `DEP-M2-SRC-01`；**但 M2-16A 出现同类漏登** → P2-2）、10 关闭（`plan-status.md:144` 外部 host 前置行）、11 关闭（`:973` 改 `if rg -q …; then echo OK; else … exit 1; fi`；`:1040` 标「證據快照，不作判定門」）、12 关闭（`:908`「僅更新既有 `memory_episode_test` 行的用例說明，不新建 target」）。
+
+**事实基线抽检（全部在核对日 commit 上成立）**
+
+- `ls src/internal/ai/memory` → 不存在 ✓；`src/internal/ai/mod.rs:50-70` 无 `memory` mod ✓（计划 `:363` 锚点 `:53-68` 落在该 mod 列表内）。
+- migration tip = `2026091901_operation_boundary_claim_columns`（`ls sql/migrations | tail`），`2026092101/02/03` 不存在 ✓。
+- 版本面三处 `0.23.36`：`Cargo.toml:3`、`install.sh:21`、`install.ps1:25`；权威 target `compat_version_surface_sync`（`Cargo.toml:260-261`），`tests/compat/version_surface_sync.rs:11-13` 注释确认 `web/`+`worker/` 已拆、当前为三处 ✓ 与模板 v2.8 `:5` 一致。
+- `base.yml`：`on: pull_request` only（`:1-2`），jobs = `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`（`:11/:32/:54/:77/:106/:312/:358`），与 `DEP-M2-CI-02` `:683` 逐字一致 ✓；`codeql.yml:21 analyze` + `:44/:46` `actions`/`rust` matrix ✓。
+- `src/cli.rs:668-676`/`:740-745` 落在 `enum Commands` 内且无 `Memory` variant ✓；`client_storage.rs:2023 pub fn put` ✓；`history.rs:1026 new_with_ref`、`:2227` companion-write 注释 ✓；`op.rs:1144 !name.starts_with("libra/")` ✓；`agent_run/run.rs:22-43 is_terminal → {Completed,Failed}` ✓。
+- bridge：`protocol.rs:62 METHOD_ALLOWLIST`、`:532-533 allowlist_has_exactly_20_methods / len()==20` ✓（M2-16C 的 20→22 重命名有真实落点）；`storage.rs:251,335` 确认 `agent_bridge_event.(bridge_session_id,event_seq,payload_sha256)` 存在且为普通 SHA-256 ✓（与 `:502` 的「只作 locator 完整性校驗」一致）。
+- `src/internal/ref_policy.rs`、`tests/fts5_capability_test.rs`、`docs/benchmarks/` 均不存在 ✓（由 M2-05 / M2-02F / M2-14 新建）；`tests/operation_restore_faults.rs`、`tests/db_migration_test.rs`、`tests/SERIAL_REGISTRY.tsv`、`.config/nextest.toml`、`Cargo.toml:590 compat_serial_registry` 均存在 ✓。
+- 锚点行号上界全部成立：`export_job.rs`(898)、`reference.rs`(47)、`vault.rs`(770)、`config.rs`(3772)、`sql/migrations/README.md`(243)、`redaction.rs`(852)、`model/mod.rs`(48)、`memory.md`(2392) ✓。
+- **25 张卡的 AC/VER 宣称值与实际条目数逐卡相符**（含 `9/8@EX-M2-01` ×3、`9/8@EX-M2-02` ×2、`9/12`）；DAG 无环且与各卡 `Dependencies` 一致；Phase 0 = M2-16A/M2-01/M2-01K（不含 M2-16B）✓；完成判据 24 卡集合计数正确 ✓；全文对 `providers`/`context_budget`/`prompt`/`client`/`mcp`/`orchestrator`/`web`/`operation_wrapper`/`test-provider` 无执行性依赖，仅历史说明与禁止守卫 ✓。
+
+---
+
+## P0
+
+无。
+
+---
+
+## P1
+
+### P1-1　§0.3 的 bridge 入口仍是「pre-envelope + pre-`terminal_evidence`」契约，与 ADR-M2-05 的安全佐证合同直接冲突（Codex r07 P1-1 未完全关闭，修订历史却自称已关闭）
+
+- **位置：** `plan-20260819.md:45`（§0.3 决策 3 bridge 路径）对比 `:502`、`:503`、`:505`、`:506`（ADR-M2-05）、`:958`（M2-16C AC3）、`:1926`（M2-08 AC1）；另 `:2539`（测试矩阵 Job/recovery）、`:2564`（追溯表 M2-08）；与修订历史 `:449`「§0.2/§0.3 舊 seam 與 bridge「主路徑」措辭**全部統一**為 `MemoryRecordEnvelopeV1`」冲突。
+- **问题：** `:45` 仍写「host 在完成一轮后提交 **`TerminalObservationV1`**（root kind/id、terminal status/time、**source ref OID**、principal、code anchor）；M2 只验证与编译」。这有两处与现行合同相悖：① 入口类型应为 `MemoryRecordEnvelopeV1`（`observation` 必填 + 可选 `proposal`/`model_label`，proposal-only 拒绝，`:505`）；② 括号内的字段集是 **r02 之前**的版本——缺 `terminal_evidence: TerminalEvidenceRefV1`、`parent_intent_root_id` 与 `related_run_ids`，并把 `source ref OID` 当作证据，而 `:503` 已显式降级它（「`source_ref_oid` 仍可携带…但佐证以 `terminal_evidence` 为准」）。同类标签漂移还有 `:2539`「`TerminalObservationV1` 触发集合」与 `:2564`「M2-08 | `TerminalObservationV1` + export job pattern」。
+- **为何重要：** §0.3 是本计划自称「取代旧 Code-era 绑定」的规范性架构决策节，也是 §0.1/GAP 表与多条 ADR 的上游引用点。按 `:45` 落地的 bridge `memory.episode.record` 会接受一个**没有 `terminal_evidence` 的 host 自报终态**——而整条自动信任链（ADR-M2-06 trust gate、GC-M2-02 fail-closed、`TerminalObservationFingerprintV1` 的 keyed digest 绑定、`:2603` 故障矩阵的 mismatch→Quarantined）都建立在「host 申报必须由不可伪造证据佐证」之上。这是安全语义的 fail-open 风险，不是措辞问题；而且计划自己宣称该项已修订，会让下一轮执行者跳过复核。
+- **最小修复：** `:45` 改为「bridge 路径（可選 host 面）：bridge 1.2+ 的 audited `memory.recall` 与 opt-in `memory.episode.record`；host 提交 `MemoryRecordEnvelopeV1`（`observation: TerminalObservationV1` 必填，含 root kind/id、`terminal_status`/`terminal_at`、`terminal_evidence: TerminalEvidenceRefV1`、`parent_intent_root_id`、`related_run_ids`、principal、code anchor；`proposal`/`model_label` 可選，proposal-only 拒絕）；M2 只验证与编译」。同批把 `:2539` 与 `:2564` 的「`TerminalObservationV1` 触发集合 / 触发来源」改为 `MemoryRecordEnvelopeV1`（`:2545` 的 adapter 行保持 `TerminalObservationV1` 不变，因为那确实是薄封装的输入）。
+
+### P1-2　M2-01 的 AC4 要求为 4 个类型冻结 version gate，但 §0.4 把这 4 个类型的**首建**判给 6 张卡之后的 M2-07，且 M2-01 写集不含 `evidence.rs`——AC 在本卡写集内不可满足
+
+- **位置：** `plan-20260819.md:1236`（M2-01 AC4）对比 `:64`（§0.4「移植所有權（**强制**）」）、`:1253`（M2-01 `Implementation write set`）、`:1279`（M2-01 `Granularity` `self-contained=yes`）、`:1879`（M2-07 写集）、`:1855-1862`（M2-07 AC）、`:648-657`（DAG）、`:693`（REL-M2-01「正向严格按 DAG 串行」）；模板 `plan-template.md:426`（G-02）、`:449`（G-05「`Acceptance criteria` 自洽可判定」）、`:520`（G-02/G-05 **永不可豁免**）。
+- **问题：** AC4 要求 `MemoryNoteV1 / MemoryEventV1 / EpisodePayloadV1 / EvidenceRefV1 / CompileRecordV1 / **TerminalObservationV1 / TerminalEvidenceRefV1 / MemoryRecordEnvelopeV1 / TerminalObservationFingerprintV1**` 全部「有显式 version gate：已知版本忽略 additive unknown fields，未知不兼容版本拒绝，未知 enum/state 始终拒绝」。但 §0.4 `:64` 明确「`source/evidence/redaction/trust/policy` → **M2-07**（`evidence.rs` 首建 `TerminalObservationV1`/`TerminalEvidenceRefV1`/`MemoryRecordEnvelopeV1`/`TerminalObservationFingerprintV1`）」，而 M2-01 的写集只有 `memory/{mod,domain,canonical,validation}.rs` + `mod.rs` + 两份设计文档，**不含 `evidence.rs`**；DAG 上 M2-01 位于 M2-07 之前 6 张卡（`M201→M201K→M202→M202F→M202R→M203→M204→M205→M206→M207`），且 REL-M2-01 是严格串行、同一时刻只允许一张卡进入发布窗口。M2-01 的 VER（`:1244-1247`，`--lib internal::ai::memory::{domain,canonical,validation}` + doctest）也无法覆盖尚不存在的类型。反过来，M2-07 的 8 条 AC 里**没有任何一条**要求首建这 4 个类型、固定其 schema-version 拒绝矩阵或 golden fixture——这正是 Codex r07 P2-1 要求的「在所有权表、**M2-07 写集/AC** 和 M2-01 合同门中明确首建、schema-version 拒绝策略与 golden fixture 归属」中未做的一半。
+- **为何重要：** 这不是排版问题：执行 M2-01 的 Agent 只有两条路——(a) 在 `domain.rs` 里提前定义这 4 个类型，直接违反 §0.4 的「**强制**」移植所有权并与 M2-07 的写集冲突；(b) 跳过 AC4 的这 4 项，则该卡 AC 无法勾选、`self-contained=yes` 不成立。两者都会在 ER-03 开工日被判不达标。模板把 G-02/G-05 列为**永不可豁免**，所以这是模板规则违规，不能靠 `EX-*` 登记绕过。同时，`MemoryRecordEnvelopeV1` 是 bridge / CLI / 进程内 API 三个入口共用的最外层 host-facing wire 类型（`:505` 带 `schema_version`），它的版本门归属不清会直接落到跨入口兼容性上。
+- **最小修复：** 二选一，同批同步：① 在 `:1236` 末尾补一句范围限定——「其中 `TerminalObservationV1` / `TerminalEvidenceRefV1` / `MemoryRecordEnvelopeV1` / `TerminalObservationFingerprintV1` 在本卡只冻结 `memory.md` 的 version-gate 规则与字段清单，Rust 类型、拒绝矩阵与 golden fixture 由 M2-07 `evidence.rs` 首建」，并在 M2-07 新增/改写一条 AC（例如把 `:1860` 扩为「`evidence.rs` 首建上述四型并实现 M2-01 冻结的 version gate 与拒绝矩阵，带 golden fixture」）+ 一条具名 VER（如 `memory_episode_test terminal_observation_schema_version_matrix`），AC/VER 分子与审计表 `:778`（`8/8`、`8/8`）同步核对；② 或把这 4 个类型的首建从 §0.4 `:64` 移回 M2-01 的 `domain.rs`（同步 M2-01 写集与 `prod-files`、并从 M2-07 的 `evidence.rs` 职责中删除首建字样）。
+
+---
+
+## P2
+
+1. **审计表末行与「Verification 新增标记」段落之间仍无空行（Codex/Claude r07 P2-3 均未关闭）。** `:793` 是 M2-15 表行，`:794` 紧接 `**Verification 新增标记：** …`，中间无空行。GFM 的表格「在首个空行或另一块级结构处终止」，纯段落行不构成块级结构，因此 `:794` 会被解析成一条单元格表行——这段**规范性**的 `(new)` 标记契约（模板 `:558` 要求）在渲染视图里会变成表格尾巴。**修复：** 在 `:793` 与 `:794` 之间插入一个空行。
+
+2. **M2-16A 的 `Granularity` 与审计表 `deps` 漏登 `DEP-M2-SRC-01`（与 M2-16C 同类，r07 只修了 M2-16C）。** 卡内 `Dependencies` `:835` 写「DEP-M2-ENV-01（执行环境）、**DEP-M2-SRC-01**（#456 只讀來源 clone）」，`Current evidence` `:812-813` 实际执行 `git -C <source clone> ls-tree/grep`，`DEP-M2-SRC-01` 的 Owner 列 `:685` 也写明「M2-16A / M2-16E」；但 `Granularity` `:865` 与审计表 `:787` 都只写 `DEP-M2-ENV-01`。模板 `:623` 把这一行定义为 ER-03 开工前**逐字段**核对的机器摘要，`:536` 的审计表判定规则同理。**修复：** `:865` 与 `:787` 的 `deps` 改为 `DEP-M2-ENV-01,DEP-M2-SRC-01`（对照 M2-16E `:1211`/`:792` 的正确形态）。
+
+3. **M2-15 把全量 nextest 登记为 `Verification` 判据行，模板明文禁止。** `:2490` 登记 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`，而模板 `:560` 写「`Verification` 只登记本卡特有判据，**不要**把 `cargo nextest run --all --no-fail-fast --retries 2` 当作本卡判据行登记（它要么由 ER-13 的触发条件带出，要么由收口阶段的全量门覆盖）」；本卡 `Full-suite trigger: T-2`（`:2514`）已经带出该门，完成判据 `:2730` 也已覆盖。r05/r06 已按同一理由把 fmt/clippy/release build 从各卡 VER 剔除，这一条是同族残留。**修复：** 删除 `:2490` 该行（VER 计数由 `3/12` 改 `2/12`，同步 `:2524` 与审计表 `:793`），ER-14 执行器口径保留在 `Full-suite trigger` 与 `:70`/`:2548` 即可。
+
+4. **多张卡 `prod-files` 分子与 G-04 计数口径不一致（系统性高报）。** 按模板 `:442-443`，只计生产代码落点（`src/**`、`sql/migrations/**`），文档集 / `COMPATIBILITY.md` / `docs/error-codes.md` / `tests/INDEX.md` / 测试文件属「随附同步集」不计。实际展开写集：M2-16C `:981` 的生产文件为 `agent_bridge/{protocol,ingress,memory}.rs` + `src/command/agent/bridge.rs` = **4**，却写 `prod-files=8`（`:1007`/`:789`）；M2-02F `:1462` 为 `Cargo.toml`+2 迁移+`migration.rs`+`fts_sql.rs`+`memory-portability.yml` = **6**，写 `10`；M2-02R `:1533` 为 2 迁移+`migration.rs`+3 个 context 文件 = **6**，写 `8`。对照 M2-05（14/14）、M2-16A（7/7）、M2-16B（2/2）、M2-16D1（2/2）都是精确按 `src/**` 计的，口径不统一使审计表失去「机械可核对」价值（虽然高报不会让任何卡越过 `M` 的 ≤12 上限）。**修复：** 按 G-04 口径重算这三卡的 `prod-files` 并同步审计表，或在「任务卡字段默认值与例外」加一句「本计划的 `prod-files` 按写集全量文件计（含随附同步集）」以统一口径。
+
+5. **M2-16C 的 20→22 method 同步未覆盖 `deepseek-harness` 规范文档的具体路径。** 写集 `:981` 以「bridge protocol/deepseek-harness 規範」泛指，而仓库侧 `rg '20-method|全量 20 method'` 命中 `docs/development/tracing/deepseek-harness.md:23`（「已实现（LB-01..LB-06 全量 20 method）」）与 `:337`（「含完整 20-method allowlist」）两处需要同批改的硬编码数字。模板 `:449`（G-05）要求写集给出可核对的落点。**修复：** 写集把泛指展开为 `docs/development/tracing/deepseek-harness.md`（与已具名的 `docs/commands/agent.md`、`docs/commands/zh-CN/agent.md`、`docs/development/commands/agent.md` 并列）。
+
+---
+
+**结论：** r07 的 4 条 P1 已关闭 3 条、部分关闭 1 条；17 条 P2 中 15 条关闭、2 条部分/未关闭。全部事实基线锚点、版本面集合（三处 + `compat_version_surface_sync`）、CI job 集合、migration tip、bridge `payload_sha256`/`METHOD_ALLOWLIST` 落点、25 张卡的 AC/VER 计数、DAG/Phase/里程碑/追溯表/发布分组一致性、`EX-M2-01/02/03` 三张 waiver 的 8 列格式与三卡「判据规范」块，均在核对日 commit 上成立。但仍存在 2 条 P1：§0.3 `:45` 的 bridge 入口契约停留在 pre-envelope / pre-`terminal_evidence` 版本（安全佐证链 fail-open，且修订历史自称已统一）；以及 M2-01 AC4 与 §0.4 首建归属的阶段倒置，使 M2-01 的 AC 在其自身写集内不可满足、M2-07 又无对应交付 AC（G-02/G-05，模板列为永不可豁免）。按「P0=0 且 P1=0」的通过口径，本版不通过。
+
+VERDICT: FAIL
+EXIT=0

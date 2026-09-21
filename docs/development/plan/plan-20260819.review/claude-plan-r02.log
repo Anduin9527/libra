@@ -1,0 +1,181 @@
+# plan-20260819 R30-r02 review — Claude
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-21T13:05:35+08:00
+d772074bc664b1b041fbe53f47d2099fbed62456c81fa55738471fde9260322a  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r02.md
+
+# R30-r02 计划评审（Claude，只读）
+
+**被审文件：** `docs/development/plan/plan-20260819.md`（2665 行）、`plan-template.md` v2.8、`plan-status.md`
+**核对基线：** 工作树 `/run/media/genedna/data/libra-main`，`Cargo.toml` `version = "0.23.36"`，迁移 tip `2026091901_operation_boundary_claim_columns`
+**方法：** `Read` 全文逐节；`Glob`/`Grep`/`ls`/`sed`/`awk` 核对每个 `file:line`、feature、target、workflow job 与 guard；未修改任何文件。
+
+---
+
+## 一、r01 findings 关闭核对
+
+| r01 条目 | 结论 | 我实际核对的证据 |
+|---|---|---|
+| P0-1 M2-08 重写 | **已关闭** | `plan:1859-1926` 全卡改 `observe_terminal`/`TerminalObservationV1`；写集无 `orchestrator/persistence.rs`、`ai/runtime/`；evidence 引 `export_job.rs:1-18,111+`（`sed -n '1,18p;105,120p' src/internal/ai/export_job.rs` 确认 `observe_idle` 在 111 附近） |
+| P0-2 去 `test-provider` | **已关闭** | `rg -n "test-provider\|LIBRA_ENABLE_TEST_PROVIDER" plan-20260819.md` → 仅 `:447/:2621` 的修订/评审历史行 |
+| P0-3 root opaque | **部分关闭** | ADR-M2-05/GC-M2-02/GAP-M2-15 已写 opaque；但 **related-ID / 父 Intent 事实源未闭合**（见 P0-1） |
+| P0-4 terminal_status 佐证 | **部分关闭** | `plan:492/606/1815/935` 已加「须与 `source_ref_oid` 一致否则 Quarantined」；但枚举映射仍缺（见 P1-3） |
+| P1-1 版本面权威 | **已关闭** | `tests/compat/version_surface_sync.rs` 只断言 `Cargo.toml`/`install.sh`/`install.ps1`；`Cargo.toml:260` 注册 `compat_version_surface_sync`；计划全文改用「版本面集合（以 `compat_version_surface_sync` 为权威；当前三处）」 |
+| P1-2 Full-suite trigger 赋值 | **未完全关闭** | 25 张卡都有该字段，但 4 张的取值与 T-1 客观事实冲突（见 P1-5、P1-6） |
+| P1-3/4 M2-15 nextest / Release write set | **已关闭** | `plan:2436` ER-14 命令；`plan:2447` `Inherited`；`rg LIBRA_SKIP_WEB_BUILD` 零命中 |
+| P1-6 迁移重编 | **已关闭** | `2026092101/02/03` 分属 M2-02/02F/02R（`plan:1359/1424/1489`）；`ls sql/migrations` 确认 main tip = `2026091901` |
+| P1-7 M2-16A 规模 | **已关闭（改走缩范围）** | M2-16A 缩为 6 个领域文件（prod-files=7 ≤ M），未登记 `EX-M2-01`，`plan:738` 「无 `EX-*` waiver」与审计表 `exception=N/A` 一致 |
+| P1-9 GC-13 | **已关闭（口径上）** | 三张迁移卡各有 role=`Repository`-only AC + `*_global_config_isolation` VER |
+| P1-10 M2-16D 拆分 | **已关闭** | M2-16D `audit`/`no-release`/`C/D coverage from: M2-15`；M2-16D1 条件性 `independent`；卡数 25 在审计表/追溯表/完成判据三处一致（我逐行数过） |
+| P1-11 bridge target | **已关闭** | `plan:929/945-946` 新建 `tests/agent_bridge_memory_test.rs` 并登记 INDEX |
+| P1-12 M2-13 EXAMPLES / ER-06a | **已关闭** | 三个守卫全部实证存在：`src/cli.rs:4116`、`tests/compat/help_examples_banner.rs:120`、`tests/compat/command_docs_examples_section.rs:37` |
+| P1-13 plan-status | **已关闭（有漂移）** | `plan-status.md:126-142` §3.3 已列 M2-16A..E/D1；但版本号与轮次落后（见 P2-8） |
+| DEP-M2-ENV-01 | **已关闭且属实** | `ls -a` 确认本工作树有 `.git`、无 `.libra` → 计划「仅作评审的 Git worktree 不得用于 C 组」是正确事实判断 |
+
+其余基线声明我也逐条实证：`providers/`、`context_budget/`、`client.rs`、`prompt/`、`mcp/`、`orchestrator/`、`web/`、`operation_wrapper.rs`、`tests/operation_wrapper_test.rs`、`src/internal/ai/memory/` 全部 **不存在**；`completion/`、`agent_run/`、`agent_bridge/`、`export_job.rs`、`review/store.rs`、`session/jsonl.rs`、`internal/operation/` 全部存在；`rg "TaskEventKind|IntentEventKind" src/` **零命中**；`op.rs:1144` 恰为 `!name.starts_with("libra/")`；`history.rs:1026` 恰为 `pub fn new_with_ref(`；`codeql.yml:21`=`analyze`、`:44-46`=language matrix；`base.yml` job id 集合 = `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`，与 DEP-M2-CI-02 **完全一致**。
+
+---
+
+## P0
+
+### P0-1 Task→父 Intent 的关系在 R30 架构下没有任何事实源，Intent Episode 轴不成立
+
+**位置：** ADR-M2-05 `plan:492`；`plan:165`、`plan:181-183`；ADR-M2-07 `plan:513`；M2-08 AC#2 `plan:1879`；M2-09 AC#2/#5 `plan:1948,1951`；M2-10 Current evidence / AC#1 `plan:2010,2015`
+
+**问题：** `TerminalObservationV1` 的字段集被 ADR-M2-05 冻结为 `{root_kind, root_id, terminal_status, terminal_at, source_ref_oid, principal, code_anchor}` — **不含任何 parent / related ID 字段**。而计划同时要求：
+
+- `plan:165`「Writer 从 host 上报…的终态观测机械填充 completion、时间、**related IDs** 与 code anchor」；
+- M2-09 AC#2 明确禁止模型输出 `related IDs`，AC#5 要求它们「由 trusted source 机械注入」；
+- M2-08 AC#2 要求由 Confirmed Task revision「唤醒**其已终态父 Intent**」；
+- ADR-M2-07 要求 Intent 指纹绑定「**terminal Intent OID** + 有序贡献 Task revision OID」；
+- M2-10 AC#1 要求「读取根 Intent、相关 Task/Run IDs」。
+
+计划中唯一被指名的推导来源是 M2-10 Current evidence `plan:2010`：「intent→task 关系可从 git-internal 物件与 agent_run/session 事实推导 | `git-internal 0.10.2 object/{intent,plan,task}.rs`」。但 §0.1 `plan:25` 与 GAP-M2-15 `plan:403` 自己声明这些物件**在 main 无 in-repo producer**。
+
+我的核对：`Grep IntentSpec src/` → 34 处全部是 doc comment / 错误字符串，**没有一处类型导入或写入器**；`Grep "TaskEventKind|IntentEventKind" src/` → 零命中；`git-internal-0.10.2/src/internal/object/{intent,task,plan}.rs` 存在但仅为类型定义。
+
+于是形成闭环矛盾：related IDs 不许模型产生 → 必须来自 trusted source → trusted source（`TerminalObservationV1`）不携带 → 唯一替代来源（git-internal 物件）无 producer。**M2-10 全卡、M2-08 的依赖唤醒、ADR-M2-02「两级摘要」与「成功定义」第 1 条都因此无法实现。**
+
+**为何重要：** 这不是字段笔误，而是 R30 重设计删掉 orchestrator 后遗留的**架构空洞**：整个 Intent Iteration Summary 轴（GAP-M2-10、M2-10、M2-08 观测唤醒、`MemoryNote.links` 固定贡献 Task revision）失去输入。r01 的 P0-3 只修了 root *身份*，没有修 root *关系*。
+
+**最小修复：** 在 ADR-M2-05 的 `TerminalObservationV1` 中新增受信任的可选关系字段（例如 `parent_root_id: Option<OpaqueRootId>` / `related_run_ids`），并明确：(a) 它由 host 提供、与 `root_id` 同属 trusted 字段；(b) 缺失时 Task Episode 的 `related_intent_ids` 为空、M2-08 不做父 Intent 唤醒、M2-10 对该 Intent 不产生 Confirmed revision（fail-closed 而非猜测）；(c) 若改为由 M2-07 resolver 从 `source_ref_oid` 解析，必须具名写出承载该边的实际记录字段（候选：`src/internal/ai/agent_run/task.rs:27` 的可选 `IntentSpec` id）并在 M2-07 AC 中登记「关系缺失 → 无父 Intent」的确定性分支。同步改写 ADR-M2-07 的「terminal Intent OID」措辞、M2-10 Current evidence（删除 git-internal 物件推导）与 GAP-M2-15 的动作列。
+
+---
+
+## P1
+
+### P1-1 M2-16B 在其 DAG 位置上不可执行，且与 §0.4 移植所有权直接冲突
+
+**位置：** M2-16B `plan:845-911`（Description `:851`、AC#1/#2 `:865-866`、VER `:875-879`、Dependencies `:881`、写集 `:885`）；§0.4 移植所有权 `plan:64`；DAG `plan:644`
+
+**问题：** M2-16B 的 `Dependencies` 只有 M2-16A，而 M2-16A 只移植 `memory/{mod,domain,canonical,validation,error,limits}.rs`。但 M2-16B 要求：
+
+1. 「把 #456 的 **Task/Intent compiler** 与 DSH adapter 改为只依赖该 trait」，写集含 `src/internal/ai/memory/compiler/**` —— 而 §0.4 明文规定 `compiler/**` → **M2-09/10**、`compiler/mod.rs` 归 M2-07（`plan:1831`），三者在 DAG 上**都排在 M2-16B 之后**；
+2. AC#1 要求请求「只含 `RedactedEpisodeSource`」—— §0.4 把 `source/evidence/redaction/trust/policy` 指派给 **M2-07**（DAG 位置 ~第 10 张）；
+3. VER 用 `--test memory_episode_test`，而该 target 的创建者按写集是 **M2-01K**（`plan:1288`），不是 M2-16A/M2-16B；若由 M2-16B 创建，其写集又缺 `tests/INDEX.md`，违反 GC-06。
+
+后果是 AC#2 的零命中守卫（`rg "AnyCompletionModel|providers::|CompletionClient" src/internal/ai/memory`）与 VER `cargo test --lib internal::ai::memory::compiler` 都会**以「没有代码所以零命中 / 0 tests」通过** —— 恰是 `plan:770` 与测试矩阵 `plan:2475` 自己禁止的「不把零命中视为通过」。
+
+**为何重要：** 这是 G-05（不读其它卡即可执行）与 G-06（依赖闭合）的硬违规，且该卡是 Phase 0 的四张卡之一，开工即卡死或以虚假绿灯通过。
+
+**最小修复：** 二选一 —— (a) 把 M2-16B 的写集收窄为 `memory/model.rs`（只定义 trait + 请求/响应/错误类型 + `#[cfg(test)]` fake），`Dependencies` 增列 M2-07（提供 `RedactedEpisodeSource`）或改由 M2-16A 一并移植该类型，AC#2 的「compiler 只经 trait 调用」判据移交 M2-09/M2-10；(b) 保留现写集但把 §0.4 的 `compiler/**` 与 `dsh.rs` 所有权一并改指 M2-16B，并把 M2-16B 在 DAG 上后移到 M2-07 之后。两种都需同步 §0.4、DAG `plan:644-646`、粒度审计表 `plan:763` 的 `deps` 列与 `plan:770` 的 `(new)` 说明。
+
+### P1-2 `memory_compile_observer_state` 仍把已不存在的 `libra/intent` 当作源 ref，与 M2-08 AC#2 自相矛盾
+
+**位置：** SQLite 表职责 `plan:326`；M2-02 AC#4 `plan:1339`；M2-08 AC#2 `plan:1879`
+
+**问题：** `plan:326` 规定该表「分别保存已完整扫描的 **`libra/intent`** 与 `libra/memory/repo` first-parent OID；**前者发现 Task/Intent 终态**」，M2-02 AC#4 据此要求「能分别跟踪 **Intent 事实 ref** 与 Memory ref」。但 M2-08 AC#2 明确写「**不扫描已删除的 `libra/intent` 终态事件**」，ADR-M2-05 也已把外部触发收敛为 host 上报。
+
+**为何重要：** M2-02 是持久 schema 卡（`forward-only`，down 仅限空表）。按当前合同实现会在数据库里固化一个永不写入的 `source_ref_name='libra/intent'` 语义，之后只能靠更高版本迁移前滚修复；同时 M2-02 与 M2-08 的 AC 互相否定，ER-03 粒度门无法判定。
+
+**最小修复：** 把 `plan:326` 与 M2-02 AC#4 改为「`(scope_key, source_ref_name)`，首个切片只使用 `libra/memory/repo` 一行（依赖唤醒 cursor）；`source_ref_name` 保持通用列以便未来新增 in-repo producer，但迁移与测试只断言 Memory ref 一行」，并在 M2-02 的 VER `observer_job_schema_transaction` 中加入「不产生 `libra/intent` 行」的断言。
+
+### P1-3 `terminal_status` 五态与 `completion_status` 三态之间缺映射，`unchanged` 与 `code_change_status` 语义冲突
+
+**位置：** ADR-M2-05 `plan:492`；负载表 `plan:186-187`；非目标 `plan:94`；M2-09 AC#7 `plan:1953`
+
+**问题：** ADR-M2-05 把 `terminal_status` 冻结为 `{completed, failed, cancelled, partial, unchanged}`（5 值），而 `plan:186` 规定 `completion_status` 由该观测「机械映射为 `completed`/`failed`/`cancelled`」（3 值）。`partial` 与 `unchanged` **没有任何目标值**。更糟的是 `unchanged` 同时是 `code_change_status` 的取值，而 `plan:187` 明确宣称两者「**与任务完成状态正交**」。`plan:94` 又把「部分完成和未改代码的尝试」列为必须保留的能力。
+
+**为何重要：** 这是 Writer 唯一的「trusted 字段机械填充」路径（GC-M2-02 要求逐项校验、否则 fail-closed）。实现者面对 host 上报 `partial` 时无合法行为：既不能映射、又不能拒绝（计划要求保留部分完成）。M2-09 AC#7 的「Done/Failed/Cancelled × changed/unchanged/unknown 正交矩阵」也因此无法覆盖全部输入。
+
+**最小修复：** 在 ADR-M2-05 把 `terminal_status` 收敛为 `{completed, failed, cancelled, partial}`（删除与 `code_change_status` 重名的 `unchanged`），并在 `plan:186` 把 `completion_status` 枚举扩为 `completed | failed | cancelled | partial`，同步 M2-09 AC#7、故障矩阵与 benchmark corpus 的 completion 维度；「未改代码」一律只由 `code_change_status=unchanged` 表达。
+
+### P1-4 没有任何卡拥有 `tests/SERIAL_REGISTRY.tsv` / `.config/nextest.toml`，ER-14 nextest 收口门必然红
+
+**位置：** 全文（`Grep "SERIAL_REGISTRY|SERIAL_CLASSIFY|NEXTEST_GROUPS|nextest\.toml|serial\(" plan-20260819.md` → **零命中**）；受影响 VER：`plan:1959-1962`、`plan:2026-2028`；全量门 `plan:2436/2495/2662`
+
+**问题：** 计划新增至少 4 个 `--test` target（`memory_episode_test`、`fts5_capability_test`、`memory_benchmark_test`、`agent_bridge_memory_test`）与大量 `src/**` 单测，其中多条**必然**触及进程级全局状态：GC-13 隔离 fixture 要改 `LIBRA_CONFIG_GLOBAL_DB`/`LIBRA_CONFIG_SYSTEM_DB`（→ `#[serial(env)]`）、`command_test` 的 `memory_search_show_status_rebuild` / `memory_branch_is_hidden_and_locked` / `ordinary_push_fetch_exclude_memory_branch` 要切 cwd（→ `#[serial(cwd)]`）。
+
+我核对的仓库事实：`tests/SERIAL_REGISTRY.tsv` 有 **828 行**（`test_fn / lane / reason`，每个 `#[serial]` 一行）；`Cargo.toml:590` 注册 `compat_serial_registry`；`tests/INDEX.md:139` 说明该守卫做**双向漂移断言**、含 TA-03「tests/** 零未加键 `#[serial]`」常驻不变式，并要求 `.config/nextest.toml` 与其生成器 `tests/NEXTEST_GROUPS.sh` **字节一致**。CLAUDE.md 同样强制此规则。
+
+同时，M2-09/M2-10 的 7 条 VER 用 `-- --test-threads=1` 取得隔离 —— 这在 **nextest（一测一进程）下完全无效**，而 ER-14 规定发布/收口证据只能由 nextest 产生。
+
+**为何重要：** 计划把 ER-14 nextest 设为唯一发布门（`plan:7/69/2436/2495/2662`），但从未登记让该门通过所需的共享测试基建改动。结果是每张会发版卡的 C 组第 ④ 步都会被 `compat_serial_registry` 直接判红，且无卡负责修复。
+
+**最小修复：** 在 M2-02（首张引入 env-mutating fixture 的卡）与 M2-13/M2-05（首批引入 cwd 测试的卡）的 `Implementation write set` 中加入 `tests/SERIAL_REGISTRY.tsv`（必要时 `tests/SRC_SERIAL_REGISTRY.tsv`、`.config/nextest.toml`），各加一条 AC「新增 `#[serial(...)]` 均有 registry 行且 `sh tests/NEXTEST_GROUPS.sh` 无 diff」与 VER `cargo test --test compat_serial_registry`，并把这些卡的 `Full-suite trigger` 改为 `T-4`；同时把 M2-09/M2-10 VER 中的 `-- --test-threads=1` 换成显式 `#[serial(...)]` 键 + registry 行。
+
+### P1-5 M2-16C 声明稳定错误码却缺 `docs/error-codes.md` 写集，`Full-suite trigger` 写 `none`
+
+**位置：** M2-16C AC#8 `plan:940`、AC#1 `plan:933`、AC#3 `plan:935`、写集 `plan:955`、`Full-suite trigger` `plan:973`
+
+**问题：** AC#1 要求「未知 method 返回稳定错误」，AC#3 要求「缺失 compiler model 时 job 保持 pending + **稳定 reason code**」，AC#8 要求「错误码稳定并有 Display-pin 测试」；GC-M2-08 `plan:612` 规定公开失败必须用稳定 `LBR-MEMORY-*`。但该卡写集**不含** `docs/error-codes.md`，且 `Full-suite trigger: none`。
+
+仓库事实：`tests/INDEX.md:132` 的 `compat_error_codes_doc_sync` 断言「`src/utils/error.rs` 中每个 `LBR-*-NNN` 都已写入 `docs/error-codes.md`」，缺失即失败。计划的其它四张引入错误码的卡（M2-01K `plan:1288/1304`、M2-04 `:1624/1640`、M2-06 `:1762/1778`、M2-13 `:2242/2258`）都正确登记了写集 + `T-1`，**只有 M2-16C 例外**。
+
+**为何重要：** ER-13 明文：「`T-1`–`T-4` 客观命中却写 `none`，视为验收造假，该卡验收无效。」且该卡会因 `compat_error_codes_doc_sync` 在 C 组第 ④ 步直接失败。
+
+**最小修复：** 在 M2-16C 写集加 `docs/error-codes.md`，`Full-suite trigger` 改 `T-1: 新增 bridge 稳定错误码 + docs/error-codes.md`；若确定复用前置卡已登记的码，则把 AC#8 改写为「复用 `<具体码>`，本卡不新增 `StableErrorCode` 变体」并保留 `none`。
+
+### P1-6 M2-03 / M2-05 / M2-07 的 `Full-suite trigger: none` 与 T-1「GC-02 单一事实源 / 共享 helper」客观冲突
+
+**位置：** M2-03 `plan:1571`（写集 `:1555`、AC#6 `:1541`）；M2-05 `plan:1710`（写集 `:1694`、AC#1 `:1672`、AC#8 `:1679`）；M2-07 `plan:1847`（写集 `:1831`）
+
+**问题：** 三张卡的正文都自述在改共享事实源，却登记 `none`：
+
+- **M2-03**：「从 `HistoryManager` 已验证的私有 CAS + companion writes 路径中提炼一个 crate-private 深接口…供 AI history 与 MemoryWriter **共用**」，AC#6 还要求「`HistoryManager` 改为复用新 primitive，现有 ref race/checkpoint 测试语义不变」。`HistoryManager` 被 session/checkpoint/review/investigate 共用（`src/internal/ai/history.rs` 5000+ 行，CAS 在 `:2227` 附近）。
+- **M2-05**：AC#1 自称「**单一 classifier**」，写集新增 `src/internal/ref_policy.rs` 并接入 `branch/checkout/switch/reset/op/push/fetch/clone` **8 个命令** + operation snapshot/restore；AC#8 要求「现有 list、checkout、restore、push/fetch 行为和性能不回归」。
+- **M2-07**：写集含 `src/internal/ai/observed_agents/redaction.rs`（计划自己标注「**共享规则扩展**」），该文件是 hooks / observed_agents / bridge 共用的脱敏引擎（`RedactedBytes` 定义在 `:63`）。
+
+**为何重要：** 同 P1-5，ER-13 把「客观命中写 `none`」定性为验收造假；而 `plan:344` 自己承认本仓库直推 `main` **没有远端全量兜底**（`base.yml` 仅 `on: pull_request`，我已核对），这三张卡恰是最容易把回归带进已发布版本的改动。
+
+**最小修复：** 三张卡的 `Full-suite trigger` 改为 `T-1: GC-02 共享 helper（<linear_ref/HistoryManager CAS | ref_policy 分类器 | observed_agents/redaction>）`，并在粒度审计表无需改动的前提下于 C 组第 ④ 步执行 ER-14 nextest 全量。
+
+### P1-7 ER-06a 的命令文档 / `../libra-backend` 判定在用户可见变更卡上缺失
+
+**位置：** M2-05 AC 全段 `plan:1670-1680` + Docs impact `plan:1700`；M2-16C AC#6 `plan:938` + Docs impact `plan:961`；对照 M2-13 `plan:2248`
+
+**问题：** 模板 ER-06a 规定「**每张任务卡必判定**…必须明确列出受影响的命令文档，或写 `N/A` 并给出理由」，且用户可见行为变化必须在**同一张卡**同步 `docs/commands/<cmd>.md` EN + `docs/commands/zh-CN/<cmd>.md` + `../libra-backend/apps/tanstack-app/content/docs/`（并记录 VCS 类型与已验证的 `cf` 分支）。
+
+M2-05 改变 8 个用户可见命令的行为（branch list 隐藏、delete/rename/reset/checkout/switch 拒绝、`push --all/--mirror` 排除、显式 refspec 稳定拒绝），但：**8 条 AC 中没有一条是文档同步判据**，`Verification` 也没有；`Docs and compatibility impact` 只写「涉及的 branch/op/push/fetch 文档同步说明」，既未点名 EN/zh 双份，也**完全没有后端网站文档判定**。M2-16C 同样只写「（含 EN/zh 命令文档**如涉及**）」——「如涉及」不是判定。全计划只有 M2-13 做了 ER-06a 判定。
+
+**为何重要：** 这是 G-02（实现+文档在同一卡）与 ER-06a 的直接违规，且 `plan:723` 的字段默认只覆盖「EN/zh 用户文档」，**从未涵盖后端网站文档**，因此不存在可继承的默认。
+
+**最小修复：** (a) 在 `plan:723` 的 `Docs and compatibility impact 默认` 中补一句「后端网站文档按 ER-06a 逐卡判定，无对应页面时记 N/A 证据」；(b) 给 M2-05 增加一条 docs AC（列出 `docs/commands/{branch,checkout,switch,reset,op,push,fetch,clone}.md` EN+zh 与后端对应页面或 N/A 理由）并在 `Verification` 加 EN/zh 存在性检查；(c) 把 M2-16C AC#6 的「如涉及」改为明确的 `N/A + 理由`（bridge 是协议面、无 `libra <cmd>` 变化）。
+
+---
+
+## P2
+
+1. **粒度审计表 VER 计数失准**（`plan:746-748`、`plan:1385/1450/1515`）：M2-02、M2-02F、M2-02R 的 `Verification` 各为 **7** 条（我逐条数过 `plan:1347-1353`、`:1412-1418`、`:1477-1483`），但审计表与 `Granularity` 行都写 `6/8` —— r01 P1-9 加入的 `*_global_config_isolation` 一条未计入。未超限，但 ER-03 的逐字段核对会对不上。**修复：** 三处改 `7/8`。
+2. **§0.2 把不存在的文件列为 main 事实面**（`plan:34`）：`src/internal/ai/agent_bridge/memory.rs` 实际不存在（`Glob src/internal/ai/agent_bridge/*.rs` → authorization/mutations/vcs/storage/workspace/redaction/mod/transport/methods/provenance/protocol/ingress，**无 memory.rs**），而 M2-08 Current evidence `plan:1873` 正确写「现无 memory 面」。**修复：** §0.2 该行删掉 `memory`。
+3. **§0.4 移植所有权与实际首建卡错位**（`plan:64`）：`fts_sql` 指派给 M2-11 但 M2-02F 先创建（AC#4 `plan:1404`、写集 `:1424`）；`job_sql` 指派给 M2-08 但 M2-02 先创建（`plan:1359`）。**修复：** §0.4 改为 `fts_sql → M2-02F（首建）/M2-11（查询扩展）`、`job_sql → M2-02（首建）/M2-08（runner 扩展）`。
+4. **Code-era 触发措辞残留**：`plan:85`「Task / Intent 终态触发」、`plan:101`「Task 的 `Done`、`Failed`、`Cancelled` 终态…写入后」、`plan:103`「Task / Intent 终态**事件**才是自动编译触发点」、M2-09 AC#7 `plan:1953`「Done/Failed/Cancelled」—— 与 ADR-M2-05（host 上报观测、无 in-repo 事件 producer）冲突。**修复：** 统一改用 `TerminalObservationV1` / `terminal_status` 词汇。
+5. **`propose_episode` 签名两版不一致**：`plan:42` 写 `propose_episode(&RedactedEpisodeSource) -> …`，ADR-M2-12 `plan:561-566` 写 `propose_episode(&self, request: EpisodeCompileRequestV1) -> …`。**修复：** §0.3 改引 ADR-M2-12 的签名。（另注：该 trait 若要经 `MemoryRuntime::with_compiler_model` 以 `dyn` 注册，原生 `async fn` 不是 object-safe，需 `#[async_trait]` 或 `-> impl Future` —— 建议在 ADR 中写明。）
+6. **事实基线抬头过期**（`plan:357`）：仍写「核对日期 2026-08-19；checkout `f76e0c1d…`，crate `0.19.148`」，而表内各行已是 R30（`45ad1f7f2`）事实，实际 `Cargo.toml:3` = `0.23.36`。**修复：** 抬头改 R30 核对日与 `45ad1f7f2` / `0.23.36`。
+7. **`(new)` 集中标记过度覆盖**（`plan:770`）：该行把 M2-04..M2-14 的所有具名测试标为 `(new)`，但 M2-13 VER 中的 `root_after_help_lists_every_visible_command`（`src/cli.rs:4116`）、`every_visible_command_help_renders_examples_section`（`tests/compat/help_examples_banner.rs:120`）、`every_command_doc_has_examples_or_common_commands_section`（`tests/compat/command_docs_examples_section.rs:37`）**均已存在**。**修复：** 照 M2-03/M2-16D 的写法为 M2-13 加一句既有守卫例外。
+8. **模板版本 / 评审轮次漂移**：`plan:7` 标题写「**迁移政策（v2.7）**」而正文写「迁到模板 v2.8」；`plan-status.md:128` 写「整份迁到模板 **v2.7**」；`plan-status.md:46` 写「Codex **进行中**」，而 `plan:2621` 已记 Codex r01 `FAIL`（0×P0/11×P1）。**修复：** 三处统一为 v2.8 与 r01 双 FAIL。
+9. **M2-11 写集锚点**（`plan:2102`）：`applicability.rs` 在同一行**重复列出两次**；括注的 `CodeHistory` 在 main **零命中**（`rg -l CodeHistory src/` 无结果）。**修复：** 去重，并把 `CodeHistory` 改为开工日实证的 ancestry helper 名或写「新建 `memory/applicability.rs` 内部 ancestry walker，不新增 `libra_vcs.rs`」。
+10. **M2-16E 依赖与 DAG 不一致**：DAG `plan:658` 有 `M216D1 --> M216E` 边，但 M2-16E `Dependencies`（`plan:1155`）与审计表 `deps` 只写 `M2-14C, M2-16D`，M2-16D1 仅在括注里。G-06 规定「不一致时以实施顺序为准并当场修正卡片」。**修复：** `Dependencies` 显式写 `M2-16D1（条件性；未启动时记 N/A 证据）`。
+11. **G-10 写集分类**：M2-02F 把 `Cargo.lock` 放进 `Implementation write set`（`plan:1424`），而模板定义 `Cargo.lock` 属 `Release write set`。**修复：** 从 I 写集移除（该卡的 `Cargo.toml` 改动本身留在 I 写集即可）。
+12. **AC 条目压缩**（`plan:1342`、`:1406`、`:1472`）：三张迁移卡把 GC-13 的两条独立判据（role=Repository-only、隔离 fixture 断言）并入已有的第 7/6 条，使单条 checkbox 含 4–6 个可分别失败的谓词，接近 G-03「多轴伪装」反模式。未超限（仍算 8 条）但削弱了机械核对价值。**修复：** 拆为独立 AC 行并把分子改为 `9/8@EX-…` 或在 waiver 表登记门族型例外。
+
+---
+
+## 结论
+
+r01 的 4×P0 中有 2 条只部分关闭：`root opaque` 改写留下了**关系字段无来源**的更大空洞（P0-1），`terminal_status` 佐证改写留下了**枚举无映射**（P1-3）。此外修订新引入了 M2-16B 的执行顺序倒置（P1-1）与 `libra/intent` 自相矛盾（P1-2），而 ER-14 nextest 作为唯一发布门所依赖的 `tests/SERIAL_REGISTRY.tsv` / `.config/nextest.toml` 基建**全计划零登记**（P1-4）。版本面权威、迁移所有权、M2-16D/D1 拆分、M2-13 三道守卫、DEP-M2-ENV-01、plan-status §3.3 这六项已实证关闭。
+
+**P0=1，P1=7，P2=12。**
+
+VERDICT: FAIL
+EXIT=0

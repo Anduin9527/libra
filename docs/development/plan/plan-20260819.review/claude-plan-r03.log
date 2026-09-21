@@ -1,0 +1,134 @@
+# plan-20260819 R30-r03 review — Claude
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-21T13:28:20+08:00
+4a91608d7109d6bb519c2acd32f59f937655f798bcee4bd0677da250cd4af93e  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r03.md
+
+我完成了只读评审。下面先给 r02 findings 的逐条核对结果，再给本轮 P0/P1/P2。
+
+## 一、r02 findings 关闭核对（实际执行的命令/行号）
+
+| r02 条目 | 状态 | 核对证据 |
+|---|---|---|
+| Claude P0 父关系无来源 → `TerminalEvidenceRefV1`+`parent_intent_root_id`+`related_run_ids` | **已关闭** | `plan-20260819.md:182,187,496,498,519,612,943,1077-1078,1831,1895-1896,1967,2031` 全线贯穿 |
+| Codex「补录路径」→ `libra memory record` | **已关闭（正文有 1 处漏同步，见 P2-2）** | `:503,2221,2241,2566`；但 `:87` 适用范围仍只列 `search/show/status/rebuild` |
+| `terminal_status` 收敛四态 + `completion_status` 四值 | **已关闭** | `:102,187,495,1969`；全文 `rg "unchanged"` 只在 `code_change_status` 语义下出现 |
+| observer 表不再承诺 `libra/intent` | **已关闭** | `:327,1347,1895` |
+| M2-16B 缩为 `memory/model.rs`、DAG `M207→M216B→M208` | **已关闭（审计表漏同步，见 P1-5）** | `:64,651-653,771,853-919` |
+| M2-16D1 `DEFER-M2-09` 墓碑与收口集合 | **已关闭** | `:1061,1163,2670,2674` |
+| T-1/T-4 触发 + `tests/SERIAL_REGISTRY.tsv` / `.config/nextest.toml` 基建 | **部分关闭** | 写集/VER/trigger 已加（`:1369,1385,1436,1452,1503,1519,1710,1726,2258,2274`）、GC-M2-14 已加（`:623`）；但 `fix-checklist-r02.md:12` 要求的「M2-09/10 VER 删 `-- --test-threads=1`」**未执行**（`:1975-1978,2042-2044`）→ **P1-9** |
+| M2-16C 错误码 + ER-06a | **已关闭** | `:946,963,981` |
+| M2-03/05/07 trigger 改 T-1 | **已关闭** | `:1585,1726,1863` |
+| PR→squash→tag 的 D-01 流程 | **已关闭（REL 表措辞滞后，见 P2-7）** | `:69,674,2444`；`:682,688` 仍按「推送 + gh release」叙述 |
+| 三张 migration 卡 `EX-M2-01` AC 拆分与计数 | **未关闭** | `:744` 放进「默认覆盖」表而非 waiver 表；`:746`/`:2674` 仍写「无 `EX-*` waiver」→ **P1-1**；VER 计数 6→7 但实际 8 → **P1-7** |
+| P2：版本面权威、§0.2 去 `memory`、`(new)` 例外、事实基线抬头、M2-11 写集、M2-02F 去 `Cargo.lock`、M2-16E deps | 已关闭 | `:7(体)`、`:34`、`:778`、`:358`、`:2118`、`:1436`、`:1163` |
+| P2：模板版本漂移 v2.7→v2.8 | **未关闭** | `:7` 标签仍写「迁移政策（**v2.7**）」；`plan-status.md:128` 首句仍写「整份迁到模板 v2.7」→ **P2-4** |
+
+仓库事实复核：`src/internal/ai/{providers,context_budget,prompt,mcp,orchestrator,web}`、`client.rs`、`operation_wrapper.rs`、`tests/operation_wrapper_test.rs` 均 `ls` 不存在 ✓；`rg -c "FTS5|bm25\(" src sql tests` 与 `rg -c "EpisodeCompiler|EpisodePayload|RepositoryKeyedDigest|principal_hmac" src` 零命中 ✓；`rg -n "AgentRunStatus::(Completed|Failed)" src/` 仅命中 `run.rs:99,100,117,118,142,143`（定义+单测）✓；`compat_version_surface_sync` 在 `Cargo.toml:260` 注册、覆盖三处版本面且当前均为 `0.23.36` ✓；`base.yml` job 集合 = `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`，与 DEP-M2-CI-02 一致 ✓；`codeql.yml:21`=`analyze`、`:44-46`=language matrix ✓；`git-internal-0.10.2` 的 9 个物件文件均存在 ✓。
+
+---
+
+## P0
+
+### P0-1　bridge（自述的「主」触发路径）没有任何可用的 `source_plane`，Confirmed Episode 结构性不可达
+
+- **位置：** ADR-M2-05 `plan-20260819.md:496-499`、GC-M2-02 `:612`、M2-07 AC `:1831`、M2-16C AC#3 `:943`、完成判据 `:2675`
+- **问题：** `TerminalEvidenceRefV1.source_plane` 被定义为封闭枚举 `{git_oid, session_jsonl, review_store}`，且 `terminal_status` 必须与该证据指向的记录一致，否则强制 `Quarantined`。但我实测：
+  - `Grep "jsonl|Jsonl|session_jsonl" src/internal/ai/agent_bridge` → **No matches**（bridge 不写 session JSONL）；
+  - bridge 的持久事实面是 `agent_bridge_session` / `agent_bridge_event`（`sql/migrations/2026081801_agent_bridge_capture.sql:13,36`，后者带 `event_type`/`event_seq`/`payload_sha256`，本可作为 locator+digest），**该平面不在枚举内**；
+  - `review_store` 只覆盖 `libra review`（`src/internal/ai/review/store.rs`）；
+  - `git_oid` 平面没有终态状态字段，且计划自己在 `:104` 声明「代码提交只是版本证据，不被当作 Task 结束信号」；能承载状态的 `TaskEvent`/`IntentEvent` 物件在 main 无 in-repo producer（计划 §0.1 `:25` 自述，我也确认 `rg` 只命中类型名）。
+- **为何重要：** 按现行合同，bridge 路径提交的每一条 `TerminalObservationV1` 都无法通过佐证校验 → 只能 `Quarantined` → 默认注入只收 `Confirmed`（ADR-M2-13 `:584`）→ 永远为空。成功定义 `:102`、核心链路 `:166`、完成判据 `:2675` 的「bridge 路径 E2E」在设计上不可达；M2-14 的 Recall/NDCG 门也只能靠手工 seed 的 fixture 通过，失去端到端意义。
+- **最小修复：** 在 `TerminalEvidenceRefV1.source_plane` 增加 `bridge_event`（locator = `(bridge_session_id, event_seq)`，digest = `agent_bridge_event.payload_sha256`，可解析性 = 该行存在且 `payload_sha256` 匹配），并同步 ADR-M2-05 `:496-498`、GC-M2-02 `:612`、M2-07 AC `:1831`、M2-16C AC#3 `:943`、故障矩阵 `:2566`；或者反向修：明确把 bridge 降级为「非主路径，需 host 另行落 `session_jsonl` 后才能 Confirmed」，同步改写 §0.3 `:44-45`、ADR-M2-05「主」定性与完成判据 `:2675`。
+
+---
+
+## P1
+
+### P1-1　`EX-M2-01` 未按模板登记为 waiver，且计划三处自述「无 `EX-*` waiver」
+- **位置：** `:744`（「默认覆盖」表内）、`:746`、`:2674`；引用处 `:754-756,1351,1395,1417,1462,1485,1529`
+- **问题：** 模板 `plan-template.md:513` 明示「默认覆盖」表「**不是例外**，无需审批」，waiver 必须进 `:520-532` 的「规则 waiver（`EX-*`，需具名审批）」表（含 `豁免项 / Approver / Review round / 证据 / 有效期` 五列）。计划把 EX-M2-01 放进了前者，没有 waiver 表行、没有有效期；同时 `:746` 写「无 `EX-*` waiver」、`:2674` 写「无未登记的…规则 waiver」，与 `AC=9/8@EX-M2-01` 直接矛盾。另外模板 `:525` 的「门族型验收」准入条件②要求卡内有「判据规范（非计数正文）」块逐条枚举门族——三张卡都没有。
+- **为何重要：** 模板 `:536` 规定，审计表超限项引用的 `EX-*` 必须「存在于 waiver 表」，任一条不满足「仍判为不达标」，而「任一列不达标即不得开工」。M2-02/M2-02F/M2-02R 因此结构性不可开工，而它们是整条 DAG 的必经节点。
+- **最小修复：** 在「字段默认值与例外」下新增「规则 waiver（`EX-*`）」表并登记一行（`EX-M2-01 | M2-02,M2-02F,M2-02R | G-03 条目上限（门族型验收）| 理由+补偿 | Approver | R30-r03 | 证据 | 本计划内`），删除 `:746`「无 `EX-*` waiver」与 `:2674`「无…规则 waiver」，并在三卡各补一个「判据规范（非计数正文）」块；或把 GC-13 的 role 与隔离两条判据合回一条 AC（8/8）并撤销 EX-M2-01。
+
+### P1-2　M2-16A / M2-16C 的 `Granularity.exception` 错引 `EX-M2-01`
+- **位置：** `:851`、`:989`；对照审计表 `:770,772`（两行 exception 列均为 `N/A`）与 `:744`（EX-M2-01 的「任务」列只含 M2-02/02F/02R）
+- **问题：** 两卡 AC 均为 `8/8`，未超限、不需要任何豁免；`Granularity` 却写 `exception=EX-M2-01`，与审计表自相矛盾，且违反模板 `:536`「`EX-*` 的『任务』列必须等于引用它的卡」。
+- **最小修复：** `:851` 与 `:989` 的 `exception=EX-M2-01` 改为 `exception=N/A`。
+
+### P1-3　ADR-M2-12 的「进程内 model registry 缺失 → job pending + 稳定 reason code」无实现卡承接
+- **位置：** ADR-M2-12 `:575`（`MemoryRuntime::with_compiler_model`）、M2-16C AC#3 `:943`、M2-16C 写集 `:963`（明文「只呼叫 M2-08 的 `observe_terminal` API；**不修改或重实现 `memory/{runtime,job}` 語義**」）、M2-08 AC `:1894-1901` 与写集 `:1916`
+- **问题：** 该行为唯一被断言的地方是 M2-16C 的 AC，但 M2-16C 被自己的写集禁止改 `runtime.rs`/`job.rs`；拥有这两个文件的 M2-08 既无对应 AC 也无对应 VER（`:1898` 只说「调用注入的 compiler Adapter」，`:1899` 只覆盖 transient/schema/auth/policy 错误）。M2-16B AC `:879` 的错误映射是 trait 的 `EpisodeCompilerError` 分支，不是 registry 缺失语义。
+- **为何重要：** 命中模板「粒度反模式速查」的**隐式依赖**（G-05 `:495`）：执行 M2-16C 时该行为不存在，实施者只能违反写集或临时开 FIX 卡，破坏串行发布窗口。
+- **最小修复：** 在 M2-08 增加一条 AC（「`MemoryRuntime::with_compiler_model` 提供进程内注册；未注册且 record 未携带 `EpisodeProposalV1` 时 job 保持 pending 并写稳定 reason code，不静默失败、不递减 generation」）与一条 VER（如 `cargo test --test memory_episode_test job_pending_without_compiler_model`），并把 M2-16C AC#3 该句改写为「复用 M2-08 已交付语义，本卡只做 bridge 侧断言」。
+
+### P1-4　实施顺序 DAG 缺 `M2-16D -> M2-16E` 边，与 M2-16E 的 `Dependencies` 不一致
+- **位置：** DAG `:641-666`（只有 `M208 --> M216D`、`M216D --> M216D1`、`M214C --> M216E`）；M2-16E `Dependencies` `:1163`、审计表 `:775`、`Granularity` `:1193` 三处均写 `M2-14C,M2-16D`
+- **为何重要：** 模板 G-06 `:450` 规定「『实施顺序』的依赖边与各卡 `Dependencies` 必须一致；不一致时以『实施顺序』为准并当场修正卡片」——按 DAG 执行会在 M2-16D 尚未产出决策记录时启动 M2-16E，而 M2-16E AC 需要引用该记录。
+- **最小修复：** 在 mermaid 中补一行 `M216D --> M216E`。
+
+### P1-5　审计表 M2-08 的 `deps` 列漏 `M2-16B`
+- **位置：** 审计表 `:762` 写 `M2-07`；卡内 `Dependencies` `:1912` 与 `Granularity` `:1942` 均写 `M2-07,M2-16B`；DAG `:653` 也有 `M216B --> M208`
+- **为何重要：** 模板 `:534` 要求审计表「逐卡汇总各卡 `Granularity` 行」，是 ER-03 开工前的机械核对面；漏一条真实依赖会让 M2-08 在 `EpisodeCompilerModel` 尚未交付时被判为可开工。
+- **最小修复：** 审计表 M2-08 行 `deps` 改为 `M2-07,M2-16B`。
+
+### P1-6　ADR-M2-05 / M2-16C 把 Codex/Claude 当作 bridge host，但 bridge `source` 被 CHECK 固定为 `deepseek-harness`
+- **位置：** ADR-M2-05 `:499`「host（DSH/Codex/Claude）在完成一轮后上报」；M2-16C `:927,941-948,963`
+- **核对结果：** `sql/migrations/2026081801_agent_bridge_capture.sql:16` = `CHECK(\`source\` = 'deepseek-harness')`；`src/internal/ai/agent_bridge/protocol.rs:16-18` = 固定常量；守卫 `tests/compat/agent_bridge_schema_test.rs:78-79`（"source must be fixed to deepseek-harness"）与 `tests/agent_bridge_migration_test.rs:158,178`（非 deepseek-harness 必须被拒）双重锁死。
+- **问题：** M2-16C 既没有放宽该 CHECK 的迁移，也没有对应 AC/写集（写集 `:963` 只含 `protocol.rs/ingress.rs/memory.rs/bridge.rs/docs/tests`）。按现状 Codex/Claude 根本无法开 bridge session，`memory.episode.record` 对它们不可达。
+- **最小修复：** 把 `:499` 改为「bridge host 当前仅 `deepseek-harness`（受 `source` CHECK 与 `agent_bridge_schema_test` 守卫）；其余 host 走嵌入 API 或 `libra memory record`」，并在 M2-16C `Out of scope` 写明「放宽 bridge source 需独立迁移卡」；若要保留原表述，则须给 M2-16C 增加迁移文件 + 守卫更新的 AC/VER/写集（并相应把 trigger 升到 `T-1/T-3`）。
+
+### P1-7　四张卡的 `VER` 计数与实际条目不符；M2-05 按 G-03 计数口径已超限且无 waiver
+- **位置与实测：**
+  - M2-02 `:1356-1363` = **8** 条，`:754`/`:1395` 声明 `7/8`
+  - M2-02F `:1423-1430` = **8** 条，`:755`/`:1462` 声明 `7/8`
+  - M2-02R `:1490-1497` = **8** 条，`:756`/`:1529` 声明 `7/8`
+  - M2-05 `:1697-1704` = **8** 条，`:759`/`:1736` 声明 `6/8`；其中第 8 条 `test -f docs/commands/branch.md && test -f docs/commands/zh-CN/branch.md && test -f docs/commands/push.md && test -f docs/commands/zh-CN/push.md` 按模板 `:438`「`&&` 串联两个都会独立判定的验收命令按两门计」应计 **4** 门 → M2-05 实为 **11/8**
+- **为何重要：** 前三张恰好卡在 8/8 上限，计数失真会让后续任何新增 VER 在无人察觉的情况下越限；M2-05 已实质超限而无 waiver，违反 G-03。
+- **最小修复：** 三张迁移卡 `VER` 改 `8/8`（审计表 + Granularity 同步）；M2-05 把四个 `test -f` 合并为一条单退出码判定的脚本门（或改用 `scripts/run-test-filter-nonempty.sh` 式包装），并把 `VER` 改为 `8/8`。
+
+### P1-8　`sqlite_fts5_release_capability` 同时被登记在两个 target，零命中守卫与四平台 CI 门必然对不上
+- **位置：** M2-02F VER `:1424`（`cargo test --test memory_episode_test sqlite_fts5_release_capability`）；测试矩阵 `:2499`（`scripts/run-test-filter-nonempty.sh --release --test fts5_capability_test --filter sqlite_fts5_release_capability`）；DEP-M2-CI-01 `:673` 四平台跑的是 `--test fts5_capability_test`
+- **问题：** 同名用例被同时声明在 `memory_episode_test` 和 `fts5_capability_test`。计划 `:2491` 自定的合同是「先用 `-- --list` 断言恰有命中，再运行」，两处必有一处零命中；更要紧的是：若该断言实际落在 `memory_episode_test`，则四平台 probe（跑 `fts5_capability_test`）就不包含 FTS5 release capability 判据，ADR-M2-08 的 release-target 能力门形同虚设。
+- **最小修复：** 把 `sqlite_fts5_release_capability` 唯一归属 `tests/fts5_capability_test.rs`，`:1424` 改为 `source .env.test && cargo test --release --test fts5_capability_test sqlite_fts5_release_capability`（与 `:1430` 合并为一门，同时把 M2-02F 的 VER 计数按 P1-7 重算）。
+
+### P1-9　r02 已接受的「M2-09/10 VER 去掉 `-- --test-threads=1`」未执行，且与 GC-M2-14 冲突
+- **位置：** `:1975-1978`（4 处）、`:2042-2044`（3 处）；决策见 `fix-checklist-r02.md:12`
+- **问题：** ER-14 的全量执行器是 nextest（每用例独立进程），`--test-threads=1` 在该执行器下不生效。二选一都没做到：
+  - 若这些用例确需进程级互斥 → 按 GC-M2-14 `:623` 必须具名 `#[serial(...)]` 并同步 `tests/SERIAL_REGISTRY.tsv` + 重生成 `.config/nextest.toml`；但 M2-09（写集 `:1984`）与 M2-10（写集 `:2050`）**都不含**这两个文件，trigger 也是 `none`（`:2000,:2066`），VER 也无 `compat_serial_registry`。
+  - 若不需要互斥 → 该参数是模板「幽灵验收」意义上的无效门。
+- **最小修复：** 删除 7 处 `-- --test-threads=1`；若确需互斥，则改用 `#[serial(env)]`/`#[serial(cwd)]`，并把 `tests/SERIAL_REGISTRY.tsv`、`.config/nextest.toml` 加入两卡写集、trigger 补 `T-4`、VER 补 `cargo test --test compat_serial_registry`（并按 P1-7 口径重算计数）。
+
+### P1-10　「事实基线」多处 `file:line` 在核对日 commit 上不成立
+- **位置与实测（工作树 `src/`、`.github/` 无改动，等同 `45ad1f7f2`）：**
+  - `:362` 写 `src/internal/ai/mod.rs:53-160` → `wc -l` = **68** 行，`160` 越界
+  - `:369` 写 `src/utils/client_storage.rs:1645-1742`（`ClientStorage::put`）→ `rg -n "fn put" src/utils/client_storage.rs` = **2023**、2600；`sed -n '1645p'` 打印的是一段与 `put` 无关的 doc comment
+  - `:2434` 写 `.github/workflows/base.yml:14-532` → `wc -l` = **422** 行，`532` 越界
+  - `:1273`（M2-01K evidence）写 `src/internal/config.rs:1381-1504`「encrypted local config」→ `sed -n '1381,1384p'` 实为 `GlobalConfigResolution` / `LegacyHome` 的全局配置**路径解析**；真正的加密面在 `src/internal/config.rs:44-74`（`encrypt_value`/`decrypt_value`/`encrypted` 列）与 `:218-290`
+- **为何重要：** `:358` 明文声明这些行号就是 R30 核对日的事实；越界/错位锚点让 ER-02 的开工核对和 G-05「`Current evidence` 给出可核对的 `file:line`」失效，也会误导 M2-01K 去错误位置实现 keyed-digest 的加密存储（好在 `config_kv` 的加密支持确实存在，结论成立、证据不成立）。
+- **最小修复：** 分别改为 `src/internal/ai/mod.rs:53-68`、`src/utils/client_storage.rs:2023-2100`、`.github/workflows/base.yml:11-422`、`src/internal/config.rs:44-74,218-290`。
+
+---
+
+## P2
+
+1. **§0.4 移植所有权与多张卡的写集冲突：** `:64` 把 `compiler/**` 判给 M2-09/10，但 M2-07 写集 `:1847` 含 `memory/compiler/mod.rs`；`:64` 把 `policy` 判给 M2-07，但 M2-04 写集 `:1638` 先建 `policy.rs`；`limits.rs` 同时在 M2-16A（`:825`）与 M2-07（`:1847`）；`:64` 把 `delivery.rs` 判给 M2-12，但 M2-12 写集 `:2187` 不含它。串行执行下无并发风险，但会让实施者无法判断「首建/扩展」。最小修复：像 `job_sql`/`fts_sql` 一样在 `:64` 标注「首建/扩展」，并把 `delivery.rs` 加入 M2-12 写集或从 `:64` 删除。
+2. **`:87` 适用范围漏 `record`：** M2-13 已交付五个命令（`:2221`），`:87` 仍只列四个。最小修复：`:87` 补 `record`。
+3. **`(new)` 集中标记误把既有 target 标为新：** `:778` 的例外清单只豁免了 M2-13 的三道 EXAMPLES 守卫，但 M2-02/02F/02R/05/13 的 VER 里新增的 `cargo test --test compat_serial_registry` 是既有 target（`Cargo.toml:590`）。最小修复：在 `:778` 的例外句中并列 `compat_serial_registry`。
+4. **模板版本标签漂移：** `:7` 标签仍写「迁移政策（**v2.7**）」而正文写 v2.8；`plan-status.md:128` 首句仍写「整份迁到模板 v2.7」，末句才改 v2.8。最小修复：两处改 v2.8。
+5. **`ContextFrame「已删除」表述不精确：** `:1826`（M2-07 AC）「ContextFrame 已删除」与 ADR-M2-13 `:583`「两者现已删除」，与 §0.2 `:31` 自己把 `ContextFrame` 列为 `git-internal 0.10.2` 现存物件类型矛盾（我确认 `git-internal-0.10.2/src/internal/object/context_frame.rs` 存在）。最小修复：统一为「libra 侧 `context_budget/*` 落点已删除；git-internal 的 `ContextFrame` 物件类型仍在，但 R30 不使用」。
+6. **M2-01 AC 对 `memory.md` 的收敛范围不足：** `:1215` 只要求处理 §4.2.1 的 `memory_entity_index`/`memory_taxonomy_node` 引用，实际引用还在 `memory.md:900-930`（两张表的 `CREATE TABLE` DDL）、`:1005`（列为「可重建投影」）、`:1124,1131,1176,1293`。最小修复：AC 改为「全文范围内删除或标注为后续切片」。
+7. **REL-M2-01 / 发布窗口顺序未同步 PR 流程：** `:682`、`:688` 仍写「签名提交、推送、`gh release create`」，与 §0.5 `:69` 的「feature branch → PR → base.yml+CodeQL 全绿 → squash merge → 以 merge SHA 发 tag」不一致。最小修复：两处改写为 PR 流程并回指 DEP-M2-CI-02。
+8. **DEP-M2-CI-01 判据与 M2-14C 的 workflow 扩展不一致：** `:673` 把 workflow 判据固定为「只跑 `--test fts5_capability_test`」，而 M2-14C AC `:2370` 要在同一 workflow 加 core migration smoke 与 `libra memory --help` 两步。最小修复：`:673` 补一句「M2-14C 落地后判据扩为三步同 matrix SHA」。另该 workflow 未说明如何在四平台安装 `cargo-nextest`（Windows 尤其），建议在 M2-02F AC 补一条 pinned 安装判据。
+9. **M2-08 / M2-12 改 `agent_bridge/protocol.rs` 却声明 `Full-suite trigger: none`：** `:1916,1932` 与 `:2187,2203`，而 M2-16C 改同一文件声明 `T-1`（`:981`）。protocol.rs 是被 15 个 `agent_bridge_*` target 复用的 wire schema 单一事实源，同文件同计划两种判定不一致。最小修复：三卡统一，或在 `:1932`/`:2203` 写明「仅新增类型、不改既有 wire 语义，故不构成 GC-02 单一事实源变更」。
+10. **新建顶层 `scripts/` 目录未同步仓库布局文档：** `ls scripts` 不存在、`ls docs/benchmarks` 不存在；现有约定是 shell helper 放 `tests/*.sh`、benchmark 放 `benchmark/`（`AGENTS.md:94`）。M2-14/M2-14C 新建 `scripts/` 与 `docs/benchmarks/` 但未把 `AGENTS.md` 布局段落加入写集。最小修复：M2-14C 写集补 `AGENTS.md`，或改用既有 `benchmark/` + `tests/` 落点。另 `:2301` 的「`docs/benchmarks/` 核对日无 M2 产物」应改为「该目录尚不存在」。
+11. **`GC-M2-14` 排在 `GC-M2-13` 之前：** `:623-624` 顺序颠倒，影响机械查找。最小修复：对调。
+12. **M2-13 的 `record` 无专属 AC：** `:2234-2241` 八条中 `record` 只在第 8 条 E2E 里出现，缺少「observation JSON schema / 幂等键 / 非法输入 fail-closed / 不可伪造观测」的独立判据。最小修复：把 `:2237` 的 `rebuild` 条拆一半给 `record`，或把 `record` 并入 `:2238` 的错误码条并点名。
+13. **模板 v2.8 自身的两处内部不一致（本次同批变更范围内）：** `plan-template.md:328`（ER-13 全量触发命令）与 `:702`（完成判据）只写 `source .env.test && cargo nextest run --all …`，缺 `source .env.live-test`，与术语表 `:71`、ER-04 C 组 `:265`、ER-14 `:346,350` 要求「两个环境文件必须同时加载」冲突；另 A 组表 `:228-233` 与完成判据 `:702` 仍保留 `web/` / `worker/` 行，而 v2.8 说明 `:5` 已声明两者在 0.23.x 被拆除。最小修复：`:328`、`:702` 补 `source .env.live-test &&`；给 `web/` / `worker/` 行加「0.23.x 已拆除，保留仅供历史计划」的注记。
+
+---
+
+**统计：P0=1、P1=10、P2=13。** 未达到 `P0=0 且 P1=0` 的 PASS 门槛。
+
+VERDICT: FAIL
+EXIT=0

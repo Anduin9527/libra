@@ -1,0 +1,99 @@
+# plan-20260819 R30-r29 review — Claude（評審期間凍結：plan sha256 fa65abf9…、template 49f94da3…）
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-22T03:28:25+08:00
+fa65abf90774448c792c184720ca6d445eaffdb1d2f9f0073462bceb65c9fc6b  docs/development/plan/plan-20260819.md
+49f94da35c8828e72caaae52006f52c84c72647016dbce188cad77715b2f7f4f  docs/development/plan/plan-template.md
+# review prompt: plan-20260819.review/review-prompt-r29.md
+
+# plan-20260819 R30-r29 review — Claude
+
+**被審版本（凍結）：** plan `fa65abf90774448c792c184720ca6d445eaffdb1d2f9f0073462bceb65c9fc6b`、template `49f94da35c8828e72caaae52006f52c84c72647016dbce188cad77715b2f7f4f`（與 `r30-r29-sha256.txt` 逐字一致，進出場各 `sha256sum` 一次，未變）。**全程只讀，未修改倉庫任何檔案。**
+
+## 一、r28 findings 逐條關閉核對
+
+| r28 finding | 關閉？ | 實測證據 |
+|---|---|---|
+| Claude P1-1：`EX-M2-06` 分子與判據塊未隨第 10 道門更新 | ✅ | `:791` waiver 已寫 `VER 分子如實寫 10/8@EX-M2-06`；`:1014` 判據首行「10 條 VER 門（…**10** 個 checkbox）」；`sed -n '1002,1011p'` 實測 10 個 checkbox，`:1015-1024` 為 B0–B9 共 10 門，B6 = `agent_bridge_approval_test::memory_recall_is_normal_and_record_requires_approval` |
+| Claude P1-2 / Codex P1：`EX-M2-07` AC 分子三處仍 31 | **部分**（見 P1-1） | `rg -n '31/8@EX-M2-07\|9/8@EX-M2-06\|= 31。\|M2-16C=31\|9 個 checkbox'` → 僅命中 `:464`（r17 修訂歷史行，屬歷史事實）。`:797` 已改 `M2-16C=32`、`:1026` 算式結論 `= 32`、`:1058`/`:824` 均 `32/8@EX-M2-07`。**但 `:790` waiver 理由欄仍寫「按獨立謂詞共 31 條」** |
+| Claude P1-3：M2-16C 寫集缺 `agent_bridge_approval_test.rs` | ✅ | `:1030` 寫集含 `tests/agent_bridge_approval_test.rs`；`:1034` 括注「為既有檔案，本卡新增 `memory_recall_is_normal_and_record_requires_approval`」。倉庫實證：該檔存在且現有 5 個用例（`dangerous_actions_default_to_deny`/`enforce_denies_without_or_with_denied_approval`/`bind_actor_rejects_spoof`/`malformed_approval_is_invalid_params`/`dispatch_enforces_approval_for_dangerous_mutation`）確不含該用例 |
+| Claude P1-4：M2-02 `proposal_canonical_json` 正文契約自相矛盾 | ✅ | `:1433` A9 已改「只含脫敏 envelope、HMAC 化 principal、M2-07 正規化/脫敏後的 `proposal_canonical_json` 與其 keyed digest 綁定」；`:1464` Security 同步為「只存脫敏 envelope + HMAC principal + `proposal_canonical_json` + keyed digest」；與 `:330` 表職責、`:1416` AC3 一致 |
+| Claude P2-1：review log 輪次筆誤 `r33` | ❌（見 P2-1） | `:2851`/`:2852` 現為「R30-r28/**r34** 修订后的完整计划」——同類筆誤換了個數字 |
+| Claude P2-2：M2-02 A1 缺 `handle_hmac` | ✅ | `:1425` A1 與 `:1439` VER 括注均為「`handle_hmac`（主鍵/唯一）＋`principal_hmac/repository_id/worktree/issued_at/expires_at/revoked_at` 七列」 |
+| Claude P2-3：M2-03 `axis` 不一致 | ✅ | `:809` 審計表與 `:1705` 卡內 `Granularity` 皆為 `typed ref CAS primitive` |
+| Codex P2：表格 `\|` 假成功證據 | ✅ | 見下「機械核對」 |
+
+## 二、本輪機械核對（r29 指定項）
+
+- **可複製命令零 `\|`：** `rg -n '`[^`]*\\\|[^`]*`'` 僅 2 命中（`:453` 修訂歷史、`:2849` review log），兩者的 `` `\|` `` 都是**描述該次修復本身**的字面量，不是可執行命令。故障矩陣原 `<file\|->` 已改 `<file-or-stdin>`（`:2722`）；源盤點命令改 pathspec／多 `-e`（`:379/:849/:917/:1074/:1211/:2105/:2172/:2239/:2306`）。
+- **表格機械列數 = 表頭（全文，含轉義）：** 以 rg 的「恰 N 個未轉義 `|`」正則分桶統計：`^\|` 共 511 行；N=3→105、N=4→116、N=5→86、N=6→148、N=7→10、N=9→19、N=16→27，**合計恰 511，無任何其它寬度**。逐表邊界核對：審計表 802–828 全部 16（27 行）、依賴表 706–714 與 waiver 表 787–796 全部 9（19 行）、故障矩陣 2710–2725 與風險表 2729–2750 等 4 欄表全部 5、review log 2793–2852 全部 6、歷史評審 2860–2866 與發布分組 718–720 全部 7。**無跨表串行，無斷行。**
+- **審計表末行獨立段落：** `sed -n '826,834p' | cat -A` → `:828` 資料行、`:829` 為純 `$`（物理空行）、`:830` 為 `**Verification 新增标记：**` 段落。`rg -n '^\|.*\|\*\*'` 零命中。
+- **`**Verification:**` / `**Dependencies:**` 空行：** 25 處 `**Verification:**` 全部後接空行；25 處 `**Dependencies:**` 全部前接空行。
+- **M2-16C 區塊結構：** 10 個 VER checkbox → 空行 → `EX-M2-06` 判據塊（B0–B9）→ 空行 → `EX-M2-07` 判據塊 → 空行 → `**Dependencies:**`。無多餘空行。
+- **25 卡逐欄一致：** 25 張卡的 `AC`/`VER`/`landing`/`prod-files`/`deps`/`axis`/`writeset`/`release`/`exception` 與審計表 803–828 逐格比對**全部一致**；AC/VER 分子與實際 checkbox 數逐卡點算一致（M2-02 9/9、M2-02F 9/8、M2-02R 9/8、M2-03 7/5、M2-04 8/7、M2-05 25 謂詞/10、M2-06 8/5、M2-07 9/10、M2-08 34 謂詞/8、M2-09 8/5、M2-10 7/4、M2-11 8/5、M2-12 8/5、M2-13 45 謂詞/15、M2-14 8/5、M2-14C 8/6、M2-15 9/2、M2-16A 8/4、M2-16B 7/5、M2-16C 32 謂詞/10、M2-16D 6/4、M2-16D1 8/6、M2-16E 8/4、M2-01 8/4、M2-01K 8/6）。`prod-files` 與寫集逐檔點算一致（M2-05=17、M2-08=12、M2-02=11、M2-02F=9、M2-04/06=9/6…）。G-04 上限（M：≤4 落點/≤12 生產檔）全部滿足，唯一超限者 M2-05 帶 `L-exception:EX-M2-03`。
+- **EX-M2-02 單一口徑：** waiver `:796`、判據首行 `:2391`、算式 `:2393`（4+3+2+2+7+4+8+1+12+2=45）、V 清單 15 門（V1/V1b–V1f/V2–V10）、拆分 `command_test 7 + lib 2 + memory_episode_test 2 + compat 4 = 15`、Granularity `:2443`、審計表 `:819` **七處一致**。
+- **EX-M2-09：** `:789` `34/8@EX-M2-09`、`:2037` 算式 AC1(2)+AC2(4)+AC3(4)+AC4(3)+AC5(13)+AC6(2)+AC7(3)+AC8(3)=34、AC5 ①–⑬ 逐條枚舉、`:2088` 與 `:814` 一致。
+- **DAG 與 25 卡 `Dependencies` 逐邊比對：** 無環、無缺邊、無多餘邊（含 `M207→M216B→M208`、`M208→M216C`、`M212→M216C`、`M216C→M213`、`M216D→M216E`、D1 條件邊）。
+
+## 三、倉庫事實基線（核對日成立）
+
+`src/internal/ai/mod.rs` 無 `memory`/`keyed_digest`（子模組確為裸 `pub mod`，印證 GC-M2-15 措辭）；`src/cli.rs` 無 `Memory` variant（`rg -c 'Memory' src/cli.rs` 零命中，`:668-745` 確在 Commands enum 內）；migration tip = `2026091901_operation_boundary_claim_columns`；`Cargo.toml` `version = "0.23.36"`、`edition = "2024"`、無 `autotests = false`（頂層 `tests/*.rs` 確可自動發現）；版本面 = 三處（`tests/compat/version_surface_sync.rs:13`「now: `Cargo.toml`, `install.sh`, `install.ps1`」）；`base.yml` job 集合 = `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`（7，與 DEP-M2-CI-02 逐字一致）；`release.yml` = 五 job（與 DEP-M2-CI-03 一致）；`authorization.rs:19 pub enum ActionClass{Normal,Dangerous}`、`:32 pub fn classify`（`_ => Dangerous`）；`protocol.rs:532 allowlist_has_exactly_20_methods`、`tests/agent_bridge_protocol_test.rs:15 protocol_v1_allowlist_is_exactly_20_methods`；`dispatch_handshake` 確實只拒 major 不同、對所有 v1 peer 回完整 allowlist（印證 DEP-M2-DSH-01 的「現有握手」表述）；`sql/migrations/2026081801_agent_bridge_capture.sql:16` `CHECK(source = 'deepseek-harness')`。全計劃對 `providers`/`context_budget`/`prompt`/`client`/`mcp`/`orchestrator`/`web`/`operation_wrapper`/`test-provider` 的引用**全部**落在 §0.1 歷史表、ADR 的 Context/Alternatives、禁止清單或零命中守衛，無執行性依賴。
+
+**證據限制：** `DEP-M2-SRC-01` 的 `$SRC_CLONE`（`/run/media/genedna/data/libra-pr456`）在本次評審沙箱外，無法執行 `rev-parse`/`merge-base`/158-path 計數；該 DEP 本身已規定「來源 clone 不可用時直接阻塞」且要求「雙評審至少一輪在可訪問 clone 的環境執行並歸檔」，故不計為 finding，但本輪不構成該項證據。
+
+---
+
+## P0（0 條）
+
+無。
+
+---
+
+## P1（1 條）
+
+### P1-1　`EX-M2-07` waiver 行的理由欄仍宣告門族為 31 條，與同行分子、判據塊算式、全域計數口徑與審計表的 32 直接矛盾
+
+- **位置：** `plan-20260819.md:790`（waiver 理由欄）；對照 `:790` 同行補償欄、`:797`、`:1026`、`:1058`、`:824`
+- **問題：** `:790` 的「理由与补偿措施」欄寫「bridge 卡的 AC 判據（協議/recall/record/identity/minor/文檔）按獨立謂詞**共 31 條**，屬同一 bridge 行為軸……補償：判據規範逐條枚舉，AC 分子如實寫 `32/8@EX-M2-07`」——**同一格內先說 31、後說 32**。全計劃其餘四處均已是 32：`:797` 全域口徑「M2-16C=32」、`:1026` 判據塊算式 `2+4+9+1+3+2+2+2+5+1+1 = 32`、`:1058` `AC=32/8@EX-M2-07`、`:824` 審計表 `32/8@EX-M2-07`。r27 為 `ActionClass` 加入第 32 條謂詞，r28 修了分子、口徑行與算式，**唯獨漏掉這一格的理由文本**。理由欄的括號枚舉（協議/recall/record/identity/minor/文檔）也未把 `ActionClass` 契約列入。
+- **為何重要：** 模板 `plan-template.md:526` 對「G-03 條目上限（門族型驗收）」waiver 的准入條件 ④ 明文要求「**門族增減時同批更新 waiver 行與粒度審計表**」；理由欄正是界定「被審批的門族有多大」的唯一文本。現況下 waiver 行自述批准了 31 條謂詞，而卡片/審計表主張 32 條在豁免範圍內——收口時無法機械判定第 32 條（ActionClass）是否被已審批的豁免覆蓋，等同於審批記錄與被審批對象不符。這是 r16–r19、r28 反覆處理過的同一失效模式（「只改一半」）第三次發生在 `EX-M2-07`/`EX-M2-06` 這組行上。
+- **最小修復：** 把 `:790` 理由欄的「共 31 條」改為「共 32 條」，並把括號枚舉補為「（協議/recall/**ActionClass**/record/identity/minor/文檔）」。分子、算式、口徑行與審計表已正確，無需再動。
+
+---
+
+## P2（4 條）
+
+### P2-1　review log 的 Scope 欄輪次筆誤再次出現（`R30-r28/r34`）
+
+- **位置：** `plan-20260819.md:2851`、`:2852`
+- **問題：** 兩行 r29 條目的 Scope 欄寫「R30-r28/**r34** 修订后的完整计划（r29 期間凍結）」；本計畫不存在 r34 輪。這是同一欄位第四次同類筆誤（r22 修 `r26`、r24 修 `r29`、r26 修 `r31`、r28 修 `r33`）。
+- **為何重要：** review log 是雙 PASS 的唯一審計軌跡；輪次筆誤讓收口時無法把被審 sha256 對回正確輪次。
+- **最小修復：** 兩行改為「R30-r28 修訂後的凍結版（sha256 `fa65abf9…`）」。建議一併在該表加一條機械檢查（Scope 欄的輪次號必須等於 Round 欄減一）避免第五次。
+
+### P2-2　另外三個 `EX-*` waiver 的理由文本與當前門族不同步
+
+- **位置：** `plan-20260819.md:791`（EX-M2-06）、`:793`（EX-M2-05）、`:794`（EX-M2-04）
+- **問題：** ①`:791` 的門族枚舉「（recall、record、mismatch/proposal/forged identity、minor 協商、20→22 守衛、錯誤碼/文檔）」未包含 r27 新增、現為 B6 的 approval／`ActionClass` 門；②`:793` 仍稱「33 份 EN/zh/開發文檔**存在性**」，但 r26 已把 V9（`:1820`）改成內容性守衛（`rg -q 'libra/memory' "$f"`）；③`:794` 仍稱「`evidence.rs` 首建**四個** host-facing wire 型」，而判據塊 T1（`:1953`）已是「**五型**（四 wire 型 + `CompilerIdentityV1`）」且 `trust.rs` 首建 `CompilerIdentityV1`。
+- **為何重要：** 與 P1-1 同源（模板 `:526` 准入條件 ④）。這三處只是描述性偏差、分子皆正確，故不阻塞執行，但同一失效模式反覆復發說明缺少「改門族必連帶改 waiver 理由」的檢查點。
+- **最小修復：** 三格理由文本各補一句對齊當前門族（`:791` 加「approval/`ActionClass` 分類」；`:793` 「存在性」改「內容性（每份須含 `libra/memory` 段）」；`:794` 「四個」改「五型（四 wire 型 + `CompilerIdentityV1`）」）。
+
+### P2-3　`EX-M2-06` 判據塊 B4/B5 的順序與 Verification checkbox 順序互換
+
+- **位置：** `plan-20260819.md:1006`（第 5 個 checkbox = `agent_bridge_protocol_test`）、`:1007`（第 6 個 = `bridge_record_host_proposal_path`）對比 `:1019`（B4 = `bridge_record_host_proposal_path`）、`:1020`（B5 = `agent_bridge_protocol_test`）
+- **問題：** 集合上確為 10↔10 的 1:1 對應，但 B 編號與 checkbox 位序在第 5/6 項互換。判據塊首行宣稱「與本卡 Verification 的 10 個 checkbox 一一對應」。
+- **為何重要：** 收口時逐條對照需人工跳行；若將來再增減門，位序錯開會提高「只改一半」的概率（正是 P1-1/P2-2 的成因）。
+- **最小修復：** 對調 `:1019`/`:1020` 兩行（或對調 `:1006`/`:1007` 兩個 checkbox），使 B0–B9 與 checkbox 位序嚴格同序。
+
+### P2-4　M2-16C AC6 要求文檔寫入的守衛名仍是重命名前的 `..._20_methods`
+
+- **位置：** `plan-20260819.md:991`（AC6）
+- **問題：** AC6 先要求「更新 **20→22 method** allowlist 契約與版本說明；含 `allowlist_has_exactly_20_methods` 與 `tests/agent_bridge_protocol_test.rs::protocol_v1_allowlist_is_exactly_20_methods` 兩處守衛」，同句稍後才說「並同步更新 …`allowlist_has_exactly_20_methods` 守衛（重命名為 22）」。而 VER B0/B5（`:1015`/`:1020`）驗的是**重命名後**的 `allowlist_has_exactly_22_methods` / `protocol_v1_allowlist_is_exactly_22_methods`。
+- **為何重要：** 字面執行 AC6 會把已作廢的 `..._20_methods` 名字寫進 EN/zh/後端三份 `agent.md`，與同卡 VER 驗的名字不一致，文檔落地即過時。
+- **最小修復：** AC6 括注改為「含重命名後的 `allowlist_has_exactly_22_methods` 與 `tests/agent_bridge_protocol_test.rs::protocol_v1_allowlist_is_exactly_22_methods` 兩處守衛（原名 `..._20_methods`）」。
+
+---
+
+**總計：P0=0，P1=1，P2=4。**
+
+本輪計劃在結構性維度（25 卡逐欄一致、DAG、表格機械列數、審計表空行、寫集/prod-files 點算、五個 `EX-*` 的分子與判據塊、倉庫事實基線）**全部通過機械核對**；唯一 P1 是 r27→r28 的 31→32 計數遷移在 `EX-M2-07` waiver 理由欄留下的最後一處未同步，改一個數字加一個詞即可關閉。
+
+VERDICT: FAIL
+EXIT=0

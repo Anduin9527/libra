@@ -1,0 +1,67 @@
+# plan-20260819 R30-r11 review — Claude
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-21T16:25:11+08:00
+185502b9969a12a4c1240e4cbd3600f9ba16fbb2369dec3abc65c62dbc555db2  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r11.md
+
+我已完整读完计划（2763 行）、模板 v2.8、`plan-status.md`，并在仓库上逐条核对了事实基线。先给 r10 findings 的关闭核对，再给本轮分组结论。
+
+## r10 findings 关闭核对（实际执行的命令 / 行号）
+
+| r10 finding | 结论 | 我的核对证据 |
+|---|---|---|
+| Claude P1-1 审计表末行断行 | **未关闭**（见 P1-4） | `sed -n '800,806p' … \| cat -A`：802 行数据行之后**紧接** 803 行 `**Verification 新增标记：**`，空行在 804 |
+| Claude P1-2 / Codex P1-1,P1-2 ER-06a 绑错卡 + AC/write set | **部分关闭** | `config.en.md`→M2-01K（AC plan:1312 + write set 1326 + Docs 1332）✓；`agent.en.md`→M2-16C（AC 970 + write set 990 + Docs 996）✓；新建 `memory.en.md`→M2-13（AC 2301 + write set 2324 + Docs 2330）✓；M2-01(1269)/M2-16B(923) 记 N/A + 理由 ✓。**但 M2-05 的 11 页只进了 AC，Docs impact 与 write set 都没有**（见 P1-2） |
+| Claude P1-3 M2-07/M2-16C 机械字段 | **已关闭** | plan:1931 `exception=EX-M2-04` 与审计行 787 一致；plan:1016 `landing=4; prod-files=4` 与审计行 798 `4/4` 一致 |
+| Codex P1-3 M2-05 错误码/COMPATIBILITY | **形式关闭、实质未闭环** | plan:1729 AC1 已写稳定 `LBR-*` + Display-pin，1761 write set 已含 `docs/error-codes.md`/`COMPATIBILITY.md`，1752 有 Display-pin VER。但全计划的 `LBR-MEMORY-*` 形态与 owner 文件均不成立（见 P1-3） |
+| Codex P2-1 M2-01 Files likely touched | **已关闭** | plan:1267 已改为四个 domain 文件 + `ai/mod.rs` + 两份设计文档 |
+| Claude P2-1 M2-01K Files=5 | **已关闭** | plan:1330 「5 个生产文件」与 1352 `prod-files=5`、审计行 779 `3/5` 一致 |
+| Claude P2-2 §0.4 prompt fixture 承接卡 | **已关闭** | plan:59 已改 M2-11 |
+| Claude P2-3 DEP-M2-CI-03 未逐卡登记 | **已关闭** | plan:746 新增字段默认值「所有 `Release boundary = independent` 卡默认继承 `DEP-M2-CI-03`」 |
+| Claude P2-4 M2-16C AC6 措辞 20 | **已关闭** | plan:970 已为「**20→22 method**」 |
+| Claude P2-5 / Codex P2-2 M2-16E 占位符 | **部分关闭** | VER/AC（1175/1181/1188）已用 `$SRC_CLONE` ✓；但同卡 Current evidence（1170）仍是 `<DEP-M2-SRC-01 source clone>`（见 P2-1） |
+
+事实基线抽查全部成立（实际执行）：`ls src/internal/ai/ | grep -i memory` → 无 `memory` 模块；`src/cli.rs` 零 `Memory` 命中；`src/internal/model/mod.rs` 零 memory entity；migration tip = `2026091901_operation_boundary_claim_columns`；`base.yml` 7 job（`format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`）、`codeql.yml` `analyze` + actions/rust matrix、`release.yml` 五 job（`build-and-upload:15`/`upload-install-scripts:310`/`update-homebrew-tap:480`/`verify-homebrew-formula:628`/`request-stable-manifest:690`）；`tests/compat/version_surface_sync.rs` 权威三处（`Cargo.toml`/`install.sh`/`install.ps1`，Cargo.toml:260 已注册）；`git merge-base 45ad1f7f2 bc1be587e4` → `2ebd409045b5114707986b66a7a6b42b5a4a4b7e`，`git diff --name-only 2ebd409… bc1be587e4 | wc -l` → **158**（与 plan:1175/1181/1188 完全一致）；`METHOD_ALLOWLIST.len()==20`（protocol.rs:533）与 `docs/commands/agent.md:89` 的 20-method 文案；`agent_bridge_event.payload_sha256` 与 `source CHECK='deepseek-harness'`（`2026081801_agent_bridge_capture.sql:16,41`）；`AgentRunStatus::{Completed,Failed}` 为终态（run.rs:32-36）；FTS5/bm25、`EpisodeCompiler|EpisodePayload`、`RepositoryKeyedDigest`、`llvm-cov` 全部零命中；M2-05 的 33 份命令文档与 11 个命令源文件均存在；`src/internal/ref_policy.rs`、`scripts/`、`docs/benchmarks/` 确不存在；M2-03 的三个既有测试函数存在、`linear_ref_transaction` 不存在（与 plan:803 `(new)` 标记一致）。25 卡 `Granularity` 行与审计表逐栏比对：**AC/VER/landing/prod-files/scope/deps/writeset/release/split-from/exception 全部一致**，且各卡 AC/VER 实际条目数与分子一致。
+
+---
+
+## P0（0 条）
+
+无。
+
+## P1（4 条）
+
+**P1-1｜`plan-20260819.md:769`（waiver 表 EX-M2-05）与 `:1738-1742`（M2-05 判据规范）、`:1787`/`:785`**
+- **问题：** waiver 行仍写「M2-05 的 **9 道門**……VER 分子如實寫 `9/8@EX-M2-05`」，而卡内（1787）与审计表（785）已是 `VER=10/8@EX-M2-05`，VER 实际条目 10 条（1746–1755）。「判据规范」块只枚举 **9** 门，且把 `memory_branch_remains_gc_root` 误挂在 `command_test`（实际是 `memory_episode_test`，plan:1753），同时**完全漏掉** `command_test memory_branch_is_hidden_and_locked`（plan:1749）。
+- **为何重要：** 模板 template:526 对 G-03 门族型 waiver 的准入条件「缺一不可」，其中 ②「门族清单在卡内『判据规范』块**逐条**枚举」与 ④「门族增减时**同批**更新 waiver 行与粒度审计表」现都不满足。准入不成立时 `VER=10/8@EX-M2-05` 属无豁免背书的超限写法，按 template:537「任一条不满足仍判为不达标」，M2-05 不得开工。这正是 r09 Claude P1-1 要求登记 EX-M2-05 的同一条规则，r10 加了第 10 道门却没同批更新 waiver。
+- **最小修复：** 把 769 行的「9 道門」「`9/8@EX-M2-05`」改为「10 道門」「`10/8@EX-M2-05`」；把 1740 行改为「`operation_restore_faults` 两门、`command_test` **四**门（hidden/locked、VCS+cloud 传输、update-ref/symbolic-ref 拒绝、Display-pin）、`memory_episode_test` GC root 一门与 `compat_serial_registry`」，使枚举数 = 10。
+
+**P1-2｜`plan-20260819.md:1767`（M2-05 `Docs and compatibility impact`）与 `:1761`（`Implementation write set`）**
+- **问题：** M2-05 AC8（1736）要求同卡同步 33 份 `docs/commands` EN/zh + `docs/development/commands`，以及 `../libra-backend/apps/tanstack-app/content/docs/commands/{branch,…,symbolic-ref}.en.md` **11 页**（`cf` 分支）。但 1767 行的 `Docs and compatibility impact` **没有任何 ER-06a 判定**，也没列出后端页面，只写「涉及的 branch/op/push/fetch 文档同步说明」；1761 行的写集对这 44 份文件只以「命令文档」一词带过，**一个都没具名**。
+- **为何重要：** 模板 ER-06a（template:288）要求「每张卡的 `Docs and compatibility impact` **和** `Acceptance criteria` 必须明确列出受影响的命令文档，或写 `N/A` 并给出理由」；plan:747 的字段默认只覆盖「**无对应页面**时记录 N/A 证据」，而 M2-05 明确有 11 页对应页面，默认救不了它。G-10 还要求写集承载本卡 AC 实际改动的文件。按现状执行，M2-05 会在写集不含后端页面的情况下通过验收——这正是 Codex r10 P1-1/P1-2 对 M2-16C/M2-01K/M2-13 关闭的同一缺陷，M2-05 被漏改（仓库已核实 11 个命令的 33 份文档与 11 个 `src/command/*.rs` 全部存在，确有真实用户可见行为对应）。
+- **最小修复：** 在 1767 行补「ER-06a：`libra branch/checkout/switch/reset/op/push/fetch/clone/cloud/update-ref/symbolic-ref` 行为变更，需同卡更新 EN/zh + `docs/development/commands` 共 33 页与后端 11 页 `*.en.md`（已验证 `cf` 分支）」；把这 44 份文件逐项写进 1761 行写集（它们属 G-04 随附同步集，`prod-files=16` 不变）。
+
+**P1-3｜`plan-20260819.md:567`、`:630`、`:1729`、`:1814`、`:2299`、`:2679`（`LBR-MEMORY-*` 稳定错误码）**
+- **问题：** 计划把用户可见的稳定错误码固定为 `LBR-MEMORY-DIGEST-KEY-UNAVAILABLE`（ADR-M2-11）、`LBR-MEMORY-PROJECTION-STALE`（M2-06 AC7）与 `LBR-MEMORY-*` 族（GC-M2-08、M2-13 AC6、兼容收口 2679），但：①**全计划从未提及该表面的唯一 owner**——`grep -n "utils/error.rs\|StableErrorCode" docs/development/plan/plan-20260819.md` → **零命中**，M2-01K/M2-04/M2-05/M2-06/M2-13/M2-16C 的写集都只有 `docs/error-codes.md`，没有 `src/utils/error.rs`；②码形不成立——仓库全部稳定码为 `LBR-<大写域>-<数字>`（`src/utils/error.rs:351-362`，如 `LBR-CLI-001`/`LBR-REPO-002`），`rg '"LBR-[A-Z]+-[A-Z][A-Z-]+"' src` **零命中**，而 `tests/compat/error_codes_doc_sync.rs:24-53` 的采集器要求后缀 `chars().all(is_ascii_digit)`，非数字后缀会被 `continue` **静默跳过**。
+- **为何重要：** 不在 `src/utils/error.rs` 增 `StableErrorCode` variant 就没有 `Error-Code:` 行与 JSON `error_code`，M2-01K AC7、M2-06 AC7、M2-13 AC6、M2-16C AC8 与 GC-M2-08「公开失败使用稳定 `LBR-MEMORY-*`」在实现上无落点；而即使硬写成命名式，`compat_error_codes_doc_sync` 也不会对其生效，plan:2679「`docs/error-codes.md` 已同步完整 `LBR-MEMORY-*`」这道收口门永远是假绿——这是用户可见失败契约的无守卫漂移（CLAUDE.md 的「新 `StableErrorCode` 变体必须进 `docs/error-codes.md`，否则 `compat_error_codes_doc_sync` 失败」只对数字形成立）。
+- **最小修复：** 把计划内所有具名 Memory 码改为 `LBR-MEMORY-001`… 形态（或明示复用既有码，如 M2-05 可复用 `LBR-POLICY-001`），并把 `src/utils/error.rs` 加入首次引入码的卡（M2-01K、M2-04、M2-06、M2-13、M2-16C）的 `Implementation write set`，相应调整 `prod-files`（M2-01K 5→6、M2-06 8→9、M2-13 10→11，均仍在 M 的 ≤12 内）。
+
+**P1-4｜`plan-20260819.md:802-803`（审计表末行与 `(new)` 标记段落）**
+- **问题：** `sed -n '800,806p' … | cat -A` 显示 M2-15 数据行（802）之后**没有空行**，803 行 `**Verification 新增标记：** …` 紧贴其后（空行在 804）。按 GFM 表格扩展，表格只在空行或另一个 block-level 结构处终止，以 `**` 开头的普通段落行会被**吸收为下一条表格行**（单元格数不足则补空），因此该段落成为审计表第 26 条数据行。修订历史 plan:450/451 自述「審計表末行與 `(new)` 段落**確實分行（獨立段落）**」——按 Markdown 语义，没有空行分隔就不是独立段落，自述与文件不符。
+- **为何重要：** 任务卡粒度审计表是 template:537 规定的「逐卡汇总 `Granularity` 行，便于机械核对与脚本校验」的计划级摘要，ER-03 要求开工前逐字段核对；多出一条只有 1 个字段的伪数据行会让机械解析失败。同时覆盖 20+ 张卡的 `(new)`「不把零命中视为通过」契约被降级为表格单元格内容而非规范性段落。
+- **最小修复：** 在 802 行与 803 行之间插入一个空行。
+
+## P2（5 条）
+
+- **P2-1｜`:13, 374, 691, 821, 890, 960, 1170, 2220`：** `<DEP-M2-SRC-01 source clone>` / `<source-clone>` 占位符仍散布在事实基线与各卡 `Current evidence`（含 M2-16E 自己的 1170 行），而同卡 VER（1175/1181/1188）与 M2-16A（822）已用 `$SRC_CLONE` / 绝对路径；plan:450 自述「M2-16E 全面改用 `$SRC_CLONE`」不完整。修：统一为 `$SRC_CLONE`（DEP-M2-SRC-01 已定义默认值）。
+- **P2-2｜`:1730, 1733, 1736`（M2-05 AC）：** AC 条目以 `；` 串联多个可分别失败的谓词（AC2 = branch list 隐藏 + 7 个命令拒绝；AC5 = push/`--all`/`--mirror` + 显式 refspec 拒绝 + `cloud sync/restore`；AC8 = 无回归 + 33 份文档 + 11 页后端），却记为 `AC=8/8`；template:440 明确禁止「通过合并长句规避」上限。修：如实计数并写 `AC=n/8@EX-M2-05`（该卡的 G-03 waiver 已存在，无需新建）。
+- **P2-3｜`docs/development/gap/mainline.md:532,606,1020,1319`：** 仍把共享 receipt 的 owner 写成 `src/internal/ai/context_budget/receipt.rs`（0.23.x 已删路径），其中 1020 行是**可执行的跨计划断言**「`rg -n "ContextSelectionReceiptV1" src/internal/ai/context_budget/receipt.rs` 非空（M2-02R 落地后）」，在 M2-02R 落到 `src/internal/ai/memory/context/receipt.rs` 后将永远为假。M2-01/M2-02R/M2-12 写集均含 `mainline.md`，但无一条 AC 具名该路径修正（M2-01 AC3 只要求统一类型与去 `ContextFrame`）。修：在 M2-01 AC3（或 M2-02R AC）补「把 `mainline.md` 的 receipt owner 路径改为 `src/internal/ai/memory/context/receipt.rs`，含 1020 行断言」。
+- **P2-4｜`:450-451`：** 同一轮 R30-r10 出现两条修订历史行，内容重叠且互相矛盾（450「含 Codex r10 追補」vs 451「Codex 進行中，其結論於 r11 前合併」）。G-09 要求每次规范性修订一行。修：合并为一行。
+- **P2-5｜`:2721`：** review log 写「R30-r11 | Codex | R30-**r10/r12** 修订后的完整计划」，`r12` 不存在。修：改为「R30-r10 修订后的完整计划」。
+
+---
+
+**结论：** P0=0，P1=4（EX-M2-05 waiver 与 10/8 门族不同步且枚举错配、M2-05 ER-06a 未在 Docs impact/write set 闭环、`LBR-MEMORY-*` 码形与 owner 文件双重不成立、审计表末行仍缺空行），P2=5。不满足 `P0=0 且 P1=0` 的 PASS 条件。
+
+VERDICT: FAIL
+EXIT=0

@@ -1,0 +1,138 @@
+# plan-20260819 R30-r22 review — Claude（評審期間凍結 sha256 312b06ef…）
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-22T01:59:33+08:00
+312b06efdeaee42f67e5e99264c91f2edf50f5e2d4f3357d1105e8d683c1435b  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r22.md
+
+# plan-20260819 R30-r22 评审 — Claude（只读）
+
+**被审版本：** `sha256sum docs/development/plan/plan-20260819.md` = `312b06efdeaee42f67e5e99264c91f2edf50f5e2d4f3357d1105e8d683c1435b`，与 `r30-r22-sha256.txt` 一致（评审期间无漂移）。模板 `0a3b7d85…`（v2.8）、`plan-status.md` `c106e9d1…`。
+
+> 核对工具说明：本工作树无 `.libra/`（`ls -d .git .libra` → 仅 `.git`），`libra` 命令不可用，只读核对全部使用 `sed`/`grep`/`rg`/`ls`。PR #456 source clone `/run/media/genedna/data/libra-pr456` 在本会话的沙箱允许目录之外，`merge-base 2ebd409…` 与 158 路径无法验证；计划已在 `DEP-M2-SRC-01`（`:704`）声明缺失即 `Lifecycle=blocked`，不计为缺陷。
+
+## 一、r21 findings 逐条核对
+
+| r21 finding | 实测证据 | 状态 |
+|---|---|---|
+| Codex P1-1 / Claude P1-1：proposal 未下沉到 AC/VER | `:2022` AC3 已含「或 proposal（新增/替換/移除，以 canonical digest + 已認證 identity 版本表達）任一單獨變化都必須產生新 generation」；`:2024` AC5 含「observation-only→附加 proposal、替換 proposal、相同 proposal 重放三態具名回歸」；`:2048` VER 已更名 `observe_terminal_status_evidence_relation_proposal_fingerprint_matrix`；`:2646` 测试矩阵同步 | ⚠️ 主体关闭，**故障矩阵新行有致命笔误**（P1-4） |
+| Claude P1-2：identity 无可达签发面 | `:2359` Description 增 `identity`；`:2376` 记 `libra memory identity register --principal <p>`；`:2397/:2398` V1c/V1d；`:2406` 写集含 `src/command/memory.rs`；`:788` waiver AC 44 | ⚠️ 命令面已加，**AC 文本/授权契约/`list` seam 缺失**（P1-5） |
+| Codex P1-2：M2-05 条件性错误码 | `:1819` 已写「**決策：複用既有穩定碼**…`prod-files=17`」；`:1823`/`:787`/`:803`/`:1845` 均为 17 | ⚠️ 计数关闭，**写集仍列 `src/utils/error.rs`、AC1 仍写「或新增」**（P1-3） |
+| Claude P2-1 / Codex P2-1：`EX-M2-06/07` 块位置 | `sed -n '991,1016p' \| cat -A`：9 个 VER checkbox 在 `:993-997`+`:1001-1004`，`EX-M2-06`（`:1005-1014`）与 `EX-M2-07`（`:1015`）**已移到全部 VER 之後** | ✅ 关闭（但块前无空行，P2-1） |
+| Claude P2-2 / Codex P2-3：review log `r26` 笔误 | `:2826`/`:2827` 现为「R30-r21/**r27** 修订后的完整计划」 | ❌ 未关闭（第五轮变形，P2-2） |
+| Claude P2-3：`GC-M2-15` 四处 crate-private | `:43` 已改「`#[doc(hidden)] pub`，非 crate-private」；`:588` 已改 `#[doc(hidden)] pub trait`；`:1135` 已改 `#[doc(hidden)] pub`；`:1603` 已标 `#[doc(hidden)]`。`rg -n "crate-private"` 残留仅 `:1637`/`:1656`（M2-03，VER 全为 `--lib`，无 Rust 语义冲突） | ✅ 主体关闭（P2-4 余项） |
+| Claude P2-4 / Codex P2-2：`EX-M2-09` 只枚举 13/34 | `:2029-2037` 现给出 AC1(2)/AC2(4)/AC3(4)/AC4(3)/AC5(13)/AC6(2)/AC7(3)/AC8(3)=34 的逐条谓词 | ✅ 关闭（编号错乱见 P2-5） |
+| Claude P2-5 / Codex P2-2：`memory_compiler_identity` 六列断言 | `:1416` A1 已具名六列 + `cargo test --test db_migration_test memory_compiler_identity_schema`；`:1430` 新增该 VER | ⚠️ 关闭，但**VER 由 8 变 9 未同步**（P1-1） |
+| Claude P2-6：ADR「五類 E2E」 | `:522` 已改「…請求體偽造與 observation-only 無 identity 被接受**六類** E2E」，与 `:2024`/`:2398` 一致 | ✅ 关闭 |
+| Claude P2-7①：`R30-r16` 行格式 | `sed -n '456p'` = 5 个单元格（`日期/触发/变更内容/原卡→新卡/受影响引用`） | ✅ 关闭（降序仍错位，P2-4） |
+| Claude P2-7③：M2-16B `testing.rs` | `:934` 写集含 `src/internal/ai/memory/testing.rs`；`:960` `prod-files=3`；审计表 `:815` `1/3` | ✅ 关闭 |
+| Claude P2-7④：plan-status 缺 r18 | `plan-status.md:46` 含「r18 兩方 `FAIL`（Codex 0×P0/4×P1/2×P2、Claude 0×P0/6×P1/9×P2）」，并已记 r21 与「r22 待跑」 | ✅ 关闭 |
+| Claude r20 P1-2：审计表末行空行 | `sed -n '820p'`：M2-15 行与 `**Verification 新增标记：**` **在同一物理行** | ❌ **第七次回归**（P1-2） |
+
+## 二、基线事实与机械字段复核（全部实测）
+
+- **migration tip**：`ls sql/migrations/ | tail -5` → `2026091901_operation_boundary_claim_columns.sql` ✅
+- **版本面集合**：`Cargo.toml:3` `0.23.36`、`install.sh:21` `v0.23.36`、`install.ps1:25` `v0.23.36`；`Cargo.toml:260` 存在 target `compat_version_surface_sync`、`tests/compat/version_surface_sync.rs` 存在 ✅（与模板 `:299` 一致）
+- **CI job 集合**：`base.yml` = `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`（7）= `DEP-M2-CI-02` ✅；`release.yml` = `build-and-upload/upload-install-scripts/update-homebrew-tap/verify-homebrew-formula/request-stable-manifest`（5）= `DEP-M2-CI-03` ✅
+- **拆除面**：`ls src/internal/ai/{providers,context_budget,client.rs,prompt} src/internal/operation_wrapper.rs` 全部 `No such file` ✅；`src/internal/ai/mod.rs` 30 个 `pub mod` 且无 `memory` ✅
+- **待建面**：`src/internal/ai/memory`、`keyed_digest.rs`、`src/internal/ref_policy.rs`、`src/command/memory.rs` 均不存在 ✅
+- **锚点**：`src/command/op.rs:1144` = `!name.starts_with("libra/")` ✅；`src/utils/client_storage.rs:2023` = `pub fn put` ✅；`src/internal/ai/export_job.rs:1-6` = export-job 模块 doc ✅；`src/cli.rs:670-743` 在 `Commands` 枚举内且无 Memory variant ✅
+- **bridge 守卫**：`src/internal/ai/agent_bridge/protocol.rs:532 allowlist_has_exactly_20_methods`（`assert_eq!(…, 20)`）、`tests/agent_bridge_protocol_test.rs:15 protocol_v1_allowlist_is_exactly_20_methods` 两处均存在 ✅（20→22 重命名前提成立）；`tests/SRC_SERIAL_REGISTRY.tsv`/`SERIAL_REGISTRY.tsv` 均无该函数行，重命名不触发 `src_serial_registry_matches_src_classifier`（`tests/compat/serial_registry.rs:2251`）✅
+- **`[[test]]` 自动发现**：`Cargo.toml` 无 `autotests = false`（`grep -n "autotests"` 零命中），edition 2024 下 `tests/*.rs` 直接子文件自动发现成立，M2-14 `:2474` 的自述正确 ✅
+- **卡片逐栏**：25 条 `**Granularity:**` 行与审计表 `:796-820` 的 15 列**逐格一致**（AC/VER/landing/prod-files/scope/deps/writeset/release/split-from/exception 全部比对通过）；各卡 AC/VER checkbox 实测数与 Granularity 分子一致（M2-01 8/4、M2-02 9/9、M2-02F 9/8、M2-02R 9/8、M2-03 7/4、M2-04 8/7、M2-05 8ck→25/10、M2-06 8/5、M2-07 9/10、M2-08 8ck→34/8、M2-09 8/5、M2-10 7/4、M2-11 8/5、M2-12 8/5、M2-13 9ck→44/13、M2-14 8/5、M2-14C 8/6、M2-15 9/2、M2-16A 8/4、M2-16B 7/5、M2-16C 8ck→31/9、M2-16D 6/4、M2-16D1 8/6、M2-16E 8/4）
+- **`**Dependencies:**` 前空行**：`grep -B1 -n "^\*\*Dependencies:\*\*" … | grep -E "^[0-9]+-.+"` 零命中 → 25/25 均有空行 ✅
+- **超限分子带 `@EX-ID`**：`grep` 逐卡核对，仅 **M2-02 `VER=9/8` 无 `@EX`**（见 P1-1），其余全部合规
+- **修订历史**：r01–r21 各一行，无重复；`(new)` 集中标记段落覆盖 M2-02/M2-13 ✅
+- **完成判据卡数**：`:2859` 列举 24 张收口卡（M2-16D1 条件性），与 25 卡总数自洽 ✅
+
+---
+
+## P0（0 条）
+
+无。
+
+---
+
+## P1（6 条）
+
+### P1-1｜M2-02 的 `VER=9/8` 是全计划唯一未带 `@EX-ID` 的超限分子，且其「判据规范」块仍只枚举 8 道 VER、漏掉本轮新增的 `memory_compiler_identity_schema`
+
+- **位置：** `plan-20260819.md:1469`（Granularity）、`:798`（审计表 VER 列）、`:1415`（判据规范首行）、`:1425`（VER 门枚举）、`:1430`（新增 VER）、`:784`（EX-M2-01 waiver 行）
+- **问题：** 本轮按 Claude r21 P2-5 / Codex r21 P2-2 补入了第 9 条 VER `db_migration_test memory_compiler_identity_schema`（`:1430`），VER checkbox 实测由 8 变 9（`:1429-1437`），Granularity 与审计表也同步为 `9/8`。但：
+  1. `9/8` 分子超过分母却**没有** `@EX-M2-01` 后缀——模板 `:624` 明写「**超限只有一种合规写法**：`AC=21/20@EX-01` —— 分子超过分母时必须紧跟豁免该列的 `EX-ID`，否则审计判为不达标」，`:537` 同样要求「`AC` / `VER` / `scope` 列超限时必须带 `@EX-ID`」。同卡 AC 写的是 `9/8@EX-M2-01`，VER 却是裸 `9/8`，是同一行内的自相矛盾。
+  2. `:1415` 判据规范首行仍写「+ **8** 條 VER 門」，`:1425` 的枚举仍是 `db_migration_test::{…}`（5）+ `observer_job_schema_migration_transaction` + `lib internal::model::memory` + `compat_serial_registry` = 8，**不含** `memory_compiler_identity_schema`。模板 `:526` 的门族 waiver 准入条件 ② 要求「门族清单在卡内『判据规范（非计数正文）』块逐条枚举」、④ 要求「门族增减时同批更新 waiver 行与粒度审计表」，两条均未满足。
+  实测：`sed -n '1415p;1425p;1429,1437p;1469p'` 与审计表 `:798`。
+- **为何重要：** 模板对超限分子的判定是**硬性**的（「否则审计判为不达标」），开工前的粒度审计会直接判 M2-02 不合格；而判据规范块是 EX-M2-01 唯一的补偿物，块里少一道门意味着实施者按块执行时会漏掉 identity 表六列的唯一具名断言——正是本轮刚补上的那条。
+- **最小修复：** ①把 `:1469` 与 `:798` 的 VER 改为 `9/8@EX-M2-01`；②`:1415` 首行改「+ 9 條 VER 門」，`:1425` 补入 `db_migration_test::memory_compiler_identity_schema` 并把计数改为（6）+3；③`:784` EX-M2-01 的「理由与补偿措施」列补一句「M2-02 的 VER 同受本 waiver 覆盖，分子写 `9/8@EX-M2-01`」。
+
+### P1-2｜审计表末行与 `**Verification 新增标记：**` 段落第七次粘在同一物理行，导致该段落在 GFM 下被吞进表格单元格
+
+- **位置：** `plan-20260819.md:820`
+- **问题：** `sed -n '818,823p' | cat -A` 与 `sed -n '820p'` 实测：第 820 行的完整内容是
+  `| M2-15 | release | … | serialized-at-M2-16E | independent | N/A | N/A |**Verification 新增标记：** M2-16A、M2-16B、…`
+  即 M2-15 的审计行与 `(new)` 标记段落之间**没有换行**（`:821` 才是空行、`:822` 是 `## 任务卡`）。GFM 会把最后一个 `|` 之后的 `**Verification 新增标记：** …` 解析为该行的第 16 个单元格；表头只有 15 列（`:794`），多余单元格被静默丢弃，整段文字在渲染结果中消失。Claude r21 曾实测该处为独立段落（当时 `:818/:819/:820=$/:821`），本轮行号上移后已再次粘连——这是第 **7** 次回归（r13/r14/r15/r17/r20/r21 均列为检查项）。
+- **为何重要：** 被吞掉的段落是全计划**唯一**声明「M2-16A/16B/16C/16D1/M2-01/01K/02/02F/02R/M2-04..M2-14 的 Verification 中所有具名测试函数/target 都是 `(new)`、由同卡创建并同步 `tests/INDEX.md`、不把零命中视为通过」的规范文本。它一旦不可渲染/不可解析，20 张卡的 `(new)` 归属与 `tests/INDEX.md` 同步义务就没有任何正文依据，ER-04/`tests/INDEX.md` 约定与「零命中不算通过」的守卫口径同时失去锚点；同时 M2-15 行变成 16 列，粒度审计表无法机械解析。
+- **最小修复：** 在 `:820` 的 `… | N/A | N/A |` 之后插入换行与一个空行，使 `**Verification 新增标记：**` 成为独立段落；修订历史如实登记「第七次回归已修」，并建议在收口前加一条机械检查（例如 `rg -n '^\|.*\|\*\*'` 必须零命中）避免第八次。
+
+### P1-3｜M2-05 已定案「复用既有错误码」，但写集仍列 `src/utils/error.rs`（=18 个生产文件）且 AC1 保留「或新增」条件分支，与 `prod-files=17` / EX-M2-03 / 审计表四处冲突
+
+- **位置：** `plan-20260819.md:1819`（Implementation write set）、`:1787`（AC1）、`:1823`（Files likely touched）、`:787`（EX-M2-03 waiver）、`:803`（审计表）、`:1845`（Granularity）
+- **问题：** 本轮按 Codex r21 P1-2 在写集内写入了决策：「`src/utils/error.rs`（**決策：複用既有穩定碼，不新增 `LBR-MEMORY-*`；如需新碼另立卡**，`prod-files=17`）」。但决策只写进了括号，没有传导到其它三处：
+  1. `src/utils/error.rs` **仍然留在 `Implementation write set` 的文件列表里**，而 `:1823` 的 17 档枚举（`src/internal/{branch,ref_policy,mod}.rs` 3 + `src/internal/operation/{snapshot,restore,store}.rs` 3 + `src/command/{branch,checkout,switch,reset,op,push,fetch,clone,cloud,update_ref,symbolic_ref}.rs` 11 = 17）**不含**它。写集 18 档 vs `prod-files=17` / `EX-M2-03`「17 个生产文件」/ 审计表 `4/17`，相差一档。
+  2. `:1787` AC1 仍写「拒绝错误使用稳定 `LBR-*`（**复用既有码或新增**并登记 `docs/error-codes.md` + `COMPATIBILITY.md`）」——条件分支未被决策收敛；`docs/error-codes.md`、`COMPATIBILITY.md` 也仍在写集里，而 AC8（`:1794`）的 33 份文档清单并不包含它们。
+- **为何重要：** `EX-M2-03` 是 G-04 的 `L-exception`，模板 `:448` 规定这类 waiver 的补偿是「写明为何不可拆、如何 review、如何恢复」，本计划 `:787` 的补偿就是「**逐文件列于写集**」。写集与 waiver 的档数不一致，waiver 的补偿即不可机械核验；而 AC1 保留的「或新增」分支正是 Codex r21 P1-2 要求删除的条件路径——一旦实施者走新增分支，prod-files 立刻变 18，卡片当场违反已登记的 scope waiver。
+- **最小修复：** 二选一并四处同改：(a) 确认复用既有码 → 从 `:1819` 写集删除 `src/utils/error.rs`（`docs/error-codes.md`/`COMPATIBILITY.md` 保留时在 AC8 的文档清单中具名，或一并删除），并把 `:1787` AC1 改为「复用既有稳定码 `LBR-…`，不新增 variant」；(b) 确认新增 → 把 `:1823`/`:787`/`:803`/`:1845` 的 17 统一改 18 并在 `:1823` 枚举里补上 `src/utils/error.rs`。
+
+### P1-4｜故障恢复矩阵新增的 proposal 行是 5 格（表头 4 列），且其「禁止结果」单元格写的正是 ADR-M2-05/M2-08 AC3 **要求**的幂等语义
+
+- **位置：** `plan-20260819.md:2714`（矩阵行）、`:2699`（表头）；对照 `:521`（ADR-M2-05）、`:2022`（M2-08 AC3）、`:2646`（测试矩阵）
+- **问题：** `grep -n "^| 故障点"` 实测表头为 `| 故障点 | 可接受残留 | 恢复动作 | 禁止结果 |`（4 列）。`sed -n '2714p'` 实测新行为：
+  `| proposal 附加/替換窗口 | observation-only job pending 後補錄有效 proposal | fingerprint 變化 → 新 generation，舊 job 由 fence 作廢 | 相同 proposal 重放不增 generation | M2-08 |`
+  即 **5 个单元格**，第 5 格 `M2-08` 超出表宽（GFM 静默丢弃），且第 4 格落在「禁止结果」列，内容是「相同 proposal 重放**不增** generation」——而 `:521` ADR-M2-05 明定「相同 proposal 重放**冪等**」、`:2022` M2-08 AC3 明定「相同指紋重掃**不遞增** generation」、`:2646` 测试矩阵明定「相同 proposal 重放幂等**不增** generation」。也就是说矩阵把契约**要求的**行为登记成了**禁止的**结果。
+- **为何重要：** 故障恢复矩阵在本计划里是规范性验收工件（`:2697` 归在「里程碑验收与回滚」之下，多张卡的 crash/replay AC 以它为口径）。按字面实现「相同 proposal 重放必须递增 generation」会直接破坏 M2-08 的幂等门：每次 host 重发同一 envelope 都会产生新 generation、新 job、新 Episode revision，违反「同一幂等键命中时返回既有 revision，不追加事件」（`:169`）与 GC-M2-02，属于数据完整性回归。多出的第 5 格还让该表无法机械解析。
+- **最小修复：** 把 `:2714` 改为 4 格，并把「禁止结果」列改成真正被禁止的结果，例如：`| proposal 附加/替換窗口 | observation-only job pending 後補錄有效 proposal | fingerprint 變化 → 新 generation，舊 job 由 fence 作廢 | 靜默替換既有 snapshot 的 proposal 而不換 generation；相同 proposal 重放卻遞增 generation |`；`M2-08` 的归属信息移入「恢复动作」文字或删除。
+
+### P1-5｜新增的 `libra memory identity register|revoke|list` 是 trust gate allowlist 的授权根，却只出现在一个括号里：没有 AC 文本、没有授权契约（`--principal` 为调用方自报）、`list` 没有任何 runtime seam 与 owner
+
+- **位置：** `plan-20260819.md:2359`（Description）、`:2376`（AC5 括号）、`:2378`（AC7 seam allowlist）、`:2382-2384`（EX-M2-02 判据规范）、`:2024`（M2-08 runtime API）、`:522`（ADR-M2-05）、`:601`（ADR-M2-12）
+- **问题：** `rg -n "identity register|register_compiler_identity|--principal"` 全文只命中 `:452`（修订历史）、`:522`、`:601`、`:788`、`:2359`、`:2376`、`:2384`。逐项实测：
+  1. **无 AC 文本**：`:2376` 只在 `record` 的 AC 里以括号提到「handle 由 `libra memory identity register --principal <p>` 一次性輸出」。`register`/`revoke`/`list` 三个子命令本身**没有任何 AC checkbox**，而 `:2384` 却把「**identity register/revoke/list(3)**」计入 44 的分子——这正是模板 `:494`「多轴伪装（把多条 AC 合成一条长句…以压到上限以内）」反模式，也不满足 `:788` EX-M2-02 的补偿承诺「判據規範…逐條枚舉 rebuild、record 與 `identity register/revoke/list` 的具名命令」（`:2382-2384` 只给了分组大小 `(3)`，没有枚举）。
+  2. **无授权契约**：`--principal <p>` 是调用方自报的参数，全文没有一句要求它必须等于**已认证的本地 repo principal**（vault/config 派生），也没有规定谁有权执行 `register`、handle 的一次性输出与存储（表 `:328` 只说存 `principal_hmac`）。而 ADR-M2-12（`:588`）把 trust gate 的 allowlist 权威**完全**押在 `CompilerIdentityV1` 上、M2-07 AC1（`:1934`）要求「拒绝请求体自报的 actor/scope/path」、GC-M2-02（`:636`）要求 principal「来自 trusted trigger/source resolver」。于是新增的 CLI 成了一个可以自报 principal 铸造 allowlisted 身份的入口，与这三条契约直接冲突。Claude r21 P1-2 的修复选项 (a) 原文要求「由本地已認證 repo principal + vault 授權」——这一半没有落地。
+  3. **`list` 无 seam/owner**：`:2024` M2-08 只交付 `register_compiler_identity`/`resolve_compiler_identity`（撤销语义折在 `resolve` 里），全文无 `list` 的 runtime API；`:2378` AC7 的 CLI seam allowlist 明写「CLI Adapter **只调用** EpisodeReader/Rebuilder/Job status Interface 与 `MemoryRuntime::observe_terminal(…)`」——按字面实现根本无法实现 `identity register/revoke/list`。M2-13 `prod-files=5`（`:2432`）也未为可能需要的 `runtime.rs` 扩展留位。
+- **为何重要：** 这三点合起来使本轮刚补上的「identity 签发面」既不可实施（AC7 不允许该 seam、`list` 无 API）也不安全（授权根无授权门）。计划的整个 fail-closed 论证建立在「`compiler_identity` 只由認證 ingress 或進程內 registry 填充」（`:522`）之上；如果 registry 的签发入口本身接受自报 principal，`trust_gate_rejects_forged_compiler_identity`（`:1966`）与 `memory_record_rejects_forged_identity…`（`:2396`）防住的只是「伪造 handle」，防不住「合法铸造一个冒名 handle」。这是安全边界缺口，不是措辞问题。
+- **最小修复：** ①在 M2-13 增加一条 AC，具名 `identity register|revoke|list` 的行为：`register` 只绑定**已认证的本地 repo principal**（`--principal` 缺省即该 principal；显式值与之不符时稳定拒绝）、handle 一次性输出且只以 HMAC 入库、`revoke` 幂等、`list` 只输出 `handle_hmac` 前缀/有效期/撤销态不回显可逆身份；②把 `:2382-2384` 的 identity `(3)` 展开为三条具名谓词并补 `list` 的 VER（或明确 V1c/V1d 覆盖三者）；③`:2378` AC7 的 seam allowlist 补入 `MemoryRuntime::{register,revoke,list}_compiler_identity`；④`:2024` M2-08 AC5 显式交付 `revoke_compiler_identity` / `list_compiler_identities`，或把三者归到 M2-13 并同步 `prod-files`。
+
+### P1-6｜`EX-M2-02` 的判据规范首行仍写「11 條 VER + 41 條 AC」，waiver 行的 VER 拆分仍是 11 —— 与本轮改成的 `44/13` 三处冲突
+
+- **位置：** `plan-20260819.md:2382`（判据规范首行）、`:788`（EX-M2-02 waiver 的 VER 拆分）；对照 `:2383`（V 清单）、`:2384`（AC 分组）、`:2432`（Granularity）、`:811`（审计表）
+- **问题：** 本轮把 M2-13 的分子改为 `AC=44/8@EX-M2-02`、`VER=13/8@EX-M2-02`（`:2432` 与审计表 `:811` 一致，VER checkbox 实测 `:2388-2400` 确为 13、AC 分组 `:2384` 实测 4+3+2+2+7+3+8+1+12+2=44）。但两处未同步：
+  1. `:2382` 判据规范首行仍写「本卡獨立門族 = **11** 條 VER + **41** 條 AC 謂詞」，而紧随其后的 `:2383` 自己就列出 V1、V1b、V1c、V1d、V2…V10 共 **13** 项，`:2384` 自己就算出 **44**——同一段落内部自相矛盾。
+  2. `:788` waiver 行的「VER 分子 `13/8@EX-M2-02`（**command_test 3、lib 2、memory_episode_test 2、compat 4**）」括号拆分合计 **11**；实测正确拆分是 command_test **5**（`:2388`/`:2390`/`:2396`/`:2397`/`:2398`）、lib 2（`:2389`/`:2393`）、memory_episode_test 2（`:2391`/`:2392`）、compat 4（`:2394`/`:2395`/`:2399`/`:2400`）= 13。
+- **为何重要：** 模板 `:526` 的门族 waiver 准入条件 ② ③ ④ 要求判据规范块逐条枚举、分子如实、门族增减时同批更新 waiver 行；`:537` 进一步规定 `EX-*` 不满足任一条即判为不达标。首行与 waiver 拆分是本轮 identity 新增门唯一的审计入口，二者停留在增门前的旧计数，等于本轮新增的 V1c/V1d 与 identity 三谓词在 waiver 侧没有登记。
+- **最小修复：** `:2382` 改为「本卡獨立門族 = 13 條 VER + 44 條 AC 謂詞」；`:788` 括号改为「command_test 5、lib 2、memory_episode_test 2、compat 4」。
+
+---
+
+## P2（8 条，不阻塞）
+
+1. **M2-16C 的两个判据规范块紧贴 VER 列表最后一项，且列表中间留有三个空行。** `sed -n '991,1016p' | cat -A` 实测：`:998`/`:999`/`:1000` 是三个连续空行（`EX-M2-06` 块原位置的残留），把 9 条 VER 切成 5+4 两个列表；`:1004`（最后一条 VER）与 `:1005`（`**判据规范…EX-M2-06**`）之间**无空行**，`:1014`（B8）与 `:1015`（`**判据规范…EX-M2-07**`）之间同样无空行。GFM 会把这两个加粗段落当作前一个 list item 的 lazy continuation 吸收进 checkbox 里。**修复：** 删除 `:998-1000` 的多余空行，并在 `:1005`、`:1015` 前各插入一个空行。同类多余空行还见于 `:927`（M2-16B）、`:1151`（M2-16D1）、`:1595-1596`（M2-02R）、`:1810`/`:1812`（M2-05）。
+
+2. **review log 末两行轮次笔误（第五次，每轮变形）。** `:2826`/`:2827` 的 Scope 写「R30-r21/**r27** 修订后的完整计划」——不存在 r27（r19 时是 `r24`、r20 时是 `r25`、r21 时是 `r26`）。**修复：** 改为「R30-r21 修訂後的完整計劃（r22 期間凍結）」，并在本轮完成后回填 SHA、日志路径与 verdict。
+
+3. **`EX-M2-09` 判据块的圈号编号自相冲突，累计只到 ㉗ 而非 34。** `:2029` 把 AC5 的 13 条明细编为 ①–⑬，`:2031-2034` 又把 AC1–AC4 的 13 条也编为 ①–⑬（标签重复），随后 `:2035` 的 AC6 直接从 ⑳ 起跳（⑭–⑲ 空缺），`:2037` 止于 ㉗。谓词本身 34 条齐全，但编号无法用来交叉引用。**修复：** 统一为连续 ①–㉞，或改用 `AC5-1…AC5-13` 之类带组前缀的标签。
+
+4. **两处收尾瑕疵与一处排序。** ①`:1637`/`:1656` 的 M2-03 仍写「crate-private 深接口 / primitive 保持 crate-private」，与 `GC-M2-15`（`:647`）的「『crate-private』類 AC **一律**改寫為『不进入 CLI/bridge 公開表面』並以 `rg` 退出碼守衛證明」不符（该卡 VER 全为 `--lib`，无编译冲突，故只是规则一致性问题）；②`:1281` M2-01 AC8 句末多一个 `」`（「…（`#[doc(hidden)]`）」。」）；③修订历史 `:456` 的 `R30-r16` 行插在 r18（`:455`）与 r17（`:457`）之间，破坏该表的降序排列。**修复：** 逐条按原样订正。
+
+5. **`GC-M2-15` 插在 `GC-M2-12`（`:646`）与 `GC-M2-13`（`:648`）之间，编号乱序。** 不影响引用（全文按 ID 引用），但机械读表时容易漏看。**修复：** 移到 `GC-M2-14`（`:649`）之后。
+
+6. **M2-09 的 `deps=M2-08,M2-16B`（`:2118`/`:2148`/审计表 `:807`）在实施顺序 DAG（`:664-694`）中没有 `M216B → M209` 的显式边。** 经 `M216B→M208→M209` 传递可达，不构成环或缺口，但 DAG 与 deps 字段不逐边对应。**修复：** 要么在 DAG 补一条虚线边，要么在 M2-09 `Dependencies` 注明「M2-16B 经 M2-08 传递」。
+
+7. **M2-16C 新建 `tests/agent_bridge_memory_test.rs`，AC6（`:987`）写「新增 compat 测试登记 `Cargo.toml`/`tests/INDEX.md`（如新建 target）」，但写集（`:1021`）不含 `Cargo.toml`。** 实测 `Cargo.toml` 无 `autotests = false`，edition 2024 下 `tests/*.rs` 直接子文件自动发现，故不会空跑；但仓库现状是 111 个 `[[test]]` 显式声明（含 `agent_bridge_protocol_test` 等全部同类 target），本卡不登记会与既有惯例不一致。**修复：** 要么把 `Cargo.toml` 纳入写集（`prod-files` 不变，属配置文件）并登记 `[[test]]`，要么在 AC6 明确「依自动发现，不新增 `[[test]]`」（与 M2-14 `:2474` 同口径）。
+
+8. **`DEP-M2-SRC-01`（`:704`）的 source clone 在本次核对环境下不可访问，导致 M2-16E 的核心判据（pinned merge-base `2ebd409…`、158 路径 disposition）在双评审阶段始终无法验证。** 计划已把缺失定义为 `Lifecycle=blocked`，规则上自洽；但这意味着 M2-16E 的 `AC=8/20`、`VER=4/20` 中最关键的两条在开工前无任何评审证据。**修复：** 在 `DEP-M2-SRC-01` 的「证据」列补一条「双评审轮次至少有一轮在可访问 clone 的环境执行并归档 `merge-base` 与 `diff --name-only | wc -l` 的实际输出」，或把该证据要求移入 M2-16A 的开工门。
+
+---
+
+**结论：** r21 的三条 P1 主体均已推进——proposal 已下沉到 M2-08 AC3/AC5 与更名后的指纹矩阵 VER、identity 签发面以 `libra memory identity register|revoke|list` 落到 M2-13、M2-05 的错误码分支已定案为「复用既有码」并把 `prod-files` 统一到 17；`EX-M2-06/07` 块位置、`EX-M2-09` 34 条枚举、M2-02 identity 六列断言、ADR 六态、`R30-r16` 行格式、M2-16B `testing.rs`、crate-private 四处、plan-status r18 也已实测关闭；25 卡逐栏、基线事实、版本面集合、CI job 集合、migration tip、`Dependencies` 空行全部成立。但三条修复各自留下了未传导的半截：M2-02 新增第 9 条 VER 后分子未带 `@EX-M2-01`、判据块仍是 8 门；M2-13 改成 44/13 后判据首行与 waiver 拆分仍是 41/11，且新增的 identity 命令族没有 AC 文本、没有授权契约（`--principal` 自报）、`list` 没有 runtime seam 并与 AC7 的 seam allowlist 直接冲突；M2-05 的决策只写进括号，写集仍多一档 `src/utils/error.rs`、AC1 仍保留条件分支；proposal 下沉新增的故障矩阵行是 5 格且把契约要求的幂等语义写成了「禁止结果」。此外审计表末行与 `(new)` 标记段落第七次粘连，使该规范段落在渲染时被吞。P0=0，P1=6，P2=8。
+
+VERDICT: FAIL
+EXIT=0

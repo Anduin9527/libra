@@ -1,0 +1,181 @@
+# plan-20260819 R30 review — Claude
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-21T12:45:45+08:00
+9662190e0fbec292ad4abd5ec90e558065a72bcf7365a07a4c74705260d1f0c6  docs/development/plan/plan-20260819.md
+# review prompt: docs/development/plan/plan-20260819.review/review-prompt-r01.md
+
+# plan-20260819 R30 计划评审（Claude，只读）
+
+**被审文件：** `docs/development/plan/plan-20260819.md`
+SHA-256 `9662190e0fbec292ad4abd5ec90e558065a72bcf7365a07a4c74705260d1f0c6`（与 `plan-20260819.review/r30-sha256.txt` 一致；工作树为未提交修改 `M docs/development/plan/plan-20260819.md`）
+**参照：** `plan-template.md` v2.7；仓库 `main` 工作树（`sha256sum` / `ls` / `Grep` / `sed` 现场核对，未修改任何文件）
+
+---
+
+## P0
+
+### P0-1 M2-08 整卡建立在已删除的 `orchestrator` 上，且触发集合与 ADR-M2-05 正面冲突
+
+**位置：** `:1794`（Current evidence）、`:1799`（AC#1）、`:1800`（AC#2）、`:1821`（Implementation write set）
+
+**问题（核对结果）：**
+- `ls src/internal/ai/orchestrator` → `No such file or directory`；`ls -d src/internal/ai/runtime` → 同样不存在。而 Current evidence 引 `src/internal/ai/orchestrator/persistence.rs:2282,2313,4136`，Implementation write set 要求改 `src/internal/ai/orchestrator/persistence.rs` 与 `src/internal/ai/runtime/`。
+- AC#1 把外部事实触发集合定死为 `TaskEventKind::{Done,Failed,Cancelled}` 与 `IntentEventKind::{Completed,Cancelled}`；`grep -rn "TaskEventKind\|IntentEventKind" src/` → **零命中**。
+- AC#2 要求 observer 扫 `libra/intent` ref「发现 Task/Intent 终态」；该 ref 上已无终态事件 producer。
+
+**为何重要：** M2-08 是 Phase 2 的唯一入口（M2-09/M2-10/M2-16D 全部依赖它）。照卡执行立刻撞不存在的文件与不存在的枚举；照 ADR-M2-05 执行则与本卡 AC 矛盾 → 无法验收。§0.3「全计划已按拆除后架构重设计」在本卡不成立，追溯表 `:2428` 写的却是 `TerminalObservationV1`，三处打架。
+
+**最小修复：** AC#1 改为「外部事实触发集合精确为经校验的 `TerminalObservationV1`（bridge `memory.episode.record` + crate API `observe_terminal`）」；AC#2 删除 `libra/intent` 终态扫描，只保留 Memory ref 的 Confirmed Task→父 Intent 依赖唤醒；Current evidence 换成 `src/internal/ai/agent_bridge/ingress.rs:77-81` + `src/internal/ai/export_job.rs`；write set 删除 `orchestrator/persistence.rs` 与 `ai/runtime/`。
+
+### P0-2 M2-09 / M2-10 的 Verification 依赖不存在的 `test-provider` feature，且与 ADR-M2-12 冲突
+
+**位置：** `:1863`（M2-09 Current evidence）、`:1880-1883`、`:1947-1949`
+
+**问题（核对结果）：** `Cargo.toml` `[features]` 只有 `worktree-fuse` / `test-network` / `test-live-cloud` / `test-live-agent` / `subagent-scaffold` / `otlp` / `keyring` / `fastcdc`；`grep "test-provider" Cargo.toml` → 零命中；`LIBRA_ENABLE_TEST_PROVIDER` 在 `src/` 零命中。7 条命令会直接报 `none of the selected packages contains these features: test-provider`。
+
+**为何重要：** 两张编译器卡的全部指定验收门不可执行；而 ADR-M2-12 `:563` 明确规定「测试只使用 `#[cfg(test)]` in-memory fake」，本卡却保留 provider-feature 门 —— 计划内部架构与卡片互斥。
+
+**最小修复：** 删除两卡全部 `LIBRA_ENABLE_TEST_PROVIDER=1` / `--features test-provider` 前缀；M2-09 Current evidence 改引 `src/internal/ai/completion/mod.rs` 与 M2-16B 交付的 `EpisodeCompilerModel` in-memory fake。
+
+### P0-3 §0 没有替换 **Episode root 物件**的来源，root 身份与 Intent 聚合在 main 上无事实面
+
+**位置：** `:31`（§0.2「M2 用途：Episode root、related IDs」）、`:362`（事实基线）、`:1731-1732`（M2-07 AC#2/#3）、`:1931`/`:1936`（M2-10）
+
+**问题（核对结果）：** R30 只处理了「终态事件 producer 消失」，没处理「`Task` / `IntentSpec` **物件本身**在 main 已无生产写入」。
+- `grep -rn '"task"\|"intent"' src/ --include=*.rs`（排除 `src/command/cat_file.rs:155-189` 的只读类型名表）只命中 `src/internal/ai/history.rs:5627,5649,6089` —— 全部在 `#[cfg(test)]` 里。
+- bridge ingress 只提供 `event.append` / `evidence.append` / `provenance.append`（`src/internal/ai/agent_bridge/ingress.rs:77-81`），没有 task/intent 物件创建面。
+
+**为何重要：** M2-07 AC#3 要求「候选 ID …必须验证对象属于 pinned source ref」，M2-10 AC#1 要求「读取根 Intent、相关 Task/Run IDs」。真实仓库里这些物件不存在 → 写入路径永远 fail-closed，Intent Episode 永远无法生成，整条纵切只能在合成 fixture 上通过，M2-14 的「冻结 corpus」也不反映真实可用性。§0.1/§0.2、GAP 表、风险表均无对应条目。
+
+**最小修复：** §0.1/§0.2 增一行事实（Task/IntentSpec 物件在 main 无 in-repo producer），并二选一落卡：(a) `root_kind` 改绑 main 实际存在的根（`AgentRun` / `agent_session` id），同步 payload 表、Cell 命名、ADR-M2-02、M2-07 AC#3、M2-10；或 (b) 在 `TerminalObservationV1` 中把 `root_id` 定义为 host 提供的 opaque 标识并显式声明不做物件可达性校验，据此改写 GC-M2-02、M2-07 AC#3 与 M2-10。两种都需新增 `GAP-M2-15` + 风险行。
+
+### P0-4 host 自报 `terminal_status` 无任何佐证要求，合同却仍宣称「由终态事实机械映射」
+
+**位置：** `:162`（核心链路 5）、`:183`（payload 表 `completion_status`）、`:486-488`（ADR-M2-05）、`:1736`（M2-07 AC#6 trust gate 输入清单）、`:929`（M2-16C AC#3）、`:1872`（M2-09 AC#5）
+
+**问题：** R30 把终态来源整体交给 host，但 payload 表仍写 `completion_status`「由终态事实机械映射…不允许模型输出」，核心链路 5 仍写「Writer 从终态事实机械填充 completion」。结合 P0-1/P0-3，已不存在可被 Writer 独立读取的 in-repo 终态事实。`AutoEpisodeTrustGateV1` 的输入清单（ADR-M2-06 `:498`、M2-07 AC#6）只列 principal / locator / digest / redaction / schema / policy —— **没有任何一条要求把 `terminal_status` 与 `source_ref_oid` 指向的记录互相印证**；M2-16C AC#3 只校验「principal/scope/root/code anchor/source ref」，不校验 status 一致性。
+
+**为何重要：** 任何取得 bridge 授权的外部 agent 都可把失败/取消的任务上报为 `completed`，Writer 会机械信任并写成 `Confirmed` Episode，随后被默认注入到后续 agent 上下文。这与 GC-M2-02（身份绑定）、GC-M2-12（自动信任）以及故障恢复矩阵 `:2466`「禁止结果：无证据地假定完成」直接冲突 —— 属数据完整性漏洞，不是风格问题。
+
+**最小修复：** 在 M2-07 增加一条 AC：`terminal_status` 必须与 `source_ref_oid` 解析出的记录（`AgentRunStatus`、review store 行、session JSONL 终态）一致；不可解析或不一致时强制 `Quarantined` + 稳定 reason code，禁止 `Confirmed`。同步修正 `:162`/`:183` 的「机械映射」措辞，并在 M2-16C AC#3 补同一校验。
+
+---
+
+## P1
+
+### P1-1 「版本面五处」与仓库事实（三处）不符，且与本计划 §0.5 自相矛盾
+
+**位置：** `:66`（§0.5 写「版本面**三处**」）vs `:667`、`:673`、`:709`、`:717`、`:2342` 及全部 21 张会发版卡的 `Release write set`
+**核对：** `ls -d web worker` → 两者均不存在；`tests/compat/version_surface_sync.rs:13` 写明「now: `Cargo.toml`, `install.sh`, `install.ps1`」，断言只覆盖这三处（模板 ER-08 自己也规定以 `compat_version_surface_sync` 为权威）。
+**为何重要：** 每张发版卡的 R 写集指向两个不存在的文件，且 §0.5 与任务卡字段默认值互相打架，发布门无法机械核对。
+**最小修复：** 把上述所有位置统一改为「版本面三处（`Cargo.toml` / `install.sh` / `install.ps1`）+ `Cargo.lock` + release artifact」，并在修订历史登记一行。
+
+### P1-2 全部 24 张卡的 `Full-suite trigger` 写成「按 ER-13 在开工与收口时判定」，不是 ER-13 要求的 `none` / `T-<n>`
+
+**位置：** `:829`、`:897`、`:967`、`:1033`、`:1101`、`:1167`、`:1228`、`:1298`、`:1362`、`:1426`、`:1492`、`:1561`、`:1631`、`:1699`、`:1768`、`:1837`、`:1905`、`:1971`、`:2039`、`:2108`、`:2176`、`:2244`、`:2308`、`:2379`
+**问题：** 模板 ER-13「登记要求」：「每张会推送的卡…写 `none` … 或 `T-<n>: <一句话依据>`；字段缺失按 `none` 处理。`T-1`–`T-4` 客观命中却写 `none`，视为验收造假」。把判定整体推迟等价于缺失登记；而多卡客观命中：M2-16A/02/02F/02R 触 `sql/**`（T-1）且为 `migration`（T-3）；M2-13 触 `src/cli.rs` 命令注册 + `docs/error-codes.md`（T-1）；M2-02F/M2-14C 触 `.github/workflows/**` 与 `Cargo.toml` 非版本行（T-1）；M2-01K/04/06 触 `docs/error-codes.md`（T-1）；M2-15 为 `release`（T-2）。
+**最小修复：** 逐卡替换为确定值，例如 M2-02 → `T-1: 新增 sql/migrations/** 与 migration registry`；M2-15 → `T-2: release 卡`；未命中的写 `none`。
+
+### P1-3 M2-15（release 卡）Verification 用 `cargo test --all`，直接违反 ER-14 与本计划 §0.5
+
+**位置：** `:2354`（`… cargo test --all`），另 `:2353`/`:2355`/`:1340` 仍带 `LIBRA_SKIP_WEB_BUILD=1`
+**核对：** `grep -rn "LIBRA_SKIP_WEB_BUILD" src/ build.rs` → 零命中（web 嵌入已随 0.23.x 移除），该前缀是死变量。模板 ER-14：「任何以 `cargo test --all` 绿色结果代替 nextest 全绿的发布一律视为该发布切片验收无效」；本计划 `:7`/`:67` 亦然。
+**为何重要：** 收口卡的验收命令与其所依据的规范互斥，发布证据自始无效。
+**最小修复：** `:2354` 换成 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`；删除三处 `LIBRA_SKIP_WEB_BUILD=1`。
+
+### P1-4 M2-15 的 `Release write set` 与 `Release boundary` / `Migration and rollback` / AC 互相矛盾
+
+**位置：** `:2365`（「tag/release artifact 为 N/A」）vs `:2373`（「按 ER-08 创建 tag 并触发 `release.yml`」）、`:2385`（`independent`）、`:2346`（AC 要求归档 release artifact）
+**为何重要：** `independent` 卡必须执行 C 组第 ⑨ 步（`gh release create`）；R 写集写 `N/A` 会在字段层免除发布义务，违反 G-07/ER-08 并与本卡自身 AC/回滚段冲突。
+**最小修复：** `:2365` 改为 `Inherited`（版本面三处 + `Cargo.lock` + release artifact）。
+
+### P1-5 M2-01 的 Current evidence 宣称已实现的三项事实在 main 全部不成立
+
+**位置：** `:1125-1127`，及 `:1142-1145` 的「（4 passed）/（3 passed）/（21 passed）」
+**核对：**
+- `grep -c "EpisodePayloadV1\|AutoEpisodeTrustGateV1\|ContextSelectionReceiptV1" docs/development/tracing/memory.md` → **0**；memory.md 现存的是另一张表 `memory_context_receipt`（`:1002`）。本计划事实基线 `:371` 也写「M2 payload、自动 lifecycle 与 Task/Intent 触发**尚未**进入规范」—— 与本卡自相矛盾。
+- `ls src/internal/ai/memory` → `No such file or directory`。
+- 「28 个用例全绿」对应测试不存在，四条 Verification 在 main 上零命中。
+
+**为何重要：** 违反计划自述「本文件只规划任务，不宣称已实现」与模板「历史计划不能作为已实现证据」；且集中 `(new)` 标记 `:761` 把 M2-01 列为「全部 (new)」，与「已全绿」证据表冲突，执行者无法判断该实现还是该复核。
+**最小修复：** 三行改写为「#456 分支既有实现（`bc1be587e4`），R30 需经 M2-16A 移植后复核」（与 M2-16A `:777` 同款），并删除 Verification 的 passed 括注。
+
+### P1-6 M2-02 的 Current evidence 与 write set 使用旧迁移号，与 ADR-M2-14 冲突
+
+**位置：** `:1254`（「最新 migration 为 `2026081301`」）、`:1282`（`sql/migrations/20260819*_memory_core*`）
+**核对：** `ls sql/migrations/` 最新为 `2026091901_operation_boundary_claim_columns.sql`；本计划 `:361` 与 ADR-M2-14 `:581` 要求重编为 `2026092101_memory_core`。
+**为何重要：** 本卡是唯一拥有核心迁移的实现卡，写集文件名低于 main tip，会被迁移器跳过 —— 正是 ADR-M2-14 要防的静默缺表。
+**最小修复：** `:1254` 改为 `2026091901`（引 `sql/migrations/` 目录），`:1282` 改为 `sql/migrations/2026092101_memory_core{,_down}.sql`。
+
+### P1-7 M2-16A 越过 G-01/G-02/G-04，并与 M2-01/02/02F/02R/04/06/11 所有权重叠
+
+**位置：** `:771`（Description）、`:789-796`（AC）、`:811`（write set）、`:754`（粒度审计 `scope=M; landing=2; prod-files=8`）
+**问题：** 本卡一次性交付「领域/canonical/validation/writer/reader/compiler/FTS/receipt/session 捕获 + `memory/context/` 三文件 + 三对迁移 + registry + 类型改名 + 文档同步 + 测试登记」。写集 `src/internal/ai/memory/**` 是整棵子树，加 6 个 migration 文件与 `src/internal/db/migration.rs`，远超 G-04 `M`（≤4 落点、≤12 生产文件），却未登记任何 `EX-*`（G-04 是白名单内唯一可豁免的规模项）。同时 AC#3/#5 直接覆盖了 M2-02（核心迁移）、M2-02F（FTS 迁移）、M2-02R（receipt 迁移）、M2-04（writer）、M2-11（reader）的验收内容，而那几张卡仍写着「创建」同一批产物。
+**为何重要：** G-01/G-02 永不可豁免；双重所有权让 M2-02/02F/02R 在 M2-16A 之后无事可做，DAG 串行顺序与「每卡一个发布切片」失去意义。
+**最小修复：** 把 M2-16A 收窄为「只移植 I/O-free 领域层（domain/canonical/validation）+ 删除已删模块 import + `EpisodeTrustLevel` 改名」，迁移重编交回 M2-02/02F/02R、writer 交回 M2-04、reader/FTS 交回 M2-11；或反向登记 `EX-*` 并把后续卡 AC 明确改写为「在移植结果上复核补齐」（不再写「创建」）。两种都须同步粒度审计表、DAG、追溯表与修订历史。
+
+### P1-8 依赖在 DAG / `Dependencies` / `Granularity` / 粒度审计表之间三处不一致
+
+**位置与核对：**
+- **M2-09**：DAG `:640` 有 `M216B --> M209`，粒度审计 `:747` 写 `deps=M2-08,M2-16B`；但卡内 `Dependencies` `:1885` 与 `Granularity` `:1915` 只写 `M2-08`。
+- **M2-13**：DAG `:647` 有 `M216C --> M213`；但 `Dependencies` `:2156`、`Granularity` `:2186`、粒度审计 `:751` 全部只写 `M2-12`。
+- **M2-16A**：粒度审计 `:754` recovery 列 `compensating`，卡内 `Rollback mode` `:819` 为 `forward-only`，`Granularity` `:837` 写 `recovery=revert code and re-port`。
+
+**为何重要：** G-06 规定「「实施顺序」的依赖边与各卡 `Dependencies` 必须一致」；G-01 要求 `Rollback mode` 与 `Granularity` 的 recovery 自洽。粒度审计表是 ER-03 的机械核对入口，三处打架时无法通过粒度门。
+**最小修复：** M2-09 的 `Dependencies`/`Granularity` 补 `M2-16B`；M2-13 三处补 `M2-16C`（或从 DAG 删该边并说明理由）；M2-16A 三处统一为 `forward-only`。
+
+### P1-9 计划缺失 GC-13 与 ER-13/ER-14 的条款登记，三张 `migration` 卡因此没有数据库角色 / 全局配置隔离验收
+
+**位置：** `:597`（「模板 v2 的 `GC-01..GC-12` 全部适用」）、`:615`（「`ER-01..ER-12` 全部适用」）、M2-02 `:1258-1267`、M2-02F `:1322-1331`、M2-02R `:1386-1395`
+**问题：** 模板 v2.4 起 `GC-13`（数据库迁移作用域与全局配置隔离）为强制，v2.6/v2.7 增补 ER-13/ER-14；本计划正文只声明到 GC-12 / ER-12。G-11 对 `migration` 卡另外要求「按 GC-13 逐项登记数据库角色、migration allowlist、对应 schema ledger 与旧/新二进制兼容判定，并以隔离 global-config fixture 证明 repo-only migration 不会推进配置库 receipt」。三张迁移卡的 AC 只有「旧 reader preflight 拒绝」，没有任何 `Repository`/`GlobalConfig`/`SystemConfig` 角色声明，也没有 `LIBRA_CONFIG_GLOBAL_DB` / `LIBRA_CONFIG_SYSTEM_DB` 隔离断言。
+**为何重要：** GC-13 是 v2.7 强制条款，且 Memory 迁移直写 `.libra/libra.db`，缺角色 allowlist 正是该条要防的事故类别。
+**最小修复：** `:597` → `GC-01..GC-13`，`:615` → `ER-01..ER-14`；三张迁移卡各加一条 AC 与一条 Verification（角色 = `Repository` only；临时配置库 fixture 断言 receipt 与配置表语义不变）。
+
+### P1-10 M2-16D 标为 `audit` / `no-release`，却允许交付生产代码
+
+**位置：** `:979`（`Task type: audit`）、`:998`（AC#2「交付只读 Adapter … + 单测 + 集成测试」）、`:1015`（write set 含 `src/internal/ai/memory/adapters/**`、`src/internal/ai/memory/mod.rs`）、`:1035-1037`（`N/A` / `no-release`）
+**问题：** 模板 B 类型门规定 `docs`/`audit`/`handoff`「必须保持 no-code / no-config：一旦发现需要改动代码或配置，不得「就地升级门」，必须先按 ER-03 重分类为 `implementation`…同步 `Release boundary`、`Version increment`、`Release write set`，重跑粒度门后再执行」。本卡把两种结果预先写进同一张 `audit` 卡，等于内置了被明令禁止的「就地升级」。
+**为何重要：** 若判定「可映射」，本卡会在 `no-release` 下推送生产代码而不 bump、不发布，违反 G-07 与 ER-08。
+**最小修复：** 拆成 `M2-16D`（纯 `audit`，只产决策记录）+ `M2-16D1`（条件性 `implementation`，`independent` / `patch`，仅在 16D 判定可映射时启动），并同步 DAG（`M2-16D1 -> M2-16E`）、粒度审计表与风险表。
+
+### P1-11 M2-16C 的 Verification 留有未替换占位符 `<bridge-target>`
+
+**位置：** `:939`、`:940`（另 `:923` Current evidence 也只写「开工时按 `tests/INDEX.md` 精确定位」）
+**问题：** G-05 要求 `Verification` 是「可直接复制执行的确切命令」，ER-04 A 组明确「不得留未替换占位符」，「幽灵验收」反模式亦指此。
+**为何重要：** 两条门不可执行、无法做零命中守卫，本卡不满足 G-05「不读其它卡即可执行」。
+**最小修复：** 现在定下 target（复用 `tests/INDEX.md` 既有 bridge target，或本卡新建 `tests/agent_bridge_memory_test.rs` 并标 `(new)` + 登记 `tests/INDEX.md`），把两条命令写成确切形式。
+
+### P1-12 M2-13 新增可见命令 `libra memory`，AC/Verification 未覆盖仓库强制的三道 EXAMPLES 守卫，且未按 ER-06a 判定后端网站文档
+
+**位置：** `:2139-2146`（AC）、`:2150-2154`（Verification）、`:2166`（Docs 段）、`:715`（Docs 默认值）
+**核对：** `src/cli.rs:4116` `root_after_help_lists_every_visible_command`、`tests/compat/help_examples_banner.rs`、`tests/compat/command_docs_examples_section.rs` 均存在，对每个可见命令强制要求 `<CMD>_EXAMPLES` 常量、Command Groups 行与 `docs/commands/<name>.md` 的 Examples 小节。本卡 AC 只笼统写「help/examples … 同步」，Verification 无任何 compat target。ER-06a 要求每张卡明确列出 `../libra-backend/apps/tanstack-app/content/docs/` 的影响或写 `N/A` + 理由；`:715` 与本卡 Docs 段均未提。
+**为何重要：** 缺 `MEMORY_EXAMPLES` 会让三个 compat 门在收口全量时同时红；ER-06a 是模板每卡必判定项。
+**最小修复：** AC 增加「`src/command/memory.rs` 提供 `pub const MEMORY_EXAMPLES` 并经 `#[command(after_help = …)]` 接入，`cli.rs` Command Groups 行含 `memory`」；Verification 增加三条 compat 命令；Docs 段按 ER-06a 补后端网站文档判定与 `cf` 分支前置。
+
+### P1-13 `plan-status.md` 未随 R30 同步：卡数 19 vs 24，M2-01 状态冲突
+
+**位置：** `docs/development/plan/plan-status.md:46`、`:126-131`、`:177` vs 本计划 `:2567`（24 张卡）、`:2540`（「M2-01 …未确认前保持 `pending`」）、`:1115`（卡内 `pending`）
+**问题：** plan-status 仍写「M2-01 `in-progress`；M2-02..M2-15 全部 `pending`」，完全没有 M2-16A..E 五张新卡；「零依赖可立即启动」列表（`:177`）也不含执行起点 M2-16A。模板「使用规则」把 plan-status 定为全仓单一执行状况视图并要求同一变更同步；M2-16D `:1001` 与 M2-16E `:1068` 自己也把「同步 plan-status §3.3」写成 AC。
+**为何重要：** R30 新增 5 张卡并重置 M2-01 生命周期属规范性变更，跨计划视图与任务卡打架时无法判定起点。
+**最小修复：** 在提交 R30 修订的同一变更里更新 plan-status「计划一览」行与 §3.3 表（列出 M2-16A..E、M2-01 改回 `pending`、标注起点为 M2-16A）。
+
+---
+
+## P2
+
+1. `:367` / `:1587` 把「prune 已保护 `libra/` 前缀」锚到 `src/command/op.rs:365-383`；实际判定在 `src/command/op.rs:1144`（`&& !name.starts_with("libra/")`），`365-383` 是 `handle_op_redo`/`handle_op_revert`。
+2. `:1452` 的 `history.rs:997-1021`（`new_with_ref`）实际在 `:1026`；`:364` 的 `2017-2180` 亦有偏移（companion 事务注释在 `:2227`）。
+3. `:2023` M2-11 write set 写 `src/internal/ai/libra_vcs.rs`，该文件不存在（已有「或既有 ancestry helper」兜底，建议直接写实际路径）。
+4. `:2336` 把 CodeQL job 锚点写成 `codeql.yml:14-31`，但 `analyze` 在 `:21`、`language` matrix 在 `:44-46`，范围不覆盖判据来源。（base.yml 的七个 job id 已核对一致。）
+5. `:761` 的集中 `(new)` 标记把 M2-16D 的 `cargo test --lib internal::ai::agent_run` 也算新增，但该 filter 命中既有测试；建议按 M2-03 的写法逐条区分。
+6. ER-14 命令依赖的 `.env.live-test` 在本仓库不存在（只有 `.env.test.example`），`source .env.live-test` 会让 `&&` 链短路；建议写成 `[ -f .env.live-test ] && source .env.live-test`，或补 `.env.live-test.example` 并在 `CLAUDE.md` 登记。
+7. `:420` 自审表仍写「18 张实现/迁移卡 + 1 个发布点」，与现在 24 张不符（虽标注为初稿结论，建议加 R30 更新说明）。
+8. GAP 表 `:385-399` 只到 `GAP-M2-14`，未覆盖 M2-16A..E 的缺口来源。
+9. `memory.md:625`（§4.2.1 step 5）要求投影事务同时更新 `memory_entity_index` / `memory_taxonomy_node`，而本计划表职责 `:311-325` 不含这两张表；M2-01 的规范修订需显式处理，否则 M2-06「rebuild 语义一致」会与规范不符。
+
+---
+
+**统计：P0 = 4，P1 = 13，P2 = 9。**
+
+VERDICT: FAIL
+EXIT=0
