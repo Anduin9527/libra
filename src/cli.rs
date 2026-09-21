@@ -2938,39 +2938,18 @@ fn command_is_agent_hook_entry(command: &Commands) -> bool {
     )
 }
 
-/// Run the `upgrade.mode=auto` check and surface its outcome (§A.8). It never
-/// errors and reports only in human mode, through an advisory warning that
-/// does not affect the command's exit status, so it cannot disturb the user's
-/// command.
-async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
-    use crate::internal::upgrade::orchestrator::{AutoUpgradeReport, run_auto_upgrade_check};
-
-    let local_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    crate::internal::upgrade::orchestrator::AUTO_ADVISORY_SUPPRESSED.store(
-        output.is_json() || output.quiet,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let report = run_auto_upgrade_check(local_now).await;
-    if output.is_json() || output.quiet {
-        return;
-    }
-    match report {
-        AutoUpgradeReport::Installed(version) => {
-            utils::error::emit_advisory_warning(format!(
-                "auto-upgraded Libra to {version}; the new version takes effect on the next command"
-            ));
-        }
-        AutoUpgradeReport::RolledBack => {
-            utils::error::emit_advisory_warning(
-                "an auto-upgrade attempt was rolled back (self-check failure, a superseding \
-                 publisher control decision, or policy-lock contention); the current version \
-                 is unchanged",
-            );
-        }
-        AutoUpgradeReport::Skipped => {}
+/// Kick off the `upgrade.mode=auto` check (§A.8) without ever blocking the
+/// command. A network-free preflight decides whether a check is even due
+/// (trust table, mode, official install, platform, cooldown/backoff); if so, a
+/// detached `libra __upgrade-background` child runs the full verified check
+/// and install off the critical path. The child has null stdio and is silent
+/// on every failure (offline, unreachable, or slow access beyond its budget is
+/// simply skipped), so the user's command is neither delayed nor notified and
+/// `--json`/`--quiet` output is never interleaved or corrupted.
+fn run_auto_upgrade_check_hook() {
+    use crate::internal::upgrade::orchestrator;
+    if orchestrator::auto_upgrade_check_due() {
+        orchestrator::spawn_background_upgrade();
     }
 }
 
@@ -3026,6 +3005,15 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     // (argv[1]), and dropping a token before it would shift that position.
     if let Some(probe) = command::upgrade::parse_probe_argv(&argv) {
         return command::upgrade::run_probe(probe);
+    }
+    // Detached auto-upgrade worker (§A.8): recognized at the very front too,
+    // before clap, repo preflight, schema migration, or any background task.
+    // It runs ONLY the verified auto-upgrade check + install and exits; it
+    // never forwards to a user command and never touches repository state.
+    if argv.get(1).and_then(|arg| arg.to_str())
+        == Some(crate::internal::upgrade::orchestrator::BACKGROUND_UPGRADE_TOKEN)
+    {
+        return crate::internal::upgrade::orchestrator::run_background_upgrade_worker().await;
     }
     let _invocation_guard = CLI_INVOCATION_LOCK.lock().await;
     // Keep the large dispatcher out of the generic task-local wrapper's state
@@ -3333,7 +3321,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         && !matches!(args.command, Commands::Upgrade(_))
         && !command_is_agent_hook_entry(&args.command)
     {
-        run_auto_upgrade_check_hook(&output).await;
+        run_auto_upgrade_check_hook();
     }
 
     // Dispatch is captured as a Result so both success and early `?` failures can

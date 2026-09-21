@@ -43,6 +43,12 @@ pub const UPGRADE_BUDGET: Duration = Duration::from_secs(15);
 /// Per-probe hard timeout for the recovery/post-install self-check.
 pub const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hidden front-of-argv token for the detached auto-upgrade worker: the CLI
+/// spawns `libra __upgrade-background` as a null-stdio background child that
+/// runs the verified auto-upgrade check + install off the user command's
+/// critical path. Recognized before clap, like `__upgrade-probe`.
+pub const BACKGROUND_UPGRADE_TOKEN: &str = "__upgrade-background";
+
 /// What the auto-upgrade check did this invocation (for the CLI to surface).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoUpgradeReport {
@@ -179,38 +185,113 @@ pub fn should_check_now(
     !cooldown_permits_skip(state, local_now)
 }
 
+/// Cheap, network-free preflight shared by the foreground spawn decision and
+/// the detached worker: is an auto-upgrade check actually due right now?
+/// The gates run in the exact §A.8 order — a non-empty trust table,
+/// `upgrade.mode=auto`, an official upgrade-manageable install on a supported
+/// platform, a readable state file, and a success-cooldown/failure-backoff
+/// throttle that permits an online attempt. Touches NO network; every
+/// short-circuit returns `None` (→ silent skip).
+fn preflight_auto_check(
+    trust: &'static [super::trusted_keys::TrustedKey],
+    local_now: i64,
+) -> Option<(InstallContext, UpgradeState)> {
+    if trust.is_empty() {
+        return None;
+    }
+    if effective_mode_for_upgrade() != UpgradeMode::Auto {
+        return None;
+    }
+    let ctx = resolve_install_context()?;
+    if ctx.platform.support() != PlatformSupport::Supported {
+        return None;
+    }
+    // An install we did not sign is not eligible for auto-upgrade (§A.2).
+    official_marker_for_target(&ctx.dir, ctx.platform.as_str())
+        .ok()
+        .flatten()?;
+    let state = read_state(&ctx.dir).ok()?;
+    if !should_check_now(UpgradeMode::Auto, false, &state, local_now) {
+        return None;
+    }
+    Some((ctx, state))
+}
+
+/// Whether to spawn the detached auto-upgrade worker on this command: the
+/// network-free preflight only. This is the single thing the auto hook does
+/// on the command's critical path, so it must never go online; the worker
+/// re-runs the identical gate inside [`run_auto_upgrade_check`] before any
+/// network I/O.
+pub fn auto_upgrade_check_due() -> bool {
+    preflight_auto_check(active_trust_table(), unix_now()).is_some()
+}
+
+/// Spawn the detached auto-upgrade worker (`libra __upgrade-background`) as a
+/// background child with null stdio, off the command's critical path. The
+/// worker runs the full verified check + install and is bounded by its own
+/// 15 s budget plus the pinned connect/read deadlines; an offline or
+/// unreachable host, or access that exceeds the budget, is silently skipped
+/// (with a persisted failure backoff), and the installed binary — when any —
+/// takes effect on the next command. Best-effort and silent: a spawn failure
+/// is ignored, and the worker's stdio is `/dev/null` so it can never
+/// interleave with — or corrupt — the user's (possibly `--json`) output.
+pub fn spawn_background_upgrade() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg(BACKGROUND_UPGRADE_TOKEN)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Detach into a new session so a Ctrl-C / SIGHUP aimed at the parent
+        // shell never aborts an in-flight verified upgrade. SAFETY: setsid(2)
+        // in the child before exec is async-signal-safe and observes no
+        // parent state; an EPERM (already a session leader) is non-fatal.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    // Fire-and-forget: never wait, never reap here — the worker is a detached
+    // process with its own bounded lifetime.
+    let _ = command.spawn();
+}
+
+/// Detached-worker entry point (`libra __upgrade-background`): run the full
+/// verified auto-upgrade check + install once and exit. Always silent (the
+/// spawner nulls stdio, and [`AUTO_ADVISORY_SUPPRESSED`] additionally silences
+/// the auto path's floor-persist advisory), and it never reads repository
+/// state, runs preflight, or mutates the caller's output.
+pub async fn run_background_upgrade_worker() -> CliResult<()> {
+    AUTO_ADVISORY_SUPPRESSED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _report = run_auto_upgrade_check(unix_now()).await;
+    Ok(())
+}
+
 /// Run the `upgrade.mode=auto` check (§A.8). Never returns an error: every
 /// failure degrades to [`AutoUpgradeReport::Skipped`] so the user's command
 /// is unaffected.
 pub async fn run_auto_upgrade_check(local_now: i64) -> AutoUpgradeReport {
     let trust = active_trust_table();
-    // Fast, allocation-free short-circuits in the common case.
-    if trust.is_empty() {
-        return AutoUpgradeReport::Skipped;
-    }
-    if effective_mode_for_upgrade() != UpgradeMode::Auto {
-        return AutoUpgradeReport::Skipped;
-    }
-    let Some(ctx) = resolve_install_context() else {
+    // Cheap, network-free preflight — the same gates the detached-worker spawn
+    // decision runs. Every short-circuit degrades to Skipped (silent).
+    let Some((ctx, state)) = preflight_auto_check(trust, local_now) else {
         return AutoUpgradeReport::Skipped;
     };
-    if ctx.platform.support() != PlatformSupport::Supported {
-        return AutoUpgradeReport::Skipped;
-    }
-    // An install we did not sign is not eligible for auto-upgrade (§A.2).
-    if official_marker_for_target(&ctx.dir, ctx.platform.as_str())
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return AutoUpgradeReport::Skipped;
-    }
-    let Ok(state) = read_state(&ctx.dir) else {
-        return AutoUpgradeReport::Skipped;
-    };
-    if !should_check_now(UpgradeMode::Auto, false, &state, local_now) {
-        return AutoUpgradeReport::Skipped;
-    }
 
     // Phase A: fetch + decide + download, under the budget. Candidate staging
     // and probing happen under the lock in Phase B so concurrent checks
