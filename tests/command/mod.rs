@@ -690,6 +690,7 @@ mod ls_remote_options_test;
 mod ls_remote_test;
 mod ls_tree_test;
 mod maintenance_test;
+mod mega2_browser_cli_test;
 mod mega2_browser_tui_test;
 mod mega2_tree_transport_test;
 mod merge_base_test;

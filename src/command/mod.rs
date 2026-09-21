@@ -72,6 +72,7 @@ pub mod mailinfo;
 pub mod maintenance;
 #[cfg(feature = "fastcdc")]
 pub mod media;
+pub mod mega2; // plan-20260912 MB-03: the single public `libra mega2 browser` surface
 pub mod mega2_browser; // plan-20260912 MB-02: mega2 browser TUI state + terminal lifecycle
 pub mod merge;
 pub mod merge_base;

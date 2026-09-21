@@ -100,6 +100,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "remote",
     "open",
     "cloud",
+    "mega2",
     "automation",
     "sandbox",
     "agent",

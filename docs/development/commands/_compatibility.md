@@ -52,6 +52,7 @@ flowchart TD
 | checkout | partial | partial | visible branch compatibility surface including worktree-scoped `checkout -` previous-target toggling shared with `switch -`, `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
 | am | partial | partial | P2-01 exposes ordered plain-text patch files plus continue/skip/abort with the P2-02 shared bounded mail parser and rollback; multipart/binary/3-way/hooks and the wider Git option surface remain P2-03 follow-ups |
 | mailinfo | partial | partial | P2-02 exposes repo-independent `mailinfo <msg> <patch> < mail`, Git-shaped basic metadata, shared transfer/RFC 2047 cleanup, body/patch split, and JSON/quiet; wider flags, MIME, non-UTF-8, binary, and multi-message mbox remain deferred |
+| mega2 | intentionally-different | intentionally-different（Libra-only） | `libra mega2 browser` 是唯一的 Mega2 远端浏览入口，Git 无等价契约：只读、匿名的单层 `GET /api/v1/tree`；交互模式要求 TTY 且退出必还原终端；`--json`/`--machine` 恰好一次请求并输出 `{ server, ref, path, items[{name,content_type}] }`；不读写本地仓库/配置。后续写入面（建目录、删除/移动、tag）由 MB-04/05、MB-07/08、MB-10/11 另行登记 |
 
 ## 子面兼容分级（CG-01）
 

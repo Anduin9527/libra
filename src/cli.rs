@@ -60,7 +60,7 @@ Command Groups:
     ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, mergetool, rebase, reset, cherry-pick, revert, am, rerere, metadata
-  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, credential, bundle, auth, login, logout, whoami
+  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, credential, bundle, auth, login, logout, whoami, mega2
   AI And Automation       automation, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
@@ -720,6 +720,11 @@ enum Commands {
     Open(command::open::OpenArgs),
     #[command(about = "Cloud backup and restore operations (D1/R2)")]
     Cloud(command::cloud::CloudArgs),
+    #[command(
+        about = "Browse a Mega2 remote repository listing (Libra extension)",
+        after_help = command::mega2::MEGA2_EXAMPLES
+    )]
+    Mega2(command::mega2::Mega2Args),
 
     #[command(about = "Manage AI automation rules and history")]
     Automation(command::automation::AutomationArgs),
@@ -1583,6 +1588,10 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
         Commands::Hooks(command::hooks::HooksArgs {
             command: command::hooks::HooksProviderSubcommand::Codex { .. },
         }) => Ok(CommandPreflight::none()),
+        // `mega2 browser` reads one bounded remote listing (or drives the TUI)
+        // and touches no repository object, index or configuration state; it
+        // must work outside a repository.
+        Commands::Mega2(_) => Ok(CommandPreflight::none()),
         Commands::Init(_)
         | Commands::Clone(_)
         | Commands::Open(_)
@@ -1972,6 +1981,7 @@ fn command_scope(command: &Commands) -> CommandScope {
         | Commands::VerifyPack(_)
         | Commands::Completions(_)
         | Commands::Open(_)
+        | Commands::Mega2(_)
         | Commands::Whoami(_) => ReadOnly,
     }
 }
@@ -3587,6 +3597,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                 command::worktree::execute_safe(cmd_args, &output).await?
             }
             Commands::Cloud(cmd_args) => command::cloud::execute_safe(cmd_args, &output).await?,
+            Commands::Mega2(cmd_args) => command::mega2::execute_safe(cmd_args, &output).await?,
             Commands::Agent(cmd_args) => command::agent::execute_safe(cmd_args, &output).await?,
             Commands::Review(cmd_args) => {
                 command::agent::review::execute_safe(cmd_args, &output).await?
