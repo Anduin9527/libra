@@ -14,7 +14,7 @@
 //! - [`protocol`]: clients for Git's wire protocols (smart HTTP, ssh, local fs) plus
 //!   the LFS client. These are pluggable behind the `protocol::SmartProtocol` trait.
 //! - [`log`]: rendering of `git log`–style output and date/time parsing helpers.
-//! - [`ai`]: agent runtime and Code UI services used by `libra code`.
+//! - [`ai`]: agent runtime and external-agent capture services.
 //! - [`vault`]: encrypted at-rest storage for credentials and provider secrets.
 //!
 //! Modules here may depend on `git-internal` and on each other but should *not* depend
@@ -33,8 +33,6 @@ pub mod deps;
 pub mod dirty;
 pub mod head;
 pub mod layer;
-pub mod legacy_operation;
-pub mod legacy_operation_model;
 pub mod log;
 pub mod maintenance_lock;
 pub mod merge_base;
@@ -44,7 +42,6 @@ pub mod mutable_state_ownership;
 pub mod notes;
 pub mod obliteration;
 pub mod operation;
-pub mod operation_wrapper;
 pub mod pack_writer;
 pub mod patch_mode;
 pub mod process_terminate;

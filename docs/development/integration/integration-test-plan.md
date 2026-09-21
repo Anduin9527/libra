@@ -522,7 +522,7 @@ runtime:
 
 ```
 ## Test Plan
-- New:      <target>::<fn>  // e.g. code_ui_remote_lease_matrix::lease_expires_after_ttl
+- New:      <target>::<fn>  // e.g. code_cli_dispatch_test::libra_code_is_unknown
 - Modified: <target>::<fn>
 - Deleted:  <target>::<fn>
 - Waves run locally: 0, 1, 2 (+ 4 if applicable)

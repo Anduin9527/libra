@@ -5,9 +5,10 @@
 //! Migrations land via `sql/migrations/2026052301_source_call_log{,_down}.sql`
 //! and the entity is registered in [`crate::internal::model`].
 //!
-//! This entity preserves source-call audit rows from the former source layer;
-//! v0.17.800 added the on-disk shape so a session crash no longer drops the
-//! audit trail.
+
+//! No live producer remains after retirement of the Code-era source runtime;
+//! this entity is retained solely for migration and compatibility data in
+//! existing repositories.
 
 use sea_orm::{DbErr, entity::prelude::*};
 

@@ -451,7 +451,7 @@ graph TB
 | 1. Operation/Snapshot 底座 | 固定 mutation/state census；实现不可变 View、Operation DAG、journal、CAS heads 和 bounded I/O |
 | 2. 完整快照与 Undo | 覆盖 HEAD/refs/index/files/sequencer；接入全部CLI mutation并进行shadow验证；开放crash-safe undo/redo/restore |
 | 3. Change ID 与 Genealogy | 接入amend/rebase/squash/split/duplicate，形成完整revision evolution，并关联Intent/Run/Invocation |
-| 4. 并发与收口 | 支持多worktree Operation heads/reconcile；移除v1 Operation代码（原「Web 图」项已随 `web/` 拆除取消；v1 删除的前置 runtime cutover 记为 DEFER-05） |
+| 4. 并发与收口 | 支持多worktree Operation heads/reconcile；移除 v1 Operation 代码（原「Web 图」项已随 `web/` 拆除取消；PR #503 由 OL-15A 完成 v1-boundary runtime cutover，OL-15 完成 removal） |
 
 实施遵循三个顺序：
 
@@ -474,8 +474,8 @@ graph TB
 - **Status:** Accepted for the 2026-09-05 execution window
 - **Atomic migration:** migration runner 在同一 SQLite 写事务中 claim version、创建 staging 表、copy v1 行、校验行数和关键字段、删除旧 source 并 rename 为 `legacy_*`，最后创建八张 v2 表；任一步失败都回滚 version claim、staging、rename 与数据。
 - **No false genealogy:** v1 的 view/workspace 快照不能无损重建 `RepoViewV2`/`WorkspaceSnapshotV2`，因此旧行不转换成 v2 view、journal、head、change genealogy 或 AI link。无法无损映射的字段继续保留在 legacy 数据中。
-- **Runtime boundary:** 本窗口 active operation logging 继续只读写 `legacy_operation*`；v2 store/codec 只读写 v2 表；禁止 v1/v2 双写。maintenance/object-root 路径也显式使用 legacy 命名空间，避免迁移后运行时断裂。
-- **Deletion condition:** 只有 v1-boundary runtime cutover（DEP-05）/OL-15 完成所有剩余 CLI/Agent mutation cutover、active logging smoke、legacy 读写零命中守卫、object-root/maintenance 收口、备份与删除演练、兼容矩阵验收后，才允许单独删除 `legacy_*` 表、legacy model/service 和 fixture；在此之前不得删除或清空 legacy 数据。（2026-09-20 评估：`operation_wrapper` 仍被 `branch`/sequencer/`worktree repair`/v1 `op restore` 调用，删除条件未满足，OL-15 已按 DEFER-05 延后。）
+- **Runtime boundary:** PR #503 起 active operation logging 只写 v2 表；v2 store/codec 只读写 v2 表；禁止 v1/v2 双写。migration/schema-convergence fixture 仍显式使用 `legacy_operation*`，但 maintenance/object-root 不再从 legacy namespace 读取。
+- **Deletion condition:** v1-boundary runtime cutover（OL-15A）与 OL-15 已完成所有剩余 CLI/Agent mutation cutover、active logging smoke、legacy 读写零命中守卫、object-root/maintenance 收口、备份与删除演练的代码侧验收；历史 migration/schema fixture 保留 legacy namespace，前向迁移不回写旧表。远端兼容矩阵仍由 PR #503 的 `compat-offline-core` 复核。
 
 | 新模块/文件 | 职责 | 借鉴的 jj 实现 |
 |---|---|---|
@@ -897,7 +897,7 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 ### 5.4 实现路径与阶段门
 
-实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做投影消费面（Web projection 已取消）。OL-02～OL-04 的落地窗口采用 ADR-OL-01b 的 legacy staging；最终仍不维护 v1 长期兼容层，v1-boundary runtime cutover（DEP-05）与 OL-15 完成切换后删除 legacy（OL-15 现按 DEFER-05 延后）。
+实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做投影消费面（Web projection 已取消）。OL-02～OL-04 的落地窗口采用 ADR-OL-01b 的 legacy staging；PR #503 的 OL-15A 已完成 runtime cutover，OL-15 已完成 v1 retirement，migration/schema fixtures 继续保留 legacy namespace 作为历史升级证据。
 
 每个阶段进入下一阶段的 Gate 必要条件：本阶段验证入口的测试全部通过（含既有 `status`/CLI 回归与 fail-closed 守卫），任一未通过不得推进，不允许把未验证代码带进下一阶段。每阶段对应具体写集与验证入口：
 

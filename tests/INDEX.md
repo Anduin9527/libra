@@ -31,12 +31,12 @@
 | `change_genealogy_rebase` | 1 | CH-03 rewrite builder, Change ID inheritance, typed rebase edges, and atomic projection rollback | `src/internal/change/{builder,genealogy}.rs` |
 | `change_genealogy_squash_split` | 1 | CH-04 squash/split/duplicate multi-edge genealogy, stable Change ID AI links, and FileHistoryStore read migration | `src/internal/change/genealogy.rs`, `src/internal/ai/session/file_history.rs` |
 | `commit_change_id_header_spike` | 1 | OL-00 real-Git Change ID header vs sidecar-only compatibility spike | `docs/development/internal/operation-log-working-copy-change-id.md` |
-| `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema, confirmed legacy-capture adoption, W4-08 linked-worktree `libra code`/`automation` enablement, and the W5-08 `graph_machine_survives_tui_removal` breaking guard (interactive graph entry refused with a migration hint; `--json`/`--machine` wire intact) | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs`, `tests/command/code_agent_linked_guard_test.rs` |
+| `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema, confirmed legacy-capture adoption, and the W5-08 `graph_machine_survives_tui_removal` breaking guard (interactive graph entry refused with a migration hint; `--json`/`--machine` wire intact) | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs` |
 | `compat_stash_subcommand_surface` | 1 | Guards `libra stash` subcommand surface vs. git CLI | `src/command/stash.rs` |
 | `compat_bisect_subcommand_surface` | 1 | Guards `libra bisect` subcommand surface | `src/command/bisect.rs` |
 | `compat_worktree_delete_dir` | 1 | Guards worktree delete semantics on dir removal | `src/command/worktree.rs` |
 | `compat_checkout_alias_help` | 1 | Guards `--help` text for checkout aliases | `src/command/checkout.rs` |
-| `compat_matrix_alignment` | 1 | Guards public docs/release matrices vs. real CLI/API surfaces, including `w203_revision_receipt_and_network_boundary_stay_aligned` for W2-03 digest-only receipts, the shared linear receipt index, permanent retry closure, typed revision errors, Phase 1 scanner/session-writer leases, and the Network-Allow 409 boundary | `COMPATIBILITY.md`, `CHANGELOG.md`, `docs/commands/code.md`, `docs/commands/zh-CN/code.md`, `docs/error-codes.md`, `docs/development/{commands/_compatibility,tracing/code,plan/plan-20260715}.md`, `src/internal/ai/{session/jsonl,workspace_snapshot}.rs`, `src/internal/ai/web/{headless,web_admission}.rs` |
+| `compat_matrix_alignment` | 1 | Guards public docs/release matrices vs. real CLI/API surfaces, including `w203_revision_receipt_and_network_boundary_stay_aligned` for W2-03 digest-only receipts, the shared linear receipt index, permanent retry closure, typed revision errors, Phase 1 scanner/session-writer leases, and the Network-Allow 409 boundary | `COMPATIBILITY.md`, `CHANGELOG.md`, `docs/commands/code.md`, `docs/commands/zh-CN/code.md`, `docs/error-codes.md`, `docs/development/{commands/_compatibility,tracing/code,plan/plan-20260715}.md`, `src/internal/ai/session/jsonl.rs` |
 | `compat_install_alias` | 1 | Guards IX-01 full-installer `lba -> libra` creation, same-version repair/idempotency, CLI/env opt-outs, foreign-path preservation, and symlink-unavailable fallback with an isolated fake downloader | `install.sh`, `tests/compat/install_alias_smoke.sh`, `README.md`, `README.zh-CN.md` |
 | `compat_live_compat_workflow` | 1 | Guards optional live AI/cloud workflow remains manual/scheduled and secret-gated | `.github/workflows/live-compat.yml` |
 | `compat_release_homebrew_verify` | 1 | Executes release Homebrew verification Bash with isolated local stubs: command/artifact failures reject, pinned formula and installed binary identity precede success evidence | `.github/workflows/release.yml` |
@@ -167,9 +167,8 @@ automation / session / safety contract suites:
 | `redaction_contract_test` | 2 | Pin the RedactedBytes contract for transcript output | `src/internal/ai/session/` |
 
 The W2-03 session-journal anchors remain in
-`src/internal/ai/session/jsonl.rs`; the Code-UI-only anchors that lived in
-`src/internal/ai/web/headless.rs` and `tests/ai_code_ui_headless_test.rs`
-were removed with those files (RC-23).
+`src/internal/ai/session/jsonl.rs`; the Code-UI-only anchors were removed
+with the retired Web implementation (RC-23).
 
 ## Wave 3 — network (test-network)
 

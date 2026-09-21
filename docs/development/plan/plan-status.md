@@ -41,7 +41,7 @@
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度） | **已收口** | NP-00..05 全部 `complete` |
 | [`plan-20260825.md`](plan-20260825.md) | B（Code provider / RT-01 后续） | **已收口** | TA 系列全部落地；发布面按用户 2026-08-30 豁免闭合 |
 | [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | **已收口** | DF-01..09 全部 `done/complete`；v0.22.0 已发布 |
-| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03 Operation Log v2） | 实施中 | OL-01..13、CH-01..04 `done/complete`；OL-14 **已取消**（`web/` 拆除，2026-09-20）；OL-15 `blocked`（DEFER-05：v1-boundary cutover 未排期） |
+| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03 Operation Log v2） | 实施中（PR #503 收口） | OL-01..13、CH-01..04 `done/complete`；OL-14 **已取消**（`web/` 拆除，2026-09-20）；OL-15A `done/complete`，OL-15 `done/remote-pending`（等待 compat-offline-core） |
 | [`plan-20260821.md`](plan-20260821.md) | A（UP-01） | **已收口** | 客户端与 CI 全部落地；closeout `00bc815`；DEFER-02..06 残留 |
 | [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02 Memory） | 实施中 | **M2-01 `in-progress`**；M2-02..M2-15 全部 `pending`（M2-15 为发布点） |
 | [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | **已收口** | LB-01..07 全部 `done/complete`；protocol v1 20-method 全实现 |
@@ -152,7 +152,8 @@
 | OL-01..OL-12、CH-01..CH-04 | `done/complete` |
 | OL-13 多 worktree Operation heads 与 reconcile | `done/complete`（v0.23.0，`9da06b4`） |
 | OL-14 Operation/Change Web 只读图 | **已取消**（G-09 墓碑，2026-09-20：`web/` 随 plan-20260920 拆除且不重建；`libra op log/show` 为现行查询面） |
-| OL-15 移除 v1 operation 代码/表/命令 | `blocked` / DEFER-05（`operation_wrapper` 仍是活路径：branch/sequencer/worktree repair/v1 op restore；`legacy_operation*` 仍被 maintenance 读取） |
+| OL-15A v1-boundary runtime cutover | `done/complete`（PR #503：生产 mutation 统一 v2 middleware，legacy namespace 仅 migration/schema fixture 保留） |
+| OL-15 移除 v1 operation 代码/表/命令 | `done/remote-pending`（PR #503：v1 wrapper/service/model/fallback 已移除；等待 compat-offline-core） |
 
 ### 3.5 plan-20260903（merge）与 plan-20260729（CT-01）
 
@@ -179,7 +180,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 | 计划 | 入口卡 | 卡要做什么（简述） | 内部前置 | 计划级 review 门 | 外部/跨计划门控 | 可立即开工 |
 |---|---|---|---|---|---|---|
-| [`plan-20260822`](plan-20260822.md) | （无；OL-14 已取消、OL-15 `blocked`/DEFER-05） | — | — | — | — | ❌ 无可开工入口 |
+| [`plan-20260822`](plan-20260822.md) | （PR #503 收口；OL-14 已取消、OL-15 `remote-pending`） | — | — | — | — | ⏳ 等待 compat-offline-core 远端门禁 |
 | [`plan-20260919`](plan-20260919.md) | GCX-02 | legacy 全局 config DB 首次使用自动迁移（锁+快照+校验+原子提交） | GCX-01（已 `done/complete`） | 已过（GCX-01 已发布 v0.23.1） | DEP-GCX-02：与 plan-20260918 串行写 `COMPATIBILITY.md`/网站页 | ⚠️ 需核 DEP-GCX-02 写集 clean |
 | [`plan-20260919`](plan-20260919.md) | GCX-04 | 用户级 hooks 文件路径对齐 XDG（macOS 只读回退） | GCX-01（已 `done`） | 已过 | DEP-GCX-01（网站 `cf` 分支）；发布队列 GCX-02→GCX-03→GCX-04 | ⚠️ 受发布队列与 DEP-GCX-01 |
 | [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal` 0.9.0 并引入 `object_format` 事实源 | 无 | **双评审已 PASS**（Grok R2 / Claude R40 / Codex R40） | 外部无；开工需 `cp .env.test.example .env.test` | ✅ |
@@ -207,7 +208,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 > 说明：✅ = 无任何门控，可立即开工；⚠️ = 内部无前置但仍有外部/跨计划 `DEP-*` 或发布队列约束；❌ = 计划级 review 门未过（多数 issue 计划尚未 Codex review），按模板 ER-05 / GC-01 **禁止**标 `in-progress`。
 >
-> **一致结论：当前真正「零依赖且未被门控」可立即开工的是 `plan-20260907` B3-00。** 它是未启动计划中第一个双评审已 PASS 且外部无前置的卡——优先启动它可同时解锁 plan-20260913（FL Media）依赖链。`plan-20260822` OL-13 已于 2026-09-20 补记账为 `done/complete`（实现随 `9da06b4`/v0.23.0 发布）；OL-14 已于同日取消（G-09 墓碑），OL-15 改判 `blocked`（DEFER-05，前置 DEP-05 无卡承接）。
+> **一致结论：当前真正「零依赖且未被门控」可立即开工的是 `plan-20260907` B3-00。** 它是未启动计划中第一个双评审已 PASS 且外部无前置的卡——优先启动它可同时解锁 plan-20260913（FL Media）依赖链。`plan-20260822` OL-13 已于 2026-09-20 补记账为 `done/complete`（实现随 `9da06b4`/v0.23.0 发布）；OL-14 已取消（G-09 墓碑），OL-15A 已完成 runtime cutover，OL-15 为 `done/remote-pending`，等待 compat-offline-core 远端门禁。
 
 ---
 
@@ -241,7 +242,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 - plan-20260830：`DEFER-SBX-06` 发布步延后（DEP-SBX-05 未就绪）。
 - plan-20260729：`DEFER-09`（CT3-07 转换轴）——已被 plan-20260825 TA-01/02 + plan-20260827 NP-00 承接关闭。
 - plan-20260819：`DEFER-M2-01..08`（Memory 范围外：向量检索、团队同步等）。
-- plan-20260822：`DEFER-01..03`（Operation Log 范围外）；`DEFER-02`（Web 图 SSE）已随 OL-14 取消关闭；新增 **`DEFER-05`**（v1-boundary runtime cutover，OL-15 的真实前置，无卡承接待立）。
+- plan-20260822：`DEFER-01..03`（Operation Log 范围外）；`DEFER-02`（Web 图 SSE）已随 OL-14 取消关闭；`DEFER-05` 已由 PR #503 的 OL-15A 承接并关闭；OL-15 等待远端兼容门禁收口。
 - plan-20260903：`DEFER-01..12`（merge 范围外/deferred 差异）。
 - plan-20260715：`DEFER-01..10`（RT-01 收尾；部分由 plan-20260824 承接关闭）。
 
@@ -256,7 +257,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 | DEP-FL-04 | 跨计划前置 | plan-20260913 依赖 plan-20260907 完整收口 | plan-20260907 未启动 |
 | DEP-CC-05 | 跨计划前置 | plan-20260905 CC-02..06 依赖 plan-20260904 全部非延后卡完成 | plan-20260904 未启动 |
 | DEP-SBX-06 | 内部发布延后 | plan-20260830 SBX 发布步 | 未就绪 |
-| DEP-05 | 内部前置（未排期） | plan-20260822 v1-boundary runtime cutover（branch/sequencer/worktree repair/v1 op restore → v2 middleware）；OL-15 阻塞于它 | 未排期；无卡承接（DEFER-05） |
+| DEP-05 | 内部前置（已承接） | plan-20260822 v1-boundary runtime cutover（branch/sequencer/worktree repair/v1 op restore → v2 middleware）；由 OL-15A 承接，OL-15 依赖其完成 | PR #503 OL-15A 已完成 |
 | DEP-WT-09 | 跨计划前置 | issues/476 关闭依赖 plan-20260918 WT-05..07 完成 | plan-20260918 未到 WT |
 | DEP-FM-06 / DEP-FM-07 | 跨计划前置 | issues/470 关闭依赖 plan-20260918 FM-03/FM-04 完成 | plan-20260918 未到 FM |
 | DEP-AD-06 / DEP-AD-07 | 跨计划写集互斥 | plan-20260918 与 issues/483（CO）、issues/490（SW）、issues/479（PL）的 `add.rs`/index 写集串行 | 生效 |

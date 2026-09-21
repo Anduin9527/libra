@@ -1061,7 +1061,7 @@ impl HistoryManager {
     /// Functional scope:
     /// - Convenience accessor for callers that need to issue auxiliary
     ///   queries against the same database (e.g. listing references for the
-    ///   Code UI) without having to thread a separate `Arc` around.
+    ///   agent clients) without having to thread a separate `Arc` around.
     pub fn database_connection(&self) -> DatabaseConnection {
         self.db_conn.as_ref().clone()
     }
@@ -1124,7 +1124,7 @@ impl HistoryManager {
     /// Return the ref name this manager writes to.
     ///
     /// Functional scope:
-    /// - Useful for diagnostics, log messages, and Code UI labels that need to
+    /// - Useful for diagnostics, log messages, and agent-client labels that need to
     ///   present the active AI history branch to the user.
     pub fn ref_name(&self) -> &str {
         &self.ref_name

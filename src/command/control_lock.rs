@@ -847,7 +847,7 @@ pub fn write_control_info(path: &Path, info: &ControlInfo) -> Result<()> {
 
 /// Fail-closed discovery/attach errors for `libra code --control stdio` (W4-10 / F34).
 ///
-/// Stable `code()` strings mirror Code UI JSON-RPC `error.data.code` naming so
+/// Stable `code()` strings provide a machine-readable error namespace so
 /// automation can key off the same identifiers whether the failure happens at
 /// local discovery or later at HTTP attach.
 #[derive(Debug)]
