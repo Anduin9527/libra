@@ -2,7 +2,9 @@
 
 本文是 `docs/development/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。
 
-**模板版本:** `v2.6`（2026-09-14 起生效；相对 v2.5 的规范性变更：**全量测试统一使用 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`**。两个环境文件必须同时加载；该多进程执行器是 ER-13 的唯一全量证据入口，保留失败集合并按受控策略重试；`cargo test --all` 仅可用于诊断，不构成全量通过证据。）
+**模板版本:** `v2.7`（2026-09-21 起生效；相对 v2.6 的规范性变更：新增 **ER-14 发布集成测试执行器** —— release 的集成测试/全量验收证据必须以 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2` 产生；`cargo test --all` 仅用于诊断，**不得**作为 release 的集成测试或通过证据。）
+
+**历史版本 — v2.6**（2026-09-14 起生效；相对 v2.5 的规范性变更：**全量测试统一使用 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`**。两个环境文件必须同时加载；该多进程执行器是 ER-13 的唯一全量证据入口，保留失败集合并按受控策略重试；`cargo test --all` 仅可用于诊断，不构成全量通过证据。）
 
 **历史版本 — v2.4**（2026-09-10 起生效；相对 v2.3 的规范性变更：新增 **GC-13 数据库迁移作用域与全局配置隔离** —— 任何触及数据库 schema、连接建构、bootstrap、schema top-up、schema 兼容检查或迁移 fixture 的计划，必须声明数据库角色与每类 schema writer 的适用范围；仓库 writer 不得推进全局/系统配置库版本或创建 Repository 表，测试不得触及真实用户/系统配置库；显式 confirmed repair 必须采用一致性备份与原子前滚。）
 
@@ -20,6 +22,7 @@
 - 存量计划整份迁移是一次独立的计划工作，必须单独立卡；不得作为其它任务的附带产物。
 - ER-13 的测试分层是**放宽**而不是收紧：存量计划继续每卡跑全量不构成违规，无需回填。一旦某份计划改按 ER-13 只跑 focused，就必须同时具备两件事——每张会推送的卡有 `Full-suite trigger` 字段，且「完成判据」里的全量收口门（含修复全量暴露 Bug 的要求）已写入；缺任一项不得降级。
 - v2.6 的全量执行器迁移适用于尚未开工的任务卡：其 ER-13 触发门、计划完成门与重跑要求一律使用 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`。已执行卡的历史命令与结果保留为事实记录，不倒改为 nextest 结果；`cargo test --all` 不得再作为新卡或收口卡的通过替代。
+- v2.7 的 ER-14（发布集成测试执行器）自生效日起适用于一切尚未执行发布切片或收口门的计划：其 release 证据一律以 nextest 产生；已完成的 release 保留历史事实，不倒改。
 - 若某份存量计划因迁移成本暂时保留与本版冲突的口径（例如旧的 clippy 命令行、L/XL 卡），在该计划的「修订历史」登记一行例外与预期迁移时机即可。
 
 ## 使用规则
@@ -338,6 +341,14 @@
     - 全量收口门未全绿之前，计划不得标记完成（见「完成判据」）。
 
     **风险归属（必须知情后再采用）:** 执行阶段跳过全量意味着单卡推送与 `gh` 发布可能带入未被全量覆盖的回归，且本仓库**没有远端兜底** —— `.github/workflows/base.yml` 仅由 `pull_request` 触发（`on: pull_request`），直推 `main` 不会跑任何 CI 全量。因此这些回归只会在收口阶段的全量门暴露，并只能前滚修复。若某计划不接受该风险（例如涉及数据安全、迁移或发布通道），可在「全局工程约束」登记一条计划级例外，要求每卡都跑全量 —— 比本条更严不构成违规。
+
+14. **ER-14 发布集成测试执行器（nextest，强制）:** 发布切片（`gh` 触发 `release.yml`）之前，其**集成测试 / 全量验收证据只能由 nextest 产生**：`source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`。
+
+    **执行器唯一性:** `cargo test --all`（同一测试二进制内线程并行、进程内共享全局状态，例如 `WorktreeScope` 的进程级 fallback）**不得**充当 release 的集成测试，也不得作为其通过证据；它只允许用于诊断 nextest 自身问题。任何以 `cargo test --all` 绿色结果代替 nextest 全绿的发布一律视为该发布切片验收无效。
+
+    **与 ER-13 的关系:** ER-14 就是 ER-13 收口阶段全量门在发布切片上的落地形态——`T-2` 发布点卡恒定命中全量；发布切片必须在**已 bump 的树**上取得这次 nextest 全绿（fmt 与 clippy 照常前置）。`--retries 2` 只按 nextest 报告的 retry/flake 语义记录（出现 `FLAKY` 必须写明），不得掩盖最终失败；`--no-fail-fast` 保留完整失败集合。
+
+    **不得替代:** 不得用 `cargo test --all`、`cargo build --release`、本地单测抽样、或 D 组远端流水线（`release.yml` 的产物编译 / R2 上传 / Homebrew）替代本门；D 组证据在推送之后取得，不能反过来充当 C 组的发布集成测试。
 
 ## 实施顺序
 
