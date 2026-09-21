@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.23.36] — 2026-09-21
+
+### Operation v2 cutover and baseline stabilization
+
+- Completed the plan-20260822 operation/change cutover (#452): `libra op`,
+  change tracking, and every operation-state writer now run on the v2
+  operation model. The legacy operation model (`legacy_operation`,
+  `legacy_operation_model/*`), the v1 operation wrapper, and their test
+  suites are removed; the v1→v2 migration path stays forward-only.
+- `libra hooks <provider> <event>` (and the hidden `libra agent hooks …`
+  alias) no longer run the auto-upgrade startup recovery gate or the
+  `upgrade.mode=auto` check, so hook callbacks succeed from read-only
+  installations (immutable containers, CI sandboxes) without recovery
+  warnings (#502).
+- `libra op undo` / `libra op restore` acquire SQLite's write lock before
+  their read-then-write transactions, removing the intermittent
+  `restore storage failed: … database is locked` failure when the background
+  object-index consumer writes the same repository.
+- CI/test baseline: archive pathspec unit tests initialize a throwaway
+  repository and serialize on the `cwd` lane; rustdoc intra-doc links, the
+  `AddArgs.sparse` build initialization, and the permission-sensitive repair
+  fixtures (scratch root under `/tmp` with explicit `0o700/0o600` modes) are
+  repaired.
+
 ## [0.23.3] — 2026-09-20
 
 ### Removed: MCP and the `web/` directory
