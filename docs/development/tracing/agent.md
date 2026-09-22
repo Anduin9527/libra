@@ -77,6 +77,25 @@ flowchart TD
 - **Transcript intelligence 与 skill event**：允许按 capability 做 transcript 准备、文件/模型/token/prompt/skill/subagent 提取和 native transcript chunk/reassemble；extractor 缺失或可选字段缺失可 fail-open 并标 `partial`，但 redaction、path 安全、UTF-8/JSON envelope、写入、rewind apply、hook install/uninstall、external launch/fix 一律 fail-closed。
 - **Review / investigate 相邻工作流**：review / investigate 可以消费 `libra agent` 的 registry、capability、checkpoint、transcript 和 findings/provenance 数据；但 mutating fix/action 必须桥接内部 `libra code` AgentRuntime serialized queue、approval、sandbox 和 tool gate。observed external agent 只能提供 transcript、hook event、findings、manual attach/provenance，不能直接成为 Libra 的受控 mutating executor。
 
+### Libra 自有 hook 配置的三层路径（plan-20260919 GCX-04）
+
+上面各节描述的是**上游 agent**（Claude Code / Codex / OpenCode）各自的 hook 安装面。
+Libra **自己**的 `hooks.json`（`internal::ai::hooks::config::load_hook_config`）是另一
+套配置，分三层读取，全部**只读**——Libra 从不写入、改写或删除用户的 hooks 文件：
+
+1. 仓库层：W4-06 resolver 解析的 `hooks.json`（仓库内），可叠加 linked-worktree overlay；
+   仓库外则读 `<working_dir>/.libra/hooks.json`；
+2. 用户层：`<XDG_CONFIG_HOME 或 ~/.config>/libra/hooks.json` —— 与 global 配置库、
+   全域 vault key 同一个配置目录（ADR-GCX-01 / ADR-GCX-07）；
+3. 兼容回退：当用户层文件不存在，且平台原生 `dirs::config_dir()/libra/hooks.json`
+   与之**不同路径**（macOS 的 `~/Library/Application Support/libra`、Windows 的
+   `%APPDATA%\libra`）并且存在时，**只读**加载它，并输出一次性 advisory 提示，
+   要求用户自行搬迁。Linux 上两者解析为同一路径，因此该回退是 no-op，行为零变化。
+
+优先级是"用户层文件一旦存在就作数"：即使它解析失败（此时按既有语义 warn 并忽略
+用户层，不阻断 agent），也**不会**回落到旧位置——否则用户会在不知情的情况下跑到
+另一套 hook。提示走 advisory 通道，不触发 `--exit-code-on-warning`。
+
 ### 第一批支持项目（执行本文档时的强制范围）
 
 执行本文档的 agent 集成计划时，第一批 supported roster **只允许**包含以下 3 个 observed external agent：

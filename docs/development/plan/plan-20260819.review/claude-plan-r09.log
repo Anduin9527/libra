@@ -1,0 +1,85 @@
+# plan-20260819 R30-r09 review — Claude
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-21T15:35:50+08:00
+3e1044d6d3dd9dac9f83ff0118286aa6bf6b2f3446a8646124a550a3eb0f3c78  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r09.md
+
+I've completed the full read-only review. Here is my r09 report.
+
+```
+# plan-20260819 R30-r09 review — Claude
+reviewer: Claude Opus 5 (1M), read-only
+date: 2026-09-21
+被审文件 sha256:
+  3e1044d6d3dd9dac9f83ff0118286aa6bf6b2f3446a8646124a550a3eb0f3c78  docs/development/plan/plan-20260819.md
+  aaadd5e0f4de51c1bc436b6c55e3537ef7680f60405e77f477c4f3176978d311  docs/development/plan/plan-template.md
+  df19a7fff1584c0b7575b1bdb7ec2909917d49bfb79be941fb68a79ce6a7fd52  docs/development/plan/plan-status.md
+repo HEAD: 45ad1f7f2（`git log --oneline -3`），crate `0.23.36`（`Cargo.toml:3`）
+范围：plan-20260819.md 全文 + plan-template.md v2.8 + plan-status.md §3.3 + 仓库事实核对。
+排除：#456 source clone（`/run/media/genedna/data/libra-pr456` 在本会话沙箱外，`ls` 被拒），
+      故 M2-16E 的「158 条路径」只能按 DEP-M2-SRC-01 的判据接受，无法独立复算。
+```
+
+## 一、r08 findings 逐条核对
+
+**Codex r08（0×P0 + 5×P1 + 1×P2）**
+
+| 项 | 状态 | 核对证据 |
+|---|---|---|
+| 模板 PR/tag 流程 | **关闭** | `plan-template.md:265` 第 ⑧⑨ 步 = push feature branch → `gh pr create` → base.yml+CodeQL 同 head SHA → `gh pr merge --squash` → merge SHA `gh release create --target`；`:273` `--verify-tag` 已限定「仅在远端 tag 已存在時使用」。计划 `:69`、`:694`、`:700`、`:2494` 四处同口径 |
+| M2-01K config key 保护 | **关闭** | AC `:1304` 覆盖 `set/unset/remove-section/rename-section/import` 拒绝 + 读/list 脱敏 + 回归；写集 `:1318` 含 `src/command/config.rs` + 三份 config 文档；VER `:1312` `memory_digest_config_key_protected`。仓库侧 `src/command/config.rs:3,365-378,505-506,766-772` 确有 `set/get/list/unset/import/--remove-section/--rename-section`，AC 可执行 |
+| update-ref/symbolic-ref 绕过 | **关闭**（机械字段除外，见 P2-2） | AC `:1721` 含 `update-ref/symbolic-ref`；写集 `:1745` 含 `src/command/{update_ref.rs,symbolic_ref.rs}`；VER `:1736` `update_ref_and_symbolic_ref_reject_memory_branch`；`:1739` 的 33 份文档 `test -f` 我已逐个验证全部存在（11×`docs/commands/`、11×`docs/commands/zh-CN/`、11×`docs/development/commands/`） |
+| #456 158 档映射 | **关闭（判据可用性见 P2-3）** | AC `:1167` 已改为 pinned 全 diff 清单逐路径 `port/replace/already-main/intentionally-drop`，并明写「不得只枚舉前綴子集」 |
+| 开发文档同步 | **关闭** | `:1727`/`:1739` 含 `docs/development/commands/*`；`:982` 含 `docs/development/commands/agent.md`（仓库侧 `docs/development/commands/agent.md:129` 确有 “Protocol v1: 20-method allowlist”） |
+| P2 审计表末行断行 | **未关闭，且已回归** | 见 **P1-2** |
+
+**Claude r08（0×P0 + 2×P1 + 5×P2）**
+
+- **P1-1（§0.3 bridge 入口 pre-envelope）关闭**：`:45` 现为「host 提交 `MemoryRecordEnvelopeV1`（`observation: TerminalObservationV1` 必填，含 …`terminal_evidence: TerminalEvidenceRefV1`、`parent_intent_root_id`、`related_run_ids`… proposal-only 拒絕）」；`:46` 嵌入路径同签名。（同类残留一处，见 P2-4）
+- **P1-2（M2-01 AC4 / M2-07 首建倒置）关闭**：`:1238` 把四型在 M2-01 限定为「只冻结 `memory.md` 的 version-gate 規則與字段清單」，Rust 类型/拒绝矩阵/golden fixture 归 M2-07；M2-07 AC `:1867` 新增 `EX-M2-04`（`evidence.rs` 首建四型）、判据规范块 `:1870-1871`、VER `:1883` `terminal_observation_schema_version_matrix`；waiver 表 `:763` 已按模板 8 列登记。
+- **P2-1（末行断行）未关闭**（→ P1-2）；**P2-2（M2-16A 漏登 `DEP-M2-SRC-01`）关闭**（`:836`、`:789`）；其余 3 条关闭。
+
+**事实基线复核（全部在核对日 commit 上成立）**：`src/internal/ai/mod.rs:53-68` 无 `memory` 模块、`ls src/internal/ai/memory` 零命中；`src/cli.rs:670-680` 无 `Memory` variant；migration tip = `2026091901_operation_boundary_claim_columns`（`ls sql/migrations | tail`）；版本面 = 3 处且权威 target 为 `compat_version_surface_sync`（`tests/compat/version_surface_sync.rs:13`）；`base.yml` jobs 恰为 `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`、`codeql.yml` job `analyze` + `actions`/`rust` matrix，与 DEP-M2-CI-02 一致；`METHOD_ALLOWLIST` + `allowlist_has_exactly_20_methods`（`protocol.rs:62,532-533`）；bridge `source` CHECK 固定 `deepseek-harness`（`sql/migrations/2026081801_agent_bridge_capture.sql:16` + `tests/compat/agent_bridge_schema_test.rs:78`）；`rg -c "FTS5|bm25\(" src sql tests`、`rg -c "EpisodeCompiler|RepositoryKeyedDigest" src` 均零命中；`scripts/`、`docs/benchmarks/` 不存在；M2-03 声明的三个既有测试函数确在 `src/internal/ai/history.rs:5889,5981,6075`。
+
+## P0
+
+无。
+
+## P1
+
+### P1-1　M2-05 用 `EX-M2-03`（仅豁免 G-04）去豁免 G-03 的 `VER=9/8`，且无「判据规范」块——模板判为验收不达标
+
+- **位置：** `plan-20260819.md:764`（waiver 行）、`:1771`（Granularity）、`:778`（审计表）、`:1731-1739`（9 条 VER）
+- **问题：** M2-05 的 `Verification` 实际 9 条（我逐条计数：`libra_owned_ref`、2×`operation_restore_faults`、3×`command_test`、`memory_branch_remains_gc_root`、`compat_serial_registry`、33 份文档 `test -f` 循环），超过 `implementation` 卡的 8 条上限。Granularity 与审计表写作 `VER=9/8@EX-M2-03`，但 waiver 表 `:764` 的「豁免项」列只有 **`G-04 规模上限（L-exception）`**——它豁免的是文件数，不是 `Verification` 条目数。模板 `plan-template.md:624` 明确「分子超过分母时必须紧跟**豁免该列**的 `EX-ID`，否则审计判为不达标」，且 `:521-527` 的 waiver 白名单把「G-03 条目上限」与「G-04 规模上限」列为两条独立可豁免项。此外「门族型验收」豁免的准入条件 ②（`:526`）要求卡内有「判据规范（非计数正文）」块逐条枚举门族——M2-02/02F/02R（`:1376`、`:1447`、`:1518`）、M2-07（`:1870`）、M2-13（`:2288`）都有，**M2-05 没有**。
+- **为何重要：** 这是模板白名单规则的直接违规，不是风格问题。按 `:624` 的字面口径，M2-05 这张卡的粒度审计当场判为不达标；而 M2-05 是 `op restore` / `push` / `cloud` 的 Memory ref 保护卡（ADR-M2-09、GC-M2-07），它若带着无效豁免开工，收口时会被审计打回并阻塞其后 20 张串行卡。
+- **最小修复：** 二选一 —— (a) 在 waiver 表新增一行 `EX-M2-05 | M2-05 | G-03 条目上限（门族型验收） | …`，并在 M2-05 内补「判据规范（非计数正文，EX-M2-05）」块逐条枚举这 9 道门，Granularity/审计表的 `exception` 列改为 `EX-M2-03,EX-M2-05`、VER 写 `9/8@EX-M2-05`；或 (b) 把 `:1739` 的 33 份文档 `test -f` 循环并入 AC8 的文档同步判据（AC 仍为 8/8），VER 降到 8/8，删掉 `@EX-M2-03` 标注。
+
+### P1-2　粒度审计表最后一行与「Verification 新增标记」段落合并在同一物理行（`:795`），规范性段落在渲染中被丢弃；r08 的「审计表断行」修复实为回归
+
+- **位置：** `plan-20260819.md:795`；自述见 `:449`（R30-r08 修订历史「審計表斷行」）
+- **问题：** `:795` 单行同时是 M2-15 的审计表行与其后的规范性段落：`… | serialized-at-M2-16E | independent | N/A | N/A |**Verification 新增标记：** M2-16A、M2-16B、…`。我用 `grep -n '|\*\*' docs/development/plan/plan-20260819.md` 确认全文只有这一处，且模板/plan-status 无同类。r08 之前二者是两行（仅缺空行，见 `claude-plan-r08.log:33`），本轮修订把它们**并成了一行**，比 r08 更严重。GFM 表格解析把最后一个 `|` 之后的内容当作**超出表头列数的多余单元格并直接丢弃**，因此整段「哪些卡的具名测试标 `(new)`、哪些是既有测试、零命中不算通过」的契约在渲染视图中消失；同时机械解析该行会得到 16 个字段（表头 15 列），破坏模板 `:624` 要求的「机器可核对摘要」。
+- **为何重要：** 这段落是全计划对模板 `plan-template.md:558`（「本任务新增的 test fn / 场景过滤必须标 `(new)`，并确保其所属 `--test` target 已存在或在同卡内注册」）的**唯一**集中兑现点——20 余张卡都不在卡内逐条标 `(new)`，而是靠这段集中声明。它一旦不可见/不可解析，`(new)` 标记与 `tests/INDEX.md` 同步的闭环就没有可引用的规范文本。另外修订历史 `:449` 自称已修，与实际不符。
+- **最小修复：** 在 `:795` 的 `| N/A |` 之后断行，并在表格与段落之间插入一个空行，使 `**Verification 新增标记：**` 成为独立段落（两行 + 中间空行，共三行）。
+
+## P2
+
+1. **M2-01K `prod-files=4` 与写集实际 5 个生产文件不符（r08 新增 `src/command/config.rs` 后未回填）。** 位置：`:1318`（写集）、`:1322`（Files likely touched「4 个生产文件以内」）、`:1344`（Granularity `prod-files=4`）、`:772`（审计表 `3/4`）。按 G-04 计入口径（`plan-template.md:443-444`，文档/测试/索引不计），生产文件为 `keyed_digest.rs`、`ai/mod.rs`、`vault.rs`、`config.rs`、`command/config.rs` = 5。仍在 `M`（≤12）内，不破上限，但审计表不准确。**最小修复：** 三处 `4` 改 `5`。
+
+2. **M2-05 `prod-files` 口径三处不一致：Granularity/审计表=16，`Files likely touched` 与 `EX-M2-03` 理由列=14。** 位置：`:1749`（枚举 14 档，缺 `update_ref.rs`/`symbolic_ref.rs`）、`:764`（「等 14 个生产文件」）、`:1771`/`:778`（`prod-files=16`）。r08 把两个命令加进写集 `:1745`（`src/command/` 由 9 档变 11 档，合计 2+3+11=16）后未同步这两处。waiver 的理由列是 L-exception 的规范性登记，数目应与卡一致。**最小修复：** `:1749` 补上 `update_ref.rs,symbolic_ref.rs` 并改写为 16；`:764` 的「14 个生产文件」改 16。
+
+3. **M2-16E 的覆盖完整性 VER 命令写法恒为 false，卡永远无法通过该门。** 位置：`:1180`（`test "$(git -C <source clone> diff --name-only 45ad1f7f2 bc1be587e4 | wc -l)" -eq "$(rg -c '^\| ' …map.md | tail -1)"`）、AC `:1173` 同口径。`rg -c '^\| '` 会同时命中映射表**表头行**（`| 路径 | disposition | …` 同样以 `| ` 开头；只有 `|---|` 分隔行不命中），以及文档中任何其它表格的行；因此即使 158 条数据行全部齐备，右式也 ≥159，等式必不成立。AC 的意图（`等於映射表資料行數`）本身正确。**最小修复：** 把计数式改为只匹配带 disposition 的数据行，例如 `rg -c '^\|.*\| (port|replace|already-main|intentionally-drop) \|' docs/development/plan/plan-20260819-456-migration-map.md`。
+
+4. **「关键时序」第 2 步仍是 pre-`terminal_evidence` 的可信字段清单（与 r08 已关闭的 §0.3 同类残留）。** 位置：`:164`「触发器只提交受信任的 `TerminalObservationV1` 字段（root kind/ID、terminal status/time、source ref OID、code anchor）与已认证 principal」——缺 `terminal_evidence`、`parent_intent_root_id`、`related_run_ids`，而同段第 5 步 `:167` 又要求 Writer 以 `terminal_evidence` 的 plane/locator/digest 与 `terminal_status` 互证。ADR-M2-05 `:502-506`、GC-M2-02 `:620`、payload 表 `:188` 的合同都完整，故实际不 fail-open，但这段是实现者最先读的时序概览。**最小修复：** `:164` 的字段清单补 `terminal_evidence`、`parent_intent_root_id`、canonicalized `related_run_ids`，或改写为「提交 `MemoryRecordEnvelopeV1`（字段以 ADR-M2-05 为准）」。
+
+5. **`agent_bridge/memory.rs` 的首建归属自相矛盾。** 位置：§0.2 `:34`「（`memory.rs` 為 M2-16C 新建）」 vs M2-08 写集 `:1960`「`src/internal/ai/agent_bridge/{protocol.rs,ingress.rs,memory.rs}`（只加 `observe_terminal`/record 入口类型…）」。DAG 上 M2-08 远早于 M2-16C（`M208→M209→M210→M211→M212→M216C`），因此实际首建者是 M2-08。与 §0.4「移植所有权」逐文件归属的严格口径不一致。**最小修复：** §0.2 `:34` 改为「`memory.rs` 由 M2-08 首建（入口类型）、M2-16C 收口协议行为」。
+
+6. **M2-16E 把 `45ad1f7f2` 称作「pinned merge-base」，实为 R30 核对日的 main tip。** 位置：`:1167`。`bc1be587e4` 距 main 296 commits（`:374`），真正的 merge-base 不是 main tip；`git diff 45ad1f7f2 bc1be587e4` 得到的是「main 现状 ↔ #456 head」的全量差异——这正是 `already-main` disposition 所需，故命令正确、术语错误。若执行者按字面去算 merge-base，会得到另一份清单与另一个行数。**最小修复：** 改称「pinned main tip（R30 核对日 `45ad1f7f2`）」，并说明选它而非 merge-base 的理由（支持 `already-main` 判定）。
+
+## 结论
+
+r08 的 7 条 findings（Codex 5×P1 + 1×P2、Claude 2×P1）中，**6 条关闭**（模板 PR/squash/tag 流程、M2-01K config 保护、M2-05 update-ref/symbolic-ref + 33 份文档、M2-16E 158 档全清单、M2-16B/M2-12 的 `DEP-M2-SRC-01`、M2-01/M2-07 四型首建归属倒置），**1 条未关闭且发生回归**（审计表末行断行 → 现已并行合并，段落被 GFM 丢弃）。事实基线锚点、版本面集合（3 处 + `compat_version_surface_sync`）、CI job 集合、migration tip、`METHOD_ALLOWLIST`/`deepseek-harness` CHECK、25 张卡的 AC/VER 计数（除 M2-05 的豁免归属）、DAG/Phase/里程碑/追溯表/发布分组/完成判据的 24+1 卡集合，均在核对日 commit 上成立。
+
+仍存在 2 条 P1：M2-05 以 G-04 waiver 去豁免 G-03 的 VER 超限且缺「判据规范」块（`plan-template.md:624` 字面判为不达标）；粒度审计表末行与规范性 `(new)` 标记段落合并成单行，导致该段落在渲染与机械解析中丢失，且修订历史自称已修。按「P0=0 且 P1=0」的通过口径，本版不通过。
+
+VERDICT: FAIL
+EXIT=0

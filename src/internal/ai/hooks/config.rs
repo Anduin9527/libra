@@ -9,7 +9,7 @@
 //! concatenated. Missing files are a valid empty state; unreadable or
 //! malformed repository/overlay JSON fails closed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -106,7 +106,7 @@ pub struct HookConfig {
 ///   repository layer, then optional linked-worktree overlay).
 /// - Outside a repository (tests / non-repo use), reads
 ///   `<working_dir>/.libra/hooks.json`.
-/// - Then appends the user-global file at `<config_dir>/libra/hooks.json`.
+/// - Then appends the user-global file at `<config dir>/libra/hooks.json`.
 ///
 /// Boundary conditions:
 /// - Missing files are skipped — running without hooks is a valid state.
@@ -115,18 +115,101 @@ pub struct HookConfig {
 /// - Malformed **user-global** JSON is logged at `warn` and ignored so a
 ///   broken personal config never blocks the agent.
 /// - Overlay cannot delete or disable a repository `PreToolUse` hook.
-/// - When `dirs::config_dir()` returns `None` only the project tiers load.
+/// - When no user configuration directory can be discovered, only the project
+///   tiers load.
 pub fn load_hook_config(working_dir: &Path) -> Result<HookConfig, String> {
     let mut all_hooks = load_project_hooks(working_dir)?;
 
-    if let Some(config_dir) = dirs::config_dir() {
-        let user_config = config_dir.join("libra").join("hooks.json");
-        if let Some(config) = load_user_config_file(&user_config) {
-            all_hooks.extend(config.hooks);
-        }
+    if let Some(config) = load_user_hook_config() {
+        all_hooks.extend(config.hooks);
     }
 
     Ok(HookConfig { hooks: all_hooks })
+}
+
+/// File name of the user-level hook configuration in both layouts.
+const USER_HOOK_CONFIG_FILE: &str = "hooks.json";
+
+/// The user-level `hooks.json`, in the same configuration directory as the
+/// global config database (plan-20260919 ADR-GCX-07).
+fn user_hook_config_path() -> Option<PathBuf> {
+    crate::internal::config::global_config_dir().map(|dir| dir.join(USER_HOOK_CONFIG_FILE))
+}
+
+/// The platform-native location this tier used before the configuration
+/// directory was unified. On Linux it is the same path, so the fallback below
+/// is a no-op there; on macOS it is `~/Library/Application Support/libra`, and
+/// on Windows `%APPDATA%\libra`.
+fn legacy_user_hook_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("libra").join(USER_HOOK_CONFIG_FILE))
+}
+
+/// Which file answers the user tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserHookSource {
+    path: PathBuf,
+    from_legacy_location: bool,
+}
+
+/// Decide the user-tier file from the two candidate paths.
+///
+/// Kept pure (existence is injected) so the platform fallback is testable on
+/// every platform, including the Linux case where both paths are identical.
+///
+/// Boundary conditions (ADR-GCX-07):
+/// - the configuration-directory file decides the tier as soon as it exists —
+///   a malformed file there is this tier's answer, because falling through
+///   would silently run a DIFFERENT hook set than the user edited;
+/// - the legacy location is read-only; nothing here writes, rewrites or
+///   deletes a user hooks file.
+fn resolve_user_hook_source(
+    primary: Option<&Path>,
+    legacy: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<UserHookSource> {
+    if let Some(path) = primary.filter(|path| exists(path)) {
+        return Some(UserHookSource {
+            path: path.to_path_buf(),
+            from_legacy_location: false,
+        });
+    }
+    let legacy = legacy?;
+    if primary == Some(legacy) || !exists(legacy) {
+        return None;
+    }
+    Some(UserHookSource {
+        path: legacy.to_path_buf(),
+        from_legacy_location: true,
+    })
+}
+
+/// Read the user tier, falling back to the pre-unification location.
+fn load_user_hook_config() -> Option<HookConfig> {
+    let primary = user_hook_config_path();
+    let legacy = legacy_user_hook_config_path();
+    let source = resolve_user_hook_source(primary.as_deref(), legacy.as_deref(), Path::exists)?;
+    if source.from_legacy_location {
+        announce_legacy_user_hook_config(&source.path, primary.as_deref());
+    }
+    load_user_config_file(&source.path)
+}
+
+/// Emitted at most once per process, and deliberately advisory: a hook config
+/// living in the old place must not change the exit status of the command the
+/// user actually ran.
+fn announce_legacy_user_hook_config(legacy: &Path, primary: Option<&Path>) {
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let target = primary
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| format!("<config dir>/libra/{USER_HOOK_CONFIG_FILE}"));
+    crate::utils::error::emit_advisory_warning(format!(
+        "reading user hooks from the old location '{}'; move the file to '{target}' — Libra will \
+         not move it for you",
+        legacy.display()
+    ));
 }
 
 fn load_project_hooks(working_dir: &Path) -> Result<Vec<HookDefinition>, String> {
@@ -233,6 +316,136 @@ fn load_user_config_file(path: &Path) -> Option<HookConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// plan-20260919 GCX-04: the user tier reads from the same configuration
+    /// directory as the global config database, with a read-only fallback to
+    /// the pre-unification platform location.
+    mod user_tier_path {
+        use super::*;
+
+        fn present(paths: &[&Path]) -> impl Fn(&Path) -> bool + use<> {
+            let owned: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
+            move |candidate: &Path| owned.iter().any(|path| path == candidate)
+        }
+
+        /// Linux resolves both candidates to the same file, so the fallback
+        /// must be a no-op rather than a second read of the same path.
+        #[test]
+        #[serial_test::serial(env)]
+        fn the_two_locations_coincide_on_linux() {
+            use crate::utils::test::ScopedEnvVar;
+
+            let root = tempfile::tempdir().expect("tempdir");
+            let _home = ScopedEnvVar::set("HOME", root.path());
+            let _profile = ScopedEnvVar::set("USERPROFILE", root.path());
+            let _xdg = ScopedEnvVar::set("XDG_CONFIG_HOME", root.path().join("xdg"));
+
+            let primary = user_hook_config_path().expect("primary path");
+            assert_eq!(primary, root.path().join("xdg/libra/hooks.json"));
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                Some(primary),
+                legacy_user_hook_config_path(),
+                "Linux must see no behavior change"
+            );
+        }
+
+        #[test]
+        fn the_configuration_directory_file_wins() {
+            let primary = Path::new("/cfg/libra/hooks.json");
+            let legacy = Path::new("/legacy/libra/hooks.json");
+            assert_eq!(
+                resolve_user_hook_source(Some(primary), Some(legacy), present(&[primary, legacy])),
+                Some(UserHookSource {
+                    path: primary.to_path_buf(),
+                    from_legacy_location: false,
+                })
+            );
+        }
+
+        #[test]
+        fn the_legacy_location_answers_only_while_the_new_one_is_absent() {
+            let primary = Path::new("/cfg/libra/hooks.json");
+            let legacy = Path::new("/legacy/libra/hooks.json");
+            assert_eq!(
+                resolve_user_hook_source(Some(primary), Some(legacy), present(&[legacy])),
+                Some(UserHookSource {
+                    path: legacy.to_path_buf(),
+                    from_legacy_location: true,
+                })
+            );
+        }
+
+        #[test]
+        fn identical_candidates_are_read_once() {
+            let path = Path::new("/cfg/libra/hooks.json");
+            assert_eq!(
+                resolve_user_hook_source(Some(path), Some(path), present(&[path])),
+                Some(UserHookSource {
+                    path: path.to_path_buf(),
+                    from_legacy_location: false,
+                })
+            );
+            assert_eq!(
+                resolve_user_hook_source(Some(path), Some(path), present(&[])),
+                None
+            );
+        }
+
+        #[test]
+        fn no_user_file_and_no_configuration_directory_are_both_silent() {
+            let primary = Path::new("/cfg/libra/hooks.json");
+            let legacy = Path::new("/legacy/libra/hooks.json");
+            assert_eq!(
+                resolve_user_hook_source(Some(primary), Some(legacy), present(&[])),
+                None
+            );
+            assert_eq!(
+                resolve_user_hook_source(None, Some(legacy), present(&[legacy])),
+                Some(UserHookSource {
+                    path: legacy.to_path_buf(),
+                    from_legacy_location: true,
+                })
+            );
+            assert_eq!(resolve_user_hook_source(None, None, present(&[])), None);
+        }
+
+        /// The user tier is additive and never fails the agent: a project
+        /// config still loads while the user file is absent.
+        #[test]
+        #[serial_test::serial(env)]
+        fn user_tier_appends_to_the_project_tier() {
+            use crate::utils::test::ScopedEnvVar;
+
+            let root = tempfile::tempdir().expect("tempdir");
+            let home = root.path().join("home");
+            let workdir = root.path().join("work");
+            std::fs::create_dir_all(workdir.join(".libra")).expect("create workdir");
+            std::fs::write(
+                workdir.join(".libra").join("hooks.json"),
+                r#"{"hooks": [{"event": "pre_tool_use", "matcher": "read_file", "command": "echo project"}]}"#,
+            )
+            .expect("write project hooks");
+            let _home = ScopedEnvVar::set("HOME", &home);
+            let _profile = ScopedEnvVar::set("USERPROFILE", &home);
+            let _xdg = ScopedEnvVar::set("XDG_CONFIG_HOME", home.join(".config"));
+
+            let only_project = load_hook_config(&workdir).expect("load hooks");
+            assert_eq!(only_project.hooks.len(), 1);
+
+            let user_path = user_hook_config_path().expect("user hook path");
+            std::fs::create_dir_all(user_path.parent().expect("parent")).expect("create cfg dir");
+            std::fs::write(
+                &user_path,
+                r#"{"hooks": [{"event": "session_start", "matcher": "", "command": "echo user"}]}"#,
+            )
+            .expect("write user hooks");
+
+            let both = load_hook_config(&workdir).expect("load hooks");
+            assert_eq!(both.hooks.len(), 2);
+            assert!(both.hooks.iter().any(|hook| hook.command == "echo user"));
+        }
+    }
 
     // Scenario: a hook listing alternatives matches each named tool but not others.
     #[test]

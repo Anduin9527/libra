@@ -1,0 +1,108 @@
+# plan-20260819 R30-r34 review — Claude（評審期間凍結：plan sha256 93415b73…、template 49f94da3…）
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-22T04:42:28+08:00
+93415b737a9ea881684c1cff05b0c716fb1b512a3c7c07728470fdd0c61a6fda  docs/development/plan/plan-20260819.md
+49f94da35c8828e72caaae52006f52c84c72647016dbce188cad77715b2f7f4f  docs/development/plan/plan-template.md
+# review prompt: plan-20260819.review/review-prompt-r34.md
+
+All checks complete. Here is my review.
+
+---
+
+## R30-r34 复审 — Claude（只读）
+
+**被审版本（本轮冻结）：** `plan-20260819.md` sha256 `93415b73…`、`plan-template.md` sha256 `49f94da3…`、`plan-status.md` sha256 `5e23dc90…`（与 `r30-r34-sha256.txt` 逐行一致）。未修改仓库任何文件。
+
+### 一、r33 findings 逐条核对
+
+| r33 finding | 状态 | 实际核对证据 |
+|---|---|---|
+| **Codex P1-2 / Claude P1-1：两条 DAG 边落在「核心链路」架构图** | **闭合** | `grep -n mermaid` → `:136`/`:234`/`:677`。`sed -n '136,165p'` 显示第 1 图（`flowchart TB` + S1–S4 subgraph）**无** `M201K` 节点；`sed -n '677,708p'` 的「实施顺序」DAG 第 682/683 行为 `M201K --> M216C`、`M201K --> M213`，两节点标签在 `M212 --> M216C[…]`、`M216C --> M213[…]` 处定义（mermaid 允许后置标签），无悬空节点 ✓ |
+| **Codex P1-1 / Claude P1-2：M2-01K Granularity 引用 `EX-M2-01`** | **闭合** | `:1415` 现为 `AC=9/8@EX-M2-10; VER=7/8; landing=3; prod-files=7; scope=M; … exception=EX-M2-10`；waiver 行 `:796`、审计 `:815` 三处一致 ✓ |
+| **Claude P1-3：`EX-M2-10` 缺「判据规范」块** | **闭合** | `:1379–1382` 新增 `**判据规范（非计数正文，EX-M2-10）：**` + K1/K2/K3；K2 为模板 exit-code 形式（`if rg …; then echo FAIL; exit 1; else rc=$?; [ "$rc" -eq 1 ] \|\| exit "$rc"; fi`）✓ |
+| **Claude P1-4：审计表 M2-13/M2-16C 的 `scope`/`deps` 错格** | **半闭合 → 见 P1-1** | `deps` 列（第 11 格）已归位并含 `M2-01K(+principal)` ✓；**但 `scope` 列（第 10 格）被写成 `4/5`/`4/7`（= 第 9 格的重复），而非卡内 `scope=M`** |
+| Claude P2-1：review log Scope 轮次笔误 | **未闭合（第 9 次）** | `:2882`/`:2883` 写 `R30-r33/r39`（本计划无 r39 轮）；见 P2-1 |
+| Claude P2-2：§0.2 producer 措辞 | **闭合** | `:32` 现为「**核对日无 in-repo producer**（…仅有定义与单测，见 §0.1 与 DEFER-M2-09）；`review/store.rs` 为同构事件存储、非 `agent_run` 写入者」✓ |
+| Codex P2-1 / Claude P2-3：M2-01K `Files likely touched` 6 缺 `principal.rs` | **闭合** | `:1386` = 「7 个生产文件（`keyed_digest.rs`、`principal.rs`、`ai/mod.rs`、`vault.rs`、`config.rs`、`command/config.rs`、`utils/error.rs`）…」，与 `prod-files=7`、审计 `3/7` 一致 ✓ |
+| Claude P2-4：M2-16C→M2-16D 卡边界缺空行 | **未闭合，且新增一处** | 多行 `rg -U '\S\n### Task M2-'` 命中 **2** 处：`:1072→:1073`（原处未修）与**新增** `:2109→:2110`（M2-08→M2-09）；见 P2-2 |
+| Claude P2-5：`EX-M2-09` AC5 标签 ①–⑰ | **实质闭合，遗留粘连** | `:2058` 已全改 `AC5-n`，但 `AC5-8AC5-9AC5-10` 三标签粘连无分隔；见 P2-3 |
+
+### 二、本轮机械核对结果（通过项）
+
+- **25 卡 AC/VER checkbox 点算：** 按 `**Acceptance criteria:**`→`**Verification:**`→`**Dependencies:**` 区间逐卡点算 `^- \[ \]`，25 卡分子与 `Granularity`/审计表**全部一致**（M2-16A 8/4、M2-16B 7/5、M2-16C 10→38/11、M2-16D 6/4、M2-16D1 8/6、M2-16E 8/4、M2-01 8/4、M2-01K 9/7、M2-02 9/9、M2-02F 9/8、M2-02R 9/8、M2-03 7/5、M2-04 8/7、M2-05 8→25/10、M2-06 8/5、M2-07 9/10、M2-08 8→38/8、M2-09 8/5、M2-10 7/4、M2-11 8/5、M2-12 8/5、M2-13 10→45/15、M2-14 8/5、M2-14C 8/6、M2-15 9/2）。
+- **审计表 15 列：** `rg -c '^(\|[^|]*){15}\|\s*$'` = **27**（header+sep+25 卡）；8 列行 = **20**（依赖表 9 + waiver 表 11）；`^\|` 总计 527 行，无宽度异常。**除 `scope` 两格外，25 行逐格等于卡内 `Granularity`。**
+- **算式自洽：** `EX-M2-02` 4+3+2+2+7+1+1+1+1+8+1+12+2 = **45**，V 清单 15 项（V1/V1b–V1f/V2–V10），拆分 command_test 7 + lib 2 + memory_episode_test 2 + compat 4 = 15 ✓；`EX-M2-07` 2+4+9+1+3+6+2+2+2+5+1+1 = **38** ✓；`EX-M2-06` B0–B10 共 **11** 门、与 11 个 VER checkbox 同序 1:1 且位于全部 VER **之后** ✓；`EX-M2-09` AC1(2)+AC2(4)+AC3(4)+AC4(3)+AC5(17)+AC6(2)+AC7(3)+AC8(3) = **38**，AC5 明细点算 17 ✓；`EX-M2-05` 4+8+3+1+3+2+1+3 = **25**、10 门 ✓；`EX-M2-04` T1–T10 ✓；`EX-M2-01` A1–A9 + 9 门 ✓。
+- **格式门：** 审计表末行 `:838` → `:839` 纯 `$` → `:840` `**Verification 新增标记：**`（`cat -A` 位元组确认）✓；`rg -U '\*\*Verification:\*\*\n\S'` 与 `rg -U '\S\n\*\*Dependencies:\*\*'` 均**零命中** ✓；表格内转义 `\|` 仅 `:458`/`:2869` 两条描述该修复本身的历史文本 ✓；`$SRC_CLONE` 全部带引号，目标 checkout 无裸 `git` ✓。
+- **字段完整性：** `^\*\*Full-suite trigger:\*\*` = 25；9 个必填字段 × 25 = 225 ✓。9 笔 `EX-*` 全为 8 列 ✓。完成判据 24 张收口卡 + M2-16D1 条件性点算一致；追溯表 25 行；Phase 0 = M2-16A/M2-01/M2-01K（不含 M2-16B）✓。
+- **plan-status：** `:46` 含 r18–r33 全部轮次与计数（r33 Codex 0/1/2、Claude 0/4/5，与 log 一致）+ `r34 待跑`；`:201` M2-16A `blocked`、禁止开工 ✓。
+
+### 三、仓库事实基线（核对日 `45ad1f7f2` 成立）
+
+`Cargo.toml version = "0.23.36"`、`git-internal = "=0.10.2"`；版本面 = 三处（`tests/compat/version_surface_sync.rs:13`「now: `Cargo.toml`, `install.sh`, `install.ps1`」）；migration tip = `2026091901_operation_boundary_claim_columns`（`ls sql/migrations/` 末档）；`base.yml` jobs = `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`（7，与 DEP-M2-CI-02 逐字一致）；`release.yml` = `build-and-upload/upload-install-scripts/update-homebrew-tap/verify-homebrew-formula/request-stable-manifest`（5，与 DEP-M2-CI-03 一致）；`authorization.rs:19 pub enum ActionClass`、`protocol.rs:532 allowlist_has_exactly_20_methods`、`tests/agent_bridge_protocol_test.rs:15 protocol_v1_allowlist_is_exactly_20_methods`（20→22 前提成立）、`METHOD_ALLOWLIST` 仅在 `protocol.rs`（已入写集）；`ls src/internal/ai/agent_bridge/` **无 `memory.rs`**（M2-16C 首建）；`tests/agent_bridge_approval_test.rs`、`tests/compat/{agent_bridge_schema_test,help_examples_banner}.rs` 均存在。全计划对已删表面（`providers`/`context_budget`/`prompt`/`client`/`mcp`/`orchestrator`/`web`/`operation_wrapper`/`test-provider`）的引用全部落在 §0.1 历史表、ADR Context、禁止清单或零命中守卫，**无执行性依赖**。模板 `:251` `opencode-export-linux` 示例（带 `web-check` 历史注记）、`:262` 单一 `sql/**` 均成立。
+
+**证据限制：** `$SRC_CLONE`（`/run/media/genedna/data/libra-pr456`）在本会话工作目录策略之外（`ls` 被拒：「may only list files in … libra-main」），本轮无法复算 merge-base `2ebd409…` 与 158 路径。`DEP-M2-SRC-01`（`:719`）已规定来源不可用即 `Lifecycle=blocked` 并要求双评审至少一轮在可访问环境归档，故不计为 finding，但本轮不构成该项证据。
+
+---
+
+## P0（0 条）
+
+无。
+
+---
+
+## P1（1 条）
+
+### P1-1　审计表 M2-13（`:829`）与 M2-16C（`:834`）的 `scope` 列被写成 `4/5` / `4/7`（第 9 格的重复），G-04 规模值 `M` 仍然缺失——r33 的修复改对了 `deps` 格，却把 `scope` 格覆盖成了落点/文件数
+
+- **位置：** `plan-20260819.md:829`（审计表 M2-13 行第 10 格）、`:834`（审计表 M2-16C 行第 10 格）；对照 `:2463`、`:1072`（两卡 `Granularity`）、`:812`（审计表表头）、`plan-template.md:539`（列取值域）、`:537`（判定规则）
+- **问题：** `grep -n '^| M2-13 |\|^| M2-16C |'` 实测两行：
+
+  ```
+  829:| M2-13 | … | 45/8@EX-M2-02 | 15/8@EX-M2-02 | 4/5 | 4/5 | M2-01K(+principal),M2-16C,M2-12 | …
+  834:| M2-16C | … | 38/8@EX-M2-07 | 11/8@EX-M2-06 | 4/7 | 4/7 | M2-01K(+principal),M2-12,M2-16B,M2-08,… | …
+  ```
+
+  第 9 格是 `landing / prod-files`、第 10 格是 `scope`、第 11 格是 `deps`。两行的第 10 格**逐字重复了第 9 格**，而卡内 `Granularity` 写的是 `:2463 … landing=4; prod-files=5; scope=M; deps=M2-01K(+principal),M2-16C,M2-12` 与 `:1072 … landing=4; prod-files=7; scope=M; deps=…`。即 r33 把「deps 补 M2-01K」修对了（第 11 格已正确），却在同一次编辑中把 `scope=M` 换成了 `4/5`/`4/7`。其余 23 行第 10 格均为合法的 `M`/`S`/`L-exception:EX-M2-03`（如 `:830` M2-14 = `… | 3/4 | M | M2-13 | …`）。行宽仍是 15 格（15 列行恰 27 = header+sep+25 卡），故不是断行错位，而是单元格内容写错。
+- **为何重要：** 模板 `:539` 规定该列取值域为 `<S/M/L-exception:EX-n>`，`:537` 规定「任一列不达标即不得开工」，并点名 `scope` 列超限必须带 `L-exception:EX-n`。现在全计划**最大的两张卡**（M2-16C：38 谓词/11 VER/4 落点/7 生产文件；M2-13：45 谓词/15 VER/4 落点/5 生产文件）在粒度审计表里没有任何可判定的 G-04 规模值——既无法确认它们仍在 `M`（≤4 落点、≤12 生产文件）之内，也无法触发 `L-exception` 的 waiver 检查；任何按列做字符串比对的脚本要么误判、要么把重复的 `4/5` 当成合法规模值接受。同时这是 r33 双方（Codex P1-2、Claude P1-4）共同点名的**同一个单元格**，连续第二轮未收敛到卡内 `Granularity` 的逐格一致。
+- **最小修复：** `:829` 第 10 格由 `4/5` 改为 `M`；`:834` 第 10 格由 `4/7` 改为 `M`。第 9 格与第 11 格保持现状（已正确），改完两行即与 `:2463`/`:1072` 逐格相同。
+
+---
+
+## P2（4 条）
+
+### P2-1　review log 的 Scope 轮次笔误第九次复发（`R30-r33/r39`），再次违反同档 `:805` 自设的机械检查
+
+- **位置：** `plan-20260819.md:2882`、`:2883`；规则行 `:805`
+- **问题：** r34 两行 Scope 写「R30-r33/**r39** 修订后的完整计划（r34 期間凍結）」。本计划不存在 r39 轮。`:805` 逐字规定「Round 欄輪次號必須等於 Scope 欄所寫修訂版之輪次 + 1（例：r30 行的 Scope 必須寫 R30-r29）」——该规则正是 r30 为此新增。历次笔误：`r31`(r26 修)、`r33`(r28)、`r34`(r29)、`r35`(r30)、`r36`(r31)、`r37`(r32)、`r38`(r33)，本轮 `r39`。且同表上一轮的 r33 行（`:2880`/`:2881`「R30-r32 修訂後的凍結版（sha256 `b7c09faf…`）」）格式正确，同一次编辑新增的 r34 行却再次不同口径。
+- **为何重要：** review log 是双 PASS 的唯一审计轨迹；Scope 的轮次号决定被审 sha256 能否回指正确修订版。一条自设机械检查连续九轮在其被新增的同一栏位上失效，该检查本身已无约束力。
+- **最小修复：** 两行 Scope 改为「R30-r33 修訂後的凍結版（sha256 `93415b73…`）」；并把 `:805` 从纯文字提醒改写为可执行断言（新增行 Scope 轮次 = Round 轮次 − 1）。
+
+### P2-2　卡边界空行：`:1072→:1073`（M2-16C→M2-16D）未修，且新增一处回归 `:2109→:2110`（M2-08→M2-09）
+
+- **位置：** `plan-20260819.md:1072`→`:1073`、`:2109`→`:2110`
+- **问题：** 多行实测 `rg -U '\S\n### Task M2-'` 命中 **2** 处（r33 为 1 处）：M2-16C 的 `**Granularity:**` 行紧接 `### Task M2-16D：…`（原处未修），M2-08 的 `**Granularity:**` 行紧接 `### Task M2-09：…`（**本轮新增**）。其余 23 张卡的 Granularity 与下一标题之间均有空行（如 `:911`→`:913`、`:1415`→`:1417`）。
+- **为何重要：** 本计划已把「表格末行下一行必须为空行」「`**Verification:**` 后必须空行」「`**Dependencies:**` 前必须空行」都立为机械检查并反复修复（本轮三者全绿）；卡边界空行是同一族约定，按空行切分卡片区间的脚本会把这两张卡的 Granularity 并入下一张卡的标题段。CommonMark 的 ATX 标题可打断段落，渲染不受影响，故列 P2；但「修一处、坏一处」说明这一族约定尚无机械守卫。
+- **最小修复：** 在 `:1072`/`:1073` 与 `:2109`/`:2110` 之间各插入一个空行，并把 `rg -U '\S\n### Task M2-'` 零命中加入 `:805` 一带的机械检查清单。
+
+### P2-3　`EX-M2-09` 判据块 AC5 明细的三个标签粘连成 `AC5-8AC5-9AC5-10`
+
+- **位置：** `plan-20260819.md:2058`（M2-08 判据规范块 AC5 明细）
+- **问题：** r33 要求的 ①–⑰ → `AC5-n` 统一已落地（`rg '①'` 在该块零命中），但其中一段逐字为「…AC5-7 `register/resolve(handle)/resolve_session/revoke/list` **五方法** identity seam；**AC5-8AC5-9AC5-10** retention N=8 / TTL 30 天 / ≤10,000 行；AC5-11 原子 prune…」——三个标签之间没有任何分隔符，与其余 14 条「`AC5-n` + 空格 + 描述 + `；`」的格式不同。点算仍为 17 条（AC5-1..AC5-17），总数 38 不受影响。
+- **为何重要：** 判据块是 waiver 准入条件②（「门族清单在卡内逐条枚举」）的落点，收口时要按条核对这 38 条谓词是否都在已审批范围内；三条 retention 谓词挤在一个 token 里，无法按统一分隔符解析，也让「AC5-9 对应哪条」只能靠人工数位序。映射本身明确，故列 P2。
+- **最小修复：** 改为「AC5-8 retention N=8；AC5-9 TTL 30 天；AC5-10 每倉 ≤10,000 行；」，与同块其余条目同格式。
+
+### P2-4　`EX-M2-07` 的 AC 分组标签在 r29/r30 插入 bridge-session checkbox 后未重编，与 M2-16C 的 checkbox 序不再对应；另有两处 `**Files likely touched:**` 缺分隔空格
+
+- **位置：** `plan-20260819.md:1039`（`EX-M2-07` 判据块）；对照 `:1001–1010`（M2-16C 的 10 个 AC checkbox）；另 `:1050`、`:1920`
+- **问题：** `:1039` 的分组序为 `AC1 協議版本(2)+AC2 recall(4)+AC3a record 入參校驗(9)+ActionClass 契約(1)+AC3b identity(3)+AC3d bridge session 簽發/解析(6)+AC3c minor 協商(2)+AC4…`。但卡内 checkbox 实际顺序是：①协议版本 ②recall ③**bridge session 身份交接** ④**ActionClass** ⑤record 入参校验（含 identity/minor）⑥单一 seam ⑦脱敏 ⑧文档 ⑨E2E ⑩错误码。即标签 `AC3d` 指向的是第 3 个 checkbox、无编号的「ActionClass 契約」是第 4 个、`AC3a/b/c` 全部落在第 5 个；分组既不按 checkbox 序排列，也有一个分组没有标签。总数 38 与 10 个 checkbox 的覆盖都成立（已逐条比对），故不影响分子。另 `:1050`、`:1920` 两行写作 `**Files likely touched:**上述路径…` / `**Files likely touched:**（entity 由…）`，字段标签与正文之间缺空格（全文仅此两处，`rg '^\*\*[^*]+:\*\*\S'`）。
+- **为何重要：** r19/r20 曾专门把 `EX-M2-07` 的分组「绑定 checkbox」，其目的是让 waiver 准入条件②可按条核对；现在读者必须先把 `AC3a/b/c/d` 与 ActionClass 重新排序才能对上 checkbox，收口时容易漏核某一组。缺空格只影响渲染整洁。
+- **最小修复：** `:1039` 按 checkbox 序重排并逐组冠以 checkbox 序号（`AC1(2)+AC2(4)+AC3 bridge session(6)+AC4 ActionClass(1)+AC5a record 入參校驗(9)+AC5b identity(3)+AC5c minor(2)+AC6…`），总数保持 38；`:1050`、`:1920` 在 `**Files likely touched:**` 后补一个空格。
+
+---
+
+**总计：P0=0，P1=1，P2=4。**
+
+本轮 r33 的四条 P1 中三条（DAG 边落点、M2-01K `EX-M2-10` 的 Granularity 与判据块、`Files likely touched` 7）已完整闭合，两条 P2（§0.2 producer、`AC5-n` 标签）也已实质落地。唯一的 P1 是 r33 P1-4 的**同一个单元格**：`deps` 格改对了，`scope` 格却被覆盖成 `4/5`/`4/7`，使两张最大卡在粒度审计表上失去合法的 G-04 规模值、且与卡内 `Granularity` 不再逐格一致。修复是纯机械的两格替换（`4/5`→`M`、`4/7`→`M`），不触及任何谓词、依赖语义或 ADR。结构性维度（25 卡 checkbox 点算、527 行表格列数全覆盖且无宽度异常、审计表末行物理空行、`**Verification:**`/`**Dependencies:**` 空行、9 个 `EX-*` 的 8 列格式与算式、B0–B10↔11 checkbox 同序、DAG 无环、完成判据/追溯表点算、仓库事实基线/版本面/CI job 集合/migration tip/模板 v2.8）本轮全部通过。
+
+VERDICT: FAIL
+EXIT=0

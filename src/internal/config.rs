@@ -46,6 +46,8 @@ use crate::{
     utils::util::{DATABASE, try_get_storage_path},
 };
 
+mod global_migration;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ConfigKv — new flat key/value API backed by the `config_kv` table
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1413,14 +1415,122 @@ pub fn legacy_global_config_notice(resolution: &GlobalConfigResolution) -> Optio
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<config dir>/libra/config.db".to_string());
     Some(format!(
-        "global configuration is still at '{legacy}'; a future release will migrate it to \
-         '{new}' automatically (keep the legacy file for downgrade safety)"
+        "global configuration is still at '{legacy}'; the next command that reads or writes it \
+         moves it to '{new}' automatically (the legacy file is kept as a downgrade backup)"
     ))
 }
 
 /// Resolve the active global config database path (see [`global_config_resolution`]).
 pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
     global_config_resolution().map(|resolution| resolution.path)
+}
+
+/// Why the global configuration database is being resolved.
+///
+/// The distinction only matters when the one-time legacy migration (GCX-02)
+/// fails: a read may continue against the untouched legacy file, while a write
+/// must fail closed so the two layouts can never diverge (ADR-GCX-02 §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalConfigAccess {
+    Read,
+    Write,
+}
+
+/// The first migration failure seen in this process.
+///
+/// A migration that failed once has failed for the rest of the process: the
+/// configuration directory does not become writable mid-command. Remembering
+/// the reason keeps every later access cheap — retrying could otherwise wait
+/// on the migration lock again on every single cascaded read — and keeps the
+/// advice to one warning instead of one per config value.
+static MIGRATION_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Resolve the global configuration database for an actual access, running the
+/// one-time legacy migration first when it is pending.
+///
+/// Boundary conditions (ADR-GCX-02):
+/// - `LIBRA_CONFIG_GLOBAL_DB` never migrates — the resolution is already final.
+/// - A successful (or concurrently completed) migration re-resolves, so the
+///   caller receives the new XDG path and never the legacy one.
+/// - A failed migration leaves the legacy database authoritative: [`Read`]
+///   warns once and continues, [`Write`] returns an actionable error.
+///
+/// [`Read`]: GlobalConfigAccess::Read
+/// [`Write`]: GlobalConfigAccess::Write
+pub(crate) async fn resolve_global_config_for_access(
+    access: GlobalConfigAccess,
+) -> Result<Option<GlobalConfigResolution>, String> {
+    let Some(resolution) = global_config_resolution() else {
+        return Ok(None);
+    };
+    if !resolution.migration_pending {
+        return Ok(Some(resolution));
+    }
+    let (Some(legacy), Some(target)) = (
+        resolution.legacy_path.as_deref(),
+        resolution.new_path.as_deref(),
+    ) else {
+        return Ok(Some(resolution));
+    };
+
+    use global_migration::GlobalConfigMigration;
+    let reason = match MIGRATION_FAILURE.get() {
+        Some(reason) => reason.clone(),
+        None => match global_migration::migrate_legacy_global_config(legacy, target).await {
+            GlobalConfigMigration::Migrated | GlobalConfigMigration::AlreadyPresent => {
+                // Re-resolve rather than patching the struct: the freshly
+                // published file decides the source (`xdg` or `home`) and
+                // clears the pending flag through the one resolver
+                // (GC-GCX-01).
+                return Ok(global_config_resolution().or(Some(resolution)));
+            }
+            GlobalConfigMigration::NotNeeded => return Ok(Some(resolution)),
+            GlobalConfigMigration::Failed(reason) => {
+                // The first failure owns the warning; `set` returning `Ok`
+                // is exactly "this call is the first one".
+                if MIGRATION_FAILURE.set(reason.clone()).is_ok() {
+                    crate::utils::error::emit_warning(format!(
+                        "could not move the global configuration to '{}': {reason}; still reading \
+                         '{}', which is unchanged. Fix the configuration directory, or set \
+                         LIBRA_CONFIG_GLOBAL_DB to choose a database explicitly",
+                        target.display(),
+                        legacy.display()
+                    ));
+                }
+                reason
+            }
+        },
+    };
+
+    match access {
+        // The legacy database is still authoritative and still readable, so a
+        // read is correct — it simply happens on the old file for now.
+        GlobalConfigAccess::Read => Ok(Some(resolution)),
+        GlobalConfigAccess::Write => Err(format!(
+            "{} '{}': {reason}; refusing to write so '{}' stays the single source of truth. \
+             Fix the configuration directory, or set LIBRA_CONFIG_GLOBAL_DB to choose a \
+             database explicitly",
+            crate::utils::error::GLOBAL_CONFIG_MIGRATION_FAILURE_MARKER,
+            target.display(),
+            legacy.display()
+        )),
+    }
+}
+
+/// Active global config path for a read, migrating the legacy database first.
+pub(crate) async fn global_config_path_for_read() -> Option<std::path::PathBuf> {
+    match resolve_global_config_for_access(GlobalConfigAccess::Read).await {
+        Ok(resolution) => resolution.map(|resolution| resolution.path),
+        // `Read` never fails closed; keep the cascade alive on the active path.
+        Err(_) => global_config_path(),
+    }
+}
+
+/// Active global config path for a write, failing closed on a failed migration.
+pub(crate) async fn global_config_path_for_write() -> Result<Option<std::path::PathBuf>, String> {
+    Ok(resolve_global_config_for_access(GlobalConfigAccess::Write)
+        .await?
+        .map(|resolution| resolution.path))
 }
 
 fn system_config_path() -> Option<std::path::PathBuf> {
@@ -1579,7 +1689,7 @@ pub async fn read_cascaded_config_value_strict(
         ));
     }
 
-    if let Some(path) = global_config_path() {
+    if let Some(path) = global_config_path_for_read().await {
         match read_config_entry_from_db_path_case_insensitive(
             &path,
             key,
@@ -1663,7 +1773,7 @@ pub(crate) async fn read_cascaded_config_keys_by_prefix_strict(
         );
     }
 
-    if let Some(path) = global_config_path() {
+    if let Some(path) = global_config_path_for_read().await {
         match read_config_keys_by_prefix_from_db_path(&path, prefix, DatabaseRole::GlobalConfig)
             .await
         {
@@ -1787,7 +1897,7 @@ pub(crate) async fn read_cascaded_subsection_values_strict(
         }
     }
 
-    if let Some(path) = global_config_path() {
+    if let Some(path) = global_config_path_for_read().await {
         match read_subsection_entries_from_db_path(
             &path,
             section,
@@ -2000,7 +2110,7 @@ async fn local_config_decrypted_value_for_target(
 }
 
 async fn global_config_decrypted_value(key: &str) -> Result<Option<String>> {
-    let Some(db_path) = global_config_path() else {
+    let Some(db_path) = global_config_path_for_read().await else {
         return Ok(None);
     };
     if !db_path.exists() {
@@ -2158,7 +2268,7 @@ async fn local_config_entry_for_target_case_insensitive(
 /// configured global settings). Otherwise behaves like
 /// [`local_env_value_for_target`].
 async fn global_env_value(name: &str, vault_key: &str) -> Result<Option<String>> {
-    let Some(global_path) = global_config_path() else {
+    let Some(global_path) = global_config_path_for_read().await else {
         return Ok(None);
     };
     if !global_path.exists() {
@@ -2214,7 +2324,7 @@ async fn local_config_value_for_target(
 /// Read a single key from the global config DB, returning `Ok(None)` if no
 /// global DB exists or the key is missing.
 async fn global_config_value(key: &str) -> Result<Option<String>> {
-    let Some(db_path) = global_config_path() else {
+    let Some(db_path) = global_config_path_for_read().await else {
         return Ok(None);
     };
     if !db_path.exists() {
@@ -2290,7 +2400,8 @@ pub async fn read_cascaded_config_value_fresh_conn(key: &str) -> Option<String> 
         // failing local store — do not let global answer for it.
         Err(_) => return None,
     };
-    read_cascaded_fresh_conn_at(local_db.as_deref(), global_config_path().as_deref(), key).await
+    let global_db = global_config_path_for_read().await;
+    read_cascaded_fresh_conn_at(local_db.as_deref(), global_db.as_deref(), key).await
 }
 
 /// Path-parameterised body of [`read_cascaded_config_value_fresh_conn`] so

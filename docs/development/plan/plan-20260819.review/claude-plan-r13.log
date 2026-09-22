@@ -1,0 +1,112 @@
+# plan-20260819 R30-r13 review — Claude
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-21T17:06:05+08:00
+055aa96ea9f3e7b5b421a41c0cb214527feb7987f66db63c0b1869ce8bd070c7  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r13.md
+
+I have completed the full read and fact-verification. Writing up the review.
+
+---
+
+# plan-20260819 R30-r13 只读评审 — Claude
+
+**被审文件：** `docs/development/plan/plan-20260819.md`
+**SHA-256：** `055aa96ea9f3e7b5b421a41c0cb214527feb7987f66db63c0b1869ce8bd070c7`（与 `plan-20260819.review/r30-r13-sha256.txt` 一致）
+**配套：** `plan-template.md` v2.8（`a8e7c642…`）、`plan-status.md`（`f95c0278…`）；仓库 `main` @ `45ad1f7f2`，crate `0.23.36`
+**范围：** 全文 2778 行 + 模板 + plan-status + 仓库事实核对。只读，未修改任何文件。
+
+## 一、r12 findings 逐条核对
+
+| r12 finding | 核对方式与结果 | 结论 |
+|---|---|---|
+| Codex P1-1 审计表末行与 `(new)` 段落未分行 | `sed -n '800,808p' \| cat -A`：804=M2-15 行、**805=`$`（空行）**、806=`**Verification 新增标记：**`、807=`$`、808=`## 任务卡` | ✅ 关闭 |
+| Codex P1-2 `EX-M2-02` 9/8↔10/8 不一致 | 五处已统一为 `10/8@EX-M2-02`：waiver `:774`、AC `:2303`、Granularity `:2360`、审计表 `:795`（AC/VER 两列）；VER 清单 `:2318-2329` 实计 **10 条**；判据规范块 `:2309-2314` 列出 **10 道具名门**（G-rebuild 1 + G-record 1 + G-unit 2 + G-json 2 + G-guards 4） | ✅ 数值关闭（waiver 行括注仍有算术错误，见 P2-1） |
+| Codex P1-3 写集泛称 | **部分关闭。** M2-16C `:993` 已具名 `tests/agent_bridge_memory_test.rs` / `tests/agent_bridge_protocol_test.rs` / `docs/development/tracing/agent.md`；M2-13 `:2334` 已具名 `src/utils/output.rs` / `tests/command/memory_test.rs` / `tests/command/mod.rs`；M2-05 `:1766` 已具名 `tests/command/`。**但 M2-01/M2-03/M2-14C/M2-15 的泛称未动**（见 P1-1） | ❌ **未关闭** |
+| Codex P1-4 模板 Code-era `test-provider`/`code_ui_scenarios` 示例 | `rg -n "test-provider\|code_ui_scenarios\|LIBRA_ENABLE_TEST_PROVIDER" plan-template.md` → **零命中**；`:238` 改为 `cargo test --features test-network --test network_remotes_test`（该 feature/target 在 `Cargo.toml` 与 `CLAUDE.md` 均实存） | ✅ 关闭 |
+| Claude P1-1 M2-13 `VISIBLE_COMMANDS` 空跑门 | `tests/compat/help_examples_banner.rs:53 const VISIBLE_COMMANDS`（硬编码）、`rg '"memory"'` 当前**零命中**；计划侧 AC `:2306` 明确「該守衛為硬編碼清單，不加則對新命令空跑」、VER `:2328` 加非空断言 `rg -q '"memory"'`、写集 `:2334` 纳入 `tests/compat/help_examples_banner.rs` | ✅ 关闭 |
+| Codex P2-1 M2-06 `prod-files` | `:1838`「9 个生产文件以内」= Granularity/审计表 `prod-files=9` | ✅ |
+| Codex P2-2 `mainline.md` owner | `mainline.md:279,532,606,771,1020,1319` 仍指旧路径（实测）；计划 `:1248` M2-01 AC3 已改为「`mainline.md` 的 receipt owner 路径改为 `src/internal/ai/memory/context/receipt.rs`（含其可執行斷言行）」、修订历史 `:450` 记为「待 M2-01 實施」 | ✅ 表述与 AC 一致 |
+| Codex P2-3 lockfile「其余四面」 | `plan-template.md:306` 现为「其余两处权威版本面」 | ✅ |
+| Claude P2-1 Files 计数 | M2-01K `:1333`=6（prod-files=6）、M2-06 `:1838`=9（9）、M2-13 `:2338`=11（11）；M2-04 `:1689` 改成「9 个以内」但 `prod-files=8`（over-correct，见 P2-6） | ⚠️ 部分 |
+| Claude P2-2 第二道 20-method 守卫 | 写集 `:993` 已具名 `tests/agent_bridge_protocol_test.rs::protocol_v1_allowlist_is_exactly_20_methods`；实测两处守卫确存（`protocol.rs:532`、`agent_bridge_protocol_test.rs:15`）。AC `:973` 仍只点名前者 | ⚠️ 写集关闭、AC 未同步（P2-8） |
+| Claude P2-3 M2-05 写集缺 `utils/error.rs`/`memory.md` | `:1766` 已含 `src/utils/error.rs`（若走「新增穩定碼」分支）与 `docs/development/tracing/memory.md` | ✅ |
+| Claude P2-4 `rg -q` 括注 | `:985` 现为「（命中即通過；零命中 `exit 1`）」 | ✅ |
+| Claude P2-5 `EX-M2-05` 未提 AC | waiver `:771` 补「AC 分子 `24/8@EX-M2-05` 同受本 waiver 覆蓋」 | ✅ |
+| Claude P2-6 M2-16A 硬编码路径 | `:824-825` 均为 `git -C $SRC_CLONE` / `git -C "$SRC_CLONE"`；全文 `<source clone>` 占位符只存于历史修订行 | ✅ |
+| Claude P2-7 M2-04 输入类型 | `:1662`「M2-01 冻结的已校验 `EpisodePayloadV1`（非 M2-07 的 `EpisodeProposalV1`）」 | ✅ |
+| Claude P2-8 M2-16D1 入口命名 | `:1093` Description 统一为「入口统一为 `observe_terminal_observation` 薄封裝」，AC `:1107` 同 | ✅ |
+| Claude P2-9/P2-10 `memory.md` ref / action 枚举 | M2-01 AC1 `:1246` 已纳入「`refs/libra/memory/*` 统一为 `refs/heads/libra/memory/repo`」与「`TaxonomyExpanded`/`Consolidated` 删除或标注后续切片」；实测 `memory.md:23,604,618` 确为待修目标 | ✅ |
+
+## 二、本轮实测通过的仓库事实
+
+| 计划自述 | 我执行的核对 | 结果 |
+|---|---|---|
+| 版本面三处、`compat_version_surface_sync` 为唯一权威 | `Cargo.toml:3 version="0.23.36"`；`install.ps1:25 $DefaultVersion="v0.23.36"`；`tests/compat/version_surface_sync.rs:13` 注释与断言只覆盖 `Cargo.toml`/`install.sh`/`install.ps1` | ✅ |
+| `base.yml` 7 job（DEP-M2-CI-02） | `rg '^  [a-z][a-z0-9-]*:' .github/workflows/base.yml` → `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux` | ✅ 完全一致 |
+| `release.yml` 五 job（DEP-M2-CI-03） | `:15 build-and-upload`、`:310 upload-install-scripts`、`:480 update-homebrew-tap`、`:628 verify-homebrew-formula`、`:690 request-stable-manifest` | ✅ |
+| CodeQL `analyze` + actions/rust matrix | `codeql.yml:21,44,46` | ✅ |
+| migration tip `2026091901_operation_boundary_claim_columns` | `ls sql/migrations/ \| tail` | ✅ `2026092101+` 重编正确 |
+| 已删 SCC 全部不存在 | `ls src/internal/ai/{providers,context_budget,client.rs,prompt}`、`src/internal/operation_wrapper.rs` 均 No such file | ✅ |
+| 保留面：`completion/`、`agent_run/`、`session/jsonl.rs`、`review/store.rs`、`agent_bridge/` | `ls` 全部存在 | ✅ |
+| 事实基线锚点 | `ai/mod.rs:50-68`（无 memory）、`src/internal/ai/memory` 不存在、`cli.rs:668-682`（Commands 无 Memory）、`op.rs:1144 !name.starts_with("libra/")`、`model/reference.rs` `ConfigKind::Branch`、`history.rs:1026 new_with_ref`、`client_storage.rs:2023 pub fn put`、`cloud.rs:2122 sync_metadata`+`:2128 reference::Entity::find()`、`export_job.rs`、`vault.rs`、`config.rs` | ✅ 全部成立 |
+| M2-03 三个「既有」filter + `linear_ref_transaction` 为 `(new)` | `history.rs:5889/5981/6075` 命中；`linear_ref_transaction` 零命中 | ✅ |
+| 新建 target 当前不存在 | `tests/{fts5_capability_test,memory_episode_test,agent_bridge_memory_test}.rs`、`docs/commands/memory.md`、`src/internal/{ref_policy.rs}`、`src/internal/ai/{keyed_digest,linear_ref}.rs`、`scripts/`、`docs/benchmarks/` 均不存在 | ✅ 与各卡 `(new)` 标记一致 |
+| M2-05 的 33 份文档存在性门今日可过 | Glob `docs/{commands,commands/zh-CN,development/commands}/{11 命令}.md` → **33 份全部存在** | ✅ |
+| ER-06a 后端页面 | `libra-backend/.../commands/` 实测：11 份 `*.en.md`（M2-05）+ `config.en.md`（M2-01K）+ `agent.en.md`（M2-16C）**均存在**；`memory.en.md` 不存在（M2-13 新建） | ✅ |
+| 25 卡 / 24 收口卡 | `rg -c '^### Task M2-'` = **25**；审计表 `:780-804` = **25 行**；完成判据 `:2768` 列举 24 张 + M2-16D1 条件性 | ✅ |
+| DAG 无环、`Dependencies` 与 DAG 一致 | 逐卡比对 `:655-683` 与 25 张卡的 `Dependencies`/`deps=`：全部可达、无环（M2-16B→M2-16C 走 `M216B→M208→M216C` 传递闭包） | ✅ |
+| 移植所有权（§0.4）无遗漏、无未串行的双写 | 逐文件比对 §0.4 与 25 份写集：`limits.rs`(16A/07)、`policy.rs`(04/07)、`error.rs`(16A/04)、`fts_sql`(02F/11)、`job_sql`(02/08)、`runner.rs`(08/09/10)、`context/*`(02R/12) 全部落在串行链上 | ✅ |
+| `DEP-M2-SRC-01` / `DEP-M2-ENV-01` 外部对象 | `/run/media/genedna/data/libra-pr456/Cargo.toml` 存在；`libra-backend` 存在 | ✅ |
+| 零命中守卫为模板 exit-code 形式、无裸 `git` | 逐条检查全部 `if rg …; then …exit 1; else rc=$?; …` 守卫；`rg 'git (ls-tree\|grep\|merge-base\|diff\|rev-parse)'` 的活动行全部为 `$SRC_CLONE` 作用域 | ✅ |
+
+**本会话无法实测（沙箱限制，非计划缺陷）：** `git -C /run/media/genedna/data/libra-pr456 merge-base 45ad1f7f2 bc1be587e4` 被权限拒绝，故 merge-base pin `2ebd409045b5114707986b66a7a6b42b5a4a4b7e` 与 158 路径清单未能复核。计划已把 pin 校验写成 M2-16E 的卡内先决命令（`:1178`、`:1191`），失败会 fail loud，设计上可接受。
+
+---
+
+## P0（0 条）
+
+无。
+
+## P1（1 条）
+
+**P1-1｜r12 Codex P1-3（写集不可机械核对的泛称）只关闭了一半；M2-14C 还与自己的 `Full-suite trigger` 直接矛盾**
+
+- **位置：** `plan-20260819.md:1266`（M2-01）、`:1615`（M2-03）、`:2466` + `:2482`（M2-14C）、`:2533`（M2-15）；模板 `plan-template.md:456-464`（G-10）、`:521`（G-10 不在 waiver 白名单）。
+- **问题：** 修订历史 `:450` 记录的修复范围是「M2-16C/M2-13/M2-05 寫集泛稱改具名」——确实改了这三张，但 r12 Codex 点名的**同一类占位描述在另外四张卡原封不动**：
+  - `:1266` M2-01 → `…、本计划、相关 unit tests。`
+  - `:1615` M2-03 → `…、相关 history unit/integration tests。`（M2-03 的 VER 全是 `--lib`，那么这里的「integration tests」指哪个 `tests/*.rs` target 无从判断）
+  - `:2466` M2-14C → `…、coverage config、…、developer test docs、…、必要 Cargo dev tooling。`
+  - `:2533` M2-15 → `版本/发布文件、…`
+
+  其中 M2-14C 是硬矛盾：同卡 `:2482` 的 `Full-suite trigger` 写明 **`T-1: .github/workflows/** 與 Cargo.toml 非版本行`**，即本卡确实会改 `Cargo.toml`（「必要 Cargo dev tooling」= dev-dependencies / `[[test]]`），但 `Implementation write set` 从头到尾**没有出现 `Cargo.toml`**。而 `Cargo.toml` 同时在 M2-02F 的写集里（`:1477` 首项）并属于每张发版卡 `Release write set` 的版本面集合。
+- **为何重要：** ① 模板 `:456-457` 把 `Implementation write set` 定义为「会被修改的**文件/目录**集合」，`:462` 明确 I–I 相交「**禁止并发，无豁免通道**（G-10 不在 waiver 白名单内）」——`coverage config` / `必要 Cargo dev tooling` / `相关 unit/integration tests` 既不是文件也不是目录，无法做 I–I 与 I–R 判定；② 这是 G-10 的**不可豁免**条款，不是风格问题；③ M2-14C 漏列 `Cargo.toml` 直接让 I–R 写锁（模板 `:463`，发布窗口对版本面文件是写锁）失去输入；④ 各卡 `prod-files`（M2-14C=8）无法按写集机械复核——这正是本计划过去十二轮反复收敛的那条审计线；⑤ 同一条 P1 在 r12 已被点名，本轮只关闭了 3/7。
+- **最小修复：** 四处泛称各换成实际文件/目录：`:1266` 删「相关 unit tests」（M2-01 的单测就在已具名的 `domain.rs`/`canonical.rs`/`validation.rs` 的 `#[cfg(test)]` 内）；`:1615` 写成 `src/internal/ai/history.rs` 的 `#[cfg(test)] mod tests`（或具名实际 `tests/*.rs` target）；`:2466` 把 `coverage config` → 具体路径（如 `.config/llvm-cov.toml` 或 `Cargo.toml` 的 `[profile]`/dev-dependencies）、`developer test docs` → `docs/development/integration/integration-test-plan.md`、`必要 Cargo dev tooling` → **显式列出 `Cargo.toml`**，并按新清单核对 `prod-files=8`；`:2533` 用「版本面集合（`Cargo.toml`/`install.sh`/`install.ps1`）」替代「版本/发布文件」。
+
+---
+
+## P2（8 条，不阻塞）
+
+1. **`EX-M2-02` waiver 行的门族拆分算术错误（`:774`）。** 括注写「10 道門：command_test 4、memory_episode_test 3、lib 2、compat EXAMPLES/serial 2」——相加为 **11**，且与实际分布不符：VER `:2318-2329` 的真实构成是 command_test 2（`memory_record_status_evidence_mismatch_quarantined`、`memory_search_show_status_rebuild_record_with_mismatch_and_proposal`）、lib 2、memory_episode_test 2、compat 4（banner、docs-section、`VISIBLE_COMMANDS` 非空断言、serial registry）。判据规范块 `:2309-2314` 的 10 道门是对的，只有 waiver 行的摘要错。**修复：** 把括注改为「command_test 2、lib 2、memory_episode_test 2、compat 4」。
+
+2. **M2-13 的 AC 分子 10 与 9 个 checkbox 不对应，且 AC7（`:2306`）是典型合并长句。** 模板 `:439` 的计数细则要求「AC 按独立 pass/fail 谓词计…用『且/以及/同时』连接的多个可分别失败的断言按多条计」。`:2306` 一条里含 help/examples、EN/zh 文档、`docs/error-codes.md`、`COMPATIBILITY.md`、开发文档、`tests/INDEX.md`、`MEMORY_EXAMPLES` 常量、`after_help` 接线、Command Groups 行、`docs/commands/memory.md` Examples 小节、`VISIBLE_COMMANDS` 含 `"memory"`、后端 `memory.en.md` 共 ~12 条独立谓词。同卡 M2-05 用的是按谓词数（24/8）的口径，两卡口径不一致。**修复：** 按 M2-05 的做法重算 M2-13 的 AC 谓词数并同步 waiver/Granularity/审计表，或把 `:2306` 拆成两条。
+
+3. **三张卡的 `**Dependencies:**` 与上一个 checkbox 之间缺空行，构成 Markdown lazy continuation。** `:1544-1545`（M2-02R）、`:1761-1762`（M2-05）、`:2329-2330`（M2-13）。渲染时 `**Dependencies:** …` 会并入最后一个 `- [ ]` 项的段落，字段机械解析（`^\*\*Dependencies:`）也随之失效。这是 r07 P2 已修后又回归的同一项（全文其余 22 张卡均正确留空行，实测 `rg -B1 '^\*\*Dependencies:'`）。**修复：** 三处各插一个空行。
+
+4. **review log 有轮次笔误（`:2733`、`:2735`、`:2736`）。** `:2733` 的 Scope 写「R30-r11 修訂後、**r13** Claude 修訂前後的計劃」——应为 r12；`:2735`/`:2736` 两行 R30-r13 的 Scope 写「R30-r12/**r14** 修订后的完整计划」——r14 尚不存在。r13 复审要求 #6 明确要求核对此项。另：`:2733` 记的 sha `328d6cf7…` 与本轮被审文件 `055aa96e…` 不同，该栏未随最终修订更新。**修复：** 三处轮次号改正，`:2735/2736` 的 Scope 统一写「R30-r12 修订后的完整计划」。
+
+5. **修订历史存在两行同轮次的 R30-r12 记录（`:450`、`:451`）。** 前者标「Claude r12 + Codex r12 追補」，后者标「Claude r12；Codex r12 進行中」，内容部分重叠（两行都记了 `AC/VER=10/8@EX-M2-02`）。r11 时刚合并过重复的 r10 行，本轮又出现同型重复。**修复：** 合并为一行 R30-r12。
+
+6. **M2-04 的 `Files likely touched` 在 r12「+1」修订中越过了实际值（`:1689`）。** 写「9 个生产文件以内」，但写集 `:1685` 具名的生产文件恰为 8（`memory/{writer,store,tree,admission,policy,error}.rs` + `utils/error.rs` + `utils/client_storage.rs`），Granularity/审计表也是 `prod-files=8`。**修复：** 改回「8 个生产文件」。
+
+7. **M2-08 写集具名 9 个生产文件，但 `prod-files=8`（`:1981` vs `:2007`、审计表 `:790`）。** `memory/{observer,job,job_state,runner,job_sql,runtime}.rs`（6）+ `agent_bridge/{protocol,ingress,memory}.rs`（3）= 9。**修复：** 三处统一为 9（仍在 `M` 的 ≤12 上限内）。
+
+8. **M2-16C 的 AC6（`:973`）只点名两道 20-method 守卫中的一道。** 写集 `:993` 已具名两处（r12 P2-2 的修复），但 AC 仍只写 `allowlist_has_exactly_20_methods`；实测 `tests/agent_bridge_protocol_test.rs:15 protocol_v1_allowlist_is_exactly_20_methods` 会 `assert_eq!(…, 20)` 失败而非空跑，故不阻塞。**修复：** AC6 补上第二处守卫名。
+
+**（模板侧，附带观察）** `plan-template.md:233` 的 `sql/publish/**`（Worker D1）行仍给出 `pnpm --dir worker test:miniflare`，但 `worker/` 与 `sql/publish/` 在本仓库均不存在（实测 `ls sql/` 只有 `migrations/` 与两份 bootstrap SQL），且该行没有邻近 `:228-230` 那样的「0.23.x 已拆除；保留仅供历史计划」注记。因该表面在本计划内永不触发，记为观察项而非 P2 计数。
+
+---
+
+**结论：** r12 的 4 条 Codex P1 关闭 3 条、1 条（写集泛称）仅部分关闭；Claude 的 P1-1 与 10 条 P2 基本关闭。本轮实测确认了版本面集合、CI job 集合、migration tip、25 卡 AC/VER/deps/DAG、§0.4 移植所有权、33 份命令文档与 13 份后端 `*.en.md`、以及全部事实基线锚点。唯一阻断项是 P1-1：`Implementation write set` 在四张卡上仍是不可机械核对的散文，其中 M2-14C 的 `Full-suite trigger` 已承认会改 `Cargo.toml` 而写集未列——这既违反不可豁免的 G-10，也使该卡 `prod-files=8` 无法复核。
+
+VERDICT: FAIL
+EXIT=0

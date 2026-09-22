@@ -1,0 +1,97 @@
+# plan-20260819 R30-r21 review — Claude（評審期間凍結 sha256 284eb643…）
+# reviewer: claude -p --effort xhigh --allowedTools Read Grep Glob (read-only, prompt via stdin)
+# date: 2026-09-22T01:44:20+08:00
+284eb6432f3fe4b208983395c7586d2c9bdcb33cda0dec0dda1703134c1c0d10  docs/development/plan/plan-20260819.md
+# review prompt: plan-20260819.review/review-prompt-r21.md
+
+Review complete. I verified the frozen file (`sha256 284eb643…`, matching `r30-r21-sha256.txt` / the `claude-plan-r21.log` header), template `v2.8` (`0a3b7d85…`), `plan-status.md`, and the live repo.
+
+# plan-20260819 R30-r21 评审 — Claude（只读）
+
+**被审版本：** `sha256sum docs/development/plan/plan-20260819.md` = `284eb6432f3fe4b208983395c7586d2c9bdcb33cda0dec0dda1703134c1c0d10`，与 `r30-r21-sha256.txt` 及 log 档头一致（评审期间无漂移）。
+
+## 一、r20 findings 逐条核对
+
+| r20 finding | 实测证据 | 状态 |
+|---|---|---|
+| Claude P1-1：crate-private 与 70 条整合测试互斥 | 新增 `GC-M2-15`（`:646`）；`:42`/`:588`/`:596`/`:849`/`:914`/`:916`/`:1282`/`:1337`/`:1938` 均已改 `#[doc(hidden)] pub`；`rg -c "cargo test --test memory_episode_test"` = 70 | ⚠️ 主体关闭，**4 处残留**（P2-3） |
+| Claude P1-2：审计表末行空行第六次回归 | `sed -n '818,822p' \| cat -A`：`:818` M2-16E、`:819` M2-15、`:820` = `$`（物理空行）、`:821` `**Verification 新增标记：**` | ✅ 关闭 |
+| Codex P1-1：M2-08 AC5 十三谓词无 waiver | `:777` 新增 `EX-M2-09` 行（实测 8 列）；`:2065` `AC=34/8@EX-M2-09`；审计表 `:800` 同步；`:2029` 判据块 `AC1(2)+AC2(4)+AC3(4)+AC4(3)+AC5(13)+AC6(2)+AC7(3)+AC8(3)` = 34 | ⚠️ 分子/waiver 关闭，**枚举仅 13/34**（P2-4） |
+| Codex P1-2：proposal 未入 fingerprint | `:520` 已把 `proposal_canonical_digest` + 已认证 `compiler_identity` 版本写入 `TerminalObservationFingerprintV1`，并明定附加/替换产新 generation | ❌ **契约已写、具名回归与 AC 未同步**（P1-1） |
+| Claude P2-1：`EX-M2-06` 块位置 | `sed -n '992,1018p'`：VER checkbox 在 `:994-998`（5 条）与 `:1013-1016`（4 条），`EX-M2-06`（`:1000-1009`）+ `EX-M2-07`（`:1011`）仍**夹在中间** | ❌ 未关闭（第四轮；P2-1） |
+| Claude P2-2：`EX-M2-07` 分组编号 | `:1011` 现为 `AC4 單一 seam/rg(2)`、`AC5 脫敏審計(2)`，合计 2+4+9+3+2+2+2+5+1+1=31 | ✅ 关闭 |
+| Claude P2-3 / Codex P2：review log 轮次笔误 | `:2813`/`:2814` 由 `r25` 变为 `R30-r20/**r26**` | ❌ 未关闭（第四轮变形；P2-2） |
+| Claude P2-4：修订历史缺 r16 | `:455` 新增 `R30-r16` 行（仅 3 格，触发/变更两列后无 `原卡`/`受影响引用` 单元格） | ✅ 关闭（格式见 P2-7） |
+| Claude P2-5 / Codex P2：M2-02 A 标号 | `:1421-1427` 现为 A1–A9（9 个标号），`:1420` 首行「共 9 條 AC 判據」 | ✅ 关闭 |
+| Claude P2-6 / Codex P2：identity 六列断言 | `rg -n "principal_hmac"` 仅命中 `:328`/`:456`/`:521`/`:569`；M2-02 的 A1–A9 与 8 条 VER **无一处点名** `memory_compiler_identity` 六列（`:1408` 仍只写「含 `memory_compiler_identity` 表結構」） | ❌ 未关闭（P2-5） |
+| Claude P2-7：observation-only 第六态回归 | `:2024` 已写「`CompilerIdentityV1` 六態（含 observation-only 無 identity 被接受並落 job）」 | ⚠️ M2-08 关闭，ADR `:521` 仍写「五類 E2E」（P2-6） |
+| Claude P2-8：M2-05 `prod-files` 条件分支 | `:1819` 写集已注「若走『新增穩定碼』分支則 `prod-files=18`，否則 17」 | ✅ 关闭 |
+| Claude P2-9：AC 计数口径 | `:787` 新增「**AC 計數口徑**」段（M2-05=25、M2-07=9、M2-13=41、M2-16C=31、M2-08=34） | ✅ 关闭 |
+
+## 二、基线事实与机械字段复核
+
+- **migration tip**：`ls sql/migrations/ | tail -4` → `2026091901_operation_boundary_claim_columns.sql` ✅
+- **版本面集合**：`Cargo.toml:3` `0.23.36`、`install.sh:21` `v0.23.36`、`install.ps1:25` `v0.23.36`（三处，与模板 v2.8 `:299` 一致）✅
+- **CI job 集合**：`base.yml` = `format/clippy/owner-liveness-macos/redundancy/test/network-remotes/opencode-export-linux`（7）= `DEP-M2-CI-02` ✅；`release.yml` = `build-and-upload/upload-install-scripts/update-homebrew-tap/verify-homebrew-formula/request-stable-manifest`（5）= `DEP-M2-CI-03` ✅
+- **源码锚点**：`src/internal/ai/mod.rs` 30 个 `pub mod`、无 `memory` ✅；`src/internal/ai/agent_bridge/protocol.rs:532` `allowlist_has_exactly_20_methods` + `tests/agent_bridge_protocol_test.rs:15` `protocol_v1_allowlist_is_exactly_20_methods` ✅（20→22 重命名前提成立）；`tests/SRC_SERIAL_CENSUS.tsv:1046` 该行 `touches=none`，重命名不触发 `src_process_global_tests_hold_matching_lanes` ✅
+- **卡片逐栏**：25 张卡的 AC/VER checkbox 实测（脚本化行号统计）与各卡 `Granularity`、审计表 15 列**全部一致**（M2-01 8/4、M2-02 9/8、M2-05 8ck→25/10、M2-07 9/10、M2-08 8ck→34/8、M2-13 9ck→41/11、M2-16C 8ck→31/9、M2-15 9/2 …）✅；`**Dependencies:**` 前空行 25/25 ✅
+- **残留清零**：`--test-threads`、`<source clone>`、`libra-pr507` 在活动卡零命中；活动卡 `git` 命令全部为 `git -C "$SRC_CLONE"` ✅
+- **不可核对项**：`test -d /run/media/genedna/data/libra-pr456/.git` → absent，merge-base `2ebd409…` 与 158 路径无法验证；`DEP-M2-SRC-01`（`:703`）已声明缺失即 `Lifecycle=blocked`，不作 finding。
+
+---
+
+## P0（0 条）
+
+无。
+
+---
+
+## P1（2 条）
+
+### P1-1｜proposal 进入幂等指纹只写在 ADR，M2-08 的 AC3/AC5/VER 与故障矩阵全部未同步；`observation-only→proposal`、proposal 变更、同 proposal 重放三类转换没有任何具名回归
+
+- **位置：** ADR-M2-05 `:520`；M2-08 AC3 `:2022`、AC5 `:2024`、VER `:2040`；测试矩阵 Job/recovery 行 `:2637`；故障恢复矩阵 `:2690-2701`；M2-13 record AC `:2368`
+- **问题：** `:520` 确实补上了契约——`TerminalObservationFingerprintV1` 含 `proposal_canonical_digest` 与已认证 `compiler_identity` 版本，且「對既有 snapshot 附加或替換 proposal 以新 generation 表達，禁止靜默替換，相同 proposal 重放冪等」。但该契约**没有下沉到任何验收门**：
+  1. M2-08 AC3（`:2022`）仍写「`terminal_status`、evidence 或任一关系字段单独变化都必须产生新 generation」——**列举中没有 proposal**；
+  2. M2-08 AC5（`:2024`）的矩阵覆盖清单写「status-only/evidence-only/关系-only 变化後重啟重放」，同样**无 proposal-only**；
+  3. 唯一的指纹矩阵 VER 名为 `observe_terminal_status_evidence_relation_fingerprint_matrix`（`:2040`），名字与覆盖维度都不含 proposal；
+  4. 测试矩阵 `:2637` 的 Job/recovery 行写「关系字段指纹（status/evidence/关系单独变化均新增 generation）」，同样漏 proposal；故障矩阵也无「附加/替换 proposal」行。
+  实测：`rg -n "proposal_canonical_digest|proposal.*generation|generation.*proposal"` 只命中 `:329`、`:452`、`:453`、`:520` 四行（其中三行是表职责与修订历史），**没有一条落在 AC/VER 上**。另外 `:520` 本身是把旧句与新句机械拼接而成，中间留下 `。；` 双标点与一段被新句取代但未删除的旧表述，AC3 复制的正是那段旧表述。
+- **为何重要：** 这正是 Codex r20 P1-2 指出的数据完整性场景，其最小修复明确要求「补充 observation-only→proposal、proposal 变化、相同 proposal 重放以及各崩溃窗口的具名回归」。现状是：契约在 ADR，实现门在 AC/VER——而 AC/VER 描述的是**旧规则**。按 AC3 字面实现（proposal 不进 generation 判定）会直接复现原风险：observation-only 先建 pending job，随后带有效 proposal 重录时指纹不变 → generation 不递增 → `memory_terminal_observation` 里 proposal carrier 被静默替换或干脆不写，job 永远 pending 或用旧输入编译。模板「Verification 判定口径」要求每条判据是可复制执行的具名命令；一条只存在于 ADR、无任何门保护的 fail-closed 语义，在本计划自己的口径下等于未测试假设。
+- **最小修复：** ①把 `:2022` AC3 与 `:2024` AC5 的变化维度改为「`terminal_status`、evidence、关系字段或 proposal（新增/替换/移除）任一单独变化」；②把 `:2040` 的矩阵 VER 更名为含 proposal 维度（例如 `observe_terminal_status_evidence_relation_proposal_fingerprint_matrix`），并在 AC5 覆盖清单中具名列出「observation-only→附加 proposal 产生新 generation」「替换 proposal 产生新 generation」「相同 proposal 重放幂等不增 generation」三态；③同步 `:2637` 测试矩阵行与故障矩阵新增一行；④清理 `:520` 的 `。；` 与重复旧句，只保留含 proposal 的单一表述。
+
+### P1-2｜`--compiler-identity` handle 在生产中无任何可达签发面，与 ADR-M2-12「CLI host 携带 proposal 完成补录」及 ADR-M2-05「Codex/Claude 等 host 走 `libra memory record`」互相矛盾
+
+- **位置：** ADR-M2-05 `:521`、`:522`；ADR-M2-12 Consequences `:600`；M2-13 Description `:2351`、AC5 `:2368`；M2-08 AC5 `:2024`；完成判据 `:2847`
+- **问题：** `:2368` 规定 CLI **不得**由 envelope/`model_label`/`agent_id` 推导 identity，「只接受 M2-08 `runtime.rs::register_compiler_identity` 簽發、存於 `memory_compiler_identity` 的 `--compiler-identity` opaque handle」；`:521` 进一步声明「不依賴任何不存在的 `agent session` 簽發子命令」。实测 `rg -n "register_compiler_identity"` 全文只命中 `:521`、`:2024`、`:2368` 三处，签发点唯一——`MemoryRuntime::with_compiler_model`/`register_compiler_identity`，二者都是 crate API。而：
+  - M2-13 的 CLI 表面被 `:2351` 固定为 `search/show/status/rebuild/record` 五个子命令，**没有任何 identity 签发/列举命令**；
+  - 本仓库拆除后无 provider，没有任何卡把 `with_compiler_model` 接进 `libra` 二进制的命令路径（M2-16D1 走的是 observation-only 薄封装，不带 identity）；
+  - `:522` 明确「bridge host 當前僅 `deepseek-harness`」，其余 host（Codex/Claude 等）被指向嵌入 API 或 `libra memory record`。
+  结论：一个进程外 host 执行 `libra memory record` 时，带 proposal 必须给 handle 而**无处获取**，不带 proposal 则按 `:2368`/`:2024` job 永久 pending（CLI 进程内无 model）。于是 `:600` 的「CLI `memory record` … 均可由 host 携带 `EpisodeProposalV1` … 在无进程内 model 时完成补错」在生产中不可达。
+- **为何重要：** `:2847` 把「嵌入 API/`libra memory record` 路径」列为完成判据的**必要门**，bridge 路径明确为条件性（`DEP-M2-DSH-01` 非阻塞）。若 CLI proposal 路径不可达、CLI observation-only 只能 pending、bridge 又可能不交付，则 25 张卡全部完成后，**生产环境没有任何可达路径产出 Confirmed Episode**，只有 `command_test`/`memory_episode_test` 内的进程内 fake 能闭环。这不是「host 责任」的正常边界——计划自己在 `:600`/`:522` 两处承诺了 CLI 承接非 bridge host，而 `:2368` 的 identity 规则把它封死，属于计划内部的架构自相矛盾（r19 Claude P1-1 只解开了 observation-only 的必填约束，签发面从未补上）。
+- **最小修复：** 三选一并同步 `:521`/`:600`/`:2351`/`:2368`：(a) 在 M2-13 增加一条 handle 签发路径（例如 `libra memory record --register-identity` 或一次性 `--issue-identity`，由本地已认证 repo principal + vault 授权，写入 `memory_compiler_identity`），并补 AC/VER/`prod-files`；(b) 明确 CLI proposal 路径的 identity 来源是「嵌入者预先签发并交付的 handle」，同时在 `:600` 与 `:522` 把「Codex/Claude 等 host 可用 `libra memory record` 携带 proposal」改为「需先由嵌入者签发 handle，否则仅支持 observation-only 补录（job pending）」，并在完成判据 `:2847` 注明该残馀风险；(c) 把 CLI proposal 路径整体移出 M2 范围（`Out of scope` + `DEFER-*`），只保留 observation-only 补录为必要门。
+
+---
+
+## P2（7 条，不阻塞）
+
+1. **`EX-M2-06` 与 `EX-M2-07` 两个判据块仍夹在 M2-16C 的 9 条 VER 中间，且修订历史第四次作出与内容不符的自述。** `sed -n '992,1018p'` 实测：VER checkbox 在 `:994-998`（5 条）与 `:1013-1016`（4 条），两个判据块在 `:1000-1011`。块首行写「與本卡 Verification 的 **9 個** checkbox 一一對應」，而 B4/B6/B7/B8 对应的 4 条 checkbox 在块**下方**；GFM 上这会把 `**Verification:**` 渲染成被两段正文切断的两个独立列表。`:452`（r20 行）、`:453`（r19 行）、`:456`（r17 行）连续三行都自述「`EX-M2-06` 塊移至全部 VER 之後」。**修复：** 把 `:1000-1011` 整体移到 `:1016` 之后，并在修订历史如实登记。
+
+2. **review log 末两行轮次笔误（第四次，且每轮变形）。** `:2813`/`:2814` 的 Scope 写「R30-r20/**r26** 修订后的完整计划」——不存在 r26（r19 时是 `r24`，r20 时是 `r25`）。**修复：** 改为「R30-r20 修訂後的完整計劃（r21 期間凍結）」。
+
+3. **`GC-M2-15` 的「『crate-private』類 AC 一律改寫」未在 4 处落实，其中 2 处与本卡自己的整合测试 VER 直接冲突。** ①`:587` ADR-M2-12 Decision 正文仍写「只调用 crate-private trait `EpisodeCompilerModel`」，而紧随其下 `:590` 的代码块是 `pub trait`；②`:43` §0.2 把 `memory/context/{memory,receipt,receipt_store}.rs` 标为「（crate-private）」；③M2-02R 写集 `:1603` 明写 `src/internal/ai/memory/mod.rs`（`mod context;` 註冊）——私有注册，而其 VER 含 `memory_episode_test::{receipt_append_and_prune_atomic,receipt_expired_vs_non_reproducible,receipt_retention_20000_rows}` 三条整合测试；④M2-16D1 AC1 `:1136` 写「适配器是 crate-private 只读实现」，写集 `:1159` 明写 `mod adapters;`，而其 VER 含 `agent_run_terminal_adapter` 等三条整合测试。后两者按字面实现需要额外 `pub use` 再导出才能编译，卡内未说明。**修复：** 按 `GC-M2-15` 把这 4 处改为「不进入 CLI/bridge 公開表面」+ `rg` 退出码守卫，或在 M2-02R/M2-16D1 写集显式注明 `pub use` 再导出面。
+
+4. **`EX-M2-09` 判据块只逐条枚举了 34 条谓词中的 13 条。** `:2029` 对 AC5 给出 ①–⑬ 明细，对 AC1(2)/AC2(4)/AC3(4)/AC4(3)/AC6(2)/AC7(3)/AC8(3) 共 21 条只给数字。模板 `:527` 的门族 waiver 准入条件 ② 要求「门族清单在卡内『判据规范（非计数正文）』块逐条枚举」。同类问题也存在于 `:2376` 的 `EX-M2-02`（41 条只有分组计数）。**修复：** 至少对 AC1–AC4、AC6–AC8 补上与 AC5 同粒度的分项标签（不必是命令，谓词短语即可）。
+
+5. **`memory_compiler_identity` 的六列合同仍无具名断言。** `:328` 定义 `principal_hmac/repository_id/worktree/issued_at/expires_at/revoked_at`，M2-02 拥有其 schema（`:1408`），但 A1–A9（`:1421-1427`）与 8 条 VER 无一处点名该表或其六列；M2-08 只从行为侧（`resolve` 拒绝过期/撤销）间接覆盖。`:452` 自述「identity 六列斷言」已补，实测未见。**修复：** 在 A1 的逐表核对中具名该表与六列，或新增 A10 并把首行改为 10 条。
+
+6. **identity E2E 态数在 ADR 与 M2-08/M2-13 之间不一致。** `:521` 仍写「有效、失效、撤銷、跨 session 替換與請求體偽造**五類** E2E」，而 `:2024` 已改为「`CompilerIdentityV1` **六態**（含 observation-only 無 identity 被接受並落 job）」；M2-13 的 `memory_record_identity_lifecycle_matrix`（`:2375` V1b）未注明态数。**修复：** 把 `:521` 改为六类，并在 M2-13 判据块注明 V1b 覆盖同一六态。
+
+7. **两处机械/格式瑕疵。** ①`:455` 的 `R30-r16` 修订历史行只有 3 个单元格（缺 `原卡 → 新卡`、`受影响引用` 两列的分隔符），且插在 r18 与 r17 之间，破坏该表的降序排列；②M2-01 AC8 `:1282` 结尾有一个多余的 `」`（「…不把 storage/compiler Implementation 纳入公开 API 契約（`#[doc(hidden)]`）」。」）；③M2-16B 交付 `#[doc(hidden)] pub mod memory::testing`（`:916`），但写集（`:953`）只列 `memory/model.rs`、`memory/mod.rs`，`prod-files=2`，未说明该 module 落在哪个文件——若新建 `memory/testing.rs` 则写集与 `prod-files` 需改为 3；④`plan-status.md:46` 的轮次枚举「…r17 兩方 `FAIL`、r19 兩方 `FAIL`…」漏了 r18。**修复：** 逐条按原样补齐。
+
+---
+
+**结论：** r20 的两条 P1 中，审计表末行空行（第六次回归）已实测关闭，模块可见性互斥由新增 `GC-M2-15` 主体解决（`memory`/`keyed_digest` → `#[doc(hidden)] pub mod`、trait → `pub trait`、fake → `memory::testing`），Codex 的 `EX-M2-09` waiver 也已按 8 列登记且 `AC=34/8` 三处一致；25 卡逐栏、基线事实、版本面集合、CI job 集合、migration tip 全部成立。但 Codex r20 P1-2 只完成了一半——proposal 进入指纹的契约写进了 ADR-M2-05，而 M2-08 的 AC3/AC5、唯一的指纹矩阵 VER、测试矩阵与故障矩阵仍描述旧规则，三类 proposal 转换没有任何具名回归；同时 `--compiler-identity` handle 在生产中仍无可达签发面，使 ADR-M2-12/ADR-M2-05 承诺的「非 bridge host 经 `libra memory record` 携带 proposal 补录」与完成判据的必要门自相矛盾。另有 7 条 P2，其中 `EX-M2-06` 块位置与 review log 轮次两项的修订自述已连续四轮与文件内容不符。P0=0，P1=2，P2=7。
+
+VERDICT: FAIL
+EXIT=0

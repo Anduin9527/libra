@@ -30,7 +30,7 @@ libra config --rename-section <old-name> <new-name>
 
 ## Description
 
-`libra config` reads and writes configuration values across three scopes: **local** (repository-level, stored in `.libra/libra.db`), **global** (user-level, stored in `<XDG_CONFIG_HOME or ~/.config>/libra/config.db`; an existing legacy `~/.libra/config.db` keeps working until the automatic migration release), and **system** (machine-wide, stored in `/etc/libra/config.db`; lowest cascade precedence, plain config only — no vault). Each database uses SQLite with a `config_kv` table.
+`libra config` reads and writes configuration values across three scopes: **local** (repository-level, stored in `.libra/libra.db`), **global** (user-level, stored in `<XDG_CONFIG_HOME or ~/.config>/libra/config.db`; an existing legacy `~/.libra/config.db` is copied there automatically on first use and kept as a backup), and **system** (machine-wide, stored in `/etc/libra/config.db`; lowest cascade precedence, plain config only — no vault). Each database uses SQLite with a `config_kv` table.
 
 Unlike Git's plaintext INI files or jj's TOML files, Libra stores configuration in a transactional database with integrated vault encryption. Sensitive values (API keys, tokens, SSH private keys) are automatically encrypted at rest using AES-256-GCM.
 
@@ -73,16 +73,92 @@ repair. Unknown/unsupported state is upgrade-only in this release.
 
 GlobalConfig uses `LIBRA_CONFIG_GLOBAL_DB` or the XDG configuration directory
 (`$XDG_CONFIG_HOME/libra/config.db`, defaulting to `<home>/.config/libra/config.db`
-on every platform); while an existing legacy `<home>/.libra/config.db` is the
+on every platform). While an existing legacy `<home>/.libra/config.db` is the
 only store present it stays the active file, so reads and writes never split
-across two databases. `LIBRA_CONFIG_GLOBAL_DB` is a verbatim override and
-disables both the XDG default and the legacy fallback.
+across two databases; the first command that actually reads or writes global
+configuration copies it to the XDG path once (see
+[First-use migration of the legacy global database](#first-use-migration-of-the-legacy-global-database)).
+`LIBRA_CONFIG_GLOBAL_DB` is a verbatim override and disables the XDG default,
+the legacy fallback and the migration.
 SystemConfig uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
 Complete process/repo-local storage configuration may make GlobalConfig
 unnecessary, but does not bypass SystemConfig compatibility for remote/cloud
 defaults. Use `--offline` or `LIBRA_READ_POLICY=offline|local` only for
 intentional local-only object access, not to bypass remote synchronization
 safety checks.
+
+## First-use migration of the legacy global database
+
+Releases before the XDG layout stored user-level configuration in
+`<home>/.libra/config.db`. When that file exists and
+`<XDG_CONFIG_HOME or ~/.config>/libra/config.db` does not, the first command
+that actually reads or writes global configuration migrates it, exactly once:
+
+1. the configuration directory is created (`0700` on Unix) and serialized with
+   a `.config.db.migrate.lock` advisory lock, so concurrent commands migrate at
+   most once;
+2. the legacy file is opened **read-only** and copied with SQLite's
+   `VACUUM INTO` into `config.db.migrate.<pid>.<nonce>.tmp` inside the target
+   directory — a consistent snapshot that folds in any WAL contents;
+3. the snapshot must pass `PRAGMA integrity_check` and carry exactly the legacy
+   migration receipts and `config_kv` row count;
+4. the snapshot is published with a same-directory `rename` and tightened to
+   `0600` on Unix.
+
+No schema migration happens: the copy carries the legacy
+`configuration_schema_versions` receipts verbatim.
+
+The legacy file is never renamed, modified or deleted — it stays as a downgrade
+backup. Nothing reads it once the new path exists, and you can delete it when
+you no longer need to run an older release. `libra config path` and
+`libra config doctor --global-schema` are diagnostics: they report
+`migration_pending` but never migrate.
+
+Verify the result:
+
+```bash
+libra --json config path --global
+# "path": "/home/user/.config/libra/config.db", "source": "home",
+# "migration_pending": false, "legacy_exists": true
+```
+
+If the migration cannot run — an unwritable configuration directory, or a
+legacy file that is not a Libra configuration database — the legacy database
+stays in use:
+
+- **reads** continue and print one `warning:` naming the target path, the
+  reason and the `LIBRA_CONFIG_GLOBAL_DB` escape hatch;
+- **writes** fail closed with `LBR-IO-002` instead of writing to a database
+  that is about to be superseded.
+
+### The global vault key moves with it
+
+The global vault unseal key — the AES-256-GCM key that encrypts `vault.*` and
+`auth.token.*` values — lives beside the database it protects, at
+`<XDG_CONFIG_HOME or ~/.config>/libra/vault-unseal-key` (`0600`, in a `0700`
+directory). A pre-XDG `~/.libra/vault-unseal-key` is copied there on first use
+and then kept, unmodified, as a backup; the key content never changes, so every
+value encrypted before the move still decrypts after it.
+
+The key is never rotated to work around a problem:
+
+- if both files exist with **different** contents, Libra fails closed and names
+  both paths — picking one would make the values encrypted with the other
+  unreadable;
+- an unreadable or malformed key file is an error, not a reason to generate a
+  replacement.
+
+Per-repository key material (`~/.libra/vault-keys/<repo-id>`) and the vault
+temp directory (`~/.libra/tmp`) are repository state, not user configuration:
+they stay in the Libra home.
+
+To downgrade to a release that predates the XDG layout, copy the migrated
+database and key back first (idempotent — the legacy files are still there):
+
+```bash
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/libra/config.db" ~/.libra/config.db
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/libra/vault-unseal-key" ~/.libra/vault-unseal-key
+```
 
 ## Read-only global schema doctor
 
@@ -103,7 +179,10 @@ output: `scope`, `role`, `path_source`, configured/canonical paths, `exists`,
 `path_source` is `LIBRA_CONFIG_GLOBAL_DB` (env override), `xdg` (absolute
 `XDG_CONFIG_HOME`), `home` (the `<home>/.config/libra` default), or `legacy`
 (the old `<home>/.libra/config.db` is still active; `migration_pending` is then
-true and `legacy_path`/`legacy_exists` name the fallback file).
+true and `legacy_path`/`legacy_exists` name the fallback file). The doctor is a
+diagnostic: it reports a pending migration but never performs one. After the
+migration `legacy_exists` stays true while the backup file is on disk, and the
+hints say it is an unused backup.
 Each ledger reports `observed_version`, `latest_version`, `readable`, and
 `verified_name`; versions are strings (including the barrier's `i64::MAX`) to
 avoid JSON number precision loss. Null metadata means absent or unavailable,
@@ -393,7 +472,7 @@ These flags are global (apply to any subcommand):
 | Flag | Description |
 |------|-------------|
 | `--local` | Use repository config (`.libra/libra.db`). This is the default for writes. |
-| `--global` | Use global user config (`<XDG_CONFIG_HOME or ~/.config>/libra/config.db`; the legacy `~/.libra/config.db` remains the active fallback until it is migrated). |
+| `--global` | Use global user config (`<XDG_CONFIG_HOME or ~/.config>/libra/config.db`; a legacy `~/.libra/config.db` is the active fallback until the first access migrates it). |
 | `--system` | Use system-wide config (`/etc/libra/config.db`, overridable via `LIBRA_CONFIG_SYSTEM_DB`). Lowest cascade precedence; writing it usually requires elevated privileges. Vault-encrypted secrets are **not** supported in this scope (see Design Rationale). |
 
 ### Hidden Git-Compatible Flags
@@ -550,7 +629,7 @@ Supported `--usage` values are `signing` and `encrypt`.
 ## Scope
 
 - Default scope is local (`.libra/libra.db`)
-- `--global` uses `<XDG_CONFIG_HOME or ~/.config>/libra/config.db` (the legacy `~/.libra/config.db` stays the active fallback until it is migrated)
+- `--global` uses `<XDG_CONFIG_HOME or ~/.config>/libra/config.db` (a legacy `~/.libra/config.db` stays the active fallback until the first access migrates it)
 - `--system` uses `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`); lowest cascade precedence, writes usually need elevated privileges, and vault-encrypted secrets are rejected in this scope (see Design Rationale)
 
 ## The `code.defaultProvider` Key
