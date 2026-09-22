@@ -3272,23 +3272,33 @@ async fn handle_generate_gpg_key(
         .map(String::from)
         .unwrap_or_else(|| "user@libra.local".to_string());
 
-    let public_key = generate_pgp_key(&storage, &unseal_key, &user_name, &user_email)
+    let (public_key, _key_name) = generate_pgp_key(&storage, &unseal_key, &user_name, &user_email)
         .await
         .map_err(|e| {
             CliError::from_legacy_string(format!("error: GPG key generation failed: {e}"))
         })?;
 
-    // Store pubkey under usage-specific dotted key
+    // generate_pgp_key already persisted vault.gpg.generated_key_name,
+    // vault.gpg.pubkey and vault.gpg.source for the signing key. The encrypt
+    // usage keeps a separate namespace slot.
     let pubkey_config_key = if is_signing {
         "vault.gpg.pubkey".to_string()
     } else {
         format!("vault.gpg.{usage}.pubkey")
     };
-    let _ = ConfigKv::set(&pubkey_config_key, &public_key, false).await;
+    if !is_signing {
+        ConfigKv::set(&pubkey_config_key, &public_key, false)
+            .await
+            .map_err(|e| {
+                config_write_cli_error(format!("failed to persist GPG public key: {e}"))
+            })?;
+    }
 
-    // Only enable vault.signing for signing usage
+    // Enable commit signing (signing usage only). No `let _ =` swallowing.
     if is_signing {
-        let _ = ConfigKv::set("vault.signing", "true", false).await;
+        ConfigKv::set("vault.signing", "true", false)
+            .await
+            .map_err(|e| config_write_cli_error(format!("failed to enable commit signing: {e}")))?;
     }
 
     if output.is_json() {

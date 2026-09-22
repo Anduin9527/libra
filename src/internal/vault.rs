@@ -156,10 +156,12 @@ pub async fn init_vault(root_dir: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Generate a PGP key pair in the vault for commit signing.
-#[allow(dead_code)]
-pub async fn generate_pgp_key(
+/// Generate a PGP key pair in the vault (pure helper — no config writes,
+/// plan-20260921 VG-14). Returns the armored public key.
+pub async fn vault_generate_pgp_key(
     root_dir: &Path,
     unseal_key: &[u8],
+    key_name: &str,
     user_name: &str,
     user_email: &str,
 ) -> Result<String> {
@@ -174,7 +176,7 @@ pub async fn generate_pgp_key(
     vault.set_token(&root_token);
 
     let data = serde_json::json!({
-        "key_name": PGP_KEY_NAME,
+        "key_name": key_name,
         "key_type": "pgp",
         "name": user_name,
         "email": user_email,
@@ -197,16 +199,62 @@ pub async fn generate_pgp_key(
         .and_then(|v| v.as_str().map(String::from))
         .ok_or_else(|| anyhow!("no public key in vault response"))?;
 
-    // Store in config so it can be exported without requiring backend-specific
-    // read-path support.
-    upsert_config_value("vault.gpg.pubkey", &public_key).await;
-
     vault
         .seal()
         .await
         .map_err(|e| anyhow!("vault seal failed: {e}"))?;
 
     Ok(public_key)
+}
+
+fn next_versioned_key_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("libra-signing-{nanos}")
+}
+
+/// Generate a signing PGP key with a versioned key name and persist the
+/// generated-key metadata (`vault.gpg.generated_key_name`). Collisions on the
+/// versioned name probe-retry up to 8 times; config write errors propagate.
+/// Returns `(public_key, key_name)`.
+pub async fn generate_pgp_key(
+    root_dir: &Path,
+    unseal_key: &[u8],
+    user_name: &str,
+    user_email: &str,
+) -> Result<(String, String)> {
+    use crate::internal::config::ConfigKv;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for _ in 0..8 {
+        let key_name = next_versioned_key_name();
+        match vault_generate_pgp_key(root_dir, unseal_key, &key_name, user_name, user_email).await {
+            Ok(public_key) => {
+                ConfigKv::set("vault.gpg.generated_key_name", &key_name, false)
+                    .await
+                    .context("failed to persist generated GPG key name")?;
+                ConfigKv::set("vault.gpg.pubkey", &public_key, false)
+                    .await
+                    .context("failed to persist generated GPG public key")?;
+                ConfigKv::set("vault.gpg.source", "generated", false)
+                    .await
+                    .context("failed to persist generated GPG key source")?;
+                return Ok((public_key, key_name));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("exist") || msg.contains("Exist") {
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to generate GPG key after 8 collision retries")))
 }
 
 /// Sign data using the vault's PGP key.
@@ -883,12 +931,6 @@ async fn create_vault(root_dir: &Path) -> Result<RustyVault> {
         RustyVault::new(backend, None).map_err(|e| anyhow!("vault creation failed: {e}"))?;
 
     Ok(vault)
-}
-
-async fn upsert_config_value(dotted_key: &str, value: &str) {
-    use crate::internal::config::ConfigKv;
-    // set does upsert for single-value keys; ignore errors for vault internals
-    let _ = ConfigKv::set(dotted_key, value, false).await;
 }
 
 /// Recover the root token by decrypting the stored encrypted token with the unseal key.
