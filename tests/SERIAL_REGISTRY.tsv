@@ -833,3 +833,4 @@ test_index_unknown_extended_bit_fails_closed	lane:hash_kind	sets the thread-loca
 test_index_v2_bytes_unchanged	lane:hash_kind	sets the thread-local object hash kind
 test_index_v3_fixture_roundtrip_matrix	lane:hash_kind	sets the thread-local object hash kind
 test_index_v4_rejected	lane:hash_kind	sets the thread-local object hash kind
+config_generate_gpg_key_migrates_imported_key_into_history	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-14)

@@ -227,11 +227,22 @@ pub async fn generate_pgp_key(
 ) -> Result<(String, String)> {
     use crate::internal::config::ConfigKv;
 
+    // (a) Preserve the currently-active key (imported or generated) in history
+    // before overwrite, so historical signatures stay verifiable through the
+    // fixed allowlist (ADR-VG-04 / ADR-VG-06 §6). VG-14 relaxes the VG-03
+    // empty-window guard by migrating rather than failing closed.
+    snapshot_active_key_to_history().await?;
+
     let mut last_err: Option<anyhow::Error> = None;
     for _ in 0..8 {
         let key_name = next_versioned_key_name();
         match vault_generate_pgp_key(root_dir, unseal_key, &key_name, user_name, user_email).await {
             Ok(public_key) => {
+                // staged writes (c) generated_pubkey, (d1) generated_key_name,
+                // (d2) vault.gpg.pubkey, (e) source=generated — errors propagate.
+                ConfigKv::set("vault.gpg.generated_pubkey", &public_key, false)
+                    .await
+                    .context("failed to persist generated GPG public key snapshot")?;
                 ConfigKv::set("vault.gpg.generated_key_name", &key_name, false)
                     .await
                     .context("failed to persist generated GPG key name")?;

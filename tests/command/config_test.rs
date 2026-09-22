@@ -3914,3 +3914,81 @@ async fn config_import_gpg_key_wrong_passphrase_writes_nothing() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn config_generate_gpg_key_migrates_imported_key_into_history() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let secret = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/fake-gpg/protected-secret.asc"
+    );
+    let passfile = temp_path.path().join("pass.txt");
+    std::fs::write(&passfile, "libra-test-fixture-passphrase").unwrap();
+    let passfile_s = passfile.to_string_lossy().into_owned();
+
+    // Replace the init-generated key with the imported one.
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            secret,
+            "--passphrase-file",
+            &passfile_s,
+            "--replace",
+        ],
+        temp_path.path(),
+    );
+    assert!(
+        out.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let get = |key: &str| {
+        let out = run_libra_command(&["config", "get", key], temp_path.path());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let imported_pubkey = get("vault.gpg.pubkey");
+    assert!(imported_pubkey.contains("BEGIN PGP PUBLIC KEY BLOCK"));
+    assert_eq!(get("vault.gpg.source"), "imported");
+
+    // VG-14: generating while imported migrates instead of failing closed.
+    let out = run_libra_command(
+        &[
+            "config",
+            "generate-gpg-key",
+            "--name",
+            "Gen",
+            "--email",
+            "gen@example.invalid",
+        ],
+        temp_path.path(),
+    );
+    assert!(
+        out.status.success(),
+        "generate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (e) source flipped to generated; (d1) versioned generated key name recorded.
+    assert_eq!(get("vault.gpg.source"), "generated");
+    assert!(
+        get("vault.gpg.generated_key_name").starts_with("libra-signing-"),
+        "versioned key name must be recorded"
+    );
+
+    // (a) the imported public key was archived to history before overwrite.
+    let history = get("vault.gpg.history.6362FF0BA5456A8E9C7DD8C04FB6368B886D5973.pubkey");
+    assert_eq!(
+        history, imported_pubkey,
+        "imported pubkey must be archived in history before the generated key overwrites it"
+    );
+
+    // The active signing slot now holds a different (generated) key.
+    assert_ne!(get("vault.gpg.pubkey"), imported_pubkey);
+}

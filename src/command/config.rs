@@ -3226,15 +3226,6 @@ async fn handle_generate_gpg_key(
 ) -> CliResult<()> {
     reject_global_key_generation(scope, "generate-gpg-key")?;
 
-    // plan-20260921 VG-03 fail-closed guard: the imported-key regeneration
-    // migration (VG-14) is not yet wired; overwriting the active imported
-    // public key here would strand signatures under a mismatched key name.
-    if gpg_source().await.as_deref() == Some("imported") {
-        return Err(gpg_conflict_error(
-            "cannot generate a key while an imported GPG key is active; re-import with --file or remove-gpg-key --force first",
-        ));
-    }
-
     let usage = match usage.unwrap_or("signing") {
         "signing" => "signing",
         "encrypt" => "encrypt",
