@@ -458,12 +458,12 @@ or configure a separate LFS tool.
 | Set upstream | `libra push -u origin main` | `git push -u origin main` | N/A (jj tracks bookmarks) |
 | Force push | `libra push --force` | `git push --force` | `jj git push --allow-new` |
 | Lease-protected force | `libra push --force-with-lease` | `git push --force-with-lease` | N/A |
-| Force-if-includes | Accepted, no-op | `git push --force-if-includes` | N/A |
+| Force-if-includes | `libra push --force-if-includes` (with the All/Ref lease forms it additionally requires the remote-tracking tip to be integrated locally; silent no-op with the exact lease form or no lease) | `git push --force-if-includes` | N/A |
 | Porcelain output | `libra push --porcelain` | `git push --porcelain` | N/A |
-| Thin pack | Accepted, no-op | `git push --thin` | N/A |
+| Thin pack | `libra push --thin` (REF_DELTA entries against server-known bases; the self-contained form is the default) | `git push --thin` | N/A |
 | Skip pre-push hook | Accepted, no-op | `git push --no-verify` | N/A |
 | Suppress progress | `libra push --no-progress` | `git push --no-progress` | N/A |
-| Atomic / signed / push-option / follow-tags | Not yet supported | `git push --atomic` / `--signed` / `-o` / `--follow-tags` | N/A |
+| Atomic / signed / push-option / follow-tags | `libra push --atomic` / `--signed` (signed push certificate built from the repository signing key: generated or imported) / `-o <opt>` / `--follow-tags` | `git push --atomic` / `--signed` / `-o` / `--follow-tags` | N/A |
 | Dry-run | `libra push --dry-run` | `git push --dry-run` | `jj git push --dry-run` |
 | Refspec mapping | `libra push origin src:dst` | `git push origin src:dst` | N/A |
 | Multiple refspecs | `libra push origin main feature:release` | `git push origin main feature:release` | N/A |
