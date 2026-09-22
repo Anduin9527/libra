@@ -24,6 +24,7 @@
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg 2.4.9` 证据、VG-00 GO、ADR-VG-01..12 Accepted）；VG-00 `done/complete`，其余 14 卡 `pending`（DEP-VG-01/02 `blocked`） |
+| [`plan-20260923.md`](plan-20260923.md) | C（MEM-01/02 研发历程记忆 · 确定性投影） | 未启动 | **取代 [`plan-20260819.md`](plan-20260819.md) 承担 MEM-01/02**（使用者 2026-09-23 要求在 `libra code` 拆除后独立重设计，不沿用 R30）。DM-00..DM-09 共 10 卡全部 `pending`；8 个发布周期（R30 为 25 卡/约 25 周期）。核心分歧：模型不在关键路径（`ADR-DM-01`）、不新建权威 ref、Memory 为可重建投影（`ADR-DM-02`）、无 host 触发信封（`ADR-DM-03`）。计划级评审尚未取得 `VERDICT: PASS`，**禁止开工** |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS，尚未开工 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 未启动 | FL-00..FL-07 全部 `pending`；前置 plan-20260907 未收口 |

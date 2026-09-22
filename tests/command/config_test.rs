@@ -3786,3 +3786,131 @@ async fn test_global_vault_key_migrates_and_decrypts() {
             .exists()
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn config_import_gpg_key_file_mode_end_to_end() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let secret = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/fake-gpg/protected-secret.asc"
+    );
+    let passfile = temp_path.path().join("pass.txt");
+    std::fs::write(&passfile, "libra-test-fixture-passphrase").unwrap();
+    let passfile_s = passfile.to_string_lossy().into_owned();
+
+    // Import a protected secret key from --file.
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            secret,
+            "--passphrase-file",
+            &passfile_s,
+        ],
+        temp_path.path(),
+    );
+    assert!(
+        out.status.success(),
+        "import-gpg-key should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Imported GPG key"), "stdout: {stdout}");
+
+    // list --gpg-keys reports source=imported + fingerprint.
+    let out = run_libra_command(&["config", "list", "--gpg-keys"], temp_path.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("imported"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("6362FF0BA5456A8E9C7DD8C04FB6368B886D5973"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("fingerprint"), "stdout: {stdout}");
+
+    // seckey_enc is redacted on get and refused on reveal.
+    let out = run_libra_command(&["config", "get", "vault.gpg.seckey_enc"], temp_path.path());
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "<REDACTED>");
+    let out = run_libra_command(
+        &["config", "get", "--reveal", "vault.gpg.seckey_enc"],
+        temp_path.path(),
+    );
+    assert!(!out.status.success(), "reveal must be refused");
+
+    // export-gpg-key --fingerprint prints the primary fingerprint.
+    let out = run_libra_command(
+        &["config", "export-gpg-key", "--fingerprint"],
+        temp_path.path(),
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "6362FF0BA5456A8E9C7DD8C04FB6368B886D5973"
+    );
+
+    // export-gpg-key default prints armored public key.
+    let out = run_libra_command(&["config", "export-gpg-key"], temp_path.path());
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("BEGIN PGP PUBLIC KEY BLOCK"));
+
+    // remove-gpg-key requires --force.
+    let out = run_libra_command(&["config", "remove-gpg-key"], temp_path.path());
+    assert!(!out.status.success(), "remove without --force must fail");
+    let out = run_libra_command(&["config", "remove-gpg-key", "--force"], temp_path.path());
+    assert!(
+        out.status.success(),
+        "remove --force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // After removal the imported metadata is gone.
+    let out = run_libra_command(&["config", "get", "vault.gpg.seckey_enc"], temp_path.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("BEGIN PGP"),
+        "seckey must be gone: {stdout}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn config_import_gpg_key_wrong_passphrase_writes_nothing() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let secret = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/fake-gpg/protected-secret.asc"
+    );
+    let wrong = temp_path.path().join("wrong.txt");
+    std::fs::write(&wrong, "wrong-passphrase").unwrap();
+    let wrong_s = wrong.to_string_lossy().into_owned();
+
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            secret,
+            "--passphrase-file",
+            &wrong_s,
+        ],
+        temp_path.path(),
+    );
+    assert!(!out.status.success(), "wrong passphrase must fail");
+
+    // Zero write: no source / fingerprint metadata left behind.
+    let out = run_libra_command(&["config", "get", "vault.gpg.source"], temp_path.path());
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    let out = run_libra_command(
+        &["config", "get", "vault.gpg.fingerprint"],
+        temp_path.path(),
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+}
