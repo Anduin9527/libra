@@ -28,7 +28,7 @@ libra config --rename-section <old-name> <new-name>
 
 ## 说明
 
-`libra config` 跨三个 scope 读写配置值：**local**（仓库级，存储在 `.libra/libra.db`）、**global**（用户级，存储在 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`；既有的 legacy `~/.libra/config.db` 在自动迁移版本发布前继续有效）和 **system**（机器级，存储在 `/etc/libra/config.db`；级联优先级最低，仅纯配置——无 vault）。各数据库都使用 SQLite 和 `config_kv` 表。
+`libra config` 跨三个 scope 读写配置值：**local**（仓库级，存储在 `.libra/libra.db`）、**global**（用户级，存储在 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`；既有的 legacy `~/.libra/config.db` 会在首次使用时自动复制过去，并原样保留为备份）和 **system**（机器级，存储在 `/etc/libra/config.db`；级联优先级最低，仅纯配置——无 vault）。各数据库都使用 SQLite 和 `config_kv` 表。
 
 不同于 Git 的明文 INI 文件或 jj 的 TOML 文件，Libra 将配置存储在事务型数据库中，并集成 vault 加密。敏感值（API keys、tokens、SSH 私钥）会使用 AES-256-GCM 自动静态加密。
 
@@ -53,7 +53,68 @@ GlobalConfig 与 SystemConfig 使用独立的配置 ledger `configuration_schema
 
 scoped get/list、默认值级联与 remote preflight 不写入 barrier；配置级联以只读方式查询，不创建缺失的库。此兼容性迁移只能前滚，旧 binary 必须升级；禁止通过删除 receipt 或手工编辑 SQLite 强行降级。识别受支持的 Repository receipt 不等于允许自动 repair；本版本对未知／不支持的状态仅提供升级路径。
 
-全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 XDG 配置目录（`$XDG_CONFIG_HOME/libra/config.db`，默认 `<home>/.config/libra/config.db`，各平台一致）；当只存在 legacy `<home>/.libra/config.db` 时，它仍是活动文件，因此读写不会分裂到两个库。`LIBRA_CONFIG_GLOBAL_DB` 是逐字覆写，同时禁用 XDG 默认与 legacy 回退。系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储配置可以证明无需 GlobalConfig，但不能绕过 remote/cloud 对 SystemConfig 默认值的兼容性检查。只有在明确需要本地对象访问时才使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`，不能借此绕过远端同步安全检查。
+全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 XDG 配置目录（`$XDG_CONFIG_HOME/libra/config.db`，默认 `<home>/.config/libra/config.db`，各平台一致）；当只存在 legacy `<home>/.libra/config.db` 时，它仍是活动文件，因此读写不会分裂到两个库；第一条真正读写 global 配置的命令会把它一次性复制到 XDG 路径（见 [legacy global 库的首次使用自动迁移](#legacy-global-库的首次使用自动迁移)）。`LIBRA_CONFIG_GLOBAL_DB` 是逐字覆写，同时禁用 XDG 默认、legacy 回退与自动迁移。系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储配置可以证明无需 GlobalConfig，但不能绕过 remote/cloud 对 SystemConfig 默认值的兼容性检查。只有在明确需要本地对象访问时才使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`，不能借此绕过远端同步安全检查。
+
+## legacy global 库的首次使用自动迁移
+
+XDG 布局之前的版本把用户级配置存放在 `<home>/.libra/config.db`。当该文件存在
+而 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db` 不存在时，第一条真正读写
+global 配置的命令会执行一次性迁移：
+
+1. 创建配置目录（Unix 下 `0700`），并用 `.config.db.migrate.lock` 咨询锁串行化，
+   并发命令最多只迁移一次；
+2. 以**只读**方式打开 legacy 文件，用 SQLite 的 `VACUUM INTO` 复制到目标目录下的
+   `config.db.migrate.<pid>.<nonce>.tmp` —— 这是合并了 WAL 内容的一致性快照；
+3. 快照必须通过 `PRAGMA integrity_check`，且迁移 receipt 与 `config_kv` 行数
+   与 legacy 完全一致；
+4. 通过同目录 `rename` 原子发布，Unix 下再收紧为 `0600`。
+
+本次迁移不涉及 schema 变更：副本原样携带 legacy 的
+`configuration_schema_versions` receipt。
+
+legacy 文件永远不会被重命名、修改或删除 —— 它作为降级备份保留。新路径出现后
+Libra 不再读取它；当你不再需要运行旧版本时可以自行删除。`libra config path` 与
+`libra config doctor --global-schema` 是诊断命令：它们报告 `migration_pending`，
+但自身从不执行迁移。
+
+验证结果：
+
+```bash
+libra --json config path --global
+# "path": "/home/user/.config/libra/config.db", "source": "home",
+# "migration_pending": false, "legacy_exists": true
+```
+
+当迁移无法进行（例如配置目录不可写，或 legacy 文件不是 Libra 配置库）时，
+legacy 库继续生效：
+
+- **读**照常返回，并打印一条 `warning:`，说明目标路径、失败原因以及
+  `LIBRA_CONFIG_GLOBAL_DB` 兜底方案；
+- **写** fail-closed 并返回 `LBR-IO-002`，而不是写入一个即将被取代的库。
+
+### 全域 vault 密钥随之迁移
+
+加密 `vault.*` 与 `auth.token.*` 值的全域 unseal key（AES-256-GCM）与它保护的
+库同域，位于 `<XDG_CONFIG_HOME 或 ~/.config>/libra/vault-unseal-key`
+（文件 `0600`，父目录 `0700`）。XDG 之前的 `~/.libra/vault-unseal-key` 会在首次
+使用时复制过去，旧文件原样保留为备份；密钥内容不变，因此迁移前加密的值迁移后
+仍可解密。
+
+密钥绝不会为了绕过问题而轮换：
+
+- 两份文件内容**不同**时 fail-closed 并列出两个路径 —— 任选其一都会让用另一把
+  密钥加密的值永久不可读；
+- 密钥文件不可读或格式非法是错误，而不是生成新密钥的理由。
+
+per-repo 密钥（`~/.libra/vault-keys/<repo-id>`）与 vault 临时目录
+（`~/.libra/tmp`）属于仓库状态而非用户配置，保持留在 Libra home。
+
+降级到 XDG 布局之前的版本时，请先把迁移后的库与密钥复制回旧路径（幂等，legacy 文件仍在）：
+
+```bash
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/libra/config.db" ~/.libra/config.db
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/libra/vault-unseal-key" ~/.libra/vault-unseal-key
+```
 
 ## 只读 global schema doctor
 
@@ -70,7 +131,9 @@ UTC `modified_at_utc`、`legacy_path`、`legacy_exists`、`migration_pending` �
 `configuration`／`legacy` ledger。`path_source` 取值为 `LIBRA_CONFIG_GLOBAL_DB`
 （env 覆写）、`xdg`（绝对 `XDG_CONFIG_HOME`）、`home`（`<home>/.config/libra` 默认）或
 `legacy`（旧的 `<home>/.libra/config.db` 仍在使用；此时 `migration_pending` 为 true，
-`legacy_path`／`legacy_exists` 描述回退文件）。
+`legacy_path`／`legacy_exists` 描述回退文件）。doctor 是诊断命令：它报告待迁移状态，
+但自身从不执行迁移。迁移完成后，只要备份文件还在磁盘上，`legacy_exists` 仍为 true，
+hints 会说明它只是一份未被读取的备份。
 每个 ledger 提供 `observed_version`、`latest_version`、`readable`、`verified_name`；
 版本使用字符串，避免 `i64::MAX` 的 JSON 数值精度丢失。null 表示缺失或不可用，
 不表示健康。仅显示通过 manifest 校验的 receipt 名称，不输出任意 receipt 文本或配置值。
@@ -326,7 +389,7 @@ libra config get vault.gpg.pubkey
 | 标志 | 说明 |
 |------|------|
 | `--local` | 使用仓库配置（`.libra/libra.db`）。这是写入的默认值。 |
-| `--global` | 使用全局用户配置（`<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`）。 |
+| `--global` | 使用全局用户配置（`<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`；legacy `~/.libra/config.db` 在首次访问迁移之前仍是活动回退）。 |
 | `--system` | 使用系统级配置（`/etc/libra/config.db`，可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）。级联优先级最低；写入通常需要提升权限。该作用域**不**支持 vault 加密密钥（见设计动机）。 |
 
 ### 隐藏的 Git 兼容标志
@@ -482,7 +545,7 @@ libra config list --gpg-keys
 ## Scope
 
 - 默认 scope 是 local（`.libra/libra.db`）
-- `--global` 使用 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在自动迁移前仍作为回退）
+- `--global` 使用 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在首次访问迁移之前仍作为回退）
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
 
 ## `code.defaultProvider` 键

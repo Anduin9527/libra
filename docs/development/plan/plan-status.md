@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-21（下次更新时替换）。
+> **当前快照：** 2026-09-22（下次更新时替换）。
 
 ---
 
@@ -21,7 +21,7 @@
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
-| [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 已排期 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 `pending` |
+| [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；15 卡尚未执行 |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
@@ -89,7 +89,7 @@
 | [`plan-20260912.md`](plan-20260912.md) | MB-01..05、MB-07/08/10/11（MB-06/09/12 已取消） | 依赖 CAP（plan-20260916）等 |
 | [`plan-20260913.md`](plan-20260913.md) | FL-00..FL-07 | **前置 plan-20260907 完整收口**（DEP-FL-04） |
 | [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；开工时按 ER-CAP-02 pin 重核 |
-| [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02→03→04 串行；写集与 plan-20260918 串行（DEP-GCX-02） |
+| [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02/03/04 已实现并本地验收（2026-09-22，`locally-accepted`），发布未执行；写集与 plan-20260918 串行（DEP-GCX-02） |
 | [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 剩余 DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted |
 | `issues/` 设计计划 | 见「计划一览」issues 表 | 各计划 Codex review `PASS` 前不得开工；`issues/476`/`479`/`483`/`490` 与 `plan-20260918` 写集串行（DEP-WT-09 / DEP-PL-04 / DEP-AD-06 / DEP-AD-07） |
 
@@ -119,9 +119,11 @@
 | 卡 | 状态 | 发布 |
 |---|---|---|
 | GCX-01 路径决议统一与 XDG 默认 | `done/complete` | v0.23.1 |
-| GCX-02 legacy 库自动迁移 | `pending` | — |
-| GCX-03 全域 vault unseal key 随迁 | `pending`（依赖 GCX-02） | — |
-| GCX-04 用户级 hooks 路径对齐 | `pending`（依赖 GCX-01） | — |
+| GCX-02 legacy 库自动迁移 | `locally-accepted`（2026-09-22：实现/单测/集成/失败注入/文档完成，fmt+clippy+聚焦门全绿） | 未发布 |
+| GCX-03 全域 vault unseal key 随迁 | `locally-accepted`（同上） | 未发布 |
+| GCX-04 用户级 hooks 路径对齐 | `locally-accepted`（同上） | 未发布 |
+
+> 2026-09-22 说明：ER-13 全量收口门已实跑并**全绿**（`fmt --check` / `clippy -D warnings` / `cargo nextest run --all --no-fail-fast --retries 2` → 7836/7836 passed, 0 failed, 3 skipped / `cargo doc` 链接门 exit 0）；期间两轮非绿全部归因执行环境（开发机 `umask 0002`、真实用户 global 配置携带未登记 receipt、隔离 home 目录权限），已登记为 `ENV-GCX-01`，无 `FIX-*`。本轮按操作者指示**不调用 Codex review**，故计划「完成判据」中的 review 门与「所有卡 `done/complete`」两项保持未满足；版本 bump（三处版本面）与 D 组发布（tag / `gh release` / CDN）属对外不可逆动作，等待操作者显式指示。DEP-GCX-01（`../libra-backend`）与 DEP-GCX-03（`.env.test`/`.env.live-test`）在本机均不满足，前者只阻塞网站页同步。
 
 ### 3.3 plan-20260819（Memory M2，R30 重设计）
 
@@ -215,8 +217,8 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 |---|---|---|---|---|---|---|
 | [`plan-20260822`](plan-20260822.md) | （PR #503 收口；OL-14 已取消、OL-15 `remote-pending`） | — | — | — | — | ⏳ 等待 compat-offline-core 远端门禁 |
 | [`plan-20260819`](plan-20260819.md) | M2-16A | #456 memory 模块正向移植到 R30 seam（审计已排除已删 Code SCC） | 无 | **未过**（r01–r37：**r37 同版雙 PASS 達成（2026-09-22，凍結 sha256 `4fbaf4bd…`）** — Codex P0/P1/P2=0、Claude P0/P1=0；實現門已開啟。殘餘 P2（不阻塞）：review log 輪次回填、`EX-M2-07` minor 重複計數（41→39）、`tests/INDEX.md` 20→22 描述刷新、未協商 minor 收斂規則 — 於 M2-16C 卡片修訂時一併處理） | **DEP-M2-ENV-01**：需已初始化 Libra checkout（`.libra/`）與 `.env.test`/`.env.live-test`；缺任一项即 `blocked` | ❌ 禁止开工（等双 PASS） |
-| [`plan-20260919`](plan-20260919.md) | GCX-02 | legacy 全局 config DB 首次使用自动迁移（锁+快照+校验+原子提交） | GCX-01（已 `done/complete`） | 已过（GCX-01 已发布 v0.23.1） | DEP-GCX-02：与 plan-20260918 串行写 `COMPATIBILITY.md`/网站页 | ⚠️ 需核 DEP-GCX-02 写集 clean |
-| [`plan-20260919`](plan-20260919.md) | GCX-04 | 用户级 hooks 文件路径对齐 XDG（macOS 只读回退） | GCX-01（已 `done`） | 已过 | DEP-GCX-01（网站 `cf` 分支）；发布队列 GCX-02→GCX-03→GCX-04 | ⚠️ 受发布队列与 DEP-GCX-01 |
+| [`plan-20260919`](plan-20260919.md) | GCX-02 | legacy 全局 config DB 首次使用自动迁移（锁+快照+校验+原子提交） | GCX-01（已 `done/complete`） | **本轮按操作者指示未评审** | DEP-GCX-02：与 plan-20260918 串行写 `COMPATIBILITY.md`/网站页（0918 未开工，写集 clean） | ✅ 已实现并本地验收（`locally-accepted`，未发布） |
+| [`plan-20260919`](plan-20260919.md) | GCX-04 | 用户级 hooks 文件路径对齐 XDG（macOS 只读回退，实现泛化到任何原生配置目录不同的平台） | GCX-01（已 `done`） | **本轮按操作者指示未评审** | DEP-GCX-01 不满足（本机无 `../libra-backend`），仅阻塞网站页；发布队列 GCX-02→GCX-03→GCX-04 | ✅ 已实现并本地验收（`locally-accepted`，未发布） |
 | [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal` 0.9.0 并引入 `object_format` 事实源 | 无 | **双评审已 PASS**（Grok R2 / Claude R40 / Codex R40） | 外部无；开工需 `cp .env.test.example .env.test` | ✅ |
 | [`plan-20260912`](plan-20260912.md) | MB-01 | 有界 mega2 tree transport 与 wire validation | 无 | **双评审已 PASS**（Codex R7 / Claude R5） | DEP-MB-01：mega2 `a1293686` tree API pin 现场重核（2026-09-21 已前推） | ✅ `done/complete`：v0.23.37（84f6bd8）；codeql + release.yml 8/8 jobs 全绿；CDN 产物 HTTP 200 |
 | [`plan-20260916`](plan-20260916.md) | CAP-01 | Agent Capture wire types、URL、uid、transport trait | 无 | **双评审已 PASS**（Codex R3 / Claude R3） | DEP-CAP-01：monoengine `2b8f365` capture HTTP pin 重核（ER-CAP-02） | ⚠️ 需重核 DEP-CAP-01 |

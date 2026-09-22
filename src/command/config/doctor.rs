@@ -24,7 +24,8 @@ use crate::{
 
 const ROLE: DatabaseRole = DatabaseRole::GlobalConfig;
 const UNREADABLE_HINT: &str = "Cannot safely inspect this file. Check the configured path and permissions; use a SQLite-consistent snapshot if necessary. Do not edit migration receipts manually.";
-const LEGACY_MIGRATION_HINT: &str = "Global configuration is still at the legacy path; a future release migrates it to the XDG config directory automatically. Keep the legacy file for downgrade safety.";
+const LEGACY_MIGRATION_HINT: &str = "Global configuration is still at the legacy path; the next command that reads or writes it moves it to the XDG config directory automatically. The legacy file is kept as a downgrade backup and can be removed once the new path is in use.";
+const LEGACY_BACKUP_HINT: &str = "The legacy global configuration file is still present next to the active one. It is an unused backup kept for downgrades; Libra never reads or writes it once the new path exists, and you can delete it when you no longer need to downgrade.";
 
 #[derive(Serialize)]
 struct LedgerReport {
@@ -344,6 +345,15 @@ pub(super) async fn execute(output: &OutputConfig) -> CliResult<()> {
     }
     if report.migration_pending && !report.hints.contains(&LEGACY_MIGRATION_HINT) {
         report.hints.push(LEGACY_MIGRATION_HINT);
+    }
+    // Both layouts on disk after the migration: the legacy file is a backup,
+    // never a second source of truth, so say so and leave its removal to the
+    // user (plan-20260919 GCX-02; DEFER-GCX-02 keeps automatic cleanup out).
+    if !report.migration_pending
+        && report.legacy_exists == Some(true)
+        && !report.hints.contains(&LEGACY_BACKUP_HINT)
+    {
+        report.hints.push(LEGACY_BACKUP_HINT);
     }
     if output.is_json() {
         emit_json_data("config", &report, output)?;

@@ -1073,14 +1073,27 @@ async fn test_config_set_read_failure_does_not_silently_skip_existing_state_chec
         err.message()
     );
 
-    assert!(
-        !config_fixture
+    for candidate in [
+        config_fixture
             .home()
             .join(".libra")
-            .join("vault-unseal-key")
-            .exists(),
-        "failed existing-state lookup should not trigger global vault lazy init"
-    );
+            .join("vault-unseal-key"),
+        config_fixture
+            .home()
+            .join(".config")
+            .join("libra")
+            .join("vault-unseal-key"),
+        config_fixture
+            .xdg_config_home()
+            .join("libra")
+            .join("vault-unseal-key"),
+    ] {
+        assert!(
+            !candidate.exists(),
+            "failed existing-state lookup should not trigger global vault lazy init ({})",
+            candidate.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -3378,4 +3391,398 @@ fn run_config_in_pty(args: &[&str], cwd: &std::path::Path, input: &str) -> (bool
         status.success(),
         String::from_utf8_lossy(&output).into_owned(),
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// plan-20260919 GCX-02 — first-use migration of the legacy global config DB
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build `<home>/.libra/config.db` the way a pre-XDG release would have, by
+/// pointing the explicit override at the legacy location for the seed writes
+/// only. The override is never set for the assertions themselves.
+fn seed_legacy_global_config(
+    home: &Path,
+    cwd: &Path,
+    entries: &[(&str, &str)],
+) -> std::path::PathBuf {
+    let legacy = home.join(".libra").join("config.db");
+    std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("create legacy dir");
+    for (key, value) in entries {
+        let output = run_libra_command_with_env(
+            &["config", "set", "--global", key, value],
+            cwd,
+            &[
+                ("HOME", home.to_str().expect("utf-8 home")),
+                ("USERPROFILE", home.to_str().expect("utf-8 home")),
+                ("XDG_CONFIG_HOME", ""),
+                (
+                    "LIBRA_CONFIG_GLOBAL_DB",
+                    legacy.to_str().expect("utf-8 legacy path"),
+                ),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "seeding {key} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    legacy
+}
+
+fn xdg_default_env(home: &Path) -> [(&'static str, String); 4] {
+    let home = home.to_str().expect("utf-8 home").to_string();
+    [
+        ("HOME", home.clone()),
+        ("USERPROFILE", home),
+        // Empty is not an absolute path, so the resolver falls through to the
+        // `<home>/.config` default without inheriting the caller's XDG root.
+        ("XDG_CONFIG_HOME", String::new()),
+        ("LIBRA_CONFIG_GLOBAL_DB", String::new()),
+    ]
+}
+
+fn borrow_env<'a>(env: &'a [(&'static str, String); 4]) -> Vec<(&'static str, &'a str)> {
+    env.iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect()
+}
+
+fn digest(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(path).expect("read file"));
+    format!("{:x}", hasher.finalize())
+}
+
+/// ADR-GCX-02: the first global-configuration access moves the legacy database
+/// into the XDG layout, keeps the legacy file as an untouched backup, and
+/// reports the new layout through `config path --json`.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn test_global_config_migrates_legacy_on_first_use() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let legacy = seed_legacy_global_config(
+        &home,
+        temp.path(),
+        &[
+            ("user.email", "legacy@example.com"),
+            ("user.name", "Legacy"),
+        ],
+    );
+    let before = digest(&legacy);
+    let migrated = home.join(".config").join("libra").join("config.db");
+    assert!(!migrated.exists(), "the XDG database must not exist yet");
+
+    let env = xdg_default_env(&home);
+    let read = run_libra_command_with_env(
+        &["config", "get", "--global", "user.email"],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    assert!(
+        read.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "legacy@example.com"
+    );
+    assert!(
+        migrated.exists(),
+        "the first access must publish the XDG database"
+    );
+    assert_eq!(
+        digest(&legacy),
+        before,
+        "the legacy file must stay untouched"
+    );
+
+    let described = run_libra_command_with_env(
+        &["--json", "config", "path", "--global"],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&described.stdout).unwrap();
+    assert_eq!(doc["data"]["path"], migrated.to_str().unwrap());
+    assert_eq!(doc["data"]["source"], "home");
+    assert_eq!(doc["data"]["migration_pending"], false);
+    assert_eq!(doc["data"]["legacy_exists"], true);
+    assert_eq!(doc["data"]["legacy_path"], legacy.to_str().unwrap());
+
+    // Writes land on the new database only; the legacy backup keeps its value.
+    let written = run_libra_command_with_env(
+        &[
+            "config",
+            "set",
+            "--global",
+            "user.email",
+            "moved@example.com",
+        ],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    assert!(written.status.success());
+    assert_eq!(digest(&legacy), before);
+    let reread = run_libra_command_with_env(
+        &["config", "get", "--global", "user.email"],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&reread.stdout).trim(),
+        "moved@example.com"
+    );
+
+    // `doctor` names the legacy file as a backup rather than a second source.
+    let doctor = run_libra_command_with_env(
+        &["--json", "config", "doctor", "--global-schema"],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["data"]["path_source"], "home");
+    assert_eq!(report["data"]["migration_pending"], false);
+    assert_eq!(report["data"]["legacy_exists"], true);
+    let hints = report["data"]["hints"].to_string();
+    assert!(hints.contains("backup"), "doctor hints: {hints}");
+}
+
+/// The migration runs once: a later access adopts the published file byte for
+/// byte instead of copying the legacy database again.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn test_global_config_migration_is_idempotent() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let legacy =
+        seed_legacy_global_config(&home, temp.path(), &[("user.email", "legacy@example.com")]);
+    let env = xdg_default_env(&home);
+    let migrated = home.join(".config").join("libra").join("config.db");
+
+    for _ in 0..3 {
+        let output = run_libra_command_with_env(
+            &["config", "get", "--global", "user.email"],
+            temp.path(),
+            &borrow_env(&env),
+        );
+        assert!(output.status.success());
+    }
+    let first = digest(&migrated);
+
+    let output = run_libra_command_with_env(
+        &["config", "list", "--global"],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    assert!(output.status.success());
+    assert_eq!(digest(&migrated), first, "a later access must not re-copy");
+    assert!(std::fs::read_to_string(&legacy).is_err() || legacy.exists());
+
+    // No staging snapshot survives any of the runs.
+    let leftovers: Vec<String> = std::fs::read_dir(migrated.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("config.db.migrate"))
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging files left behind: {leftovers:?}"
+    );
+}
+
+/// Failure injection (ER-GCX-02): an unwritable configuration directory keeps
+/// reads working against the untouched legacy database with an actionable
+/// warning, while a write fails closed with the IO write code.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn test_global_config_migration_failure_keeps_legacy_and_warns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let legacy =
+        seed_legacy_global_config(&home, temp.path(), &[("user.email", "legacy@example.com")]);
+    let before = digest(&legacy);
+    let config_home = home.join(".config");
+    std::fs::create_dir_all(&config_home).unwrap();
+    std::fs::set_permissions(&config_home, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let env = xdg_default_env(&home);
+    let read = run_libra_command_with_env(
+        &["config", "get", "--global", "user.email"],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    let write = run_libra_command_with_env(
+        &[
+            "config",
+            "set",
+            "--global",
+            "user.email",
+            "blocked@example.com",
+        ],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    // Restore before asserting so the temp dir can always be removed.
+    std::fs::set_permissions(&config_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        read.status.success(),
+        "a read must survive a failed migration: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "legacy@example.com"
+    );
+    let read_stderr = String::from_utf8_lossy(&read.stderr);
+    assert!(
+        read_stderr.contains("could not move the global configuration"),
+        "missing migration warning: {read_stderr}"
+    );
+    assert!(
+        read_stderr.contains("LIBRA_CONFIG_GLOBAL_DB"),
+        "the warning must name the explicit escape hatch: {read_stderr}"
+    );
+
+    assert!(!write.status.success(), "a write must fail closed");
+    let write_stderr = String::from_utf8_lossy(&write.stderr);
+    assert!(
+        write_stderr.contains("Error-Code: LBR-IO-002"),
+        "a refused migration is a write failure: {write_stderr}"
+    );
+    assert!(
+        write_stderr.contains("refusing to write"),
+        "the error must explain the fail-closed choice: {write_stderr}"
+    );
+
+    assert!(
+        !config_home.join("libra").join("config.db").exists(),
+        "no database may be published by a failed migration"
+    );
+    assert_eq!(
+        digest(&legacy),
+        before,
+        "the legacy file must stay untouched"
+    );
+}
+
+/// plan-20260919 GCX-03: the global unseal key follows the configuration
+/// database into the XDG layout, and a value encrypted before the move still
+/// decrypts after it. Both legacy files survive byte-identical as backups.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn test_global_vault_key_migrates_and_decrypts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    std::fs::create_dir_all(home.join(".libra")).unwrap();
+    let legacy_db = home.join(".libra").join("config.db");
+    let legacy_key = home.join(".libra").join("vault-unseal-key");
+    let config_dir = home.join(".config").join("libra");
+
+    // Seed through the real command so the value is encrypted exactly the way
+    // a pre-XDG release would have encrypted it, then relocate the generated
+    // key to the legacy layout this card migrates away from.
+    let seeded = run_libra_command_with_env(
+        &[
+            "config",
+            "set",
+            "--global",
+            "vault.env.TEST_SECRET",
+            "s3cr3t",
+        ],
+        temp.path(),
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("USERPROFILE", home.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", ""),
+            ("LIBRA_CONFIG_GLOBAL_DB", legacy_db.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        seeded.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    std::fs::rename(config_dir.join("vault-unseal-key"), &legacy_key).unwrap();
+    std::fs::remove_dir_all(home.join(".config")).unwrap();
+
+    let db_before = digest(&legacy_db);
+    let key_before = digest(&legacy_key);
+    let env = xdg_default_env(&home);
+
+    let revealed = run_libra_command_with_env(
+        &[
+            "config",
+            "get",
+            "--global",
+            "vault.env.TEST_SECRET",
+            "--reveal",
+        ],
+        temp.path(),
+        &borrow_env(&env),
+    );
+    assert!(
+        revealed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&revealed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&revealed.stdout).trim(),
+        "s3cr3t",
+        "a value encrypted before the move must still decrypt"
+    );
+
+    let migrated_key = config_dir.join("vault-unseal-key");
+    assert!(migrated_key.exists(), "the key must follow the database");
+    assert_eq!(
+        std::fs::read(&migrated_key).unwrap(),
+        std::fs::read(&legacy_key).unwrap(),
+        "the key must be copied, never rotated"
+    );
+    assert_eq!(
+        std::fs::metadata(&migrated_key)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        digest(&legacy_db),
+        db_before,
+        "legacy DB must stay untouched"
+    );
+    assert_eq!(
+        digest(&legacy_key),
+        key_before,
+        "legacy key must stay untouched"
+    );
+
+    // Per-repo key material and the vault temp dir keep their Libra-home
+    // location: only the user-level global key moved (ADR-GCX-04 §4).
+    assert!(
+        !home
+            .join(".config")
+            .join("libra")
+            .join("vault-keys")
+            .exists()
+    );
 }

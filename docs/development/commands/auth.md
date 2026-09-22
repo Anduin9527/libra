@@ -14,7 +14,9 @@ lore.md §1.6：token-only auth v1，令牌**生命周期同 PR 闭环**——�
 ## 设计方案
 
 - **存储**：属主模块 `internal::auth`（单一门面，1.5 惯例）。全局 vault
-  unseal key（`~/.libra/vault-unseal-key`，0600）AES-256-GCM 加密整条记录
+  unseal key（`<XDG_CONFIG_HOME 或 ~/.config>/libra/vault-unseal-key`，0600；
+  legacy `~/.libra/vault-unseal-key` 首次使用时复制过去并保留为备份）
+  AES-256-GCM 加密整条记录
   `{version,host,port,username,token,expires_at,created_at}`，hex 密文存
   全局 config_kv（键 `auth.token.<sha256(host,port)>`——落盘不泄露主机名；
   credential.rs 先例 secret=false）。**OS keyring 诚实延后 2.7**（行文自身

@@ -1442,9 +1442,23 @@ fn infer_stable_error_code(kind: CliErrorKind, message: &str) -> StableErrorCode
     }
 }
 
+/// Opening words of the fail-closed error raised when the one-time global
+/// configuration migration cannot run (plan-20260919 GCX-02). Shared so the
+/// message and its stable-code rule can never drift apart.
+pub(crate) const GLOBAL_CONFIG_MIGRATION_FAILURE_MARKER: &str =
+    "cannot move the global configuration to";
+
 fn infer_runtime_error_code(lower: &str) -> StableErrorCode {
     if is_internal_error(lower) {
         return StableErrorCode::InternalInvariant;
+    }
+    // plan-20260919 GCX-02: a refused one-time global-configuration migration
+    // IS a write failure, whatever the underlying `io::Error` text says. The
+    // rule sits above the auth check because the common cause — an unwritable
+    // configuration directory — surfaces as "permission denied" and would
+    // otherwise be reported as a credentials problem.
+    if lower.contains(GLOBAL_CONFIG_MIGRATION_FAILURE_MARKER) {
+        return StableErrorCode::IoWriteFailed;
     }
     if is_auth_permission_error(lower) {
         return StableErrorCode::AuthPermissionDenied;

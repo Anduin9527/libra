@@ -157,7 +157,14 @@ impl ScopedConfig {
         scope: ConfigScope,
         scope_name: &str,
     ) -> Result<DatabaseConnection, String> {
-        let Some(config_path) = scope.get_config_path() else {
+        // plan-20260919 GCX-02: acquiring a global connection is the trigger
+        // for the one-time legacy migration, so the path is resolved through
+        // the migrating resolver rather than the pure path query.
+        let config_path = match scope {
+            ConfigScope::Global => crate::internal::config::global_config_path_for_read().await,
+            _ => scope.get_config_path(),
+        };
+        let Some(config_path) = config_path else {
             return Err(format!(
                 "Could not determine config path for {scope_name} scope"
             ));
@@ -216,6 +223,12 @@ impl ScopedConfig {
     // ── ConfigKv wrappers with scope ─────────────────────────────────
 
     async fn begin_mutation(scope: ConfigScope) -> Result<DatabaseTransaction, String> {
+        // A write must never land while the legacy and XDG databases could
+        // both be live, so a failed migration fails the write closed
+        // (ADR-GCX-02 §6) instead of silently writing to the legacy file.
+        if scope == ConfigScope::Global {
+            crate::internal::config::global_config_path_for_write().await?;
+        }
         let conn = Self::get_connection(scope).await?;
         let txn = begin_write_transaction(&conn).await.map_err(|error| {
             format!(

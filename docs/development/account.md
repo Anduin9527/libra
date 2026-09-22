@@ -280,7 +280,7 @@ Libra 当前有两套秘密存储，账号登录态必须走 **global** 路径�
 | 存储 | 路径 | 账号登录态 |
 |------|------|------------|
 | Repo-local vault | `.libra/vault.db` + repo `ConfigKv` | **禁止**写入 `vault.account.*` |
-| Global config + global unseal | `~/.libra/config.db`（或 `LIBRA_CONFIG_GLOBAL_DB`）+ `~/.libra/vault-unseal-key` | **必须**写入 `vault.account.*`（`ConfigKv::set(..., encrypted=true)`，经 `vault::encrypt_token`） |
+| Global config + global unseal | `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（或 `LIBRA_CONFIG_GLOBAL_DB`）+ `<同一配置目录>/libra/vault-unseal-key`（legacy `~/.libra/config.db` 与 `~/.libra/vault-unseal-key` 首次使用时自动迁移过去，旧文件原样保留为备份） | **必须**写入 `vault.account.*`（`ConfigKv::set(..., encrypted=true)`，经 `vault::encrypt_token`） |
 
 实现约束：
 
@@ -308,7 +308,7 @@ account.host.<host_sha256>.token = <encrypted JWT>
 - `config list` / `config get` 默认显示 `<REDACTED>`；`--reveal` 不得 reveal `vault.account.*`。
 - `--json` / `--machine` 不输出 token，即使用户传 `--reveal` 也不应该通过 login/whoami 输出 token。
 - 文件权限沿用全局 Vault 现有约束（密钥文件 0600、目录 0700）；不要新增独立 plaintext token 文件。
-- 诚实记录残余风险：全局加密的机密性来自文件权限 + `~/.libra/vault-unseal-key`（32 字节 AES-256-GCM，见 `src/internal/vault.rs::lazy_init_vault_for_scope("global")`），不是口令派生加密。能以同一用户身份读取 `~/.libra/` 的本机攻击者可同时拿到密钥和密文并解出 token——这是与系统 keychain / 浏览器同级的固有边界，靠短 token 生命周期 + 服务端可撤销（`jti`）来限制损失。
+- 诚实记录残余风险：全局加密的机密性来自文件权限 + `<XDG_CONFIG_HOME 或 ~/.config>/libra/vault-unseal-key`（32 字节 AES-256-GCM，见 `src/internal/vault.rs::lazy_init_vault_for_scope("global")`），不是口令派生加密。能以同一用户身份读取该配置目录（以及仍保留 legacy 备份时的 `~/.libra/`）的本机攻击者可同时拿到密钥和密文并解出 token——这是与系统 keychain / 浏览器同级的固有边界，靠短 token 生命周期 + 服务端可撤销（`jti`）来限制损失。边界说明：per-repo 密钥 `~/.libra/vault-keys/<repo-id>` 与 `~/.libra/tmp` 属于仓库状态，**不随本次迁移移动**。
 - **多 host**：允许同时保存多个 `account.host.<host_sha256>`；`--host` 选择操作对象；`logout --all` 清空全部。
 
 ## 八、Scope 注册表

@@ -109,7 +109,9 @@ fn repair_global_modes() {
         use std::os::unix::fs::PermissionsExt;
         for path in [
             ConfigScope::Global.get_config_path(),
-            dirs::home_dir().map(|home| home.join(".libra").join("vault-unseal-key")),
+            // Only the key Libra actually uses: a migrated legacy file is a
+            // user-owned backup and is left untouched (ADR-GCX-04).
+            crate::internal::vault::active_global_unseal_key_path(),
         ]
         .into_iter()
         .flatten()
