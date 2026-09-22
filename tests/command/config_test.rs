@@ -3992,3 +3992,81 @@ async fn config_generate_gpg_key_migrates_imported_key_into_history() {
     // The active signing slot now holds a different (generated) key.
     assert_ne!(get("vault.gpg.pubkey"), imported_pubkey);
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn config_generate_gpg_key_after_import_resumes_idempotently() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let secret = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/fake-gpg/protected-secret.asc"
+    );
+    let passfile = temp_path.path().join("pass.txt");
+    std::fs::write(&passfile, "libra-test-fixture-passphrase").unwrap();
+    let passfile_s = passfile.to_string_lossy().into_owned();
+
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            secret,
+            "--passphrase-file",
+            &passfile_s,
+            "--replace",
+        ],
+        temp_path.path(),
+    );
+    assert!(
+        out.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_libra_command(&["config", "generate-gpg-key"], temp_path.path());
+    assert!(
+        out.status.success(),
+        "first generate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let get = |key: &str| {
+        let out = run_libra_command(&["config", "get", key], temp_path.path());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let first_key_name = get("vault.gpg.generated_key_name");
+    let first_pubkey = get("vault.gpg.pubkey");
+    assert!(first_key_name.starts_with("libra-signing-"));
+    assert_eq!(get("vault.gpg.source"), "generated");
+
+    // Simulate a run that failed at step (e): the new generated key is already
+    // active, but `source` still names the previous provenance.
+    let out = run_libra_command(
+        &["config", "set", "vault.gpg.source", "imported"],
+        temp_path.path(),
+    );
+    assert!(
+        out.status.success(),
+        "simulate (e) failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get("vault.gpg.source"), "imported");
+
+    // Re-running must complete (e) without minting a second key.
+    let out = run_libra_command(&["config", "generate-gpg-key"], temp_path.path());
+    assert!(
+        out.status.success(),
+        "resume generate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get("vault.gpg.source"), "generated");
+    assert_eq!(
+        get("vault.gpg.generated_key_name"),
+        first_key_name,
+        "resume must not mint a second generated key"
+    );
+    assert_eq!(get("vault.gpg.pubkey"), first_pubkey);
+}

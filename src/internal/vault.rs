@@ -227,6 +227,36 @@ pub async fn generate_pgp_key(
 ) -> Result<(String, String)> {
     use crate::internal::config::ConfigKv;
 
+    // VG-14 §(e) resume: a previous run that already established the generated
+    // key ((c) generated_pubkey, (d1) generated_key_name, (d2) pubkey) but
+    // failed before committing (e) left the new generated key active while
+    // `source` still names the old provenance. Completing that sequence must
+    // not mint a second key — just commit (e) and report the existing pair.
+    {
+        let read = async |key: &str| {
+            ConfigKv::get(key)
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value)
+                .unwrap_or_default()
+        };
+        let key_name = read("vault.gpg.generated_key_name").await;
+        let generated_pubkey = read("vault.gpg.generated_pubkey").await;
+        let source = read("vault.gpg.source").await;
+        let active_pubkey = read("vault.gpg.pubkey").await;
+        if !key_name.is_empty()
+            && !generated_pubkey.is_empty()
+            && source != "generated"
+            && active_pubkey == generated_pubkey
+        {
+            ConfigKv::set("vault.gpg.source", "generated", false)
+                .await
+                .context("failed to persist generated GPG key source")?;
+            return Ok((generated_pubkey, key_name));
+        }
+    }
+
     // (a) Preserve the currently-active key (imported or generated) in history
     // before overwrite, so historical signatures stay verifiable through the
     // fixed allowlist (ADR-VG-04 / ADR-VG-06 §6). VG-14 relaxes the VG-03
