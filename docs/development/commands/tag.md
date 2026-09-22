@@ -54,7 +54,7 @@ flowchart TD
 - `-a/--annotate 创建附注 tag`：与 `-m`/`-F`/`-e` 组合时走既有附注创建路径；单独使用时等价于 `-e`（打开编辑器，清理后为空则 `EmptyEditedMessage`、不写 ref）。与 `-d`/`-l`/`-v` 等非创建模式组合为用法错误 129（`MessageOptionRequiresCreate`）。不进入 clap `action` 组，以免挡住 `-a -f`。
 - `-e, --edit`：打开编辑器撰写或编辑附注标签消息。编辑器缓冲以 `-m`/`-F` 的 base 消息（如有）加注释说明块预填，经 `editor::resolve_editor`（`GIT_EDITOR`→`core.editor`→`VISUAL`→`EDITOR`，无配置且有 TTY 时回退 `vi`，否则报 `TagError::NoEditor`→exit 128）→`editor::edit_message`（落 `TAG_EDITMSG`）打开。保存后用 `clean_tag_message`（`git stripspace` 语义：剥离整行注释、去行尾空白、折叠空行）清理；为空则报 `TagError::EmptyEditedMessage`→exit 128（`failure`+`RepoStateInvalid`，对齐 `commit` 空消息）。`-a` 单独使用走同一编辑器路径。
 - `-s, --sign`（clap `requires = "message"`，即要求 `-m`；`-e` 可进一步编辑该 `-m` 消息，但 `-s` 不接受 `-F` 或仅编辑器消息）：用 vault PGP 密钥对规范化的未签名标签内容（`object/type/tag/tagger/\n\n/message`）签名，并把 armored 签名块（`vault::signature_to_armored`）追加到标签消息后，对齐 Git 的 signed-tag 布局；tagger 仅构建一次以保证被签名字节与落库对象一致。无 unseal key 时报 `CreateTagError::VaultSign`→`TagError::VaultSign`。
-- `-v, --verify <name>`：`internal::tag::verify` 在签名标记处切分标签消息、重建未签名内容、`vault::armored_to_signature_hex` 还原签名后调用 `vault::pgp_verify`（libvault `pki/keys/verify`）。好签名打印 `Good signature for tag '<name>'`（exit 0）；坏签名 `TagError::BadSignature`（exit 1）；未签名/非 annotated/未找到/无密钥经 `map_verify_tag_error` 报错。
+- `-v, --verify <name>`：`internal::tag::verify` 在签名标记处切分标签消息、重建未签名内容、`vault::armored_to_signature_hex` 还原签名后调用 `vault::pgp_verify`（进程内验证本仓库允许列表公钥：活动 → 生成 → 历史）。好签名打印 `Good signature for tag '<name>'`（exit 0）；坏签名 `TagError::BadSignature`（exit 1）；未签名/非 annotated/未找到/无密钥经 `map_verify_tag_error` 报错。
 - `--contains <commit>` / `--no-contains <commit>`：仅保留（或排除）其 peeled commit 以 `<commit>` 为祖先的标签（即 tag “包含”该 commit），隐含 list 模式；复用 `log::get_reachable_commits` 对每个 tag 的 peeled commit 做一次可达性遍历。
 
 
