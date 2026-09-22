@@ -3,7 +3,10 @@
 //! the terminal lifecycle; performs no prefetch and delegates every fetch to
 //! [`Mega2TreeSession`].
 
+pub mod tag_panel;
 pub mod terminal;
+
+pub use tag_panel::{TAG_PAGE_SIZE, TagEditor, TagPanel, TagPanelAction};
 
 #[cfg(unix)]
 pub(crate) mod terminal_unix;
@@ -21,6 +24,7 @@ use crate::{
         mega2_auth::Mega2Token,
         mega2_entry::{Mega2EntryClient, validate_entry_name},
         mega2_mutate::Mega2MutateClient,
+        mega2_tag::{CreateTagOptions, Mega2TagClient},
         mega2_tree::{
             ContentType, Listing, MAX_CACHE_ENTRIES, MAX_NAME_BYTES, Mega2TreeSession,
             normalize_path,
@@ -46,6 +50,8 @@ pub enum Key {
     Move,
     /// `R`: start the same-parent rename editor (distinct from `r` reload).
     Rename,
+    /// `t`: toggle the tag panel.
+    Tags,
     /// Lone `Esc`: cancel the active editor (or quit when idle).
     Cancel,
     Quit,
@@ -73,6 +79,19 @@ pub enum ActionResult {
         from_name: String,
         to_parent: String,
         to_name: String,
+    },
+    /// One explicit tag page fetch (panel open or page change; never prefetched).
+    FetchTags {
+        page: u64,
+    },
+    /// One confirmed tag creation, then refresh the panel page.
+    CreateTag {
+        name: String,
+        message: Option<String>,
+    },
+    /// One confirmed tag deletion, then refresh the panel page.
+    DeleteTag {
+        name: String,
     },
     Continue,
     Quit,
@@ -105,6 +124,8 @@ pub struct BrowserState {
     pub running: bool,
     /// The single active modal editor, if any (sanitized input only).
     pub editor: Option<Editor>,
+    /// The tag panel when it is open (directory keys become inert).
+    pub panel: Option<TagPanel>,
 }
 
 impl BrowserState {
@@ -120,6 +141,7 @@ impl BrowserState {
             status: None,
             running: true,
             editor: None,
+            panel: None,
         })
     }
 
@@ -305,6 +327,20 @@ impl BrowserState {
         if self.editor.is_some() {
             return self.handle_editor_key(key);
         }
+        if let Some(panel) = self.panel.as_mut() {
+            return match panel.handle_key(key) {
+                TagPanelAction::Continue => ActionResult::Continue,
+                TagPanelAction::Close => {
+                    self.panel = None;
+                    ActionResult::Continue
+                }
+                TagPanelAction::Fetch { page } => ActionResult::FetchTags { page },
+                TagPanelAction::Create { name, message } => {
+                    ActionResult::CreateTag { name, message }
+                }
+                TagPanelAction::Delete { name } => ActionResult::DeleteTag { name },
+            };
+        }
         match key {
             Key::Up => {
                 if self.selection > 0 {
@@ -405,6 +441,10 @@ impl BrowserState {
                 }
                 ActionResult::Continue
             }
+            Key::Tags => {
+                self.panel = Some(TagPanel::new());
+                ActionResult::FetchTags { page: 1 }
+            }
             Key::Cancel | Key::Quit => {
                 self.running = false;
                 ActionResult::Quit
@@ -415,7 +455,7 @@ impl BrowserState {
 }
 
 /// Appends one printable character while staying within the shared name bound.
-fn push_bounded(input: &mut String, ch: char) {
+pub(crate) fn push_bounded(input: &mut String, ch: char) {
     if !ch.is_control() && input.len() + ch.len_utf8() <= MAX_NAME_BYTES {
         input.push(ch);
     }
@@ -437,6 +477,7 @@ pub fn parse_key(byte: u8, sequence: &[u8]) -> Key {
         b'+' => Key::Create,
         b'd' => Key::Delete,
         b'm' => Key::Move,
+        b't' => Key::Tags,
         b'h' | b'H' => Key::Home,
         b'k' | b'K' => Key::Up,
         b'j' | b'J' => Key::Down,
@@ -463,6 +504,10 @@ pub fn render(state: &BrowserState, server: &str) -> String {
         state.path
     ));
     out.push_str("──────────────────────────────────────────────\r\n");
+    if let Some(panel) = state.panel.as_ref() {
+        out.push_str(&panel.render_lines());
+        return out;
+    }
     if state.entries.is_empty() {
         out.push_str("(empty directory)\r\n");
     }
@@ -649,6 +694,64 @@ pub async fn perform_move(
     state.fetch_current().await
 }
 
+/// Runs one explicit tag page fetch (no prefetch) and applies it to the panel.
+pub async fn perform_fetch_tags(
+    state: &mut BrowserState,
+    client: &Mega2TagClient,
+    page: u64,
+) -> CliResult<()> {
+    let page_data = client.list_tags(page, TAG_PAGE_SIZE, "/").await?;
+    if let Some(panel) = state.panel.as_mut() {
+        panel.apply_page(page, page_data.total, page_data.items);
+    }
+    Ok(())
+}
+
+/// Runs one confirmed tag creation (exactly one POST) and refreshes the page.
+pub async fn perform_create_tag(
+    state: &mut BrowserState,
+    client: &Mega2TagClient,
+    name: &str,
+    message: Option<&str>,
+) -> CliResult<()> {
+    let options = CreateTagOptions {
+        name,
+        message,
+        ..CreateTagOptions::default()
+    };
+    client.create_tag(&options).await?;
+    refresh_tag_panel(state, client).await;
+    Ok(())
+}
+
+/// Runs one confirmed tag deletion (exactly one DELETE) and refreshes the page.
+pub async fn perform_delete_tag(
+    state: &mut BrowserState,
+    client: &Mega2TagClient,
+    name: &str,
+) -> CliResult<()> {
+    client.delete_tag(name, "/").await?;
+    refresh_tag_panel(state, client).await;
+    Ok(())
+}
+
+/// Refreshes the currently visible tag page after a successful mutation.
+async fn refresh_tag_panel(state: &mut BrowserState, client: &Mega2TagClient) {
+    let page = state.panel.as_ref().map(|panel| panel.page).unwrap_or(1);
+    match client.list_tags(page, TAG_PAGE_SIZE, "/").await {
+        Ok(page_data) => {
+            if let Some(panel) = state.panel.as_mut() {
+                panel.apply_page(page, page_data.total, page_data.items);
+            }
+        }
+        Err(e) => {
+            if let Some(panel) = state.panel.as_mut() {
+                panel.status = Some(format!("error: {}", e.message()));
+            }
+        }
+    }
+}
+
 /// Full interactive run: TTY check → terminal guard → event loop with exactly
 /// one fetch per navigation action and no background work.
 pub async fn run(
@@ -661,7 +764,8 @@ pub async fn run(
     let session = Mega2TreeSession::new(server)?;
     let mut state = BrowserState::new(session, start_path, git_ref.map(str::to_string))?;
     let entry_client = Mega2EntryClient::new(server, token.clone())?;
-    let mutate_client = Mega2MutateClient::new(server, token)?;
+    let mutate_client = Mega2MutateClient::new(server, token.clone())?;
+    let tag_client = Mega2TagClient::new(server, token)?;
     let mut guard = TerminalGuard::enter()?;
 
     state.fetch_current().await?;
@@ -728,6 +832,28 @@ pub async fn run(
                     .await
                     {
                         state.status = Some(format!("error: {}", e.message()));
+                    }
+                }
+                ActionResult::FetchTags { page } => {
+                    if let Err(e) = perform_fetch_tags(&mut state, &tag_client, page).await
+                        && let Some(panel) = state.panel.as_mut()
+                    {
+                        panel.status = Some(format!("error: {}", e.message()));
+                    }
+                }
+                ActionResult::CreateTag { name, message } => {
+                    if let Err(e) =
+                        perform_create_tag(&mut state, &tag_client, &name, message.as_deref()).await
+                        && let Some(panel) = state.panel.as_mut()
+                    {
+                        panel.status = Some(format!("error: {}", e.message()));
+                    }
+                }
+                ActionResult::DeleteTag { name } => {
+                    if let Err(e) = perform_delete_tag(&mut state, &tag_client, &name).await
+                        && let Some(panel) = state.panel.as_mut()
+                    {
+                        panel.status = Some(format!("error: {}", e.message()));
                     }
                 }
                 ActionResult::Continue => {}

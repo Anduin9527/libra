@@ -48,6 +48,7 @@ libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|-
 | `d` | 删除选中目录（需要额外确认行；文件为惰性） |
 | `m` | 将选中目录移动到编辑后的目标父路径 |
 | `R` | 原地重命名选中目录（同层移动；`r` 仍是重新加载） |
+| `t` | 开关 tag 面板（见下） |
 | `r` | 重新加载当前列表 |
 | `q`（或 `Ctrl-C`、`Esc`） | 退出 |
 
@@ -107,6 +108,20 @@ raw mode，TUI 也永不要求你在备用屏幕上输入原始 token。
 失败（401/403、源不存在、目标重名、超时）保留最后一次安全列表并显示不含秘密的
 状态行，终端保持完好。没有多选、没有递归：每次操作只针对一个选中目录。
 
+### Tag 面板（`t`，仅交互模式）
+
+按 `t` 打开 tag 面板，并为第 1 页执行**一次**匿名
+`GET /api/v1/tags/list`（三个必填 query 键为 `page`、`per_page`、`path`；本 MVP
+固定使用仓库根 `path=/`）。`n`/`p` 显式请求下一页/上一页——每键一次请求，绝不
+预取。`+` 先收集 tag 名，再收集可选 message（message 为空 = lightweight tag，
+非空 = annotated tag）；`d` 在删除选中 tag 前要求额外确认行。`t`、`Esc` 或 `q`
+关闭面板但不退出 browser，目录列表原样恢复。
+
+tag 名在发请求前按服务端规则校验（非空、≤255 字节、不含 `..`、`@{`、`//`、不以
+`.lock` 结尾，且不含空白/控制字符/禁用字符）。列表匿名；create 与 delete 复用
+ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意服务端字符串
+无法控制终端。面板仅操作 root tag。
+
 ## 选项
 
 | 选项 | 说明 |
@@ -151,7 +166,7 @@ libra mega2 browser --server https://mega2.example.com src/pkg
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
 
-# 交互建/删/移/改名：在 TUI 中按 +、d、m 或 R，可配 --token-file
+# 交互建/删/移/改名（+、d、m、R）与 tag 面板（t），可配 --token-file
 libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token
 
 # 单次请求 + JSON envelope（无需 TTY，可在仓库外运行）

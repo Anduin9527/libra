@@ -32,7 +32,7 @@
   - 交互状态机与终端生命周期：`src/command/mega2_browser/`（`BrowserState`、
     `Key`/`parse_key`、`render`、`sanitize`、`ensure_tty`/`tty_required`、`run`、
     `perform_create`；Unix 采用 `terminal_unix.rs` 的 termios RAII guard，Windows
-    采用 `terminal_windows.rs` 的 windows-sys console guard）。MB-05 增加 `+` 键的单行编辑器，MB-08 扩展为统一 modal `Editor`
+    采用 `terminal_windows.rs` 的 windows-sys console guard）。MB-05 增加 `+` 键的单行编辑器，MB-08 扩展为统一 modal `Editor`；MB-11 追加 `t` tag 面板（`tag_panel.rs`，页面/编辑器状态与 `TagPanelAction`）
     （`+` 建目录、`d` 删除确认、`m` 移动、`R` 同层改名；输入即消毒、长度受
     `MAX_NAME_BYTES` 限制，`Esc` 取消零网络，文件与根均惰性）。
   - 有界传输与 wire 校验：`src/internal/protocol/mega2_tree.rs`（URL/path/name
@@ -78,7 +78,7 @@ flowchart TD
   仓库外零本地写入、help 面（仅 `browser`，无 mkdir）；`mega2_browser_mkdir` 覆盖
   `+` 编辑器（文件选择拒绝、`Esc` 零网络、敌意名称不发 POST）、成功路径
   （1 POST + 1 重载 GET）、401/400/403/409 保持最后安全列表且无 token/响应体泄漏、
-  token flag 与 `--json` 互斥；`mega2_browser_mutate` 覆盖 `d`/`m`/`R`
+  token flag 与 `--json` 互斥；`mega2_browser_tag` 覆盖 `t` 面板（第 1 页单次匿名 GET、显式翻页、create 名称+可选 message、delete 确认、敌意名不发请求、面板关闭恢复目录视图、渲染消毒）；`mega2_browser_mutate` 覆盖 `d`/`m`/`R`
   （确认行、Esc 取消零网络、文件惰性、改名=同层移动、敌意目标不发 POST、
   1 POST + 1 重载 GET、help 无 rmdir/mv）。
 - 架构守衛：`compat_agent_architecture_guard` 保证不引入

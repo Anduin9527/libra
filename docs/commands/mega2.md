@@ -59,6 +59,7 @@ state machine with no recursion and no background prefetch:
 | `d` | Delete the selected directory (extra confirmation line; files are inert) |
 | `m` | Move the selected directory under an edited destination parent |
 | `R` | Rename the selected directory (same parent; `r` still reloads) |
+| `t` | Toggle the tag panel (see below) |
 | `r` | Reload the current listing |
 | `q` (or `Ctrl-C`, `Esc`) | Quit |
 
@@ -129,6 +130,25 @@ timeout) keep the last safe listing and show a secret-free status line while
 the terminal stays intact. There is no multi-select and no recursion: one
 selected directory per operation.
 
+### Tag panel (`t`, interactive only)
+
+`t` opens the tag panel and performs exactly **one** anonymous
+`GET /api/v1/tags/list` for page 1 (the three required query keys are
+`page`, `per_page`, `path`; this MVP always uses the repository root
+`path=/`). `n`/`p` request the explicit next/previous page — one request per
+key, never prefetched. `+` collects a tag name and then an optional message
+(an empty message creates a lightweight tag; a non-empty one creates an
+annotated tag); `d` deletes the selected tag after an extra confirmation
+line. `t`, `Esc` or `q` close the panel without leaving the browser, and the
+directory listing reappears unchanged.
+
+Tag names are validated with the server's rules before any request (non-empty,
+at most 255 bytes, no `..`, `@{`, `//`, no `.lock` suffix and no
+whitespace/control/forbidden characters). Listing is anonymous; create and
+delete reuse the session write token from ADR-MB-03. Rendered tag fields
+(tagger, message) are sanitized so hostile server strings cannot control the
+terminal. The panel operates root tags only.
+
 ## Options
 
 | Option | Description |
@@ -176,7 +196,7 @@ libra mega2 browser --server https://mega2.example.com src/pkg
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
 
-# Create, delete, move or rename directories interactively (press +, d, m or R)
+# Create, delete, move or rename directories interactively (press +, d, m or R; t for tags)
 libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token
 
 # Exactly one fetch, JSON envelope (works without a TTY, outside any repository)
