@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-22（下次更新时替换）。
+> **当前快照：** 2026-09-23（下次更新时替换）。
 
 ---
 
@@ -23,7 +23,7 @@
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
-| [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；15 卡尚未执行 |
+| [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg 2.4.9` 证据、VG-00 GO、ADR-VG-01..12 Accepted）；VG-00 `done/complete`，其余 14 卡 `pending`（DEP-VG-01/02 `blocked`） |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS，尚未开工 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 未启动 | FL-00..FL-07 全部 `pending`；前置 plan-20260907 未收口 |
@@ -39,14 +39,14 @@
 | [`plan-20260901.md`](plan-20260901.md) | 横切（SB-01 pkt-line fail-closed） | **已收口** | 全部卡 `done/complete`；最新 v0.22.47 |
 | [`plan-20260830.md`](plan-20260830.md) | 横切（SB-02 sandbox export） | **已收口** | SBX-01..05 `done/locally-accepted`（发布步按 DEFER-SBX-06 延后）；ER-13 收口门绿 |
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度） | **已收口** | NP-00..05 全部 `complete` |
-| [`plan-20260825.md`](plan-20260825.md) | B（Code provider / RT-01 后续） | **已收口** | TA 系列全部落地；发布面按用户 2026-08-30 豁免闭合 |
-| [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | **已收口** | DF-01..09 全部 `done/complete`；v0.22.0 已发布 |
+| [`plan-20260825.md`](plan-20260825.md) | B（历史：Code provider / RT-01 后续）+ 横切测试 | **已收口** | **历史完成/封存**：PS 产品轴已随 plan-20260920 拆除，Code 专属 DEFER 已墓碑化；TA 测试并行度交付及通用测试 DEFER 仍按承接计划解释 |
+| [`plan-20260824.md`](plan-20260824.md) | B（历史：RT-01 延后项收口） | **已收口** | **历史完成/封存**：DF-01..09 全部 `done/complete`、v0.22.0 已发布；其 Code 产品面与专属 DEFER 已随 plan-20260920 拆除/墓碑化 |
 | [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03 Operation Log v2） | 实施中（PR #503 收口） | OL-01..13、CH-01..04 `done/complete`；OL-14 **已取消**（`web/` 拆除，2026-09-20）；OL-15A `done/complete`，OL-15 `done/remote-pending`（等待 compat-offline-core） |
 | [`plan-20260821.md`](plan-20260821.md) | A（UP-01） | **已收口** | 客户端与 CI 全部落地；closeout `00bc815`；DEFER-02..06 残留 |
 | [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02 Memory） | 实施中（R30 重设计） | **R30 起点：M2-16A**；M2-16A..E/D1 与 M2-01..M2-15 全部 `pending`（M2-01 在 M2-16A 移植复核前不再为 `in-progress`）；R30 双评审 r01 兩方 `FAIL`（Codex 0×P0/11×P1、Claude 4×P0/13×P1/9×P2）、r02 兩方 `FAIL`（Codex 0×P0/7×P1、Claude 1×P0/7×P1/12×P2）、r03 兩方 `FAIL`（Codex 0×P0/9×P1/4×P2、Claude 1×P0/10×P1/13×P2）；已按 `fix-checklist-r01..r04.md` 修訂；r04 兩方 `FAIL`（Codex 0×P0/6×P1/3×P2、Claude 0×P0/2×P1/13×P2）、r05 兩方 `FAIL`（Codex 0×P0/5×P1、Claude 0×P0/3×P1/12×P2）、r06 兩方 `FAIL`（Codex 0×P0/4×P1/2×P2、Claude 0×P0/2×P1/11×P2）、r07 兩方 `FAIL`（Codex 0×P0/2×P1/5×P2、Claude 0×P0/2×P1/12×P2）、r08 兩方 `FAIL`、r09 兩方 `FAIL`、r10 兩方 `FAIL`、r11 兩方 `FAIL`、r12 兩方 `FAIL`、r13 兩方 `FAIL`、r14 兩方 `FAIL`、r15 兩方 `FAIL`、r16 兩方 `FAIL`（Codex 0×P0/6×P1/1×P2、Claude 0×P0/4×P1/5×P2）、r17 兩方 `FAIL`、r18 兩方 `FAIL`（Codex 0×P0/4×P1/2×P2、Claude 0×P0/6×P1/9×P2）、r19 兩方 `FAIL`（Codex 0×P0/2×P1/2×P2、Claude 0×P0/3×P1/7×P2）、r20 兩方 `FAIL`（Codex 0×P0/2×P1/2×P2、Claude 0×P0/2×P1/9×P2）；r21 兩方 `FAIL`（Codex 0×P0/1×P1/3×P2、Claude 0×P0/2×P1/7×P2）；r22 兩方 `FAIL`（Codex 0×P0/3×P1/2×P2、Claude 0×P0/6×P1/8×P2）；r23 兩方 `FAIL`（Codex 0×P0/2×P1/4×P2、Claude 0×P0/3×P1/5×P2）；r24 兩方 `FAIL`（Codex 0×P0/2×P1/5×P2、Claude 0×P0/3×P1/8×P2）；r25 兩方 `FAIL`（Codex 0×P0/2×P1、Claude 0×P0/4×P1/6×P2）；r26 兩方 `FAIL`（Codex 0×P0/1×P1/2×P2、Claude 0×P0/4×P1/10×P2）；r27 兩方 `FAIL`（Codex 0×P0/1×P1/1×P2、Claude 0×P0/3×P1/7×P2）；r28 兩方 `FAIL`（Codex 0×P0/2×P1/1×P2、Claude 0×P0/4×P1/3×P2）；r29 兩方 `FAIL`（Codex 0×P0/1×P1/1×P2、Claude 0×P0/1×P1/4×P2）；r30 兩方 `FAIL`（Codex 0×P0/1×P1/1×P2、Claude 0×P0/3×P1/5×P2）；r31 Codex **PASS**（0×P0/0×P1/2×P2）、Claude `FAIL`（0×P0/2×P1/5×P2）；r32 兩方 `FAIL`（Codex 0×P0/2×P1/3×P2、Claude 0×P0/2×P1/5×P2）；r33 兩方 `FAIL`（Codex 0×P0/1×P1/2×P2、Claude 0×P0/4×P1/5×P2）；r34 兩方 `FAIL`（審計 scope 格）；r35 Codex `FAIL`（協議會話隔離）/**Claude `PASS`**；r36 Codex `FAIL`（plan-status 合併行）、**Claude `PASS`**；r37 雙 PASS（見下）；PR #456 由 R30 计划承接（ADR-M2-15） |
 | [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | **已收口** | LB-01..07 全部 `done/complete`；protocol v1 20-method 全实现 |
 | [`plan-20260729.md`](plan-20260729.md) | A（CT-01） | 实施中（收尾） | CT4-01 发布卡已执行（v0.21.21）；**CT3-07 `blocked`/已延后**；完成判据未全部勾选 |
-| [`plan-20260715.md`](plan-20260715.md) | B（RT-01 Code Web-only） | **已收口** | W0..W6 主线 + W5-01 家族全部合入；完成判据全勾选；DEFER-01..10 残留（部分由 plan-20260824 承接） |
+| [`plan-20260715.md`](plan-20260715.md) | B（历史：RT-01 Code Web-only） | **已收口** | **历史完成/封存**：W0..W6 + W5-01/WIO 完成证据保留；Code 产品面由 plan-20260920 拆除，DEFER-01..08 已关闭/墓碑化，DEFER-09/10 已完成关闭 |
 | [`plan-20260714.md`](plan-20260714.md) | A（UP-01、LR-01）+ 横切 | **已收口** | Part A 迁移至 plan-long；Part C W1..W4 勾选；Part D 残留由 LR 承接 |
 | [`plan-20260713.md`](plan-20260713.md) | B（LR-06/07/10 捕获前置） | **已收口** | DR-BASELINE..DR-07 全部实现并收口 |
 | [`plan-20260708.md`](plan-20260708.md) | A（LR-04/05/09 相邻基础） | **已收口** | 41 项主线全部实现；只保留历史记录，活跃残留另行排期 |
@@ -77,7 +77,7 @@
 
 ## 二、未启动的计划与卡
 
-以下计划尚无任何卡开工（设计态，全部 `pending`）。按建议优先级排列，优先级依据为跨计划依赖（`DEP-*`）与产品路线（`plan-long.md`）：
+以下计划均未进入实施/发布阶段（多数为设计态、全部 `pending`；`plan-20260919` 与 `plan-20260921` 已收口前置卡/Phase 0，但实施与发布仍未开工）。按建议优先级排列，优先级依据为跨计划依赖（`DEP-*`）与产品路线（`plan-long.md`）：
 
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
@@ -90,7 +90,7 @@
 | [`plan-20260913.md`](plan-20260913.md) | FL-00..FL-07 | **前置 plan-20260907 完整收口**（DEP-FL-04） |
 | [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；开工时按 ER-CAP-02 pin 重核 |
 | [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02/03/04 已实现并本地验收（2026-09-22，`locally-accepted`），发布未执行；写集与 plan-20260918 串行（DEP-GCX-02） |
-| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 剩余 DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted |
+| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted）；VG-00 已 `done/complete`，开工前置为 DEP-VG-01（plan-20260919 GCX-02/03 发布）与 DEP-VG-02（`../libra-backend` 脏页处置） |
 | `issues/` 设计计划 | 见「计划一览」issues 表 | 各计划 Codex review `PASS` 前不得开工；`issues/476`/`479`/`483`/`490` 与 `plan-20260918` 写集串行（DEP-WT-09 / DEP-PL-04 / DEP-AD-06 / DEP-AD-07） |
 
 ---
@@ -280,7 +280,9 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 - plan-20260819：`DEFER-M2-01..09`（含 `DEFER-M2-09`：AgentRun/session 终态适配，M2-16D 判定不可映射时启用）。
 - plan-20260822：`DEFER-01..03`（Operation Log 范围外）；`DEFER-02`（Web 图 SSE）已随 OL-14 取消关闭；`DEFER-05` 已由 PR #503 的 OL-15A 承接并关闭；OL-15 等待远端兼容门禁收口。
 - plan-20260903：`DEFER-01..12`（merge 范围外/deferred 差异）。
-- plan-20260715：`DEFER-01..10`（RT-01 收尾；部分由 plan-20260824 承接关闭）。
+- plan-20260715：历史封存；Code 专属 `DEFER-01..08` 已由 plan-20260824 交付后拆除或由 plan-20260920 直接墓碑化，`DEFER-09/10` 已完成关闭；无现行可重启项。
+- plan-20260824：历史封存；全部 Code 专属 DEFER 已由 plan-20260920 墓碑化，无现行可重启项。
+- plan-20260825：历史封存；Code 专属 `DEFER-PS-01..04` 已墓碑化；`DEFER-PS-05` 已由 plan-20260917 关闭。仅通用测试基础设施 `DEFER-PS-06/07` 保留为另立计划候选，不得用于恢复 Code。
 
 ---
 
@@ -304,6 +306,6 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 ## 七、完成计划清单（已收口）
 
-日期计划：`plan-20260708`、`plan-20260713`、`plan-20260714`、`plan-20260715`、`plan-20260818`、`plan-20260821`、`plan-20260824`、`plan-20260825`、`plan-20260827`、`plan-20260901`、`plan-20260910`、`plan-20260917`、`plan-20260920`。
+日期计划：`plan-20260708`、`plan-20260713`、`plan-20260714`、`plan-20260715`（历史完成、Code 产品面已拆除）、`plan-20260818`、`plan-20260821`、`plan-20260824`（历史完成、Code 产品面已拆除）、`plan-20260825`（历史完成、PS 产品轴已拆除；TA 测试轴保留历史）、`plan-20260827`、`plan-20260901`、`plan-20260910`、`plan-20260917`、`plan-20260920`。
 
 Issue 计划：`issues/477`（31 卡，v0.22.49）、`issues/486`（AB-01，v0.22.31）。各自完成判据见对应计划文件。
