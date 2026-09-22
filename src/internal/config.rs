@@ -2740,6 +2740,9 @@ pub fn is_vault_internal_key(key: &str) -> bool {
         || lower == "vault.unsealkey"
         || lower == "vault.roottoken"
         || lower == "vault.roottoken_enc"
+        // Imported GPG secret key (plan-20260921 ADR-VG-02): must be redacted
+        // on every read path and can never be revealed.
+        || lower == "vault.gpg.seckey_enc"
         // `libra auth` token records: unset via config would be an unaudited
         // logout outside the owner API.
         || lower.starts_with("auth.token.")

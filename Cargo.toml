@@ -122,6 +122,10 @@ pulldown-cmark = "0.13.3"
 unicode-width = "0.2.2"
 libvault = { version = "0.4.0", features = ["storage_sqlite"] }
 base64 = "0.22.1"
+# Imported GPG key deprotection/rebuild/sign/verify (plan-20260921 VG-02)
+pgp = "0.19.0"
+rand = "0.8.5"
+rsa = "0.9"
 
 # OTLP telemetry (lore.md 1.7) — optional, compiled only with `--features otlp`;
 # http-proto + blocking reqwest + rustls (no tonic: init/flush run on the
@@ -166,7 +170,6 @@ testcontainers = { version = "0.27.3", features = [
 ] }
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "query", "rustls"] }
 assert_cmd = "2.2.1"
-pgp = "0.19.0"
 gag = "1.0.0"
 portable-pty = "0.9.0"
 # AST-level use-tree/path walking for tests/compat/agent_architecture_guard.rs

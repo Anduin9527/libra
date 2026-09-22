@@ -213,6 +213,17 @@ pub async fn generate_pgp_key(
 ///
 /// `data` is the raw bytes to sign. Returns the hex-encoded detached signature.
 pub async fn pgp_sign(root_dir: &Path, unseal_key: &[u8], data: &[u8]) -> Result<String> {
+    use crate::internal::config::ConfigKv;
+
+    let source = ConfigKv::get("vault.gpg.source")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value);
+    if source.as_deref() == Some("imported") {
+        return sign_with_imported_key(unseal_key, data).await;
+    }
+
     let vault = create_vault(root_dir).await?;
 
     vault
@@ -223,9 +234,10 @@ pub async fn pgp_sign(root_dir: &Path, unseal_key: &[u8], data: &[u8]) -> Result
     let root_token = recover_root_token(unseal_key).await?;
     vault.set_token(&root_token);
 
+    let key_name = generated_key_name().await;
     let data_hex = hex::encode(data);
     let req_data = serde_json::json!({
-        "key_name": PGP_KEY_NAME,
+        "key_name": key_name,
         "data": data_hex,
     });
 
@@ -252,57 +264,94 @@ pub async fn pgp_sign(root_dir: &Path, unseal_key: &[u8], data: &[u8]) -> Result
     Ok(signature_hex)
 }
 
-/// Verify a hex-encoded PGP `signature` over `data` using the vault PGP key.
-/// Mirrors [`pgp_sign`] but calls the `keys/verify` endpoint and returns whether
-/// the signature is valid.
+/// The versioned generated-key name (`vault.gpg.generated_key_name`), falling
+/// back to the legacy constant `libra-signing` for repositories created before
+/// plan-20260921 VG-14 (reader-side legacy fallback).
+async fn generated_key_name() -> String {
+    use crate::internal::config::ConfigKv;
+    ConfigKv::get("vault.gpg.generated_key_name")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| PGP_KEY_NAME.to_string())
+}
+
+/// Decrypt the imported secret key stored in `vault.gpg.seckey_enc` and sign
+/// the data in-process (ADR-VG-03 §1).
+async fn sign_with_imported_key(unseal_key: &[u8], data: &[u8]) -> Result<String> {
+    use crate::internal::config::ConfigKv;
+
+    let seckey = ConfigKv::get("vault.gpg.seckey_enc")
+        .await
+        .context("failed to read imported secret key")?
+        .ok_or_else(|| anyhow!("no imported GPG secret key (vault.gpg.seckey_enc missing)"))?;
+    let signing_key_id = ConfigKv::get("vault.gpg.signing_key_id")
+        .await
+        .context("failed to read signing key id")?
+        .ok_or_else(|| anyhow!("no signing key id (vault.gpg.signing_key_id missing)"))?
+        .value;
+
+    let ciphertext = hex::decode(&seckey.value).context("failed to decode imported secret key")?;
+    let armored_secret =
+        decrypt_token(unseal_key, &ciphertext).context("failed to decrypt imported secret key")?;
+
+    sign_with_armored_secret_key(&armored_secret, &signing_key_id, data)
+}
+
+/// Public keys eligible for verification, in ADR-VG-03 §2 order:
+/// active `vault.gpg.pubkey` → `vault.gpg.generated_pubkey` → `history.*`
+/// (fingerprint lexicographic). Deduplicated by value.
+async fn verify_pubkey_allowlist() -> Result<Vec<String>> {
+    use crate::internal::config::ConfigKv;
+
+    let mut armors: Vec<String> = Vec::new();
+    let mut push = |value: Option<String>| {
+        if let Some(v) = value
+            && !v.is_empty()
+            && !armors.contains(&v)
+        {
+            armors.push(v);
+        }
+    };
+
+    push(
+        ConfigKv::get("vault.gpg.pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value),
+    );
+    push(
+        ConfigKv::get("vault.gpg.generated_pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value),
+    );
+
+    let mut history = ConfigKv::get_by_prefix("vault.gpg.history.")
+        .await
+        .map_err(|e| anyhow!("failed to read GPG key history: {e}"))?;
+    history.sort_by(|l, r| l.key.cmp(&r.key));
+    for entry in history {
+        push(Some(entry.value));
+    }
+
+    Ok(armors)
+}
+
+/// Verify a hex-encoded PGP `signature` over `data` against the fixed allowlist
+/// (active → generated → history), independent of `vault.gpg.source`.
 pub async fn pgp_verify(
-    root_dir: &Path,
-    unseal_key: &[u8],
+    _root_dir: &Path,
+    _unseal_key: &[u8],
     data: &[u8],
     signature_hex: &str,
 ) -> Result<bool> {
-    let vault = create_vault(root_dir).await?;
-
-    vault
-        .unseal(&[unseal_key])
-        .await
-        .map_err(|e| anyhow!("vault unseal failed: {e}"))?;
-
-    let root_token = recover_root_token(unseal_key).await?;
-    vault.set_token(&root_token);
-
-    let req_data = serde_json::json!({
-        "key_name": PGP_KEY_NAME,
-        "data": hex::encode(data),
-        "signature": signature_hex,
-    });
-
-    let resp = vault
-        .write(
-            Some(root_token),
-            format!("{PKI_MOUNT_PATH}/keys/verify"),
-            req_data.as_object().cloned(),
-        )
-        .await
-        .map_err(|e| anyhow!("vault pgp verify failed: {e}"))?;
-
-    // The PGP verify path returns `{valid: bool}`; the generic key path returns
-    // `{result: bool}`. Accept either.
-    let valid = resp
-        .and_then(|r| r.data)
-        .and_then(|d| {
-            d.get("valid")
-                .or_else(|| d.get("result"))
-                .and_then(|v| v.as_bool())
-        })
-        .ok_or_else(|| anyhow!("no verification result in vault verify response"))?;
-
-    vault
-        .seal()
-        .await
-        .map_err(|e| anyhow!("vault seal failed: {e}"))?;
-
-    Ok(valid)
+    let pubkeys = verify_pubkey_allowlist().await?;
+    Ok(verify_signature_hex(signature_hex, data, &pubkeys))
 }
 
 /// Decode an ASCII-armored PGP signature block back into the hex-encoded
@@ -950,6 +999,718 @@ async fn remove_unseal_key_from_home() -> Result<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// plan-20260921: imported GPG key discovery, deprotection, sign and verify
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A signing candidate discovered from `gpg --with-colons --list-secret-keys`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpgCandidate {
+    pub fingerprint: String,
+    pub key_id: String,
+    pub uid: String,
+    pub algorithm_bits: String,
+    pub capabilities: String,
+}
+
+/// Parse `gpg --with-colons --list-secret-keys` output into candidates.
+///
+/// Colon record kinds consumed: `sec` (primary secret key), `ssb` (secret
+/// subkey), `fpr` (fingerprint), `uid` (user id). Only keys with a secret part
+/// (`sec`) are enumerated; a subkey carries capability letters in field 12
+/// (`e` encrypt, `s` sign, `c` certify, `a` authenticate). A candidate is
+/// reported once per primary key.
+///
+/// The unit test feeds this the fixed sample produced by `tests/data/fake-gpg`.
+pub fn parse_gpg_colon_list(input: &str) -> Vec<GpgCandidate> {
+    // field indices (0-based) for the colon-delimited record:
+    // 0 type, 1 validity, 2 key length, 3 public key algo, 4 key id,
+    // 9 user id, 11 capabilities, 12 capabilities (computed trust/caps)
+    let mut candidates: Vec<GpgCandidate> = Vec::new();
+
+    for line in input.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 2 || fields[0].is_empty() {
+            continue;
+        }
+        match fields[0] {
+            "sec" => {
+                let key_id = fields.get(4).copied().unwrap_or_default().to_string();
+                candidates.push(GpgCandidate {
+                    fingerprint: String::new(),
+                    key_id,
+                    uid: String::new(),
+                    algorithm_bits: format_gpg_algo_bits(
+                        fields.get(2).copied().unwrap_or_default(),
+                        fields.get(3).copied().unwrap_or_default(),
+                    ),
+                    capabilities: String::new(),
+                });
+            }
+            "fpr" => {
+                if let Some(last) = candidates.last_mut()
+                    && last.fingerprint.is_empty()
+                {
+                    last.fingerprint = fields.get(9).copied().unwrap_or_default().to_string();
+                }
+            }
+            "uid" => {
+                if let Some(last) = candidates.last_mut()
+                    && last.uid.is_empty()
+                {
+                    last.uid = unescape_gpg_colon(fields.get(9).copied().unwrap_or_default());
+                }
+            }
+            "ssb" | "sub" => {
+                if let Some(last) = candidates.last_mut() {
+                    let caps = fields
+                        .get(11)
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| fields.get(12).filter(|v| !v.is_empty()))
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string();
+                    last.capabilities = caps;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates
+}
+
+fn format_gpg_algo_bits(length: &str, algo: &str) -> String {
+    let algo = match algo {
+        "1" => "RSA",
+        "17" => "DSA",
+        "18" => "ECC",
+        "19" => "ECDSA",
+        "22" => "Ed25519",
+        "20" | "16" => "ELG",
+        other => other,
+    };
+    if length.is_empty() || length == "0" {
+        algo.to_string()
+    } else {
+        format!("{algo} {length}")
+    }
+}
+
+fn unescape_gpg_colon(value: &str) -> String {
+    value.replace("\\x3a", ":")
+}
+
+/// Parse the version out of a `gpg --version` first line.
+///
+/// The first line looks like `gpg (GnuPG) 2.4.9` or `gpg (GnuPG) 2.2.27`.
+/// Returns `None` when the version cannot be parsed.
+pub fn parse_gpg_version(first_line: &str) -> Option<(u32, u32)> {
+    // find the first version-like token `X.Y.Z`
+    for token in first_line.split_whitespace() {
+        let token = token.trim_end_matches('.');
+        if let Some((major, rest)) = token.split_once('.')
+            && major.chars().all(|c| c.is_ascii_digit())
+            && !major.is_empty()
+        {
+            let minor = rest.split('.').next().unwrap_or("0");
+            if let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) {
+                return Some((major, minor));
+            }
+        }
+    }
+    None
+}
+
+/// True when the parsed version is at least `min_major.min_minor`.
+pub fn gpg_version_at_least(version: Option<(u32, u32)>, min_major: u32, min_minor: u32) -> bool {
+    match version {
+        Some((major, minor)) => major > min_major || (major == min_major && minor >= min_minor),
+        None => false,
+    }
+}
+
+/// Run `gpg --with-colons --list-secret-keys` and return the raw colon output
+/// plus the first line of `gpg --version`. Reads the user's GnuPG home only
+/// (read-only); never modifies it.
+pub async fn discover_gpg_secret_keys(
+    gpg_program: &str,
+    gnupghome: Option<&std::path::Path>,
+) -> Result<(Option<(u32, u32)>, Vec<GpgCandidate>)> {
+    use std::process::Stdio;
+
+    let version_output = tokio::process::Command::new(gpg_program)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| anyhow!("failed to run '{gpg_program} --version': {e}"))?;
+    let version_first_line = String::from_utf8_lossy(&version_output.stdout)
+        .lines()
+        .next()
+        .map(str::to_string);
+    let version = version_first_line.as_deref().and_then(parse_gpg_version);
+
+    let mut cmd = tokio::process::Command::new(gpg_program);
+    cmd.arg("--with-colons")
+        .arg("--list-secret-keys")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(home) = gnupghome {
+        cmd.env("GNUPGHOME", home);
+    }
+    let output = cmd.output().await.map_err(|e| {
+        anyhow!("failed to run '{gpg_program} --with-colons --list-secret-keys': {e}")
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("gpg --list-secret-keys failed: {}", stderr.trim()));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok((version, parse_gpg_colon_list(&raw)))
+}
+
+/// Export the armored secret key for `fingerprint` from the GnuPG home via
+/// `gpg --batch --armor --export-secret-keys <fingerprint>`.
+pub async fn export_gpg_secret_key(
+    gpg_program: &str,
+    gnupghome: Option<&std::path::Path>,
+    fingerprint: &str,
+) -> Result<String> {
+    use std::process::Stdio;
+
+    let mut cmd = tokio::process::Command::new(gpg_program);
+    cmd.arg("--batch")
+        .arg("--armor")
+        .arg("--export-secret-keys")
+        .arg(fingerprint)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(home) = gnupghome {
+        cmd.env("GNUPGHOME", home);
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| anyhow!("failed to run '{gpg_program} --export-secret-keys': {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "gpg --export-secret-keys failed for '{fingerprint}': {}",
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Select a single signing candidate using ADR-VG-01's protocol:
+/// 1. More than one candidate requires an explicit `--key` (fingerprint or
+///    long/short key id).
+/// 2. Exactly one candidate may omit `--key`.
+/// 3. Zero candidates, or an unrecognised/multi-matching selector, is an error.
+///
+/// Returns the index of the selected candidate. On error the returned message
+/// lists candidate fingerprints for the caller to surface.
+pub fn select_signing_candidate(
+    candidates: &[GpgCandidate],
+    key: Option<&str>,
+) -> Result<usize, String> {
+    if candidates.is_empty() {
+        return Err("no secret keys with signing capability found in GnuPG home".to_string());
+    }
+
+    let list = |_| {
+        candidates
+            .iter()
+            .map(|c| c.fingerprint.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    match key {
+        None => {
+            if candidates.len() == 1 {
+                Ok(0)
+            } else {
+                Err(format!(
+                    "multiple secret keys found; specify one with --key:\n{}",
+                    list(())
+                ))
+            }
+        }
+        Some(selector) => {
+            let sel = selector.trim();
+            let matches: Vec<usize> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.fingerprint.eq_ignore_ascii_case(sel)
+                        || c.key_id.eq_ignore_ascii_case(sel)
+                        || (!c.uid.is_empty()
+                            && c.uid
+                                .to_ascii_lowercase()
+                                .contains(&sel.to_ascii_lowercase()))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            match matches.len() {
+                0 => Err(format!(
+                    "no secret key matching '{selector}' found; candidates:\n{}",
+                    list(())
+                )),
+                1 => Ok(matches[0]),
+                _ => Err(format!(
+                    "selector '{selector}' is ambiguous (matches {} keys); use --key <fingerprint>:\n{}",
+                    matches.len(),
+                    list(())
+                )),
+            }
+        }
+    }
+}
+
+/// Rebuild a password-protected ASCII-armored transferable secret key into an
+/// unprotected one (ADR-VG-10). On wrong passphrase this returns `Err` before
+/// any output is produced, so the caller can guarantee zero-write.
+pub fn rebuild_unprotected_certificate(armor: &str, passphrase: &str) -> Result<String> {
+    use pgp::{
+        composed::{ArmorOptions, Deserializable, SignedSecretKey},
+        types::Password,
+    };
+
+    let (mut skey, _headers) = SignedSecretKey::from_armor_single(armor.as_bytes())
+        .context("failed to parse armored secret key")?;
+
+    let pw = Password::from(passphrase);
+    skey.primary_key
+        .remove_password(&pw)
+        .context("failed to unlock secret key — wrong passphrase or corrupt key")?;
+    for sub in skey.secret_subkeys.iter_mut() {
+        sub.key
+            .remove_password(&pw)
+            .context("failed to unlock signing subkey — wrong passphrase or corrupt key")?;
+    }
+
+    skey.to_armored_string(ArmorOptions::default())
+        .context("failed to serialize unprotected secret key")
+}
+
+/// Parse an armored secret or public key block and return its primary-key
+/// fingerprint as an uppercase hex string (with subkey material ignored).
+pub fn key_fingerprint_from_armor(armor: &str) -> Result<String> {
+    use pgp::{
+        composed::{Deserializable, SignedPublicKey},
+        types::KeyDetails,
+    };
+
+    if let Ok((key, _)) = SignedPublicKey::from_armor_single(armor.as_bytes()) {
+        return Ok(format!("{:X}", key.primary_key.fingerprint()));
+    }
+
+    use pgp::composed::SignedSecretKey;
+    let (key, _) = SignedSecretKey::from_armor_single(armor.as_bytes())
+        .context("failed to parse armored key")?;
+    Ok(format!("{:X}", key.primary_key.fingerprint()))
+}
+
+/// Extract the primary user id from an armored secret key, if one exists.
+pub fn primary_uid_from_armor(armor: &str) -> String {
+    use pgp::composed::{Deserializable, SignedSecretKey};
+
+    let Ok((key, _)) = SignedSecretKey::from_armor_single(armor.as_bytes()) else {
+        return String::new();
+    };
+    key.details
+        .users
+        .first()
+        .map(|u| String::from_utf8_lossy(u.id.id()).into_owned())
+        .unwrap_or_default()
+}
+
+/// Describe the real algorithm/bits of an armored public key (VG-06), so the
+/// list surface is not stuck on a hard-coded `PGP 2048`.
+pub fn describe_public_key(armor: &str) -> Result<String> {
+    use pgp::{
+        composed::{Deserializable, SignedPublicKey},
+        crypto::public_key::PublicKeyAlgorithm,
+        types::{KeyDetails, PublicParams},
+    };
+    use rsa::traits::PublicKeyParts;
+
+    let (key, _) = SignedPublicKey::from_armor_single(armor.as_bytes())
+        .context("failed to parse public key")?;
+    let alg = key.primary_key.algorithm();
+    let name = match alg {
+        PublicKeyAlgorithm::RSA | PublicKeyAlgorithm::RSAEncrypt | PublicKeyAlgorithm::RSASign => {
+            "RSA"
+        }
+        PublicKeyAlgorithm::EdDSALegacy | PublicKeyAlgorithm::Ed25519 => "Ed25519",
+        PublicKeyAlgorithm::ECDSA => "ECDSA",
+        PublicKeyAlgorithm::ECDH => "ECDH",
+        PublicKeyAlgorithm::DSA => "DSA",
+        PublicKeyAlgorithm::Ed448 => "Ed448",
+        PublicKeyAlgorithm::X25519 => "X25519",
+        PublicKeyAlgorithm::X448 => "X448",
+        other => return Ok(format!("{other:?}")),
+    };
+    let bits = match key.primary_key.public_params() {
+        PublicParams::RSA(rsa) => Some(rsa.key.n().bits()),
+        _ => None,
+    };
+    Ok(match bits {
+        Some(bits) => format!("{name} {bits}"),
+        None => name.to_string(),
+    })
+}
+
+/// Material extracted from an imported secret key during `import-gpg-key`.
+#[derive(Debug, Clone)]
+pub struct ImportedKeyMaterial {
+    pub fingerprint: String,
+    pub signing_key_id: String,
+    pub uid: String,
+    pub rebuilt_armor: String,
+    pub pubkey_armor: String,
+}
+
+fn algorithm_can_sign(alg: pgp::crypto::public_key::PublicKeyAlgorithm) -> bool {
+    use pgp::crypto::public_key::PublicKeyAlgorithm::*;
+    matches!(
+        alg,
+        RSA | RSASign | DSA | ECDSA | EdDSALegacy | Ed25519 | Ed448
+    )
+}
+
+/// Parse a (possibly protected) armored secret key, validate the passphrase,
+/// rebuild an unprotected transferable certificate, and select the signing
+/// (sub)key (ADR-VG-09 / ADR-VG-10).
+///
+/// Selection: prefer the newest secret signing subkey with a SubkeyBinding and
+/// no SubkeyRevocation signature; deterministic by legacy key id on ties. When
+/// no usable signing subkey exists, fall back to the primary key.
+pub fn prepare_imported_key(armor: &str, passphrase: &str) -> Result<ImportedKeyMaterial> {
+    use pgp::{
+        composed::{ArmorOptions, Deserializable, SignedSecretKey},
+        packet::SignatureType,
+        types::{KeyDetails, Password},
+    };
+
+    let (skey, _headers) = SignedSecretKey::from_armor_single(armor.as_bytes())
+        .context("failed to parse armored secret key")?;
+
+    let fingerprint = format!("{:X}", skey.primary_key.fingerprint());
+    let uid = skey
+        .details
+        .users
+        .first()
+        .map(|u| String::from_utf8_lossy(u.id.id()).into_owned())
+        .unwrap_or_default();
+
+    let pw = Password::from(passphrase);
+
+    // Select the newest valid signing subkey (deterministic by key id on tie).
+    let mut candidates: Vec<(String, u32)> = Vec::new();
+    for sub in &skey.secret_subkeys {
+        let has_binding = sub
+            .signatures
+            .iter()
+            .any(|s| s.typ() == Some(SignatureType::SubkeyBinding));
+        let has_revocation = sub
+            .signatures
+            .iter()
+            .any(|s| s.typ() == Some(SignatureType::SubkeyRevocation));
+        if has_binding && !has_revocation && algorithm_can_sign(sub.key.algorithm()) {
+            candidates.push((
+                format!("{}", sub.key.legacy_key_id()),
+                sub.key.created_at().as_secs(),
+            ));
+        }
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let signing_key_id = candidates
+        .first()
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(|| format!("{}", skey.primary_key.legacy_key_id()));
+
+    // Rebuild unprotected certificate (also validates the passphrase).
+    let mut skey = skey;
+    skey.primary_key
+        .remove_password(&pw)
+        .context("failed to unlock secret key — wrong passphrase or corrupt key")?;
+    for sub in skey.secret_subkeys.iter_mut() {
+        sub.key
+            .remove_password(&pw)
+            .context("failed to unlock signing subkey — wrong passphrase or corrupt key")?;
+    }
+    let rebuilt_armor = skey
+        .to_armored_string(ArmorOptions::default())
+        .context("failed to serialize unprotected secret key")?;
+    let pubkey_armor = skey
+        .to_public_key()
+        .to_armored_string(ArmorOptions::default())
+        .context("failed to serialize public key")?;
+
+    Ok(ImportedKeyMaterial {
+        fingerprint,
+        signing_key_id,
+        uid,
+        rebuilt_armor,
+        pubkey_armor,
+    })
+}
+
+/// Sign raw data in-process with an unprotected armored secret key, selecting
+/// the key identified by `signing_key_id` (primary or subkey legacy key id).
+/// Returns the hex-encoded detached signature (existing wire encoding).
+pub fn sign_with_armored_secret_key(
+    armored_secret: &str,
+    signing_key_id: &str,
+    data: &[u8],
+) -> Result<String> {
+    use pgp::{
+        composed::{Deserializable, SignedSecretKey},
+        types::{KeyDetails, Password},
+    };
+
+    let (skey, _) = SignedSecretKey::from_armor_single(armored_secret.as_bytes())
+        .context("failed to parse secret key for signing")?;
+    let pw = Password::empty();
+
+    // Match the selected signing key by legacy key id; default to primary.
+    let sign_result = if skey
+        .primary_key
+        .legacy_key_id()
+        .to_string()
+        .eq_ignore_ascii_case(signing_key_id)
+    {
+        sign_detached(&skey.primary_key, &pw, data)
+    } else {
+        let sub = skey
+            .secret_subkeys
+            .iter()
+            .find(|s| {
+                s.key
+                    .legacy_key_id()
+                    .to_string()
+                    .eq_ignore_ascii_case(signing_key_id)
+            })
+            .ok_or_else(|| {
+                anyhow!("signing key id '{signing_key_id}' not found in imported key")
+            })?;
+        sign_detached(&sub.key, &pw, data)
+    }?;
+
+    Ok(sign_result)
+}
+
+fn sign_detached<K: pgp::types::SigningKey>(
+    key: &K,
+    pw: &pgp::types::Password,
+    data: &[u8],
+) -> Result<String> {
+    use pgp::{
+        composed::{ArmorOptions, DetachedSignature},
+        crypto::hash::HashAlgorithm,
+    };
+
+    let rng = rand::rngs::OsRng;
+    let sig = DetachedSignature::sign_binary_data(rng, key, pw, HashAlgorithm::Sha256, data)
+        .context("failed to produce detached signature")?;
+    // No armor checksum: `armored_to_signature_hex` expects a bare base64 body
+    // matching the legacy wire encoding produced by `signature_to_armored`.
+    let opts = ArmorOptions {
+        headers: None,
+        include_checksum: false,
+    };
+    let armored_sig = sig
+        .to_armored_string(opts)
+        .context("failed to armor signature")?;
+    armored_to_signature_hex(&armored_sig)
+}
+
+fn issuer_matches(issuers: &[&pgp::types::KeyId], key_id: &pgp::types::KeyId) -> bool {
+    issuers.is_empty() || issuers.contains(&key_id)
+}
+
+/// Verify a hex-encoded detached `signature` over `data` against a list of
+/// armored public keys (active → generated → history, in caller order).
+/// Returns `true` when any listed public key verifies the signature.
+/// Parse failures on individual keys are skipped (debug) and never fatal.
+pub fn verify_signature_hex(signature_hex: &str, data: &[u8], pubkey_armors: &[String]) -> bool {
+    use pgp::{
+        composed::{Deserializable, DetachedSignature, SignedPublicKey},
+        types::KeyDetails,
+    };
+
+    let armored = match signature_to_armored(signature_hex) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let parsed = match DetachedSignature::from_armor_single(armored.as_bytes()) {
+        Ok((sig, _)) => sig,
+        Err(_) => return false,
+    };
+    let issuers = parsed.signature.issuer_key_id();
+
+    for armor in pubkey_armors {
+        let Ok((key, _)) = SignedPublicKey::from_armor_single(armor.as_bytes()) else {
+            continue;
+        };
+        let primary_id = key.primary_key.legacy_key_id();
+        if issuer_matches(&issuers, &primary_id) && parsed.verify(&key, data).is_ok() {
+            return true;
+        }
+        for sub in &key.public_subkeys {
+            if issuer_matches(&issuers, &sub.key.legacy_key_id())
+                && parsed.verify(sub, data).is_ok()
+            {
+                return true;
+            }
+        }
+        // Issuer subpacket may be absent; retry the primary key regardless.
+        if issuers.is_empty() {
+            for sub in &key.public_subkeys {
+                if parsed.verify(sub, data).is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Persist an imported (rebuilt unprotected) secret key and its metadata into
+/// the local config (ADR-VG-02/03). `source` is written last; any failure
+/// before that propagates and leaves no `source=imported` marker.
+///
+/// History invariant (ADR-VG-04): when an active public key is about to be
+/// overwritten, its fingerprint is recorded in `vault.gpg.history.<FPR>.pubkey`
+/// first. This function is only called for a *different* fingerprint (duplicate
+/// imports short-circuit in the CLI) so the caller preserves idempotency.
+pub async fn persist_imported_gpg_key(
+    unseal_key: &[u8],
+    material: &ImportedKeyMaterial,
+) -> Result<()> {
+    use crate::internal::config::ConfigKv;
+
+    // VG-13 G1/G2: record the current active key (and a generated snapshot when
+    // needed) before any overwrite.
+    snapshot_active_key_to_history().await?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    let seckey_hex = hex::encode(encrypt_token(
+        unseal_key,
+        material.rebuilt_armor.as_bytes(),
+    )?);
+
+    ConfigKv::set("vault.gpg.pubkey", &material.pubkey_armor, false).await?;
+    ConfigKv::set("vault.gpg.fingerprint", &material.fingerprint, false).await?;
+    ConfigKv::set("vault.gpg.signing_key_id", &material.signing_key_id, false).await?;
+    ConfigKv::set("vault.gpg.uid", &material.uid, false).await?;
+    ConfigKv::set("vault.gpg.imported_at", &now, false).await?;
+    ConfigKv::set("vault.gpg.seckey_enc", &seckey_hex, true).await?;
+    // source last: presence of `imported` is the commit point.
+    ConfigKv::set("vault.gpg.source", "imported", false).await?;
+
+    // ADR-VG-12: first import with `vault.signing` unset enables signing; an
+    // explicit `false` stays off (the caller prints the hint).
+    let signing = ConfigKv::get("vault.signing")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value);
+    if signing.is_none() {
+        ConfigKv::set("vault.signing", "true", false).await?;
+    }
+
+    Ok(())
+}
+
+/// Record the currently-active public key into `history.<FPR>.pubkey` (idempotent
+/// by fingerprint). When `source == generated` and no `vault.gpg.generated_pubkey`
+/// snapshot exists yet, snapshot it first (ADR-VG-04 §4 / VG-13 G2).
+async fn snapshot_active_key_to_history() -> Result<()> {
+    use crate::internal::config::ConfigKv;
+
+    let active = match ConfigKv::get("vault.gpg.pubkey").await.ok().flatten() {
+        Some(e) if !e.value.is_empty() => e.value,
+        _ => return Ok(()),
+    };
+
+    let source = ConfigKv::get("vault.gpg.source")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value);
+    if source.as_deref() == Some("generated") {
+        let snapshot = ConfigKv::get("vault.gpg.generated_pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        if snapshot.is_none() {
+            ConfigKv::set("vault.gpg.generated_pubkey", &active, false).await?;
+        }
+    }
+
+    let fp = key_fingerprint_from_armor(&active).unwrap_or_else(|_| String::new());
+    if fp.is_empty() {
+        return Ok(());
+    }
+    let key = format!("vault.gpg.history.{fp}.pubkey");
+    if ConfigKv::get(&key).await?.is_none() {
+        ConfigKv::set(&key, &active, false).await?;
+    }
+    Ok(())
+}
+
+/// The `source` value for the active GPG key (`generated`/`imported`/empty).
+pub async fn gpg_source() -> Option<String> {
+    use crate::internal::config::ConfigKv;
+    ConfigKv::get("vault.gpg.source")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+}
+
+/// Remove an active imported GPG key and fall back to the generated key
+/// (ADR-VG-06 §3/4). Deletes only the allowlist keys; `history.*`,
+/// `generated_pubkey` and `generated_key_name` are never touched.
+pub async fn remove_imported_gpg_key() -> Result<()> {
+    use crate::internal::config::ConfigKv;
+
+    snapshot_active_key_to_history().await?;
+
+    for key in [
+        "vault.gpg.seckey_enc",
+        "vault.gpg.fingerprint",
+        "vault.gpg.signing_key_id",
+        "vault.gpg.uid",
+        "vault.gpg.imported_at",
+    ] {
+        ConfigKv::unset(key).await?;
+    }
+
+    let generated = ConfigKv::get("vault.gpg.generated_pubkey")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value);
+    match generated.filter(|g| !g.is_empty()) {
+        Some(g) => ConfigKv::set("vault.gpg.pubkey", &g, false).await?,
+        None => {
+            let _ = ConfigKv::unset("vault.gpg.pubkey").await;
+        }
+    }
+    ConfigKv::set("vault.gpg.source", "generated", false).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -959,6 +1720,171 @@ mod tests {
         config::ConfigKv,
         db::{create_database, reset_db_conn_instance_for_path},
     };
+
+    /// plan-20260921: imported GPG key discovery, selection, desprotection and
+    /// sign/verify round-trips. Fixtures in `tests/data/fake-gpg/` are fixed
+    /// (protected secret key passphrase `libra-test-fixture-passphrase`).
+    mod gpg_import {
+        use super::super::*;
+
+        const SECRET: &str = "tests/data/fake-gpg/protected-secret.asc";
+        const PUBLIC: &str = "tests/data/fake-gpg/pubkey.asc";
+        const PASSPHRASE: &str = "libra-test-fixture-passphrase";
+
+        #[test]
+        fn gpg_colon_list_parses_fingerprint_uid_and_capabilities() {
+            let sample = concat!(
+                "sec:u:25519:22:4FB6368B886D5973:1790096777::u:::cEsSC::::::22::",
+                ":::::::",
+                "\n",
+                "fpr:::::::::6362FF0BA5456A8E9C7DD8C04FB6368B886D5973:\n",
+                "uid:u::::1790096777::1234::libra-test-fixture <fixture@libra.invalid>:::::::::my::",
+                "\n",
+                "ssb:u:25519:22:237B8B4AF7B4A7EF:1790096777::::::s::::::22::::::",
+                "\n",
+                "fpr:::::::::237B8B4AF7B4A7EF:1790096777:::::::\n",
+            );
+            let candidates = parse_gpg_colon_list(sample);
+            assert_eq!(candidates.len(), 1);
+            let c = &candidates[0];
+            assert_eq!(c.fingerprint, "6362FF0BA5456A8E9C7DD8C04FB6368B886D5973");
+            assert_eq!(c.key_id, "4FB6368B886D5973");
+            assert!(c.uid.contains("libra-test-fixture"));
+            assert_eq!(c.algorithm_bits, "Ed25519 25519");
+            assert_eq!(c.capabilities, "s");
+        }
+
+        #[test]
+        fn gpg_version_gate_rejects_old_or_unparsable_version() {
+            assert!(gpg_version_at_least(
+                parse_gpg_version("gpg (GnuPG) 2.4.9"),
+                2,
+                2
+            ));
+            assert!(gpg_version_at_least(
+                parse_gpg_version("gpg (GnuPG) 2.2.0"),
+                2,
+                2
+            ));
+            assert!(!gpg_version_at_least(
+                parse_gpg_version("gpg (GnuPG) 2.1.22"),
+                2,
+                2
+            ));
+            assert!(!gpg_version_at_least(
+                parse_gpg_version("gpg (GnuPG) 1.4.20"),
+                2,
+                2
+            ));
+            assert!(!gpg_version_at_least(
+                parse_gpg_version("gpg (GnuPG)"),
+                2,
+                2
+            ));
+        }
+
+        #[test]
+        fn gpg_selector_requires_explicit_key_when_multiple_candidates() {
+            let candidates = vec![
+                GpgCandidate {
+                    fingerprint: "AA".into(),
+                    key_id: "1".into(),
+                    uid: "a".into(),
+                    algorithm_bits: "Ed25519".into(),
+                    capabilities: "s".into(),
+                },
+                GpgCandidate {
+                    fingerprint: "BB".into(),
+                    key_id: "2".into(),
+                    uid: "b".into(),
+                    algorithm_bits: "Ed25519".into(),
+                    capabilities: "s".into(),
+                },
+            ];
+            assert!(select_signing_candidate(&candidates, None).is_err());
+            assert!(select_signing_candidate(&candidates, Some("AA")).is_ok());
+        }
+
+        #[test]
+        fn gpg_selector_auto_selects_single_signing_candidate() {
+            let candidates = vec![GpgCandidate {
+                fingerprint: "AA".into(),
+                key_id: "1".into(),
+                uid: "a".into(),
+                algorithm_bits: "Ed25519".into(),
+                capabilities: "s".into(),
+            }];
+            assert_eq!(select_signing_candidate(&candidates, None), Ok(0));
+        }
+
+        #[test]
+        fn gpg_selector_rejects_no_candidate_and_ambiguous_email() {
+            assert!(select_signing_candidate(&[], None).is_err());
+            let dup = vec![
+                GpgCandidate {
+                    fingerprint: "AA".into(),
+                    key_id: "1".into(),
+                    uid: "shared".into(),
+                    algorithm_bits: "Ed25519".into(),
+                    capabilities: "s".into(),
+                },
+                GpgCandidate {
+                    fingerprint: "BB".into(),
+                    key_id: "2".into(),
+                    uid: "shared x".into(),
+                    algorithm_bits: "Ed25519".into(),
+                    capabilities: "s".into(),
+                },
+            ];
+            assert!(select_signing_candidate(&dup, Some("shared")).is_err());
+        }
+
+        #[test]
+        fn rebuilt_certificate_is_unprotected_and_fingerprint_stable() {
+            let secret = std::fs::read_to_string(SECRET).unwrap();
+            let before = key_fingerprint_from_armor(&secret).unwrap();
+            let material = prepare_imported_key(&secret, PASSPHRASE).unwrap();
+            let after = key_fingerprint_from_armor(&material.rebuilt_armor).unwrap();
+            assert_eq!(before, after);
+            // Rebuilt certificate signs without any passphrase using the selected key.
+            let sig = sign_with_armored_secret_key(
+                &material.rebuilt_armor,
+                &material.signing_key_id,
+                b"payload",
+            )
+            .unwrap();
+            let public = std::fs::read_to_string(PUBLIC).unwrap();
+            assert!(verify_signature_hex(&sig, b"payload", &[public]));
+        }
+
+        #[test]
+        fn rebuilt_certificate_can_sign_roundtrip() {
+            let secret = std::fs::read_to_string(SECRET).unwrap();
+            let material = prepare_imported_key(&secret, PASSPHRASE).unwrap();
+            let sig = sign_with_armored_secret_key(
+                &material.rebuilt_armor,
+                &material.signing_key_id,
+                b"roundtrip data",
+            )
+            .unwrap();
+            assert!(verify_signature_hex(
+                &sig,
+                b"roundtrip data",
+                std::slice::from_ref(&material.pubkey_armor)
+            ));
+            assert!(!verify_signature_hex(
+                &sig,
+                b"different data",
+                &[material.pubkey_armor]
+            ));
+        }
+
+        #[test]
+        fn wrong_passphrase_fails_before_rebuild() {
+            let secret = std::fs::read_to_string(SECRET).unwrap();
+            assert!(rebuild_unprotected_certificate(&secret, "wrong-passphrase").is_err());
+        }
+    }
 
     /// plan-20260919 GCX-03: the global key resolution and its one-time move
     /// out of the legacy Libra home. `LIBRA_TEST_HOME` redirects both layouts,
