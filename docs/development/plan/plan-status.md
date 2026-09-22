@@ -27,7 +27,7 @@
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS，尚未开工 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 未启动 | FL-00..FL-07 全部 `pending`；前置 plan-20260907 未收口 |
-| [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | 进行中 | MB-01..MB-05 `done/complete`（v0.23.37 / v0.23.39 / v0.23.40 / v0.23.41 / v0.23.42，D 门全绿）；MB-07 `done/complete`（v0.23.43，D 门全绿）；MB-08 `done/complete`（v0.23.44，D 门全绿）；MB-10 `done/complete`（v0.23.45，D 门全绿）；MB-11 `in-progress`（v0.23.46 已 bump；A/B 组绿：lib 12、tag 8、mkdir/mutate/cli 回归、guard/docs、anchors 25、零命中、fmt/clippy；backend `cf` docs 已推送 7e4389f；待全量 nextest + push/release/D 门）；MB-06/09/12 已取消（`done`） |
+| [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | **已收口** | MB-01..MB-05、MB-07/08、MB-10/11 全部 `done/complete`（v0.23.37/.39/.40/.41/.42/.43/.44/.45/.46，各卡 ER-14 全量绿、D-MB-STD 远端 evidence 绿）；MB-06/09/12 墓碑 `done`（无对应子命令）；EX-MB-01/02（G-03）与 EX-MB-03（ER-07 签名）已登记；使用者 2026-09-21 双评审豁免已登记；完成判据全数勾选 |
 | [`plan-20260911.md`](plan-20260911.md) | B（pi capture / hook boundary） | 未启动 | PI-01..06 全部 `pending`；Claude Code 429 未给出 verdict，**禁止开工** |
 | [`plan-20260910.md`](plan-20260910.md) | 横切（数据库迁移作用域） | **已收口** | MIG-00..MIG-06、MIG-R01..R03 全部 `done/complete` |
 | [`plan-20260907.md`](plan-20260907.md) | 横切（BLAKE3 object format） | 未启动 | B3-00..B3-17 全部 `pending` |
