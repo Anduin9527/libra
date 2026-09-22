@@ -16,6 +16,9 @@ libra config import [--global]
 libra config path [--global | --system]
 libra config generate-ssh-key --remote <name>
 libra config generate-gpg-key [--name <name>] [--email <email>] [--usage <usage>]
+libra config import-gpg-key [--list] [--key <fpr>] [--file <path>] [--passphrase-file <path>] [--replace]
+libra config export-gpg-key [--fingerprint] [--out <path>]
+libra config remove-gpg-key [--force]
 ```
 
 也支持 Git 兼容的标志风格（从帮助中隐藏）：
@@ -382,6 +385,47 @@ libra config generate-gpg-key --name "Jane Doe" --email "jane@example.com" --usa
 libra config get vault.gpg.pubkey
 ```
 
+#### `import-gpg-key`
+
+从本机 GnuPG home 或 armored 文件导入现有 OpenPGP 签名密钥，并使用该身份进行 commit/tag/merge 签名。
+
+| 标志 | 说明 |
+|------|------|
+| `--list` | 列出 GnuPG home 中可发现的私钥后退出（零写入） |
+| `--key <fpr>` | 通过指纹/key id 选择要导入的 key（存在多个候选时必填） |
+| `--file <path>` | 从 armored 文件导入私钥，而不是 GnuPG home |
+| `--passphrase-file <path>` | 从文件读取 key 口令（非交互下受保护 key 必填） |
+| `--replace` | 替换活动 key，先将当前公钥归档到历史 |
+
+```bash
+libra config import-gpg-key --list
+libra config import-gpg-key --key ABCDEF...
+libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
+```
+
+#### `export-gpg-key`
+
+导出活动 GPG 公钥。永远不会导出私钥。
+
+| 标志 | 说明 |
+|------|------|
+| `--fingerprint` | 仅打印主指纹 |
+| `--out <path>` | 原子写入 armored 公钥到文件，而不是 stdout |
+
+```bash
+libra config export-gpg-key            # armored 公钥到 stdout
+libra config export-gpg-key --fingerprint
+libra config export-gpg-key --out pubkey.asc
+```
+
+#### `remove-gpg-key`
+
+移除活动导入的 GPG key 并回退到生成的 key（绝不删除历史或生成 key 元数据）。
+
+```bash
+libra config remove-gpg-key --force
+```
+
 ### Scope 标志
 
 这些标志是全局的（适用于任意子命令）：
@@ -539,6 +583,20 @@ libra config generate-gpg-key --usage encrypt
 libra config get vault.gpg.pubkey
 libra config list --gpg-keys
 ```
+
+支持的 `--usage` 值为 `signing` 与 `encrypt`。
+
+现有 OpenPGP 密钥可以从 GnuPG home 或 armored 文件导入：
+
+```bash
+libra config import-gpg-key --list
+libra config import-gpg-key --key ABCDEF...
+libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
+libra config export-gpg-key --fingerprint
+libra config remove-gpg-key --force
+```
+
+导入的私钥加密存储（`vault.gpg.seckey_enc`）并在所有读取路径上脱敏；`config get --reveal` 会拒绝它。签名使用 `vault.gpg.signing_key_id` 记录的 key，验证使用「活动、生成、历史」公钥的固定允许列表。
 
 支持的 `--usage` 值是 `signing` 和 `encrypt`。
 

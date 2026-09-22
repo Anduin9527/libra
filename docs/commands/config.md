@@ -18,6 +18,9 @@ libra config path [--global | --system]
 libra config doctor --global-schema
 libra config generate-ssh-key --remote <name>
 libra config generate-gpg-key [--name <name>] [--email <email>] [--usage <usage>]
+libra config import-gpg-key [--list] [--key <fpr>] [--file <path>] [--passphrase-file <path>] [--replace]
+libra config export-gpg-key [--fingerprint] [--out <path>]
+libra config remove-gpg-key [--force]
 ```
 
 Git-compatible flag style is also supported (hidden from help):
@@ -465,6 +468,47 @@ libra config generate-gpg-key --name "Jane Doe" --email "jane@example.com" --usa
 libra config get vault.gpg.pubkey
 ```
 
+#### `import-gpg-key`
+
+Import an existing OpenPGP signing key from the local GnuPG home or an armored file, enabling commit/tag/merge signing with that identity.
+
+| Flag | Description |
+|------|-------------|
+| `--list` | List discoverable secret keys from the GnuPG home and exit (no writes) |
+| `--key <fpr>` | Select the key to import by fingerprint/key id (required when multiple candidates) |
+| `--file <path>` | Import a secret key from an armored file instead of the GnuPG home |
+| `--passphrase-file <path>` | Read the key passphrase from a file (required for protected keys in non-interactive use) |
+| `--replace` | Replace the active key, archiving the current public key into history first |
+
+```bash
+libra config import-gpg-key --list
+libra config import-gpg-key --key ABCDEF...
+libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
+```
+
+#### `export-gpg-key`
+
+Export the active GPG public key. Secrets are never exported.
+
+| Flag | Description |
+|------|-------------|
+| `--fingerprint` | Print only the primary fingerprint |
+| `--out <path>` | Write the armored public key to a file atomically instead of stdout |
+
+```bash
+libra config export-gpg-key            # armored public key to stdout
+libra config export-gpg-key --fingerprint
+libra config export-gpg-key --out pubkey.asc
+```
+
+#### `remove-gpg-key`
+
+Remove the active imported GPG key and fall back to the generated key (never deletes history or generated-key metadata).
+
+```bash
+libra config remove-gpg-key --force
+```
+
 ### Scope Flags
 
 These flags are global (apply to any subcommand):
@@ -625,6 +669,18 @@ libra config list --gpg-keys
 ```
 
 Supported `--usage` values are `signing` and `encrypt`.
+
+Existing OpenPGP keys can be imported from the GnuPG home or an armored file:
+
+```bash
+libra config import-gpg-key --list
+libra config import-gpg-key --key ABCDEF...
+libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
+libra config export-gpg-key --fingerprint
+libra config remove-gpg-key --force
+```
+
+The imported secret key is persisted encrypted (`vault.gpg.seckey_enc`) and redacted on every read path; `config get --reveal` refuses it. Signing selects the key recorded in `vault.gpg.signing_key_id`, verification uses a fixed allowlist of the active, generated, and historical public keys.
 
 ## Scope
 
