@@ -23,6 +23,7 @@ pub mod local_client;
 pub mod mega2_auth; // plan-20260912 MB-04: mega2 write-token resolution (ADR-MB-03)
 pub mod mega2_entry; // plan-20260912 MB-04: bounded POST /api/v1/create-entry directory client
 pub mod mega2_mutate; // plan-20260912 MB-07: bounded delete-entry / move-entry client
+pub mod mega2_tag; // plan-20260912 MB-10: tag_router list/create/get/delete client
 pub mod mega2_tree; // plan-20260912: bounded mega2 /api/v1/tree listing client
 pub mod ssh_client; // to support SSH transport (ssh:// and git@host:path)
 
