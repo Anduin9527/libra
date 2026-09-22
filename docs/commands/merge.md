@@ -374,7 +374,7 @@ Worktree materialization is mode-aware (plan issues/470 FM-02): files are create
 | `--stat` | Show a diffstat of the merge result (the changes between the pre-merge HEAD and the new commit) after the merge completes. Git shows this by default; Libra defaults to no diffstat, so `--stat` opts in. Last-one-wins toggle with `--no-stat`/`-n`. Human output only. |
 | `-n`, `--no-stat` | Do not show a diffstat at the end of the merge (Libra's default). Last-one-wins toggle with `--stat`. |
 | `--no-progress` | Do not show a progress meter. No-op accepted for Git parity: Libra's merge never renders a progress meter. |
-| `--verify-signatures` | Verify the PGP signature on every target tip and abort before mutation if any is unsigned or bad. Overrides `merge.verifySignatures`; only signatures made by this repository's vault PGP key can be validated. |
+| `--verify-signatures` | Verify the PGP signature on every target tip and abort before mutation if any is unsigned or bad. Overrides `merge.verifySignatures`; signatures made by any public key this repository has ever configured (active, generated, or historical) are validated. |
 | `--no-verify-signatures` | Do not verify the merged commit's signature, overriding `merge.verifySignatures=true`. The inverse of `--verify-signatures`; the last one wins. |
 | `--rerere-autoupdate`, `--no-rerere-autoupdate` | Override replay staging for this merge: positive stages a replayed resolution, negative leaves it unstaged; the last supplied flag wins. Omit both to inherit `rerere.autoUpdate`. Rerere identifies a conflict from its normalized hunk sides and only writes a replay after its three-way application is clean. The explicit choice is retained in merge state so a later `merge --continue` preserves it. Both are no-ops while rerere is disabled. |
 | `--signoff` | Append `Signed-off-by: <committer name> <committer email>` after the final merge message. The initial request is retained by merge state for `--continue`; a matching final trailer is not duplicated. There is no `-s` alias because `-s` selects a strategy. |
@@ -550,7 +550,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Unrelated histories | `--allow-unrelated-histories` | Supported | N/A |
 | Merge-message shortlog | `--log[=<n>]` / `--no-log` | Supported | N/A |
 | Other custom strategies/options | Not supported | Supported | N/A |
-| Verify signatures | `--verify-signatures` (vault-key PGP only) | `--verify-signatures` | N/A |
+| Verify signatures | `--verify-signatures` (repository-configured public keys) | `--verify-signatures` | N/A |
 | JSON output | `--json` / `--machine` | Not supported | N/A |
 
 ## Error Handling

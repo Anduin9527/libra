@@ -414,6 +414,10 @@ with the repository vault key and `false` disables signing. `--no-gpg-sign` has
 highest precedence and suppresses either configuration. Git's positive
 `-S`/`--gpg-sign` is not exposed.
 
+When `vault.gpg.source=imported` (set by `libra config import-gpg-key`), commit
+signing uses the imported signing key instead of the generated vault key; removal
+(`libra config remove-gpg-key --force`) falls back to the generated key.
+
 ```bash
 libra commit --no-gpg-sign -m "message"
 ```

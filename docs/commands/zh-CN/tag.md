@@ -173,7 +173,7 @@ Git 的 `--sign` 用 GPG 生成嵌入标签对象的内联 PGP 签名。Libra **
 
 ### --verify
 
-`-v`/`--verify` 验证具名附注标签的 vault PGP 签名。验证走 vault/trust 层，而不是逐标签 GPG 检查，避免了 Git 中 `git tag -v` 因签名者公钥不在本地 keyring 而令人困惑地失败的情况。
+`-v`/`--verify` 验证具名附注标签的 PGP 签名，而非逐标签 GPG 检查。验证使用本仓库曾配置过的公钥允许列表（活动、生成、历史），避免了 Git 中 `git tag -v` 因签名者公钥不在本地 keyring 而令人困惑地失败的情况。
 
 ### 为什么区分轻量标签和附注标签？
 
