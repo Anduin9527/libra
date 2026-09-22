@@ -48,6 +48,8 @@ config_db_fixture_creates_sqlite_only_beneath_its_root	lane:env	mutates config-p
 config_db_fixture_restores_caller_values_after_drop_and_early_return	lane:env	mutates config-path environment through the shared scoped fixture
 config_db_fixture_restores_caller_values_after_panic	lane:env	mutates config-path environment through the shared scoped fixture
 config_scope_uses_isolated_db	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
+config_import_gpg_key_file_mode_end_to_end	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921)
+config_import_gpg_key_wrong_passphrase_writes_nothing	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921)
 content_hash_format_and_recompute	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 d1_batch	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 d1_connection	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
