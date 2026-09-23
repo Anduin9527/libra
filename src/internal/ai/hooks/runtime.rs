@@ -185,8 +185,9 @@ pub struct HookEnvelopeInvalid(pub String);
 /// For [`HookTarget::AiIntent`] the function is exactly the historical
 /// behaviour (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the
 /// function runs the external-Agent capture ingest — stdin parse, validate,
-/// redact, upsert into `agent_session`, and (on `SessionEnd`) write an
-/// E4-libra checkpoint commit on `refs/libra/traces`.
+/// redact, and upsert into `agent_session`. Checkpoint class comes from
+/// `session_capture::decide` and covers `TurnEnd`, `SessionEnd`,
+/// `SubagentStart`, and `SubagentEnd`.
 pub async fn process_hook_event_with_target(
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -747,13 +748,7 @@ async fn ingest_agent_traces_payload_with_scope(
         }
     }
 
-    let new_state = match event.kind {
-        LifecycleEventKind::SessionStart => "active",
-        LifecycleEventKind::SessionEnd => "stopped",
-        LifecycleEventKind::Compaction => "condensed",
-        LifecycleEventKind::CompactionCompleted => "active",
-        _ => "active",
-    };
+    let new_state = super::session_capture::decide(event.kind).session_state;
 
     // UPSERT: insert a fresh row on first sight; otherwise just bump
     // `last_event_at`, `state`, and `redaction_report`. We key by
@@ -925,13 +920,9 @@ async fn ingest_agent_traces_payload_with_scope(
     // redacted transcript blob (now the agent's full on-disk transcript, see
     // the writer); events-blob inclusion remains a follow-up. Per-turn
     // checkpoints give `libra agent checkpoint rewind` turn-level granularity.
-    if matches!(
-        event.kind,
-        LifecycleEventKind::SessionEnd
-            | LifecycleEventKind::TurnEnd
-            | LifecycleEventKind::SubagentStart
-            | LifecycleEventKind::SubagentEnd
-    ) && let Some(repo) = repo_path
+    let checkpoint = super::session_capture::decide(event.kind).checkpoint;
+    if checkpoint != super::session_capture::CheckpointWrite::None
+        && let Some(repo) = repo_path
     {
         // AG-19 owner-race closure: the pre-upsert owner check above is a
         // fast path, but two providers racing on a fresh provider session
@@ -1005,10 +996,7 @@ async fn ingest_agent_traces_payload_with_scope(
         // `doctor` surface nested runs as first-class checkpoints instead of
         // leaving them as bounded `subagent_events` metadata on the main
         // checkpoint. `SessionEnd` / `TurnEnd` keep the `committed` path.
-        if matches!(
-            event.kind,
-            LifecycleEventKind::SubagentStart | LifecycleEventKind::SubagentEnd
-        ) {
+        if checkpoint == super::session_capture::CheckpointWrite::SubagentBoundary {
             write_subagent_checkpoint(
                 conn,
                 repo,
@@ -3375,7 +3363,7 @@ impl SessionPhase {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::Map;
     use serial_test::serial;
 
@@ -3674,7 +3662,7 @@ mod tests {
 
     const LEGACY_BOOTSTRAP_SQL: &str = include_str!("../../../../sql/sqlite_20260309_init.sql");
 
-    async fn ingest_fresh_conn() -> (TempDir, DatabaseConnection) {
+    pub(crate) async fn ingest_fresh_conn() -> (TempDir, DatabaseConnection) {
         let dir = tempfile::tempdir().expect("tempdir");
         // Use the canonical `libra.db` filename here so the Phase 3.5c
         // object_index queue (`enqueue_agent_blob_object_index_update`)
@@ -3715,7 +3703,7 @@ mod tests {
         (dir, conn)
     }
 
-    fn ingest_envelope(
+    pub(crate) fn ingest_envelope(
         hook_event_name: &str,
         session_id: &str,
         extra: serde_json::Value,

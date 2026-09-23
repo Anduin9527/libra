@@ -20,7 +20,7 @@
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
-| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | 已排期 | SCAP-02 → SCAP-01 均 `pending`。前置句已写入 OpenCode、Codex、Claude Code、Pi 计划，并与 B3-00 互斥。实现卡尚未开工 |
+| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | 执行中 | SCAP-02 `in-progress` / `locally-accepted`。SCAP-01 `in-progress`。R9 双 `PASS`。B3-00 仍 `pending`，未与本卡同时开工 |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
@@ -83,7 +83,7 @@
 
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
-| [`plan-20260925.md`](plan-20260925.md) | SCAP-02、SCAP-01 | 同一修订版 Codex 与 Claude 均为字面 `VERDICT: PASS` 且 P0/P1/P2 为 0。SCAP-01 依赖 SCAP-02 的关系表登记 |
+| [`plan-20260925.md`](plan-20260925.md) | SCAP-02、SCAP-01 | R9 对同一修订版 Codex 与 Claude 均为字面 `VERDICT: PASS` 且 P0/P1/P2 为 0。SCAP-02 的登记已在 `fba6cbc`，本卡只核对。SCAP-01 依赖该登记 |
 | [`plan-20260923.md`](plan-20260923.md) | CP-00..20 pending; expand bounded domain cards after inventory if needed | Audit handoff, required review PASS and DEP-CP-01..07; dynamic implementation requires CP-06 done/complete |
 | [`plan-20260904.md`](plan-20260904.md) | CX-00..CX-30（35 卡） | Phase 0：Codex `PASS`；CX-30 受 DEP-CLI-mirror 三态串行约束 |
 | [`plan-20260905.md`](plan-20260905.md) | CC-00..CC-06 | CC-02..06 依赖 plan-20260904 的 RG 卡完成 |
@@ -223,8 +223,9 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `issues/474` → `CL-03` 发布窗口（`v0.23.49`，PR #512）。`compat-network-remotes` 因自托管 runner 掉线失败后已 `--failed` 重跑；其余 base.yml 作业此前已绿。`CL-04`..`CL-08` 已 `locally-accepted`，均未 bump。
-- **下一步（CL-03 D 组落地后）：** 按窗口依次 bump 并发布 `CL-04` → `CL-08`。
+- **当前正在执行：** `plan-20260925` SCAP-01（发布者：本会话执行该卡的 Agent）。远端已发布 `v0.23.54`，本卡版本面是 `0.23.55`。
+- **SCAP-01 与 B3-00：** B3-00 保持 `pending`，不与本卡同时 `in-progress`。
+- **下一步（本卡发布之后）：** `issues/474` 的 `CL-04`..`CL-08` 已 `locally-accepted`，按窗口依次 bump。
 - **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---
@@ -248,7 +249,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260906`](plan-20260906.md) | SC-01 / SC-02（可并发） | SC-01 `base.yml` 最小权限加固；SC-02 会话入口 id 守卫 | 无 | **未定稿**（R2 PASS 已作废；R22 `FAIL`） | SC-04 受 DEP-SC-01/04/05/06；SC-07 受 DEP-SC-07 | ❌ 禁止开工 |
 | [`plan-20260902`](plan-20260902.md) | OG-00 | opencode 1.18.29 Hook/export 契约探测 | 无 | **未取得双 PASS**（Claude 限额，Codex 仍在 FAIL 循环） | 无（Phase 1 与 RG 六卡解耦） | ❌ 禁止开工 |
 | [`plan-20260911`](plan-20260911.md) | PI-01 | Repository-only `agent_kind=pi` migration | 无（DEP-PI-04 已满足：9/10 已收口） | **Claude Code 429 无 verdict，禁止开工** | DEP-PI-01/03 | ❌ 禁止开工 |
-| [`plan-20260925`](plan-20260925.md) | SCAP-02 | 向四份采集计划登记 AgentTraces `decide` 前置与 `runtime.rs` 文件锁，并与 B3-00 互斥 | 无 | 关联段落已由 Codex 与 Claude 分别 `PASS` | 无 | 实现卡仍 `pending`，本表不标记开工 |
+| [`plan-20260925`](plan-20260925.md) | SCAP-01 | AgentTraces ingest 改调 `decide`。发布者是本会话执行该卡的 Agent。B3-00 仍 `pending` | SCAP-02（登记已核对） | R9 双 `PASS` | 与 B3-00 不得同时 `in-progress` | 执行中 |
 | [`issues/470`](issues/470.md) | FM-01 | 共享写入原语与 `restore` 系物化 | 无 | 尚未 Codex review | 关闭依赖 plan-20260918 FM-03/04（DEP-FM-06/07） | ❌ 禁止开工 |
 | [`issues/473`](issues/473.md) | IN-01 / IN-03 / IN-02 | 空模板自引用防护 / 存储路径前置检测 / 换格式 reinit fail-closed | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/474`](issues/474.md) | CL-03 | 其余历史遍历尊重 shallow 边界 | CL-02 | **R6 `PASS`** | 无 | ✅ `locally-accepted`（C 组 `v0.23.49`） |
