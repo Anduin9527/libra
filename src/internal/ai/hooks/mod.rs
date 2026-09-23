@@ -19,6 +19,7 @@
 //! - [`runner`]: spawns hook commands and translates their exit codes into
 //!   [`event::HookAction`].
 //! - [`runtime`]: turns stdin envelopes into recorded session updates.
+//! - `session_capture`: pure AgentTraces state and checkpoint decision.
 //! - `setup`: helper for materialising hook scripts on disk during `libra code`
 //!   bootstrap.
 
@@ -29,6 +30,7 @@ pub mod provider;
 pub mod providers;
 pub mod runner;
 pub mod runtime;
+mod session_capture;
 mod setup;
 
 pub use config::{HookConfig, HookDefinition, load_hook_config};
