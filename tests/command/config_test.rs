@@ -6168,3 +6168,271 @@ fn config_export_gpg_key_out_overwrites_existing() {
     assert!(!written.contains("stale-content"), "{written}");
     assert!(written.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{written}");
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260921 VG-08 G3/G4/G7/G8: the removal surface's declared gates.
+// ---------------------------------------------------------------------------
+
+/// Number of archived `vault.gpg.history.*` rows reported by the config list.
+fn gpg_history_row_count(repo: &std::path::Path) -> usize {
+    let out = run_libra_command(&["config", "list", "--name-only"], repo);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.starts_with("vault.gpg.history."))
+        .count()
+}
+
+#[test]
+fn config_remove_gpg_key_force_restores_generated_pubkey() {
+    let repo = create_committed_repo_via_cli();
+    let generated = run_libra_command(&["config", "get", "vault.gpg.pubkey"], repo.path());
+    assert_eq!(
+        generated.status.code(),
+        Some(0),
+        "a fresh repository has a generated key"
+    );
+    let generated_pubkey = String::from_utf8_lossy(&generated.stdout)
+        .trim()
+        .to_string();
+    assert!(generated_pubkey.contains("BEGIN PGP PUBLIC KEY BLOCK"));
+
+    import_fixture_key(repo.path());
+    let imported = run_libra_command(&["config", "get", "vault.gpg.pubkey"], repo.path());
+    assert_ne!(
+        String::from_utf8_lossy(&imported.stdout).trim(),
+        generated_pubkey,
+        "the import must install a different certificate"
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path()),
+        "remove the imported key",
+    );
+    let restored = run_libra_command(&["config", "get", "vault.gpg.pubkey"], repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&restored.stdout).trim(),
+        generated_pubkey,
+        "removal must restore the generated certificate byte-for-byte"
+    );
+}
+
+#[test]
+fn config_remove_gpg_key_never_deletes_history_snapshot_or_keyname() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let keyname = run_libra_command(
+        &["config", "get", "vault.gpg.generated_key_name"],
+        repo.path(),
+    );
+    let keyname_before = String::from_utf8_lossy(&keyname.stdout).trim().to_string();
+    assert!(
+        !keyname_before.is_empty(),
+        "a fresh repository records a versioned generated key name"
+    );
+    let history_before = gpg_history_row_count(repo.path());
+    assert!(history_before >= 1, "the import archives the replaced key");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path()),
+        "remove the imported key",
+    );
+    let keyname_after = String::from_utf8_lossy(
+        &run_libra_command(
+            &["config", "get", "vault.gpg.generated_key_name"],
+            repo.path(),
+        )
+        .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        keyname_after, keyname_before,
+        "removal must never delete vault.gpg.generated_key_name"
+    );
+    assert!(
+        gpg_history_row_count(repo.path()) >= history_before,
+        "removal must never delete archived history snapshots"
+    );
+}
+
+#[test]
+fn config_remove_gpg_key_history_stays_good() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    assert_cli_success(
+        &run_libra_command(&["config", "commit.gpgSign", "true"], repo.path()),
+        "force vault signing",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["tag", "-s", "-m", "signed before removal", "v1"],
+            repo.path(),
+        ),
+        "sign a tag with the imported key",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "-v", "v1"], repo.path()),
+        "the tag verifies while the key is active",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path()),
+        "remove the imported key",
+    );
+    let after = run_libra_command(&["tag", "-v", "v1"], repo.path());
+    assert_cli_success(
+        &after,
+        "a tag signed before removal must stay verifiable through the archived history",
+    );
+}
+
+#[test]
+fn config_remove_gpg_key_is_idempotent() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path()),
+        "first removal",
+    );
+    let second = run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path());
+    assert_cli_success(&second, "a second removal is a no-op");
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("No imported GPG key to remove"),
+        "the no-op must say so: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let third = run_libra_command(&["config", "remove-gpg-key"], repo.path());
+    assert_cli_success(
+        &third,
+        "without an imported key even a flag-less removal is a no-op",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260921 VG-08 G1/G2/G5/G6: force semantics, history row, generated
+// fallback signing and the fail-closed path without a generated key.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_remove_gpg_key_requires_force_for_active_key() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let refused = run_libra_command(&["config", "remove-gpg-key"], repo.path());
+    assert!(
+        !refused.status.success(),
+        "an active imported key must need --force"
+    );
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("pass --force to remove it"),
+        "the refusal names the flag: {err}"
+    );
+    let fingerprint =
+        run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&fingerprint.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT,
+        "a refused removal keeps the imported key active"
+    );
+    let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&source.stdout).trim(), "imported");
+}
+
+#[test]
+fn config_remove_gpg_key_force_writes_history_row() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path()),
+        "remove the imported key",
+    );
+    let names = run_libra_command(&["config", "list", "--name-only"], repo.path());
+    let listed = String::from_utf8_lossy(&names.stdout).to_lowercase();
+    let archived = format!(
+        "vault.gpg.history.{}.pubkey",
+        GPG_FIXTURE_FINGERPRINT.to_lowercase()
+    );
+    assert!(
+        listed.contains(&archived),
+        "removal must archive the imported certificate, saw: {listed}"
+    );
+}
+
+#[test]
+fn config_remove_gpg_key_force_signs_with_generated_key() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path()),
+        "remove the imported key",
+    );
+    let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&source.stdout).trim(),
+        "generated",
+        "removal falls back to the generated key"
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "commit.gpgSign", "true"], repo.path()),
+        "force vault signing",
+    );
+    std::fs::write(repo.path().join("signed-after-removal.txt"), "after\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "signed-after-removal.txt"], repo.path()),
+        "add signed-after-removal.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "signed by the generated key", "--no-verify"],
+            repo.path(),
+        ),
+        "the generated key must sign after removal",
+    );
+    let raw = run_libra_command_with_stdin(&["cat-file", "--batch"], repo.path(), "HEAD\n");
+    assert_cli_success(&raw, "read the raw commit object");
+    assert!(
+        String::from_utf8_lossy(&raw.stdout).contains("-----BEGIN PGP SIGNATURE-----"),
+        "the commit must carry a vault signature: {}",
+        String::from_utf8_lossy(&raw.stdout)
+    );
+}
+
+#[test]
+fn config_remove_gpg_key_without_generated_key_fails_signing() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "unset", "vault.gpg.generated_pubkey"],
+            repo.path(),
+        ),
+        "drop the generated fallback",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path()),
+        "remove the imported key",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "commit.gpgSign", "true"], repo.path()),
+        "force vault signing",
+    );
+    std::fs::write(repo.path().join("no-fallback.txt"), "x\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "no-fallback.txt"], repo.path()),
+        "add no-fallback.txt",
+    );
+    let commit = run_libra_command(
+        &["commit", "-m", "must fail closed", "--no-verify"],
+        repo.path(),
+    );
+    assert!(
+        !commit.status.success(),
+        "without any signing key the commit must fail closed: {}",
+        String::from_utf8_lossy(&commit.stdout)
+    );
+    let err = String::from_utf8_lossy(&commit.stderr).to_lowercase();
+    assert!(
+        err.contains("gpg") || err.contains("sign") || err.contains("key"),
+        "the failure must point at signing: {err}"
+    );
+}

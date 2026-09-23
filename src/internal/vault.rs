@@ -415,6 +415,30 @@ pub async fn pgp_sign(root_dir: &Path, unseal_key: &[u8], data: &[u8]) -> Result
         return sign_with_imported_key(unseal_key, data).await;
     }
 
+    // plan-20260921 VG-08 G6: a signature the repository cannot verify is
+    // worse than no signature. The generated path signs through the vault by
+    // key name, so it would happily emit a signature whose public half is no
+    // longer published (`vault.gpg.pubkey` and `vault.gpg.generated_pubkey`
+    // both gone) — verification would then fail later, far from the cause.
+    // Fail closed here, with the recovery hint.
+    let published = |value: Option<crate::internal::config::ConfigKvEntry>| {
+        value.is_some_and(|entry| !entry.value.is_empty())
+    };
+    let has_public_half = published(ConfigKv::get("vault.gpg.pubkey").await.ok().flatten())
+        || published(
+            ConfigKv::get("vault.gpg.generated_pubkey")
+                .await
+                .ok()
+                .flatten(),
+        );
+    if !has_public_half {
+        return Err(anyhow!(
+            "no active GPG public key to verify with; signing would be unverifiable — \
+             run `libra config generate-gpg-key` or import one with \
+             `libra config import-gpg-key --file <armored-secret> --replace`"
+        ));
+    }
+
     let vault = create_vault(root_dir).await?;
 
     vault
@@ -3106,6 +3130,8 @@ mod gpg_issuer_gate_tests {
 
 #[cfg(test)]
 mod gpg_allowlist_gate_tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn fixture(name: &str) -> String {
@@ -3179,6 +3205,69 @@ mod gpg_allowlist_gate_tests {
         assert!(
             !rejected,
             "a certificate that is not in the allowlist must not verify"
+        );
+    }
+
+    /// plan-20260921 VG-05 G8 (`malformed_history_key_is_skipped_not_fatal`):
+    /// history entries that do not parse must be skipped, never fatal — a
+    /// malformed row cannot take verification down with it.
+    #[test]
+    fn malformed_history_key_is_skipped_not_fatal() {
+        let secret = fixture("secret-two-signing-subkeys.asc");
+        let material = prepare_imported_key(&secret, "").expect("fixture imports");
+        let data = b"malformed history payload";
+        let sig_hex = sign_with_armored_secret_key(&secret, &material.signing_key_id, data)
+            .expect("detached signature");
+
+        // Malformed rows interleaved with the certificate that really signed.
+        let mut allowlist = vec![
+            "not-a-pgp-block".to_string(),
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\ntruncated".to_string(),
+            String::new(),
+        ];
+        assert!(
+            !verify_signature_hex(&sig_hex, data, &allowlist),
+            "a list of only malformed rows is simply not verified"
+        );
+        allowlist.push(material.pubkey_armor.clone());
+        assert!(
+            verify_signature_hex(&sig_hex, data, &allowlist),
+            "malformed history rows must be skipped so the valid certificate still verifies"
+        );
+    }
+
+    /// plan-20260921 VG-05 G15 (`verification_cost_is_linear_with_history`):
+    /// every candidate is attempted once, so the work grows with the length of
+    /// the allowlist instead of its square. The bound is deliberately loose so
+    /// the gate is not a timing flake: only a quadratic blow-up (≈4096× for a
+    /// 64× longer list) can trip it.
+    #[test]
+    fn verification_cost_is_linear_with_history() {
+        let secret = fixture("secret-two-signing-subkeys.asc");
+        let material = prepare_imported_key(&secret, "").expect("fixture imports");
+        let data = b"linearity payload";
+        let sig_hex = sign_with_armored_secret_key(&secret, &material.signing_key_id, data)
+            .expect("detached signature");
+        let unrelated = fixture("pubkey.asc");
+
+        let elapsed = |entries: usize| {
+            let allowlist = vec![unrelated.clone(); entries];
+            let start = std::time::Instant::now();
+            let verified = verify_signature_hex(&sig_hex, data, &allowlist);
+            (verified, start.elapsed())
+        };
+
+        let _ = elapsed(1); // warm-up
+        let (verified_one, one) = elapsed(1);
+        let (verified_many, many) = elapsed(64);
+        assert!(
+            !verified_one && !verified_many,
+            "unrelated keys must not verify"
+        );
+        let one = one.max(Duration::from_micros(200));
+        assert!(
+            many <= one * 300,
+            "64 candidates took {many:?} against {one:?} for one — verification must stay linear"
         );
     }
 }
