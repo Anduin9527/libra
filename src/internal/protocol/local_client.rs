@@ -372,6 +372,7 @@ impl LocalClient {
         match object_format.as_str() {
             "sha1" => Ok(HashKind::Sha1),
             "sha256" => Ok(HashKind::Sha256),
+            "blake3" => Ok(HashKind::Blake3),
             _ => Err(format!(
                 "unsupported object format '{object_format}' in local repository '{}'",
                 db_path.display()

@@ -21,7 +21,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use git_internal::hash::{HashKind, set_hash_kind};
+use git_internal::hash::set_hash_kind;
 use serde_json::{Value, json};
 
 use super::{
@@ -2983,21 +2983,34 @@ fn merge_redaction_report_into(
 /// Mirrors `cli::set_local_hash_kind_for_storage` but reads via the already-open
 /// connection that the hook runtime obtains. Defaults to `sha1` for repositories
 /// initialised before SHA-256 support landed.
+///
+/// Config **read errors** propagate (fail-closed). A missing key (`Ok(None)`)
+/// keeps the sha1 default so pre-objectformat repositories stay usable.
 async fn set_hash_kind_from_repo() -> Result<()> {
-    let object_format = ConfigKv::get("core.objectformat")
+    let lookup = ConfigKv::get("core.objectformat")
         .await
-        .ok()
-        .flatten()
-        .map(|e| e.value)
-        .unwrap_or_else(|| "sha1".to_string());
-
-    let hash_kind = match object_format.as_str() {
-        "sha1" => HashKind::Sha1,
-        "sha256" => HashKind::Sha256,
-        _ => bail!("unsupported object format: '{object_format}'"),
-    };
+        .map(|entry| entry.map(|e| e.value));
+    let hash_kind = hash_kind_from_object_format_lookup(lookup)?;
     set_hash_kind(hash_kind);
     Ok(())
+}
+
+/// Map a `core.objectformat` lookup onto [`HashKind`].
+///
+/// - `Ok(Some(value))` → [`object_format::parse_config_value`]
+/// - `Ok(None)` → `HashKind::Sha1` (legacy repos without the key)
+/// - `Err(_)` → propagated (fail-closed; never swallowed into sha1)
+fn hash_kind_from_object_format_lookup(
+    lookup: Result<Option<String>>,
+) -> Result<git_internal::hash::HashKind> {
+    let raw = match lookup {
+        Ok(Some(value)) => value,
+        Ok(None) => "sha1".to_string(),
+        Err(error) => {
+            return Err(error).context("failed to read core.objectformat from repository config");
+        }
+    };
+    crate::internal::object_format::parse_config_value(&raw)
 }
 
 /// Apply the canonical event together with bookkeeping into `session`.
@@ -3369,6 +3382,36 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::internal::ai::hooks::providers::{claude_provider, codex_provider, gemini_provider};
+
+    /// B3-00: config read errors fail closed; missing key stays sha1; blake3 parses.
+    #[test]
+    fn runtime_config_read_error_fail_closed() {
+        let blake3 = hash_kind_from_object_format_lookup(Ok(Some("blake3".to_string())))
+            .expect("blake3 accepted via object_format helper");
+        assert_eq!(blake3, git_internal::hash::HashKind::Blake3);
+
+        let missing =
+            hash_kind_from_object_format_lookup(Ok(None)).expect("missing key defaults to sha1");
+        assert_eq!(missing, git_internal::hash::HashKind::Sha1);
+
+        let err =
+            hash_kind_from_object_format_lookup(Err(anyhow!("simulated config read failure")));
+        let message = format!("{:#}", err.expect_err("Err must propagate"));
+        assert!(
+            message.contains("failed to read core.objectformat"),
+            "expected contextual fail-closed message, got: {message}"
+        );
+        assert!(
+            message.contains("simulated config read failure"),
+            "expected underlying cause preserved, got: {message}"
+        );
+
+        let bad = hash_kind_from_object_format_lookup(Ok(Some("SHA256".to_string())));
+        assert!(
+            bad.is_err(),
+            "mixed-case objectformat must fail closed via parse_config_value"
+        );
+    }
 
     /// AG-21 metadata persistence (codex review R2 P1): the generic E6
     /// path (codex/opencode) must persist `subagent_token_usage` and

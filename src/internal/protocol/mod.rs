@@ -155,6 +155,7 @@ pub fn parse_discovered_references(
                     let format_kind = match format_cap.as_str() {
                         "object-format=sha1" => HashKind::Sha1,
                         "object-format=sha256" => HashKind::Sha256,
+                        "object-format=blake3" => HashKind::Blake3,
                         _ => {
                             return Err(GitError::NetworkError(
                                 "Unsupported object format capability".to_string(),
