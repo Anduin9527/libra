@@ -61,7 +61,7 @@
 |---|---|---|---|
 | [`issues/470.md`](issues/470.md) | 工作树物化丢失可执行位与 mode 变化检测 | 未启动 | FM-01/02/05（3 卡） |
 | [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | 未启动 | IN-01..IN-12（12 卡） |
-| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `done`/`complete`（`v0.23.47`）；CL-02 `done`/`complete`（`v0.23.48`）；CL-03 C 组 `v0.23.49`；CL-04 `locally-accepted`（未 bump）；CL-05 `locally-accepted`（未 bump） |
+| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `done`/`complete`（`v0.23.47`）；CL-02 `done`/`complete`（`v0.23.48`）；CL-03 C 组 `v0.23.49`；CL-04..CL-06 `locally-accepted`（未 bump） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495 |
@@ -180,7 +180,8 @@
 | **CL-03 其余历史遍历** | **`in-progress`/`locally-accepted`** | **v0.23.49（C 组进行中）** |
 | **CL-04 本地 Git 浅边界** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-03 发布窗口）** |
 | **CL-05 `--depth` 隐含单分支** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-04 发布窗口）** |
-| CL-06..CL-15 | `pending` | 未 bump |
+| **CL-06 普通路径忽略浅化参数** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-05 发布窗口）** |
+| CL-07..CL-15 | `pending` | 未 bump |
 
 ### 3.6 issues/476（工作树命令族）
 
@@ -220,9 +221,9 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `plan-20260925` SCAP-01（发布者：本会话执行该卡的 Agent）。`issues/474` 的 `CL-03` 发布窗口记录仍是 `v0.23.49` / PR #512；仓库版本面已是 `0.23.51`，本卡从该版本做 `patch + 1`。
+- **当前正在执行：** `plan-20260925` SCAP-01（发布者：本会话执行该卡的 Agent）。远端已发布 `v0.23.52`，本卡版本面是 `0.23.53`。
 - **SCAP-01 与 B3-00：** B3-00 保持 `pending`，不与本卡同时 `in-progress`。
-- **下一步（CL-03 D 组落地后）：** bump 并发布 `CL-04`，再发布 `CL-05`。
+- **下一步（本卡发布之后）：** `issues/474` 的 `CL-04`、`CL-05`、`CL-06` 已 `locally-accepted`，按窗口依次 bump。
 - **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---
