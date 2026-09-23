@@ -503,11 +503,13 @@ libra config export-gpg-key --out pubkey.asc
 
 #### `remove-gpg-key`
 
-Remove the active imported GPG key and fall back to the generated key (never deletes history or generated-key metadata).
+Remove the active imported GPG key and fall back to the generated key (never deletes history or generated-key metadata). The removal runs as **one transaction**: if any of its four steps fails, the imported key stays active exactly as it was.
 
 ```bash
 libra config remove-gpg-key --force
 ```
+
+Archived public keys live in `vault.gpg.history.<FPR>.pubkey`. Dropping one is an ordinary config unset — `libra config unset vault.gpg.history.<FPR>.pubkey` removes just that fingerprint's snapshot and leaves the other fingerprints alone. **Consequence:** signatures made by the dropped key are no longer accepted by `libra tag -v` or `libra merge --verify-signatures` — that is exactly what the archive exists to prevent, so only drop a row when those signatures no longer matter.
 
 ### Scope Flags
 

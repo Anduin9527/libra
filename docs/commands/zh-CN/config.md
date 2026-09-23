@@ -420,7 +420,9 @@ libra config export-gpg-key --out pubkey.asc
 
 #### `remove-gpg-key`
 
-移除活动导入的 GPG key 并回退到生成的 key（绝不删除历史或生成 key 元数据）。
+移除活动导入的 GPG key 并回退到生成的 key（绝不删除历史或生成 key 元数据）。移除是**单个事务**：四步中任一步失败，导入的 key 会原样保持活动。
+
+归档公钥存放于 `vault.gpg.history.<FPR>.pubkey`。显式丢弃单行就是普通的 config unset —— `libra config unset vault.gpg.history.<FPR>.pubkey` 只删除该指纹的快照，其它指纹不受影响。**后果：** 被丢弃密钥签出的签名将不再被 `libra tag -v` / `libra merge --verify-signatures` 接受——这正是归档要避免的情形，故仅在这些签名已无意义时才删除该行。
 
 ```bash
 libra config remove-gpg-key --force
