@@ -4355,3 +4355,310 @@ fn config_import_gpg_key_outside_repository_reports_not_a_repo() {
         "a failed import outside a repository must not create repository state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260921 VG-06/VG-07/VG-08/VG-13: export surface, list metadata,
+// history invariants and removal gates declared by the plan.
+// ---------------------------------------------------------------------------
+
+const GPG_FIXTURE_FINGERPRINT: &str = "6362FF0BA5456A8E9C7DD8C04FB6368B886D5973";
+
+/// Import the fixture key over whatever active key the repository already has.
+fn import_fixture_key(repo: &std::path::Path) {
+    let passfile = write_fixture_passfile(repo);
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            &passfile,
+            "--replace",
+        ],
+        repo,
+    );
+    assert!(
+        out.status.success(),
+        "import fixture key: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn config_export_gpg_key_fingerprint_stdout() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let out = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
+    assert_eq!(out.status.code(), Some(0), "export --fingerprint exits 0");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT
+    );
+}
+
+#[test]
+fn config_export_gpg_key_default_stdout_armor() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let out = run_libra_command(&["config", "export-gpg-key"], repo.path());
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"), "{stdout}");
+    assert!(!stdout.contains("PRIVATE KEY"), "export must not leak the secret key");
+}
+
+#[test]
+fn config_export_gpg_key_fingerprint_conflicts_with_out() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let target = repo.path().join("out.asc");
+    let out = run_libra_command(
+        &[
+            "config",
+            "export-gpg-key",
+            "--fingerprint",
+            "--out",
+            &target.to_string_lossy(),
+        ],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "--out and --fingerprint must conflict");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("mutually exclusive"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!target.exists(), "a conflicting invocation writes nothing");
+}
+
+#[test]
+fn config_export_gpg_key_missing_parent_fails_closed() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let target = repo.path().join("missing-dir").join("out.asc");
+    let out = run_libra_command(
+        &["config", "export-gpg-key", "--out", &target.to_string_lossy()],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "missing parent must fail closed");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not exist"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!target.exists());
+}
+
+#[test]
+fn config_export_gpg_key_out_is_atomic_and_overwrites() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let target = repo.path().join("exported.asc");
+    // Pre-existing unrelated content must be replaced, never merged.
+    std::fs::write(&target, "stale-content").unwrap();
+    let out = run_libra_command(
+        &["config", "export-gpg-key", "--out", &target.to_string_lossy()],
+        repo.path(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert!(written.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+    assert!(!written.contains("stale-content"), "overwrite must not append");
+
+    // The atomic replace must leave no temporary sibling behind.
+    let leftovers: Vec<String> = std::fs::read_dir(repo.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("exported.asc") && name != "exported.asc")
+        .collect();
+    assert!(leftovers.is_empty(), "no temp files expected, saw {leftovers:?}");
+}
+
+#[test]
+fn config_export_gpg_key_missing_public_key_fails_closed() {
+    // A repository initialised without the vault has no active public key.
+    let dir = tempdir().unwrap();
+    assert!(
+        run_libra_command(&["init", "--vault", "false"], dir.path())
+            .status
+            .success()
+    );
+    let out = run_libra_command(&["config", "export-gpg-key"], dir.path());
+    assert!(!out.status.success(), "export without a key must fail closed");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no active GPG public key to export"),
+        "message: {err}"
+    );
+    assert!(err.contains("LBR-CONFLICT-002"), "stable error code: {err}");
+}
+
+#[test]
+fn config_list_gpg_keys_reports_source_fingerprint_and_signing_key_id() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let out = run_libra_command(&["config", "list", "--gpg-keys"], repo.path());
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("imported"), "source: {stdout}");
+    assert!(stdout.contains(GPG_FIXTURE_FINGERPRINT), "fingerprint: {stdout}");
+    assert!(
+        stdout.to_lowercase().contains("signing"),
+        "signing key id must be reported: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BEGIN PGP PRIVATE"),
+        "list must never print the secret key"
+    );
+}
+
+#[test]
+fn config_list_gpg_keys_json_shape_is_additive() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let out = run_libra_command(&["--json", "config", "list", "--gpg-keys"], repo.path());
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let json = parse_json_stdout(&out);
+    let text = json.to_string();
+    assert!(text.contains(GPG_FIXTURE_FINGERPRINT), "json: {text}");
+    assert!(text.contains("imported"), "json: {text}");
+    assert!(
+        !text.contains("PRIVATE KEY"),
+        "json must not leak the secret key"
+    );
+}
+
+#[test]
+fn config_replace_keeps_history_verifiable() {
+    // A tag signed by the *generated* key must stay verifiable after the key is
+    // replaced by an imported one, because the replaced public key moves into
+    // `vault.gpg.history` (the verification allowlist).
+    let repo = create_committed_repo_via_cli();
+    assert!(
+        run_libra_command(&["tag", "-s", "-m", "generated", "v1"], repo.path())
+            .status
+            .success(),
+        "sign a tag with the generated key"
+    );
+    assert!(
+        run_libra_command(&["tag", "-v", "v1"], repo.path()).status.success(),
+        "generated-key tag verifies before replacement"
+    );
+
+    import_fixture_key(repo.path());
+    let after = run_libra_command(&["tag", "-v", "v1"], repo.path());
+    assert!(
+        after.status.success(),
+        "history allowlist must still verify the pre-replacement signature: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("Good signature"),
+        "stdout: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+
+    // History is stored per replaced fingerprint (`vault.gpg.history.<FPR>.pubkey`).
+    let history = run_libra_command(&["config", "list"], repo.path());
+    let history_out = String::from_utf8_lossy(&history.stdout);
+    assert!(
+        history_out.contains("vault.gpg.history."),
+        "replacement must record the replaced key under vault.gpg.history.<FPR>: {history_out}"
+    );
+    assert!(
+        history_out.contains(".pubkey"),
+        "history entries carry the public key: {history_out}"
+    );
+
+    // The imported key now signs new tags.
+    assert!(
+        run_libra_command(&["tag", "-s", "-m", "imported", "v2"], repo.path())
+            .status
+            .success(),
+        "sign a tag with the imported key"
+    );
+    assert!(
+        run_libra_command(&["tag", "-v", "v2"], repo.path()).status.success(),
+        "imported-key tag verifies"
+    );
+}
+
+#[test]
+fn duplicate_import_is_idempotent() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let first = run_libra_command(&["config", "get", "vault.gpg.pubkey"], repo.path());
+    let first_pubkey = String::from_utf8_lossy(&first.stdout).trim().to_string();
+
+    // Re-importing the same key must converge, not duplicate or rotate.
+    import_fixture_key(repo.path());
+    let second = run_libra_command(&["config", "get", "vault.gpg.pubkey"], repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&second.stdout).trim(),
+        first_pubkey,
+        "the same key must not be re-rotated"
+    );
+    let fp = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&fp.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT
+    );
+}
+
+#[test]
+fn config_get_reveal_list_hide_imported_secret() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+
+    let get = run_libra_command(&["config", "get", "vault.gpg.seckey_enc"], repo.path());
+    assert_eq!(get.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "<REDACTED>");
+
+    let reveal = run_libra_command(
+        &["config", "get", "--reveal", "vault.gpg.seckey_enc"],
+        repo.path(),
+    );
+    assert!(!reveal.status.success(), "reveal of the secret key is refused");
+    assert!(
+        !String::from_utf8_lossy(&reveal.stdout).contains("BEGIN PGP"),
+        "a refused reveal must not print key material"
+    );
+
+    let list = run_libra_command(&["config", "list", "--show-origin"], repo.path());
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !stdout.contains("BEGIN PGP PRIVATE KEY BLOCK"),
+        "list must not print the secret key"
+    );
+}
+
+#[test]
+fn config_remove_gpg_key_and_force_message_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+
+    let refused = run_libra_command(&["config", "remove-gpg-key"], repo.path());
+    assert!(!refused.status.success(), "removal needs --force");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("--force") || err.contains("force"),
+        "removal refusal must mention --force: {err}"
+    );
+
+    let removed = run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path());
+    assert_eq!(removed.status.code(), Some(0), "{}", String::from_utf8_lossy(&removed.stderr));
+    let fp = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
+    assert_ne!(
+        String::from_utf8_lossy(&fp.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT,
+        "removal must fall back to the generated key, not keep the imported one"
+    );
+    assert!(
+        run_libra_command(&["tag", "-s", "-m", "after removal", "v3"], repo.path())
+            .status
+            .success(),
+        "signing keeps working after removal"
+    );
+}
