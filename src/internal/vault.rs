@@ -207,7 +207,50 @@ pub async fn vault_generate_pgp_key(
     Ok(public_key)
 }
 
+/// Test-only override for the sequence of versioned key names.
+///
+/// Retry exhaustion cannot be induced from outside: the probe only retries
+/// when the vault reports an existing name, and the real name is derived from
+/// the current nanosecond, so no caller can pre-create a colliding key.
+/// Tests therefore inject names at this seam. It is compiled out of non-test
+/// builds — ADR-VG-07 §2 forbids *env* hooks, not `#[cfg(test)]` seams.
+#[cfg(test)]
+static KEY_NAME_OVERRIDE: std::sync::Mutex<Option<std::collections::VecDeque<String>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_key_name_override(names: Vec<String>) {
+    if let Ok(mut guard) = KEY_NAME_OVERRIDE.lock() {
+        *guard = Some(names.into_iter().collect());
+    }
+}
+
+/// How many injected names are still queued — used as proof that the retry
+/// loop really consumed all eight attempts.
+#[cfg(test)]
+pub(crate) fn key_name_override_remaining() -> usize {
+    KEY_NAME_OVERRIDE
+        .lock()
+        .map(|guard| guard.as_ref().map_or(0, |queue| queue.len()))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_key_name_override() {
+    if let Ok(mut guard) = KEY_NAME_OVERRIDE.lock() {
+        *guard = None;
+    }
+}
+
 fn next_versioned_key_name() -> String {
+    #[cfg(test)]
+    if let Ok(mut guard) = KEY_NAME_OVERRIDE.lock()
+        && let Some(queue) = guard.as_mut()
+        && let Some(name) = queue.pop_front()
+    {
+        return name;
+    }
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -2750,5 +2793,119 @@ mod gpg_binding_issuer_tests {
                 .unwrap_or_else(|e| panic!("{name} must stay importable: {e}"));
             assert!(!material.signing_key_id.is_empty(), "{name}: no key chosen");
         }
+    }
+}
+
+#[cfg(test)]
+mod gpg_retry_exhaustion_tests {
+    use serial_test::serial;
+
+    use super::*;
+    use crate::internal::config::ConfigKv;
+
+    /// plan-20260921 ADR-VG-06 §6 / VG-14 (`generate_pgp_key_retry_exhaustion_fails_closed`):
+    /// when every name probe collides the generator must fail closed instead of
+    /// overwriting the active key.
+    #[tokio::test]
+    #[serial(env)]
+    #[serial(cwd)]
+    async fn generate_pgp_key_retry_exhaustion_fails_closed() {
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let root = crate::utils::util::storage_path();
+        let unseal = lazy_init_vault_for_scope("local")
+            .await
+            .expect("local vault");
+
+        // Seed one key so a colliding name really exists in the vault.
+        let (_pubkey, seeded_name) =
+            generate_pgp_key(&root, &unseal, "Seed", "seed@example.invalid")
+                .await
+                .expect("the first generation must succeed");
+        let active_before = ConfigKv::get("vault.gpg.pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+
+        set_key_name_override(vec![seeded_name; 8]);
+        let outcome = generate_pgp_key(&root, &unseal, "Seed", "seed@example.invalid").await;
+        clear_key_name_override();
+
+        let err = outcome.expect_err("exhausted retries must fail closed");
+        // Exhaustion surfaces the last collision error (the "after 8 collision
+        // retries" fallback is unreachable once a collision was seen at all).
+        assert!(
+            err.to_string().to_lowercase().contains("exist"),
+            "unexpected error: {err}"
+        );
+        // All eight probes were consumed: the loop really retried.
+        assert_eq!(
+            key_name_override_remaining(),
+            0,
+            "the generator must retry through every injected name"
+        );
+        let active_after = ConfigKv::get("vault.gpg.pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        assert_eq!(
+            active_after, active_before,
+            "the active key must be unchanged after exhaustion"
+        );
+    }
+
+    /// plan-20260921 (`config_generate_gpg_key_after_import_same_nanosecond_collision_retries`):
+    /// after an import, a generation whose first name probe collides must retry
+    /// with a fresh name instead of failing or overwriting.
+    ///
+    /// Imported keys live in `vault.gpg.seckey_enc` (ADR-VG-12) rather than
+    /// under a versioned vault name, so the collision is injected at the same
+    /// seam the nanosecond-derived probe uses — the state a same-nanosecond
+    /// collision would produce.
+    #[tokio::test]
+    #[serial(env)]
+    #[serial(cwd)]
+    async fn config_generate_gpg_key_after_import_same_nanosecond_collision_retries() {
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let root = crate::utils::util::storage_path();
+        let unseal = lazy_init_vault_for_scope("local")
+            .await
+            .expect("local vault");
+
+        let (_pubkey, colliding_name) =
+            generate_pgp_key(&root, &unseal, "Seed", "seed@example.invalid")
+                .await
+                .expect("seed generation");
+
+        let armor = std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/protected-secret.asc",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture armor");
+        let material = prepare_imported_key(&armor, "libra-test-fixture-passphrase")
+            .expect("fixture key must unlock");
+        persist_imported_gpg_key(&unseal, &material)
+            .await
+            .expect("persist imported key");
+        crate::internal::config::ConfigKv::set("vault.gpg.source", "imported", false)
+            .await
+            .expect("record imported source");
+
+        set_key_name_override(vec![colliding_name.clone()]);
+        let outcome = generate_pgp_key(&root, &unseal, "Seed", "seed@example.invalid").await;
+        clear_key_name_override();
+
+        let (_pubkey, new_name) = outcome.expect("a colliding probe must be retried, not fatal");
+        assert_ne!(new_name, colliding_name, "the retry must mint a fresh name");
+        assert_eq!(key_name_override_remaining(), 0);
     }
 }
