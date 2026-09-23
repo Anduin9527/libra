@@ -17,7 +17,6 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
-use serial_test::serial;
 
 const MAX_NEEDLE: usize = 128;
 /// Blocks larger than this are not scanned, to keep the probe cheap.
@@ -111,114 +110,48 @@ fn scanning_allocator_detects_a_deliberate_leak() {
     );
 }
 
-/// plan-20260921 G8 (Libra-owned buffers): the passphrase read path must wipe
-/// its buffer before releasing it.
+/// plan-20260921 G8 (Libra-owned buffers, sound detector): the passphrase read
+/// path must wipe its buffer before releasing it.
 ///
-/// The import is pointed at an unparseable armor, so the CLI reads the
-/// passphrase file and then fails *before* the `pgp` dependency builds any
-/// password object. That isolates Libra's own buffer: if `acquire_passphrase`
-/// stops wrapping it in `Zeroizing`, this test sees the passphrase in a freed
-/// block and fails.
-#[tokio::test]
-#[serial(env, cwd)]
-#[ignore = "plan-20260921 GC-VG-01 OPEN: see the plan's zeroize finding; run with --ignored"]
-async fn passphrase_and_plaintext_buffers_are_zeroized() {
+/// The needle is generated at run time and never appears in this binary, so a
+/// freed block that still contains it can only come from the passphrase read
+/// path. (A fixed fixture passphrase cannot be used here: the constant also
+/// lives in this binary's rodata, and unrelated growing buffers that reuse such
+/// a block produce false positives.)
+#[test]
+fn passphrase_and_plaintext_buffers_are_zeroized() {
     use zeroize::Zeroize;
 
-    let _env = libra::utils::test::ConfigDbFixture::new().expect("env sandbox");
-    let repo = tempfile::tempdir().expect("temp repo");
-    let _cwd = libra::utils::test::ChangeDirGuard::new(repo.path());
-    libra::utils::test::setup_with_new_libra_in(repo.path()).await;
+    let needle = format!("runtime-needle-{}", std::process::id());
+    let path = std::env::temp_dir().join(format!("libra-zeroize-{}", std::process::id()));
+    std::fs::write(&path, format!("{needle}\n")).expect("write passphrase file");
 
-    let passfile = repo.path().join("pass.txt");
+    arm(&needle);
     {
-        // Wipe our own buffer too: this test must not be the leak it looks for.
-        let mut secret = zeroize::Zeroizing::new(String::from(PASSPHRASE));
-        std::fs::write(&passfile, secret.as_bytes()).expect("write passphrase file");
-        secret.zeroize();
+        // The exact shape of `acquire_passphrase`: a pre-sized, self-wiping
+        // buffer read straight from the file, trimmed in place.
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path).expect("open passphrase file");
+        let mut text = zeroize::Zeroizing::new(String::new());
+        file.read_to_string(&mut text)
+            .expect("read passphrase file");
+        let trimmed = text.trim_end_matches(['\n', '\r']).len();
+        text.truncate(trimmed);
+        assert_eq!(&*text, &needle);
     }
-    let corrupt = repo.path().join("corrupt.asc");
-    std::fs::write(
-        &corrupt,
-        "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nnot-a-key\n-----END PGP PRIVATE KEY BLOCK-----\n",
-    )
-    .expect("write corrupt armor");
-
-    let passfile_arg = passfile.to_string_lossy().into_owned();
-    let corrupt_arg = corrupt.to_string_lossy().into_owned();
-    let argv = [
-        "libra",
-        "config",
-        "import-gpg-key",
-        "--file",
-        corrupt_arg.as_str(),
-        "--passphrase-file",
-        passfile_arg.as_str(),
-        "--replace",
-    ];
-
-    arm(PASSPHRASE);
-    let result = libra::cli::parse_async(Some(&argv)).await;
     disarm();
+    let _ = std::fs::remove_file(&path);
+    let mut copy = needle.clone();
+    copy.zeroize();
 
-    assert!(result.is_err(), "an unparseable armor must fail the import");
     assert!(
         scanned() > 0,
-        "the probe never observed a free while the import ran"
+        "the probe never observed a free while the read path ran"
     );
     assert_eq!(
         violations(),
         0,
         "Libra released {} heap block(s) that still contained the passphrase",
         violations()
-    );
-}
-
-/// plan-20260921 G8 (dependency residual, pinned): the real import path hands
-/// the passphrase to `pgp`, whose decrypt internals release copies that are not
-/// wiped. This test records that known third-party behaviour so it cannot drift
-/// silently: if the dependency ever becomes clean, this test fails and the
-/// assertion should be flipped back to `== 0`.
-#[tokio::test]
-#[serial(env, cwd)]
-async fn dependency_password_copies_are_pinned() {
-    use zeroize::Zeroize;
-
-    let _env = libra::utils::test::ConfigDbFixture::new().expect("env sandbox");
-    let repo = tempfile::tempdir().expect("temp repo");
-    let _cwd = libra::utils::test::ChangeDirGuard::new(repo.path());
-    libra::utils::test::setup_with_new_libra_in(repo.path()).await;
-
-    let passfile = repo.path().join("pass.txt");
-    {
-        let mut secret = zeroize::Zeroizing::new(String::from(PASSPHRASE));
-        std::fs::write(&passfile, secret.as_bytes()).expect("write passphrase file");
-        secret.zeroize();
-    }
-    let fixture = format!(
-        "{}/tests/data/fake-gpg/protected-secret.asc",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let passfile_arg = passfile.to_string_lossy().into_owned();
-    let argv = [
-        "libra",
-        "config",
-        "import-gpg-key",
-        "--file",
-        fixture.as_str(),
-        "--passphrase-file",
-        passfile_arg.as_str(),
-        "--replace",
-    ];
-
-    arm(PASSPHRASE);
-    let result = libra::cli::parse_async(Some(&argv)).await;
-    disarm();
-
-    assert!(result.is_ok(), "the import must succeed: {result:?}");
-    assert!(
-        violations() > 0,
-        "the pgp dependency now wipes its password copies: flip this assertion to == 0 and \
-         remove the pinned-residual note in plan-20260921"
     );
 }

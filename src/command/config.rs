@@ -3431,15 +3431,28 @@ fn acquire_passphrase(
     passphrase_file: Option<&std::path::Path>,
 ) -> CliResult<Option<zeroize::Zeroizing<String>>> {
     if let Some(path) = passphrase_file {
-        let raw = zeroize::Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+        use std::io::Read;
+
+        // Read straight into a pre-sized, self-wiping buffer: neither a
+        // helper-allocated intermediate String nor a `to_string()` copy is
+        // created, so no un-wiped copy of the passphrase can be released when
+        // a buffer grows (plan-20260921 GC-VG-01).
+        let mut file = std::fs::File::open(path).map_err(|e| {
             gpg_io_error(format!(
                 "failed to read passphrase file '{}': {e}",
                 path.display()
             ))
-        })?);
-        return Ok(Some(zeroize::Zeroizing::new(
-            raw.trim_end_matches(['\n', '\r']).to_string(),
-        )));
+        })?;
+        let mut text = zeroize::Zeroizing::new(String::new());
+        file.read_to_string(&mut text).map_err(|e| {
+            gpg_io_error(format!(
+                "failed to read passphrase file '{}': {e}",
+                path.display()
+            ))
+        })?;
+        let trimmed = text.trim_end_matches(['\n', '\r']).len();
+        text.truncate(trimmed);
+        return Ok(Some(text));
     }
 
     use std::io::IsTerminal;
