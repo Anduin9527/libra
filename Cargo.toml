@@ -124,6 +124,7 @@ libvault = { version = "0.4.0", features = ["storage_sqlite"] }
 base64 = "0.22.1"
 # Imported GPG key deprotection/rebuild/sign/verify (plan-20260921 VG-02)
 pgp = "0.19.0"
+zeroize = "1"
 rand = "0.8.5"
 rsa = "0.9"
 

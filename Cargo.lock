@@ -3874,6 +3874,7 @@ dependencies = [
  "walkdir",
  "wax",
  "windows-sys 0.61.2",
+ "zeroize",
  "zip",
 ]
 

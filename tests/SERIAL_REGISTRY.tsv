@@ -840,3 +840,4 @@ import_sets_vault_signing_true_when_unset	lane:cwd	runs in an isolated temp repo
 import_keeps_signing_disabled_in_vault_false_repo	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 ADR-VG-12 vault=false branch)
 generate_pgp_key_propagates_config_write_error	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-14 config write failure propagation)
 import_partial_failure_rolls_back	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-02/03 partial import failure atomically rolls back)
+passphrase_and_plaintext_buffers_are_zeroized	lane:cwd+env	plan-20260921 GC-VG-01/VG-03 G8: sandboxed HOME/XDG plus a temp repository, because the scanning global allocator observes the whole process and the real CLI runs in-process

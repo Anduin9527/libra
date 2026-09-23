@@ -3422,22 +3422,31 @@ async fn load_or_init_local_unseal_key(output: &OutputConfig) -> CliResult<Vec<u
 /// Acquire the passphrase (file > hidden TTY prompt > `None` when non-interactive
 /// and no `--passphrase-file`). Zero-ing is the caller's responsibility; the
 /// plaintext string is dropped as soon as `prepare_imported_key` returns.
-fn acquire_passphrase(passphrase_file: Option<&std::path::Path>) -> CliResult<Option<String>> {
+/// Read the GPG passphrase for an import.
+///
+/// The returned buffer and the intermediate file contents are wrapped in
+/// `Zeroizing` so the passphrase never survives in a freed heap block
+/// (plan-20260921 GC-VG-01).
+fn acquire_passphrase(
+    passphrase_file: Option<&std::path::Path>,
+) -> CliResult<Option<zeroize::Zeroizing<String>>> {
     if let Some(path) = passphrase_file {
-        let raw = std::fs::read_to_string(path).map_err(|e| {
+        let raw = zeroize::Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
             gpg_io_error(format!(
                 "failed to read passphrase file '{}': {e}",
                 path.display()
             ))
-        })?;
-        return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_string()));
+        })?);
+        return Ok(Some(zeroize::Zeroizing::new(
+            raw.trim_end_matches(['\n', '\r']).to_string(),
+        )));
     }
 
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         let pw = rpassword::prompt_password("Enter passphrase for GPG key: ")
             .map_err(|e| gpg_io_error(format!("failed to read passphrase: {e}")))?;
-        return Ok(Some(pw));
+        return Ok(Some(zeroize::Zeroizing::new(pw)));
     }
 
     Ok(None)
@@ -3502,7 +3511,7 @@ async fn handle_import_gpg_key(
     let _ = try_get_storage_path(None).map_err(|_| not_a_repo_error())?;
     let unseal_key = load_or_init_local_unseal_key(output).await?;
 
-    let armor = match file {
+    let armor_plain = match file {
         Some(path) => std::fs::read_to_string(path).map_err(|e| {
             gpg_io_error(format!(
                 "failed to read secret key file '{}': {e}",
@@ -3532,10 +3541,15 @@ async fn handle_import_gpg_key(
                 .map_err(|e| gpg_unsupported_error(format!("failed to export secret key: {e}")))?
         }
     };
+    // The armored secret key is plaintext key material (plan GC-VG-01).
+    let armor = zeroize::Zeroizing::new(armor_plain);
 
     let passphrase = acquire_passphrase(passphrase_file)?;
     let provided_passphrase = passphrase.is_some();
-    let material = prepare_imported_key(&armor, passphrase.as_deref().unwrap_or(""))
+    let material = prepare_imported_key(
+        armor.as_str(),
+        passphrase.as_ref().map(|p| p.as_str()).unwrap_or(""),
+    )
         .map_err(|e| {
             if provided_passphrase {
                 gpg_io_error(format!(

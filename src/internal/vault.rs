@@ -1511,7 +1511,9 @@ pub struct ImportedKeyMaterial {
     pub fingerprint: String,
     pub signing_key_id: String,
     pub uid: String,
-    pub rebuilt_armor: String,
+    /// Self-wiping: the unprotected certificate is plaintext key material
+    /// (plan GC-VG-01), so the buffer is zeroed when it is dropped.
+    pub rebuilt_armor: zeroize::Zeroizing<String>,
     pub pubkey_armor: String,
 }
 
@@ -1677,9 +1679,10 @@ pub fn prepare_imported_key(armor: &str, passphrase: &str) -> Result<ImportedKey
             .remove_password(&pw)
             .context("failed to unlock signing subkey — wrong passphrase or corrupt key")?;
     }
-    let rebuilt_armor = skey
-        .to_armored_string(ArmorOptions::default())
-        .context("failed to serialize unprotected secret key")?;
+    let rebuilt_armor = zeroize::Zeroizing::new(
+        skey.to_armored_string(ArmorOptions::default())
+            .context("failed to serialize unprotected secret key")?,
+    );
     let pubkey_armor = skey
         .to_public_key()
         .to_armored_string(ArmorOptions::default())
