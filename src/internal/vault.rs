@@ -2584,3 +2584,37 @@ mod gpg_expiry_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod gpg_revoked_subkey_tests {
+    use super::prepare_imported_key;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 ADR-VG-09: a revoked signing subkey must be skipped, so
+    /// selection falls back to the primary key instead of signing with a
+    /// revoked (and therefore rejected) key.
+    #[test]
+    fn revoked_subkey_is_rejected() {
+        let material = prepare_imported_key(&fixture("secret-revoked-subkey.asc"), "")
+            .expect("the certificate itself stays importable");
+        assert!(
+            !material.signing_key_id.eq_ignore_ascii_case("A7C42C5A0F208C7A"),
+            "the revoked signing subkey must not be selected, got {}",
+            material.signing_key_id
+        );
+        assert!(
+            material
+                .signing_key_id
+                .eq_ignore_ascii_case("8D2D0A59FBDBC481"),
+            "the primary key must sign instead, got {}",
+            material.signing_key_id
+        );
+    }
+}

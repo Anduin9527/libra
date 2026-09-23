@@ -5296,3 +5296,61 @@ fn merge_gpg_sign_uses_imported_key() {
     let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
     assert_eq!(String::from_utf8_lossy(&source.stdout).trim(), "imported");
 }
+
+/// plan-20260921 ADR-VG-10/VG-01: on a terminal the import path prompts for the
+/// passphrase instead of requiring `--passphrase-file`. The child runs under a
+/// pty (`script`) so `stdin().is_terminal()` is true and `rpassword` can read
+/// the passphrase from the terminal.
+#[cfg(unix)]
+#[test]
+fn tty_prompt_collects_passphrase() {
+    let repo = create_committed_repo_via_cli();
+    let home = repo.path().join(".libra-test-home");
+    let config_home = home.join(".config");
+    std::fs::create_dir_all(&config_home).unwrap();
+
+    let inner = format!(
+        "{} config import-gpg-key --file {} --replace",
+        env!("CARGO_BIN_EXE_libra"),
+        GPG_FIXTURE_SECRET
+    );
+    let mut child = std::process::Command::new("script")
+        .arg("-qec")
+        .arg(&inner)
+        .arg("/dev/null")
+        .current_dir(repo.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("LIBRA_CONFIG_GLOBAL_DB", home.join(".libra").join("config.db"))
+        .env(
+            "LIBRA_CONFIG_SYSTEM_DB",
+            home.join(".libra").join("system-config.db"),
+        )
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("LIBRA_TEST", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the CLI under a pty");
+
+    {
+        let stdin = child.stdin.as_mut().expect("pty stdin");
+        std::io::Write::write_all(stdin, b"libra-test-fixture-passphrase\n").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "tty import must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The prompted passphrase unlocked the key, so the imported source is active.
+    let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&source.stdout).trim(), "imported");
+}
