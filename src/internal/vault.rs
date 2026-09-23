@@ -1528,6 +1528,49 @@ fn algorithm_can_sign(alg: pgp::crypto::public_key::PublicKeyAlgorithm) -> bool 
 /// `sign` (encryption-only subkeys) is rejected, while a binding signature that
 /// carries no key flags at all stays eligible on algorithm capability alone
 /// (older implementations do not always emit flags).
+/// ADR-VG-09: a subkey whose binding self-signature declares an expiry that has
+/// already passed must not be selected as the signing key. `None` means the
+/// binding declares no expiry at all. When several bindings exist (GnuPG
+/// supersedes expiry by adding a newer binding signature) the latest declared
+/// expiry wins.
+fn subkey_declared_expiry(signatures: &[pgp::packet::Signature]) -> Option<u64> {
+    use pgp::packet::{SignatureType, SubpacketData};
+
+    let mut latest: Option<u64> = None;
+    for sig in signatures {
+        if sig.typ() != Some(SignatureType::SubkeyBinding) {
+            continue;
+        }
+        let Some(config) = sig.config() else {
+            continue;
+        };
+        let mut created: Option<u64> = None;
+        let mut duration: Option<u64> = None;
+        for sub in config.hashed_subpackets() {
+            match &sub.data {
+                SubpacketData::SignatureCreationTime(ts) => created = Some(u64::from(ts.as_secs())),
+                SubpacketData::KeyExpirationTime(key_expiration) => {
+                    duration = Some(u64::from(key_expiration.as_secs()));
+                }
+                _ => {}
+            }
+        }
+        if let (Some(created), Some(duration)) = (created, duration) {
+            let expiry = created.saturating_add(duration);
+            latest = Some(latest.map_or(expiry, |current| current.max(expiry)));
+        }
+    }
+    latest
+}
+
+/// Seconds since the Unix epoch (0 if the clock is somehow before it).
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 fn binding_signature_allows_signing(signatures: &[pgp::packet::Signature]) -> bool {
     use pgp::packet::{SignatureType, SubpacketData};
 
@@ -1598,6 +1641,7 @@ pub fn prepare_imported_key(armor: &str, passphrase: &str) -> Result<ImportedKey
             && !has_revocation
             && algorithm_can_sign(sub.key.algorithm())
             && binding_signature_allows_signing(&sub.signatures)
+            && subkey_declared_expiry(&sub.signatures).is_none_or(|expiry| expiry > now_epoch_secs())
         {
             candidates.push((
                 format!("{}", sub.key.legacy_key_id()),
@@ -2503,6 +2547,40 @@ mod gpg_revocation_tests {
             result.is_err(),
             "a revoked certificate must not be importable as a signer; got {:?}",
             result.map(|m| m.signing_key_id)
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpg_expiry_tests {
+    use super::prepare_imported_key;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 ADR-VG-09: an expired signing subkey must be skipped, so
+    /// selection falls back to the primary key instead of signing with a key
+    /// every verifier treats as expired.
+    #[test]
+    fn expired_subkey_is_rejected_at_evaluation_time() {
+        let material = prepare_imported_key(&fixture("secret-expired-subkey.asc"), "")
+            .expect("the certificate itself stays importable");
+        assert!(
+            !material.signing_key_id.eq_ignore_ascii_case("A6688F6A48A7839B"),
+            "the expired signing subkey must not be selected, got {}",
+            material.signing_key_id
+        );
+        assert!(
+            material
+                .signing_key_id
+                .eq_ignore_ascii_case("631383892167E13C"),
+            "the primary key must sign instead, got {}",
+            material.signing_key_id
         );
     }
 }
