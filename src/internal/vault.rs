@@ -3222,6 +3222,7 @@ mod gpg_allowlist_gate_tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::internal::config::ConfigKv;
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!(
@@ -3294,6 +3295,80 @@ mod gpg_allowlist_gate_tests {
         assert!(
             !rejected,
             "a certificate that is not in the allowlist must not verify"
+        );
+    }
+
+    /// plan-20260921 VG-05 G3 (`history_public_keys_verify_replaced_key_signatures`):
+    /// once a key is replaced it moves into `vault.gpg.history.*`, and the
+    /// signatures it produced must still verify through that archive.
+    #[tokio::test]
+    #[serial_test::serial(env, cwd)]
+    async fn history_public_keys_verify_replaced_key_signatures() {
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        // The replaced (older) certificate, with a signature it made.
+        let old_secret = fixture("secret-two-signing-subkeys.asc");
+        let old = prepare_imported_key(&old_secret, "").expect("old fixture imports");
+        let data = b"replaced-key payload";
+        let sig_hex = sign_with_armored_secret_key(&old_secret, &old.signing_key_id, data)
+            .expect("old key signs");
+
+        // Replacement: the new key takes the active slot, the old one is archived.
+        let new = prepare_imported_key(
+            &fixture("protected-secret.asc"),
+            "libra-test-fixture-passphrase",
+        )
+        .expect("new fixture imports");
+        ConfigKv::set("vault.gpg.pubkey", &new.pubkey_armor, false)
+            .await
+            .expect("install the replacement key");
+        ConfigKv::set(
+            &format!("vault.gpg.history.{}.pubkey", old.fingerprint),
+            &old.pubkey_armor,
+            false,
+        )
+        .await
+        .expect("archive the replaced key");
+
+        let allowlist = verify_pubkey_allowlist().await.expect("allowlist");
+        assert!(
+            allowlist.iter().any(|a| a == &old.pubkey_armor),
+            "the replaced key must be in the allowlist"
+        );
+        assert!(
+            verify_signature_hex(&sig_hex, data, &allowlist),
+            "a signature made before the replacement must still verify"
+        );
+        // Control: without the archive the same signature is rejected.
+        assert!(
+            !verify_signature_hex(&sig_hex, data, std::slice::from_ref(&new.pubkey_armor)),
+            "the replacement key alone must not verify the replaced key's signature"
+        );
+    }
+
+    /// plan-20260921 VG-05 G5 (`unknown_key_signature_is_rejected`): a signature
+    /// from a key the repository never listed is rejected, never accepted.
+    #[test]
+    fn unknown_key_signature_is_rejected() {
+        let donor_secret = fixture("secret-two-signing-subkeys.asc");
+        let donor = prepare_imported_key(&donor_secret, "").expect("donor fixture imports");
+        let data = b"unknown-key payload";
+        let sig_hex = sign_with_armored_secret_key(&donor_secret, &donor.signing_key_id, data)
+            .expect("donor signs");
+
+        // An allowlist that only holds an unrelated certificate rejects it.
+        let unrelated = fixture("pubkey.asc");
+        assert!(
+            !verify_signature_hex(&sig_hex, data, std::slice::from_ref(&unrelated)),
+            "a key outside the allowlist must not verify"
+        );
+        // And an empty allowlist rejects everything.
+        assert!(
+            !verify_signature_hex(&sig_hex, data, &[]),
+            "an empty allowlist must reject every signature"
         );
     }
 
