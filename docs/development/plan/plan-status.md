@@ -24,7 +24,7 @@
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
-| [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg 2.4.9` 证据、VG-00 GO、ADR-VG-01..12 Accepted）；VG-00 `done/complete`，其余 14 卡 `pending`（DEP-VG-01/02 `blocked`） |
+| [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg 2.4.9` 证据、VG-00 GO、ADR-VG-01..12 Accepted）；VG-00 `done/complete`，其余 14 卡**已全部实施完成**（`locally-accepted`；门 22 全量 7944/7944 绿、门 23 三连收口，`../libra-backend` 五页已同步）；仅 VG-09 发布与 REL-VG-01 证据待操作者授权 |
 | [`plan-20260925.md`](plan-20260925.md) | C（MEM-01/02 研发历程记忆 · 确定性投影） | 未启动 | 原 `plan-20260923.md`（2026-09-25 改名）。**取代 [`plan-20260819.md`](plan-20260819.md) 承担 MEM-01/02**（使用者 2026-09-23 要求在 `libra code` 拆除后独立重设计，不沿用 R30）。**13 卡**全部 `pending`：`DM-00`..`DM-09` + `DM-10`（迁移 B，自 DM-01 拆出）+ `DM-11`/`DM-12`（CLI 家族 `REL-DM-02` 的子卡与 `release` 发布点，自 DM-03 拆出）；全计划**无活动 `EX-*` 豁免**。`DM-09` 为唯一收口卡，AC 按 `DM-06` 的 go/no-go 结论分 A/B 两组；`NO-GO` 时 `DM-07`/`DM-08` 经规范性修订移入 `DEFER-DM-12`。发布周期：GO 分支 9 个、降级分支 7 个（R30 为 25 卡 / 约 25 周期）。**R04 范围收窄（使用者决策）：** 「未提交 Agent 工作按代码路径召回」实测不可实现（`agent_checkpoint.tree_oid` 是 traces 树、`ToolCallRecord.paths_written` 无生产者），已移入 `DEFER-DM-11`。**评审（findings 已改为直接记入计划正文的「Codex review log」章节，`*.review/` 目录已删除）：** Codex r01 `FAIL`（21×P1）、r02（18）、r03（9）、r04（13）、r05（8）、r06（11）、r07（12×P1/4×P2）；**`P0` 全程为 0，但七轮未收敛**。阻塞：`DEP-DM-06`（plan-20260924 拥有 `agent_session` 终态/resume 语义）阻塞 `DM-05`。**计划级评审未 PASS 前禁止开工** |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS；CAP-01..06 可先行，CAP-07 受 `DEP-ACF-CAP` 阻塞 |
@@ -79,7 +79,7 @@
 
 ## 二、未启动的计划与卡
 
-以下计划均未进入实施/发布阶段（多数为设计态、全部 `pending`；`plan-20260919` 与 `plan-20260921` 已收口前置卡/Phase 0，但实施与发布仍未开工）。按建议优先级排列，优先级依据为跨计划依赖（`DEP-*`）与产品路线（`plan-long.md`）：
+以下计划中，`plan-20260921` 的实施已完成（14 卡 `locally-accepted`，仅发布待授权）；其余计划均未进入实施/发布阶段（多数为设计态、全部 `pending`；`plan-20260919` 已收口前置卡/Phase 0，实施与发布仍未开工）。按建议优先级排列，优先级依据为跨计划依赖（`DEP-*`）与产品路线（`plan-long.md`）：
 
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
@@ -95,7 +95,7 @@
 | [`plan-20260913.md`](plan-20260913.md) | FL-00..FL-07 | **前置 plan-20260907 完整收口**（DEP-FL-04） |
 | [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；CAP-01..06 按 ER-CAP-02 pin 重核，CAP-07 另等待 `DEP-ACF-CAP` |
 | [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02/03/04 已实现并本地验收（2026-09-22，`locally-accepted`），发布未执行；写集与 plan-20260918 串行（DEP-GCX-02） |
-| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted）；VG-00 已 `done/complete`，开工前置为 DEP-VG-01（plan-20260919 GCX-02/03 发布）与 DEP-VG-02（`../libra-backend` 脏页处置） |
+| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted）；VG-00 已 `done/complete`；14 卡实施已完成（`locally-accepted`），DEP-VG-02 的网站五页已于后端仓 `cf` 提交 `1bb46c0` 同步；剩余为 VG-09 家族发布与 REL-VG-01 证据（需操作者授权改写真实远端） |
 | `issues/` 设计计划 | 见「计划一览」issues 表 | 各计划 Codex review `PASS` 前不得开工；`issues/476`/`479`/`483`/`490` 与 `plan-20260918` 写集串行（DEP-WT-09 / DEP-PL-04 / DEP-AD-06 / DEP-AD-07） |
 
 ---
