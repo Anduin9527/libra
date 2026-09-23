@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# plan-20260921 VG-09 release runbook (operator-facing).
+#
+#   bash release-runbook.sh preflight          # local-only checks (safe, no remote writes)
+#   bash release-runbook.sh release <tag> --i-authorize-remote-writes
+#
+# `preflight` never touches the network: it re-runs every check that the plan's
+# release script defers to release time, so the remote sequence cannot fail on a
+# locally detectable problem.
+#
+# `release` first runs `preflight`, then performs the plan's remote sequence
+# verbatim (push main → annotated tag → push tag → gh release create
+# --verify-tag → gh run watch/view assertions → CDN gate). It refuses to run
+# without the explicit authorization flag.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"   # tests/harness/<script> -> repo root
+CDN_GATE="$REPO/tests/harness/release_cdn_gate.sh"
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+preflight() {
+  echo "== version surface: Cargo.toml / install.sh / install.ps1 =="
+  local cargo_v sh_v ps1_v
+  cargo_v="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+  sh_v="$(grep -m1 -oE 'DEFAULT_VERSION="[^"]+"' "$REPO/install.sh" | sed -E 's/.*"([^"]+)"/\1/')"
+  ps1_v="$(grep -m1 -oE '\$DefaultVersion = "[^"]+"' "$REPO/install.ps1" | sed -E 's/.*"([^"]+)"/\1/')"
+  echo "  Cargo.toml=$cargo_v install.sh=${sh_v:-<none>} install.ps1=${ps1_v:-<none>}"
+  [ -n "$cargo_v" ] || fail "Cargo.toml version unreadable"
+  # The installers may legitimately pin the previous release until this one is
+  # published; the *guard test* `compat_version_surface_sync` is authoritative.
+  echo "  (authoritative check: cargo nextest run --test compat_version_surface_sync)"
+
+  echo "== CHANGELOG carries the version section =="
+  grep -q "^## \[$cargo_v\]" "$REPO/CHANGELOG.md" \
+    || fail "CHANGELOG.md has no '## [$cargo_v]' section (the release-notes assertion would fail)"
+
+  echo "== CDN gate harness is present, syntax-clean and fail-closed =="
+  [ -f "$CDN_GATE" ] || fail "missing $CDN_GATE"
+  bash -n "$CDN_GATE" || fail "CDN gate syntax error"
+  if LIBRA_CDN_BASE=https://127.0.0.1:1 timeout 30 bash "$CDN_GATE" v9.9.9 >/dev/null 2>&1; then
+    fail "the CDN gate passed against an unreachable CDN — it must fail closed"
+  fi
+
+  echo "== remote divergence (informational) =="
+  ( cd "$REPO" && libra status --short --branch | head -1 )
+
+  echo "PREFLIGHT: OK"
+}
+
+release() {
+  local tag="${1:-}"
+  local ack="${2:-}"
+  [ -n "$tag" ] || fail "usage: release-runbook.sh release <tag> --i-authorize-remote-writes"
+  [ "$ack" = "--i-authorize-remote-writes" ] \
+    || fail "refusing to rewrite the real remote without --i-authorize-remote-writes"
+  preflight
+  cd "$REPO"
+  local V="${tag#v}" SHA
+  SHA="$(libra rev-parse HEAD | tail -1)"
+  echo "== releasing $tag at $SHA =="
+  libra push origin main
+  local REMOTE_MAIN
+  REMOTE_MAIN="$(libra ls-remote origin refs/heads/main | awk '{print $1}')"
+  [ "$REMOTE_MAIN" = "$SHA" ] || fail "remote main ($REMOTE_MAIN) != intended SHA ($SHA)"
+  libra tag -a "$tag" -m "Libra $tag"
+  libra push origin "$tag"
+  local TAG_SHA
+  TAG_SHA="$(libra rev-parse "refs/tags/$tag^{}")"
+  [ "$TAG_SHA" = "$SHA" ] || fail "tag deref ($TAG_SHA) != intended SHA ($SHA)"
+  mkdir -p /tmp/issue-vg/vg09
+  { printf 'Libra %s\n\n' "$tag"; sed -n "/^## \\[$V\\]/,/^## \\[/p" CHANGELOG.md | sed '$d'; } \
+    >/tmp/issue-vg/vg09/release-notes.md
+  grep -q "^## \[$V\]" /tmp/issue-vg/vg09/release-notes.md || fail "version section missing in release notes"
+  gh release create "$tag" -R libra-tools/libra --verify-tag --notes-file /tmp/issue-vg/vg09/release-notes.md
+  local RID
+  RID="$(gh run list -R libra-tools/libra --workflow release.yml --limit 10 \
+    --json databaseId,headBranch,event \
+    -q ".[] | select(.event==\"push\" and .headBranch==\"$tag\") | .databaseId" | head -1)"
+  [ -n "$RID" ] || fail "no matching release run"
+  gh run watch "$RID" -R libra-tools/libra --exit-status
+  gh run view "$RID" -R libra-tools/libra \
+    --json status,conclusion,jobs,event,headBranch,headSha >/tmp/issue-vg/vg09/run.json
+  jq -e --arg v "$V" --arg sha "$SHA" \
+    '.status=="completed" and .conclusion=="success" and .event=="push" and .headBranch==("v"+$v) and .headSha==$sha' \
+    /tmp/issue-vg/vg09/run.json >/dev/null || fail "run.json assertions failed"
+  bash "$CDN_GATE" "$tag" | tee /tmp/issue-vg/vg09/cdn.log
+  echo "RELEASE: complete for $tag"
+}
+
+case "${1:-}" in
+  preflight) preflight ;;
+  release) shift; release "${1:-}" "${2:-}" ;;
+  *) echo "usage: release-runbook.sh preflight | release <tag> --i-authorize-remote-writes" >&2; exit 2 ;;
+esac
