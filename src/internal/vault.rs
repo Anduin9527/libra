@@ -215,6 +215,32 @@ fn next_versioned_key_name() -> String {
     format!("libra-signing-{nanos}")
 }
 
+/// Read a config value into `Option<String>` (empty ⇒ `None`).
+async fn read_cfg_value(key: &str) -> Option<String> {
+    use crate::internal::config::ConfigKv;
+    ConfigKv::get(key)
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+        .filter(|v| !v.is_empty())
+}
+
+/// Restore a config key to its before-image: set when it existed, otherwise
+/// remove it. Used by the ADR-VG-06 §6 staged-step compensation.
+async fn restore_cfg_value(key: &str, before: Option<String>) -> Result<()> {
+    use crate::internal::config::ConfigKv;
+    match before {
+        Some(value) => ConfigKv::set(key, &value, false)
+            .await
+            .with_context(|| format!("failed to restore '{key}'")),
+        None => ConfigKv::unset(key)
+            .await
+            .map(|_| ())
+            .with_context(|| format!("failed to clear '{key}'")),
+    }
+}
+
 /// Generate a signing PGP key with a versioned key name and persist the
 /// generated-key metadata (`vault.gpg.generated_key_name`). Collisions on the
 /// versioned name probe-retry up to 8 times; config write errors propagate.
@@ -268,20 +294,53 @@ pub async fn generate_pgp_key(
         let key_name = next_versioned_key_name();
         match vault_generate_pgp_key(root_dir, unseal_key, &key_name, user_name, user_email).await {
             Ok(public_key) => {
-                // staged writes (c) generated_pubkey, (d1) generated_key_name,
-                // (d2) vault.gpg.pubkey, (e) source=generated — errors propagate.
-                ConfigKv::set("vault.gpg.generated_pubkey", &public_key, false)
-                    .await
-                    .context("failed to persist generated GPG public key snapshot")?;
-                ConfigKv::set("vault.gpg.generated_key_name", &key_name, false)
-                    .await
-                    .context("failed to persist generated GPG key name")?;
-                ConfigKv::set("vault.gpg.pubkey", &public_key, false)
-                    .await
-                    .context("failed to persist generated GPG public key")?;
-                ConfigKv::set("vault.gpg.source", "generated", false)
-                    .await
-                    .context("failed to persist generated GPG key source")?;
+                // ADR-VG-06 §6 staged writes: (c) generated_pubkey, (d1)
+                // generated_key_name, (d2) vault.gpg.pubkey, (e) source. Each
+                // step captures a before-image and compensates on the next
+                // step's failure; the (e)-failure residue is intentionally
+                // kept (history already holds the old key) and converges on
+                // re-run via the resume branch above.
+                let before_generated_pubkey = read_cfg_value("vault.gpg.generated_pubkey").await;
+                let before_generated_key_name =
+                    read_cfg_value("vault.gpg.generated_key_name").await;
+                let before_pubkey = read_cfg_value("vault.gpg.pubkey").await;
+
+                // (c) generated_pubkey
+                if let Err(e) =
+                    ConfigKv::set("vault.gpg.generated_pubkey", &public_key, false).await
+                {
+                    return Err(e).context("failed to persist generated GPG public key snapshot");
+                }
+
+                // (d1) generated_key_name
+                if let Err(e) =
+                    ConfigKv::set("vault.gpg.generated_key_name", &key_name, false).await
+                {
+                    let _ =
+                        restore_cfg_value("vault.gpg.generated_pubkey", before_generated_pubkey)
+                            .await;
+                    return Err(e).context("failed to persist generated GPG key name");
+                }
+
+                // (d2) vault.gpg.pubkey
+                if let Err(e) = ConfigKv::set("vault.gpg.pubkey", &public_key, false).await {
+                    let _ =
+                        restore_cfg_value("vault.gpg.generated_pubkey", before_generated_pubkey)
+                            .await;
+                    let _ = restore_cfg_value(
+                        "vault.gpg.generated_key_name",
+                        before_generated_key_name,
+                    )
+                    .await;
+                    // ADR-VG-06 §6: the active pubkey may have partially applied.
+                    let _ = restore_cfg_value("vault.gpg.pubkey", before_pubkey).await;
+                    return Err(e).context("failed to persist generated GPG public key");
+                }
+
+                // (e) source=generated
+                if let Err(e) = ConfigKv::set("vault.gpg.source", "generated", false).await {
+                    return Err(e).context("failed to persist generated GPG key source");
+                }
                 return Ok((public_key, key_name));
             }
             Err(e) => {
@@ -1968,10 +2027,6 @@ mod tests {
             assert!(rebuild_unprotected_certificate(&secret, "wrong-passphrase").is_err());
         }
     }
-
-    /// plan-20260919 GCX-03: the global key resolution and its one-time move
-    /// out of the legacy Libra home. `LIBRA_TEST_HOME` redirects both layouts,
-    /// so these never touch the developer's real key.
     mod global_unseal_key {
         use std::path::Path;
 

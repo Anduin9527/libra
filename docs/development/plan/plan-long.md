@@ -222,7 +222,7 @@ Libra 自身（HEAD `9da06b4bf700472781c2e76ec48e96815475caf3`，`Cargo.toml` ve
 - **Memory**：仍无实现——`ls src/internal/ai/memory` 不存在、`src/cli.rs` 无 memory 子命令、`grep -rn 'fts5\|bm25'` = 0、`grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0；MEM-01/02 维持已排期，MEM-06 本轮由竞品证据推进为已验证。
 - **未发布变更（v0.22.47..HEAD，3 条）**：`9da06b4` operation/change genealogy milestones（上两行）；`06d0840` add unmerged staging、`-u` pathspec 检查、literal-pathspecs（用户可见行为变更）；`07ba2d9` pkt-line 计划收口文档。CHANGELOG `[Unreleased]` 另有 isolated agent task 单一 `agent.task.sync-back` operation 语义与 operation-v2 HEAD pinning（触及「兼容与迁移」「数据正确性」门禁，须随发布补迁移/回滚证据）。
 - **stale facts 更正**：第 10 轮遗留的 `ssh.strictHostKeyChecking` 文档债已闭合（`COMPATIBILITY.md:617` 与 clone/config/fetch/push 命令文档均已记录）；plan-20260901 已完成（索引状态同步更新）。
-- **日期计划对账**：磁盘含 `plan-20260918.md`（`add` 收口，排在 `issues/477` 之后）与 `plan-20260917.md`（cargo-test 进程内剥落）；索引已补齐 `plan-20260902`..`plan-20260918` 与 [`plan-20260921.md`](plan-20260921.md)（原 `plan-20260919-gpg-import.md`，R29 双 PASS；Phase 0 已收口、VG-00 `done/complete`，其余 14 卡 `pending` 且因 DEP-VG-01/02 `blocked`，实施未开工）；`plan-20260916.md`（Mega remote Agent Capture 客户端）为设计态；`plan-20260901` 状态由实施中更新为已完成（其自述收口门与 DEFER-02 登记以其修订史为准）。
+- **日期计划对账**：磁盘含 `plan-20260918.md`（`add` 收口，排在 `issues/477` 之后）与 `plan-20260917.md`（cargo-test 进程内剥落）；索引已补齐 `plan-20260902`..`plan-20260918`、[`plan-20260921.md`](plan-20260921.md)（原 `plan-20260919-gpg-import.md`，R29 双 PASS；Phase 0 已收口、VG-00 `done/complete`，其余 14 卡 `pending` 且因 DEP-VG-01/02 `blocked`，实施未开工）與 [`plan-20260924.md`](plan-20260924.md)（Agent Capture 通用協調/儲存前置，ACF-01..09 `pending`）；`plan-20260916.md` 的 CAP-01..06 HTTP client 可獨立，CAP-07 等待 ACF；`plan-20260901` 状态由实施中更新为已完成（其自述收口门与 DEFER-02 登记以其修订史为准）。
 - deepseek-harness bridge：`plan-20260818.md` 事实不变；本轮复核上游 `session/created|event|flush|disposed` 事件面仍在（deepseek 上游 `packages/core/session/src/index.ts` 的 50–81 行），bridge 按方法分发、不锁定 `SESSION_FORMAT_VERSION`（现 v3），事件面依赖成立；载荷字段级兼容列入待验证账本。
 ---
 
@@ -747,22 +747,23 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度与序列注册） | 已完成 | NP-00..05 六卡全部 complete（nextest 离线 CI face `a8218ac`、串行注册 `315132a`、TA-03/06/07 承接）；D 组 CI 证据环境受阻部分按 backfill 窗口记录 |
 | [`plan-20260830.md`](plan-20260830.md) | 横切（SB-02 sandbox export） | 已完成 | SBX-01..05 五卡 done/locally-accepted（共享 SandboxManager transform、macOS seatbelt OpenCode export）；ER-13 全量收口门绿（2026-09-01）；DEFER-SBX-06 发布步延后 |
 | [`plan-20260901.md`](plan-20260901.md) | 横切（SB-01 pkt-line fail-closed） | 已完成 | 原PKT01..14及FIX-PKT01..05全部done/complete；十六实际发布C/D完整，家族02/03/04由05覆盖，最新v0.22.47。所有卡D后新的无过滤默认全量10221/10221（231 binaries、零失败/重试）和原113具名门及FIX05四新增门通过，Codex/Claude最终PASS；同步/异步协议与CLI分类、SSH诊断/BatchMode、push ng净化、空仓库尾部帧校验及五恢复修复全部交付。失败历史与全部DEFER条目/具名P2如计划，不冒称历史SIGKILL根因已查明或已本地安装。 |
-| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 实施中 | 计划仍有未完成卡；以当前计划状态为准 |
+| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 已排期 | OG-00/OG-04 可先行；其余 production 卡受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
 | [`plan-20260903.md`](plan-20260903.md) | A（LR-05 merge） | 实施中 | MG-01..MG-21 已有代码、测试与发布提交；最终计划收口与 deferred 差异仍待完成 |
-| [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 已排期 | 设计计划，任务卡尚未完成 |
-| [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 已排期 | 设计计划，任务卡尚未完成 |
+| [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 已排期 | CX-00/CX-12 audit 可先行；RG 與 CX production 卡受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
+| [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 已排期 | CC-00 source probe 可先行；CC-01..06 受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
 | [`plan-20260906.md`](plan-20260906.md) | 横切（安全扫描） | 已排期 | 设计计划，任务卡尚未完成 |
 | [`plan-20260907.md`](plan-20260907.md) | 横切（BLAKE3 object format） | 已排期 | 设计计划，任务卡尚未执行；与 Media 计划的边界见其关系表 |
 | [`plan-20260910.md`](plan-20260910.md) | 横切（数据库迁移作用域） | 已排期 | 设计计划，任务卡尚未执行 |
-| [`plan-20260911.md`](plan-20260911.md) | B（hook boundary） | 已排期 | 设计计划，任务卡尚未执行 |
+| [`plan-20260911.md`](plan-20260911.md) | B（Pi hook/capture boundary） | 已排期 | 只讀 Pi pin/source 重核可先行；PI-01..06 受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
 | [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | 已排期 | 设计计划，任务卡尚未执行 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 已排期 | 设计计划，任务卡尚未执行；Libra 侧以前置 `plan-20260907` 完整收口为准 |
-| [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | 承接 monoengine `DEFER-AC-01`：新增 `libra agent capture-push` HTTP 客户端；双评审 PASS，任务卡尚未执行 |
+| [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | CAP-01..06 HTTP client 可先行；CAP-07 local orchestration 受 plan-20260924 `DEP-ACF-CAP` 阻塞 |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | 已排期 | 收口与 nextest 分组无关的 `--lib` 串行锁对齐 + `command_test` 高并行 spawn；禁止改 nextest 成员 |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | 已完成（WT-06/WT-07 blocked） | 合并原 issues/469、484、489、491-494 及 490/476/470 的 add 卡。23/25 卡 `done`/`complete`（SW-06→v0.23.25/27、FM-03→v0.23.26/27、FM-04→v0.23.27、WT-05→v0.23.28，其余见各卡 D 组记录）；WT-06/WT-07 因 DEP-AD-11（[`issues/476.md`](issues/476.md) 全部 `pending`）按依赖失败策略保持 `blocked`。`add -p` 仍由 477 Phase 4 交付 |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆除 `libra code` / Publish / Worker） | **已完成** | RC-00..RC-36 全部 `done/complete`；公开 Code/Publish、内部 SCC、Code UI 测试面与 `worker/` 已删除，三份 RT-01/Code provider 计划转为历史封存 |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁到 XDG） | 实施中 | 用户 2026-09-19 裁决：global config DB + 全域 vault unseal key 迁到 `<XDG_CONFIG_HOME\|~/.config>/libra`（macOS 同）；旧库首次使用自动迁移并保留备份；`~/.libra` 仍为 `LIBRA_HOME`；四个 `independent` 卡、`patch` 发布。**进度**：GCX-01 `done`（2026-09-19，`v0.23.1`）；GCX-02（首次使用自动迁移）/ GCX-03（全域 vault key 随迁）/ GCX-04（用户级 hooks 路径对齐）于 2026-09-22 完成实现+测试+文档，三卡 `locally-accepted`，版本 bump 与发布未执行。版本面本轮重核为**三处**（`web/package.json` 已随 `web/` 拆除）；DEP-GCX-01（`../libra-backend`）与 DEP-GCX-03（`.env.test`/`.env.live-test`）在本机均不满足 |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 2026-09-21 由 `plan-20260919-gpg-import.md` 改名。用户 2026-09-19 指示 Codex+Claude 双评审：**R29 同版双 `PASS`（P0/P1/P2 全 0）**；15 卡（家族 REL-VG-01 + 四张独立 patch VG-06/07/08/14）。**Phase 0 已收口（2026-09-20）**：`plan-long.md` 索引、`gpg --version` 证据（`gpg (GnuPG) 2.4.9`）、ADR-VG-01..12 Accepted（12/12）、VG-00 go 结论 **GO**、开工 DEP 复核完成。**进度**：VG-00 `done/complete`；VG-01..VG-14 共 14 卡 `pending`，因 DEP-VG-01（`plan-20260919` GCX-02/03 仅 `locally-accepted`、未发布，写集含 `src/internal/vault.rs`）与 DEP-VG-02（`../libra-backend` 8 页脏）按依赖表 `blocked` |
+| [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | 對標 Entire `main@9c06bfb13`；ACF-01..09 建立 validated ingress、純 reducer、snapshot、catalog/checkpoint store、coordinator、bounded finalizer 與獨立 handoff；是 0902/04/05/11 production 與 CAP-07 前置 |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---

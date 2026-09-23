@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-23（下次更新时替换）。
+> **当前快照：** 2026-09-24（下次更新时替换）。
 
 ---
 
@@ -20,23 +20,24 @@
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
+| [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R1A `FAIL` 已修訂、最終 review 待完成；是 0902/0904/0905/0911 production 與 0916 CAP-07 的前置 |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg 2.4.9` 证据、VG-00 GO、ADR-VG-01..12 Accepted）；VG-00 `done/complete`，其余 14 卡 `pending`（DEP-VG-01/02 `blocked`） |
-| [`plan-20260923.md`](plan-20260923.md) | C（MEM-01/02 研发历程记忆 · 确定性投影） | 未启动 | **取代 [`plan-20260819.md`](plan-20260819.md) 承担 MEM-01/02**（使用者 2026-09-23 要求在 `libra code` 拆除后独立重设计，不沿用 R30）。DM-00..DM-09 共 10 卡全部 `pending`；8 个发布周期（R30 为 25 卡/约 25 周期）。核心分歧：模型不在关键路径（`ADR-DM-01`）、不新建权威 ref、Memory 为可重建投影（`ADR-DM-02`）、无 host 触发信封（`ADR-DM-03`）。计划级评审尚未取得 `VERDICT: PASS`，**禁止开工** |
+| [`plan-20260923.md`](plan-20260923.md) | C（MEM-01/02 研发历程记忆 · 确定性投影） | 未启动 | **取代 [`plan-20260819.md`](plan-20260819.md) 承担 MEM-01/02**（使用者 2026-09-23 要求在 `libra code` 拆除后独立重设计，不沿用 R30）。DM-00/01/01B/02/03/03B/04/05/06/07/08/09 共 **12 卡**全部 `pending`；**全计划无 `EX-*` 豁免**（R06 按 G-03 拆卡：两张迁移卡 `2026092301`/`2026092302`、注册卡与子命令卡各自分开）。`DM-09` 为唯一收口卡，AC 按 `DM-06` 的 go/no-go 结论分 A/B 两组；`NO-GO` 时 `DM-07`/`DM-08` 经规范性修订移入 `DEFER-DM-12`。发布周期：GO 分支 10 个、降级分支 8 个（R30 为 25 卡 / 约 25 周期）。**R04 范围收窄（使用者决策）：** 「未提交 Agent 工作按代码路径召回」实测不可实现（`agent_checkpoint.tree_oid` 是 traces 树、`ToolCallRecord.paths_written` 无生产者），已移入 `DEFER-DM-11`。核心 ADR：模型不在关键路径（`ADR-DM-01`）、不新建权威 ref、Memory 为可重建投影（`ADR-DM-02`）、无 host 触发信封（`ADR-DM-03`）。评审：Codex r01 `FAIL`（21×P1）、r02（18）、r03（9）、r04（13）、r05（8），r06 待跑；P0 全程为 0。阻塞：`DEP-DM-06`（plan-20260924 拥有 `agent_session` 终态/resume 语义）阻塞 `DM-05`。**计划级评审未 PASS 前禁止开工** |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
-| [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS，尚未开工 |
+| [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS；CAP-01..06 可先行，CAP-07 受 `DEP-ACF-CAP` 阻塞 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 未启动 | FL-00..FL-07 全部 `pending`；前置 plan-20260907 未收口 |
 | [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | **已收口** | MB-01..MB-05、MB-07/08、MB-10/11 全部 `done/complete`（v0.23.37/.39/.40/.41/.42/.43/.44/.45/.46，各卡 ER-14 全量绿、D-MB-STD 远端 evidence 绿）；MB-06/09/12 墓碑 `done`（无对应子命令）；EX-MB-01/02（G-03）与 EX-MB-03（ER-07 签名）已登记；使用者 2026-09-21 双评审豁免已登记；完成判据全数勾选 |
-| [`plan-20260911.md`](plan-20260911.md) | B（pi capture / hook boundary） | 未启动 | PI-01..06 全部 `pending`；Claude Code 429 未给出 verdict，**禁止开工** |
+| [`plan-20260911.md`](plan-20260911.md) | B（pi capture / hook boundary） | 未启动 | PI-01..06 全部 `pending`；Claude Code 429 未给出 verdict且 `DEP-ACF-MIRROR` 未满足，**禁止 production 开工** |
 | [`plan-20260910.md`](plan-20260910.md) | 横切（数据库迁移作用域） | **已收口** | MIG-00..MIG-06、MIG-R01..R03 全部 `done/complete` |
 | [`plan-20260907.md`](plan-20260907.md) | 横切（BLAKE3 object format） | 未启动 | B3-00..B3-17 全部 `pending` |
 | [`plan-20260906.md`](plan-20260906.md) | 横切（安全扫描） | 未启动 | SC-01..SC-07、SC-CLOSE 全部 `pending` |
-| [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 未启动 | CC-00..CC-06 全部 `pending` |
-| [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 未启动 | CX-00..CX-30（35 卡）全部 `pending` |
+| [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 未启动 | CC-00..CC-06 全部 `pending`；CC-00 可先行，CC-01..06 受 `DEP-ACF-MIRROR` 阻塞 |
+| [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 未启动 | 6 張 RG + 29 張已定義 CX 卡（共 35 卡）全部 `pending`；CX-00/CX-12 可先行，其餘 33 張 production 卡受 `DEP-ACF-MIRROR` 阻塞（無 CX-18/CX-21） |
 | [`plan-20260903.md`](plan-20260903.md) | A（LR-05 merge） | 实施中（收尾） | MG-01..MG-21 卡片全部 `done/complete`；最终计划收口与 deferred 差异仍待完成 |
-| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 未启动 | OG-00..OG-15 全部 `pending` |
+| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 未启动 | OG-00..OG-15 全部 `pending`；OG-00/OG-04 可先行，其余 production 卡受 `DEP-ACF-MIRROR` 阻塞 |
 | [`plan-20260901.md`](plan-20260901.md) | 横切（SB-01 pkt-line fail-closed） | **已收口** | 全部卡 `done/complete`；最新 v0.22.47 |
 | [`plan-20260830.md`](plan-20260830.md) | 横切（SB-02 sandbox export） | **已收口** | SBX-01..05 `done/locally-accepted`（发布步按 DEFER-SBX-06 延后）；ER-13 收口门绿 |
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度） | **已收口** | NP-00..05 全部 `complete` |
@@ -82,14 +83,16 @@
 
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
-| [`plan-20260904.md`](plan-20260904.md) | CX-00..CX-30（35 卡） | Phase 0：Codex `PASS`；CX-30 受 DEP-CLI-mirror 三态串行约束 |
-| [`plan-20260905.md`](plan-20260905.md) | CC-00..CC-06 | CC-02..06 依赖 plan-20260904 的 RG 卡完成 |
+| [`plan-20260924.md`](plan-20260924.md) | ACF-01..ACF-09 | Claude 字面 `VERDICT: PASS`；ACF-01 重核 Entire/Libra pin 與 shared files clean |
+| [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | OG-00/04 以各自 review gate 為準；其余 production 卡等待 `DEP-ACF-MIRROR` |
+| [`plan-20260904.md`](plan-20260904.md) | 6 張 RG + 29 張已定義 CX 卡（共 35 卡） | CX-00/12 以原 Phase 0 gate 為準；其餘 33 張 production 卡等待 `DEP-ACF-MIRROR`；CX-30 另受 DEP-CLI-mirror |
+| [`plan-20260905.md`](plan-20260905.md) | CC-00..CC-06 | CC-00 以原 review gate 為準；CC-01..06 等待 `DEP-ACF-MIRROR`，且 reasoning 卡保留 RG 前置 |
 | [`plan-20260906.md`](plan-20260906.md) | SC-01..SC-07、SC-CLOSE | — |
 | [`plan-20260907.md`](plan-20260907.md) | B3-00..B3-17 | Phase 0 冻结；是 plan-20260913 的前置 |
-| [`plan-20260911.md`](plan-20260911.md) | PI-01..PI-06 | **Claude Code 429 未出 verdict，禁止开工** |
+| [`plan-20260911.md`](plan-20260911.md) | PI-01..PI-06 | **Claude Code 429 未出 verdict且 `DEP-ACF-MIRROR` 未满足，禁止 production 开工**；只讀 pin/source 重核可先行 |
 | [`plan-20260912.md`](plan-20260912.md) | MB-01..05、MB-07/08/10/11（MB-06/09/12 已取消） | 依赖 CAP（plan-20260916）等 |
 | [`plan-20260913.md`](plan-20260913.md) | FL-00..FL-07 | **前置 plan-20260907 完整收口**（DEP-FL-04） |
-| [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；开工时按 ER-CAP-02 pin 重核 |
+| [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；CAP-01..06 按 ER-CAP-02 pin 重核，CAP-07 另等待 `DEP-ACF-CAP` |
 | [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02/03/04 已实现并本地验收（2026-09-22，`locally-accepted`），发布未执行；写集与 plan-20260918 串行（DEP-GCX-02） |
 | [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted）；VG-00 已 `done/complete`，开工前置为 DEP-VG-01（plan-20260919 GCX-02/03 发布）与 DEP-VG-02（`../libra-backend` 脏页处置） |
 | `issues/` 设计计划 | 见「计划一览」issues 表 | 各计划 Codex review `PASS` 前不得开工；`issues/476`/`479`/`483`/`490` 与 `plan-20260918` 写集串行（DEP-WT-09 / DEP-PL-04 / DEP-AD-06 / DEP-AD-07） |
@@ -223,6 +226,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal` 0.9.0 并引入 `object_format` 事实源 | 无 | **双评审已 PASS**（Grok R2 / Claude R40 / Codex R40） | 外部无；开工需 `cp .env.test.example .env.test` | ✅ |
 | [`plan-20260912`](plan-20260912.md) | MB-01 | 有界 mega2 tree transport 与 wire validation | 无 | **双评审已 PASS**（Codex R7 / Claude R5） | DEP-MB-01：mega2 `a1293686` tree API pin 现场重核（2026-09-21 已前推） | ✅ `done/complete`：v0.23.37（84f6bd8）；codeql + release.yml 8/8 jobs 全绿；CDN 产物 HTTP 200 |
 | [`plan-20260916`](plan-20260916.md) | CAP-01 | Agent Capture wire types、URL、uid、transport trait | 无 | **双评审已 PASS**（Codex R3 / Claude R3） | DEP-CAP-01：monoengine `2b8f365` capture HTTP pin 重核（ER-CAP-02） | ⚠️ 需重核 DEP-CAP-01 |
+| [`plan-20260924`](plan-20260924.md) | ACF-01 | Agent Capture validated ingress contract | `DEP-ACF-01`（來源/工作樹基線） | Claude 最終 review 待完成 | Entire `9c06bfb13` / Libra `c74813d` pin 與 shared files clean | ❌ review 前禁止開工 |
 | [`plan-20260913`](plan-20260913.md) | FL-00 | 核实 Media 前提与热路径（audit，no-release） | 无 | 联合 review 已 PASS（U2 `VERDICT: PASS`） | DEP-FL-04：**plan-20260907 须完整收口**（未启动 → 硬门） | ❌ 阻塞（等 9/07 收口） |
 | [`plan-20260904`](plan-20260904.md) | CX-00 | codex-cli 0.152 基线探测与 ADR go/no-go | 无 | **未过**（R5 `FAIL`；Claude 亦未出 verdict） | CX-30 另受 DEP-CLI-mirror | ❌ 禁止开工 |
 | [`plan-20260905`](plan-20260905.md) | CC-00 | Claude Code 2.1.259 Hook source 契约探测 | 无 | **未过**（须 Claude `PASS`） | 无 | ❌ 禁止开工 |
@@ -291,6 +295,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
+| DEP-ACF-MIRROR / DEP-ACF-CAP | Agent Capture 架構前置 | 0902/0904/0905/0911 production 卡與 0916 CAP-07 必須等待 plan-20260924 ACF-09 `done/complete`；只允許各鏡像明列的 audit/source/CAP HTTP 例外先行 | 生效；ACF-01..09 全部 `pending` |
 | DEP-AD-12 / DEP-CLI-mirror | 跨计划写集互斥 | `src/cli.rs` 三态串行：plan-20260918 OI-05、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、issues/483 CO-03/04 | 生效；OI-05 开工前必须核对 |
 | DEP-GCX-02 | 跨计划写集互斥 | plan-20260919 与 plan-20260918 的 `COMPATIBILITY.md`/docs/网站页串行 | 生效 |
 | DEP-FL-04 | 跨计划前置 | plan-20260913 依赖 plan-20260907 完整收口 | plan-20260907 未启动 |
