@@ -1995,6 +1995,34 @@ async fn snapshot_active_key_to_history() -> Result<()> {
     snapshot_active_key_to_history_with_conn(&db).await
 }
 
+/// plan-20260921 VG-08 G9–G12: `#[cfg(test)]`-only injection point so each of
+/// the four removal steps can be failed individually. ADR-VG-07 §2 forbids env
+/// hooks, so the seam exists only in test builds — the same approach the two
+/// generator injection gates use.
+#[cfg(test)]
+static REMOVE_FAIL_AT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn set_remove_fail_at(step: u8) {
+    REMOVE_FAIL_AT.store(step, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn clear_remove_fail_at() {
+    REMOVE_FAIL_AT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Fail the step named by the injected value (once), or do nothing.
+fn remove_failpoint(step: u8) -> Result<()> {
+    #[cfg(test)]
+    if REMOVE_FAIL_AT.load(std::sync::atomic::Ordering::SeqCst) == step {
+        REMOVE_FAIL_AT.store(0, std::sync::atomic::Ordering::SeqCst);
+        return Err(anyhow!("injected removal failure at step {step}"));
+    }
+    let _ = step;
+    Ok(())
+}
+
 /// [`snapshot_active_key_to_history`] against a caller-provided connection, so
 /// the whole import sequence can run inside one transaction.
 async fn snapshot_active_key_to_history_with_conn<C>(db: &C) -> Result<()>
@@ -2053,9 +2081,24 @@ pub async fn gpg_source() -> Option<String> {
 /// (ADR-VG-06 §3/4). Deletes only the allowlist keys; `history.*`,
 /// `generated_pubkey` and `generated_key_name` are never touched.
 pub async fn remove_imported_gpg_key() -> Result<()> {
+    use sea_orm::TransactionTrait;
+
     use crate::internal::config::ConfigKv;
 
-    snapshot_active_key_to_history().await?;
+    // plan-20260921 VG-08 G9–G12: the removal is ONE transaction, so a failure
+    // at any of the four steps (archive the active key, drop the imported
+    // metadata, restore the generated public half, switch `source`) rolls back
+    // and leaves the imported key exactly as it was. Without the transaction a
+    // mid-way failure would leave, say, `source=imported` with the secret key
+    // already deleted — signing would then fail far from the cause.
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let txn = db
+        .begin()
+        .await
+        .context("failed to start the GPG key removal transaction")?;
+
+    snapshot_active_key_to_history_with_conn(&txn).await?;
+    remove_failpoint(1)?;
 
     for key in [
         "vault.gpg.seckey_enc",
@@ -2064,21 +2107,29 @@ pub async fn remove_imported_gpg_key() -> Result<()> {
         "vault.gpg.uid",
         "vault.gpg.imported_at",
     ] {
-        ConfigKv::unset(key).await?;
+        ConfigKv::unset_with_conn(&txn, key).await?;
     }
+    remove_failpoint(2)?;
 
-    let generated = ConfigKv::get("vault.gpg.generated_pubkey")
+    let generated = ConfigKv::get_with_conn(&txn, "vault.gpg.generated_pubkey")
         .await
         .ok()
         .flatten()
         .map(|e| e.value);
     match generated.filter(|g| !g.is_empty()) {
-        Some(g) => ConfigKv::set("vault.gpg.pubkey", &g, false).await?,
+        Some(g) => ConfigKv::set_with_conn(&txn, "vault.gpg.pubkey", &g, false).await?,
         None => {
-            let _ = ConfigKv::unset("vault.gpg.pubkey").await;
+            let _ = ConfigKv::unset_with_conn(&txn, "vault.gpg.pubkey").await;
         }
     }
-    ConfigKv::set("vault.gpg.source", "generated", false).await?;
+    remove_failpoint(3)?;
+
+    ConfigKv::set_with_conn(&txn, "vault.gpg.source", "generated", false).await?;
+    remove_failpoint(4)?;
+
+    txn.commit()
+        .await
+        .context("failed to commit the GPG key removal")?;
     Ok(())
 }
 
@@ -3269,5 +3320,196 @@ mod gpg_allowlist_gate_tests {
             many <= one * 300,
             "64 candidates took {many:?} against {one:?} for one — verification must stay linear"
         );
+    }
+}
+
+#[cfg(test)]
+mod gpg_remove_gate_tests {
+    use serial_test::serial;
+
+    use super::*;
+    use crate::internal::config::ConfigKv;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// Sandboxed repository whose active key is the shared fixture import, with
+    /// a generated key behind it so the removal's "restore the generated public
+    /// half" step is meaningful.
+    struct Sandbox {
+        _env: crate::utils::test::ConfigDbFixture,
+        repo: tempfile::TempDir,
+        _cwd: crate::utils::test::ChangeDirGuard,
+        unseal: Vec<u8>,
+        fingerprint: String,
+    }
+
+    async fn imported_key_repo() -> Sandbox {
+        let env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let root = crate::utils::util::storage_path();
+        let unseal = lazy_init_vault_for_scope("local")
+            .await
+            .expect("local vault");
+        let (_pubkey, _name) = generate_pgp_key(&root, &unseal, "Seed", "seed@example.invalid")
+            .await
+            .expect("the generated key must exist for the fallback step");
+
+        let material = prepare_imported_key(
+            &fixture("protected-secret.asc"),
+            "libra-test-fixture-passphrase",
+        )
+        .expect("fixture unlocks");
+        let fingerprint = material.fingerprint.clone();
+        persist_imported_gpg_key(&unseal, &material)
+            .await
+            .expect("persist the imported key");
+        ConfigKv::set("vault.gpg.source", "imported", false)
+            .await
+            .expect("record imported source");
+
+        Sandbox {
+            _env: env,
+            repo,
+            _cwd: cwd,
+            unseal,
+            fingerprint,
+        }
+    }
+
+    /// The four removal steps' invariant: after a failed removal the imported
+    /// key must still be the active, usable one.
+    async fn assert_imported_state_intact(web: &Sandbox, pubkey_before: Option<String>) {
+        let value = |key: &'static str| async move {
+            ConfigKv::get(key)
+                .await
+                .ok()
+                .flatten()
+                .map(|entry| entry.value)
+        };
+        assert_eq!(
+            value("vault.gpg.source").await.as_deref(),
+            Some("imported"),
+            "a failed removal must not flip the source"
+        );
+        assert_eq!(
+            value("vault.gpg.fingerprint").await.as_deref(),
+            Some(web.fingerprint.as_str()),
+            "a failed removal must keep the imported fingerprint"
+        );
+        assert!(
+            value("vault.gpg.seckey_enc").await.is_some(),
+            "a failed removal must keep the imported secret key"
+        );
+        assert_eq!(
+            value("vault.gpg.pubkey").await,
+            pubkey_before,
+            "a failed removal must keep the active public key"
+        );
+        assert!(
+            value("vault.gpg.generated_pubkey").await.is_some(),
+            "a failed removal must keep the generated fallback snapshot"
+        );
+        let _ = &web.unseal;
+        let _ = &web.repo;
+    }
+
+    /// plan-20260921 VG-08 G9 (`config_remove_gpg_key_inject_failure_history`):
+    /// a failure while archiving the active key must leave the import untouched.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_remove_gpg_key_inject_failure_history() {
+        let web = imported_key_repo().await;
+        let pubkey_before = ConfigKv::get("vault.gpg.pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        set_remove_fail_at(1);
+        let outcome = remove_imported_gpg_key().await;
+        clear_remove_fail_at();
+        let err = outcome.expect_err("an injected step-1 failure must abort the removal");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_imported_state_intact(&web, pubkey_before).await;
+    }
+
+    /// plan-20260921 VG-08 G10
+    /// (`config_remove_gpg_key_inject_failure_delete_imported`): a failure while
+    /// dropping the imported metadata must roll the whole removal back.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_remove_gpg_key_inject_failure_delete_imported() {
+        let web = imported_key_repo().await;
+        let pubkey_before = ConfigKv::get("vault.gpg.pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        set_remove_fail_at(2);
+        let outcome = remove_imported_gpg_key().await;
+        clear_remove_fail_at();
+        let err = outcome.expect_err("an injected step-2 failure must abort the removal");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_imported_state_intact(&web, pubkey_before).await;
+    }
+
+    /// plan-20260921 VG-08 G11
+    /// (`config_remove_gpg_key_inject_failure_restore_pubkey`): a failure while
+    /// restoring the generated public half must roll back the deleted metadata.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_remove_gpg_key_inject_failure_restore_pubkey() {
+        let web = imported_key_repo().await;
+        let pubkey_before = ConfigKv::get("vault.gpg.pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        set_remove_fail_at(3);
+        let outcome = remove_imported_gpg_key().await;
+        clear_remove_fail_at();
+        let err = outcome.expect_err("an injected step-3 failure must abort the removal");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_imported_state_intact(&web, pubkey_before).await;
+    }
+
+    /// plan-20260921 VG-08 G12
+    /// (`config_remove_gpg_key_inject_failure_source`): a failure while writing
+    /// the `source` marker must roll back everything written before it.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_remove_gpg_key_inject_failure_source() {
+        let web = imported_key_repo().await;
+        let pubkey_before = ConfigKv::get("vault.gpg.pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        set_remove_fail_at(4);
+        let outcome = remove_imported_gpg_key().await;
+        clear_remove_fail_at();
+        let err = outcome.expect_err("an injected step-4 failure must abort the removal");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_imported_state_intact(&web, pubkey_before).await;
     }
 }

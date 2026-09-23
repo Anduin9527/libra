@@ -2911,3 +2911,7 @@ src/utils/util.rs	test_uninspectable_markers_fail_closed	none	none	none;callees:
 src/utils/util.rs	test_worktree_info_file_path_is_local_for_git_layout_linked_worktree	none	none	none;callees:test_worktree_info_file_path_is_local_for_git_layout_linked_worktree
 src/utils/util.rs	test_worktree_info_file_paths_resolve_dot_libra_layouts	none	none	none;callees:test_worktree_info_file_paths_resolve_dot_libra_layouts
 src/internal/vault.rs	verification_ignores_source_with_internal_fixture	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-05 G2);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_remove_gpg_key_inject_failure_history	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-08);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_remove_gpg_key_inject_failure_delete_imported	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-08);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_remove_gpg_key_inject_failure_restore_pubkey	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-08);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_remove_gpg_key_inject_failure_source	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-08);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
