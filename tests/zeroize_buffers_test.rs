@@ -17,7 +17,6 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
-
 const MAX_NEEDLE: usize = 128;
 /// Blocks larger than this are not scanned, to keep the probe cheap.
 const MAX_SCAN: usize = 4 * 1024 * 1024;
