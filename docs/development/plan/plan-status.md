@@ -95,7 +95,7 @@
 | [`plan-20260913.md`](plan-20260913.md) | FL-00..FL-07 | **前置 plan-20260907 完整收口**（DEP-FL-04） |
 | [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；CAP-01..06 按 ER-CAP-02 pin 重核，CAP-07 另等待 `DEP-ACF-CAP` |
 | [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02/03/04 已实现并本地验收（2026-09-22，`locally-accepted`），发布未执行；写集与 plan-20260918 串行（DEP-GCX-02） |
-| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted）；VG-00 已 `done/complete`；14 卡实施已完成（`locally-accepted`），DEP-VG-02 的网站五页已于后端仓 `cf` 提交 `1bb46c0` 同步；剩余为 VG-09 家族发布与 REL-VG-01 证据（需操作者授权改写真实远端） |
+| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted）；VG-00 已 `done/complete`；14 卡实施已完成（`locally-accepted`），DEP-VG-02 的网站五页已于后端仓 `cf` 提交 `1bb46c0` 同步；**门 31 权威全量 7969/7969 全绿（fmt/clippy/nextest 三连），本轮补 15 张声明门并修复两项生产缺陷（`pgp_sign` 公钥双缺时 fail-closed、GPG 密钥移除改单事务）**；剩余为 VG-09 家族发布与 REL-VG-01 证据（需操作者授权改写真实远端） |
 | `issues/` 设计计划 | 见「计划一览」issues 表 | 各计划 Codex review `PASS` 前不得开工；`issues/476`/`479`/`483`/`490` 与 `plan-20260918` 写集串行（DEP-WT-09 / DEP-PL-04 / DEP-AD-06 / DEP-AD-07） |
 
 ---
