@@ -2918,3 +2918,9 @@ src/internal/vault.rs	config_remove_gpg_key_inject_failure_source	lane:cwd+env	e
 src/internal/vault.rs	generated_path_legacy_fallback_when_key_name_absent	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-04);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
 src/internal/vault.rs	history_public_keys_are_sorted_and_deduplicated	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
 src/internal/vault.rs	generated_snapshot_is_written_before_overwrite	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_a	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_b	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_c	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_d1	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_d2	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_e	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard

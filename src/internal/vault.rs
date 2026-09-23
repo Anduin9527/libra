@@ -314,6 +314,11 @@ pub async fn generate_pgp_key(
         let generated_pubkey = read("vault.gpg.generated_pubkey").await;
         let source = read("vault.gpg.source").await;
         let active_pubkey = read("vault.gpg.pubkey").await;
+        // VG-14 G5: the recorded pair is only resumable when the minted key
+        // already holds the active slot (a failure after (d2) but before (e)) —
+        // there `source` still names the previous provenance, and completing
+        // (e) must not mint a second key. Other residues (e.g. after (c)/(d1))
+        // are not resumable: the next generation overwrites the stale pair.
         if !key_name.is_empty()
             && !generated_pubkey.is_empty()
             && source != "generated"
@@ -331,12 +336,14 @@ pub async fn generate_pgp_key(
     // fixed allowlist (ADR-VG-04 / ADR-VG-06 §6). VG-14 relaxes the VG-03
     // empty-window guard by migrating rather than failing closed.
     snapshot_active_key_to_history().await?;
+    generate_failpoint(1)?;
 
     let mut last_err: Option<anyhow::Error> = None;
     for _ in 0..8 {
         let key_name = next_versioned_key_name();
         match vault_generate_pgp_key(root_dir, unseal_key, &key_name, user_name, user_email).await {
             Ok(public_key) => {
+                generate_failpoint(2)?;
                 // ADR-VG-06 §6 staged writes: (c) generated_pubkey, (d1)
                 // generated_key_name, (d2) vault.gpg.pubkey, (e) source. Each
                 // step captures a before-image and compensates on the next
@@ -354,6 +361,7 @@ pub async fn generate_pgp_key(
                 {
                     return Err(e).context("failed to persist generated GPG public key snapshot");
                 }
+                generate_failpoint(3)?;
 
                 // (d1) generated_key_name
                 if let Err(e) =
@@ -364,6 +372,7 @@ pub async fn generate_pgp_key(
                             .await;
                     return Err(e).context("failed to persist generated GPG key name");
                 }
+                generate_failpoint(4)?;
 
                 // (d2) vault.gpg.pubkey
                 if let Err(e) = ConfigKv::set("vault.gpg.pubkey", &public_key, false).await {
@@ -379,11 +388,13 @@ pub async fn generate_pgp_key(
                     let _ = restore_cfg_value("vault.gpg.pubkey", before_pubkey).await;
                     return Err(e).context("failed to persist generated GPG public key");
                 }
+                generate_failpoint(5)?;
 
                 // (e) source=generated
                 if let Err(e) = ConfigKv::set("vault.gpg.source", "generated", false).await {
                     return Err(e).context("failed to persist generated GPG key source");
                 }
+                generate_failpoint(6)?;
                 return Ok((public_key, key_name));
             }
             Err(e) => {
@@ -1985,6 +1996,33 @@ pub async fn persist_imported_gpg_key(
         .await
         .context("failed to commit the imported GPG key")?;
     Ok(())
+}
+
+/// plan-20260921 VG-14 G1–G6: `#[cfg(test)]`-only injection point so each step
+/// of the staged generated-key migration ((a) history snapshot, (b) vault key
+/// generation, (c) `generated_pubkey`, (d1) `generated_key_name`,
+/// (d2) `vault.gpg.pubkey`, (e) `source`) can be failed individually.
+fn generate_failpoint(step: u8) -> Result<()> {
+    #[cfg(test)]
+    if GENERATE_FAIL_AT.load(std::sync::atomic::Ordering::SeqCst) == step {
+        GENERATE_FAIL_AT.store(0, std::sync::atomic::Ordering::SeqCst);
+        return Err(anyhow!("injected generation failure after step {step}"));
+    }
+    let _ = step;
+    Ok(())
+}
+
+#[cfg(test)]
+static GENERATE_FAIL_AT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn set_generate_fail_at(step: u8) {
+    GENERATE_FAIL_AT.store(step, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn clear_generate_fail_at() {
+    GENERATE_FAIL_AT.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Record the currently-active public key into `history.<FPR>.pubkey` (idempotent
@@ -3658,6 +3696,271 @@ mod gpg_history_order_gate_tests {
             history.as_deref(),
             Some(active.as_str()),
             "the active key must also be archived in history"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpg_generate_failpoint_tests {
+    use serial_test::serial;
+
+    use super::*;
+    use crate::internal::config::ConfigKv;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    struct Sandbox {
+        _env: crate::utils::test::ConfigDbFixture,
+        _repo: tempfile::TempDir,
+        _cwd: crate::utils::test::ChangeDirGuard,
+        root: std::path::PathBuf,
+        unseal: Vec<u8>,
+        imported_fingerprint: String,
+    }
+
+    /// Sandboxed repository whose active key is the fixture *import* — the
+    /// scenario the declared gates name (`..._after_import_...`).
+    async fn imported_key_repo() -> Sandbox {
+        let env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let root = crate::utils::util::storage_path();
+        let unseal = lazy_init_vault_for_scope("local")
+            .await
+            .expect("local vault");
+        let material = prepare_imported_key(
+            &fixture("protected-secret.asc"),
+            "libra-test-fixture-passphrase",
+        )
+        .expect("fixture unlocks");
+        let imported_fingerprint = material.fingerprint.clone();
+        persist_imported_gpg_key(&unseal, &material)
+            .await
+            .expect("persist the imported key");
+        ConfigKv::set("vault.gpg.source", "imported", false)
+            .await
+            .expect("record imported source");
+
+        Sandbox {
+            _env: env,
+            _repo: repo,
+            _cwd: cwd,
+            root,
+            unseal,
+            imported_fingerprint,
+        }
+    }
+
+    async fn cfg(key: &str) -> Option<String> {
+        ConfigKv::get(key).await.ok().flatten().map(|e| e.value)
+    }
+
+    /// The imported key must still be the active, usable one.
+    async fn assert_import_still_active(web: &Sandbox) {
+        assert_eq!(
+            cfg("vault.gpg.source").await.as_deref(),
+            Some("imported"),
+            "a failed migration must leave the imported key active"
+        );
+        assert_eq!(
+            cfg("vault.gpg.fingerprint").await.as_deref(),
+            Some(web.imported_fingerprint.as_str()),
+            "the imported fingerprint must survive a failed migration"
+        );
+        assert!(
+            cfg("vault.gpg.seckey_enc").await.is_some(),
+            "the imported secret key must survive a failed migration"
+        );
+    }
+
+    async fn run_with_failpoint(web: &Sandbox, step: u8) -> anyhow::Error {
+        set_generate_fail_at(step);
+        let outcome =
+            generate_pgp_key(&web.root, &web.unseal, "Seed", "seed@example.invalid").await;
+        clear_generate_fail_at();
+        outcome.expect_err("the injected failure must fail the migration")
+    }
+
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_generate_gpg_key_after_import_inject_failure_after_a() {
+        let web = imported_key_repo().await;
+        let err = run_with_failpoint(&web, 1).await;
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_import_still_active(&web).await;
+    }
+
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_generate_gpg_key_after_import_inject_failure_after_b() {
+        let web = imported_key_repo().await;
+        let err = run_with_failpoint(&web, 2).await;
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_import_still_active(&web).await;
+        assert!(
+            cfg("vault.gpg.generated_pubkey").await.is_none(),
+            "step (c) must not have run"
+        );
+    }
+
+    /// VG-14 G3: a (c)-only residue has no key name, so it is not resumable —
+    /// the next mint overwrites the stale snapshot; the replaced import is
+    /// archived, so no signature is lost.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_generate_gpg_key_after_import_inject_failure_after_c() {
+        let web = imported_key_repo().await;
+        let err = run_with_failpoint(&web, 3).await;
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_import_still_active(&web).await;
+        assert!(
+            cfg("vault.gpg.generated_key_name").await.is_none(),
+            "step (d1) must not have run right after (c)"
+        );
+        assert!(
+            cfg("vault.gpg.generated_pubkey").await.is_some(),
+            "the (c) write is the residue this gate pins"
+        );
+
+        let (fresh, _name) =
+            generate_pgp_key(&web.root, &web.unseal, "Seed", "seed@example.invalid")
+                .await
+                .expect("a re-run must succeed");
+        assert!(!fresh.is_empty(), "the re-run must mint a usable key");
+        assert_eq!(cfg("vault.gpg.source").await.as_deref(), Some("generated"));
+        assert!(
+            cfg(&format!(
+                "vault.gpg.history.{}.pubkey",
+                web.imported_fingerprint
+            ))
+            .await
+            .is_some(),
+            "the replaced imported key must stay verifiable through history"
+        );
+    }
+
+    /// VG-14 G4: a failure after `generated_key_name` leaves the import active;
+    /// the re-run completes the recorded pair instead of minting a second key.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_generate_gpg_key_after_import_inject_failure_after_d1() {
+        let web = imported_key_repo().await;
+        let err = run_with_failpoint(&web, 4).await;
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        assert_import_still_active(&web).await;
+        // A (d1) residue records a name+snapshot but the active slot still
+        // holds the import, so it is not resumable: the next generation mints
+        // (and overwrites the stale pair) instead of switching to it.
+        let stale = cfg("vault.gpg.generated_pubkey")
+            .await
+            .expect("the minted key is recorded");
+        let stale_name = cfg("vault.gpg.generated_key_name")
+            .await
+            .expect("the minted name is recorded");
+
+        let (fresh, fresh_name) =
+            generate_pgp_key(&web.root, &web.unseal, "Seed", "seed@example.invalid")
+                .await
+                .expect("a re-run must succeed");
+        assert!(!fresh.is_empty());
+        assert_ne!(
+            fresh_name, stale_name,
+            "a (d1) residue must be replaced by a fresh mint, not resumed"
+        );
+        assert_ne!(fresh, stale, "the stale snapshot must not be switched in");
+        assert_eq!(cfg("vault.gpg.source").await.as_deref(), Some("generated"));
+        assert!(
+            cfg(&format!(
+                "vault.gpg.history.{}.pubkey",
+                web.imported_fingerprint
+            ))
+            .await
+            .is_some(),
+            "the replaced imported key must stay verifiable through history"
+        );
+    }
+    /// VG-14 G5: a failure after `vault.gpg.pubkey` leaves the `source` switch
+    /// unrun (the resumable pair); the re-run converges on the same key.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_generate_gpg_key_after_import_inject_failure_after_d2() {
+        let web = imported_key_repo().await;
+        let err = run_with_failpoint(&web, 5).await;
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        let active = cfg("vault.gpg.pubkey").await.expect("active key");
+        assert_eq!(
+            cfg("vault.gpg.generated_pubkey").await.as_deref(),
+            Some(active.as_str()),
+            "the minted key already holds the active slot"
+        );
+        assert_eq!(
+            cfg("vault.gpg.source").await.as_deref(),
+            Some("imported"),
+            "the source switch is the step that did not run"
+        );
+
+        let (again, _name) =
+            generate_pgp_key(&web.root, &web.unseal, "Seed", "seed@example.invalid")
+                .await
+                .expect("a re-run must converge");
+        assert_eq!(again, active, "the re-run must not mint a second key");
+        assert_eq!(cfg("vault.gpg.source").await.as_deref(), Some("generated"));
+    }
+
+    /// VG-14 G6: (e) had already applied, so the residue is a fully migrated
+    /// state — active key named and switched, replaced key archived.
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn config_generate_gpg_key_after_import_inject_failure_after_e() {
+        let web = imported_key_repo().await;
+        let err = run_with_failpoint(&web, 6).await;
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        let active = cfg("vault.gpg.pubkey").await.expect("active public key");
+        assert_eq!(
+            cfg("vault.gpg.generated_pubkey").await.as_deref(),
+            Some(active.as_str()),
+            "the minted key is the active one"
+        );
+        assert!(
+            cfg("vault.gpg.generated_key_name").await.is_some(),
+            "the minted key is recorded by name"
+        );
+        assert_eq!(cfg("vault.gpg.source").await.as_deref(), Some("generated"));
+        assert!(
+            cfg(&format!(
+                "vault.gpg.history.{}.pubkey",
+                web.imported_fingerprint
+            ))
+            .await
+            .is_some(),
+            "the imported key must be archived so its signatures stay verifiable"
         );
     }
 }
