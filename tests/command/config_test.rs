@@ -4152,3 +4152,206 @@ async fn config_imported_key_signs_commits_end_to_end() {
     let out = run_libra_command(&["config", "get", "vault.gpg.source"], temp_path.path());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "imported");
 }
+
+// ---------------------------------------------------------------------------
+// plan-20260921 VG-01/VG-06/VG-07/VG-08: argument-surface, scope and
+// fail-closed gates that the plan declares but the tree did not implement.
+// ---------------------------------------------------------------------------
+
+const GPG_FIXTURE_SECRET: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/fake-gpg/protected-secret.asc"
+);
+const GPG_FIXTURE_PASSPHRASE: &str = "libra-test-fixture-passphrase";
+
+/// Helper: stage the fixture passphrase file inside the given repository.
+#[allow(dead_code)]
+fn write_fixture_passfile(repo: &std::path::Path) -> String {
+    let passfile = repo.join("pass.txt");
+    std::fs::write(&passfile, GPG_FIXTURE_PASSPHRASE).unwrap();
+    passfile.to_string_lossy().into_owned()
+}
+
+#[test]
+fn config_import_gpg_key_rejects_global_and_system_scope() {
+    let repo = create_committed_repo_via_cli();
+    for scope in ["--global", "--system"] {
+        let out = run_libra_command(
+            &[
+                "config",
+                "import-gpg-key",
+                scope,
+                "--file",
+                GPG_FIXTURE_SECRET,
+            ],
+            repo.path(),
+        );
+        assert!(
+            !out.status.success(),
+            "import-gpg-key {scope} must be rejected"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("import-gpg-key only supports the local scope"),
+            "stderr: {err}"
+        );
+    }
+}
+
+#[test]
+fn import_scope_rejection_message_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    let out = run_libra_command(
+        &["config", "import-gpg-key", "--global", "--file", GPG_FIXTURE_SECRET],
+        repo.path(),
+    );
+    assert_eq!(out.status.code(), Some(129), "usage error exit code");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("import-gpg-key only supports the local scope; --global/--system are not supported"),
+        "pinned message changed: {err}"
+    );
+}
+
+#[test]
+fn config_export_gpg_key_rejects_global_and_system_scope() {
+    let repo = create_committed_repo_via_cli();
+    for scope in ["--global", "--system"] {
+        let out = run_libra_command(&["config", "export-gpg-key", scope], repo.path());
+        assert!(!out.status.success(), "export-gpg-key {scope} rejected");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("only supports the local scope"),
+            "scope rejection message"
+        );
+    }
+}
+
+#[test]
+fn config_list_gpg_keys_rejects_global_and_system_scope() {
+    let repo = create_committed_repo_via_cli();
+    for scope in ["--global", "--system"] {
+        let out = run_libra_command(&["config", "list", "--gpg-keys", scope], repo.path());
+        assert!(!out.status.success(), "list --gpg-keys {scope} rejected");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("only supports the local scope"),
+            "scope rejection message"
+        );
+    }
+}
+
+#[test]
+fn config_export_gpg_key_rejects_json_machine_and_quiet() {
+    let repo = create_committed_repo_via_cli();
+    for flag in ["--json", "--machine", "--quiet"] {
+        let out = run_libra_command(&["config", "export-gpg-key", flag], repo.path());
+        assert!(!out.status.success(), "export-gpg-key {flag} must be rejected");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("does not support"),
+            "export-gpg-key {flag} rejection: {err}"
+        );
+    }
+}
+
+#[test]
+fn config_import_gpg_key_requires_replace_when_active_key_exists() {
+    // A repository that already committed carries an active generated key.
+    let repo = create_committed_repo_via_cli();
+    let passfile = write_fixture_passfile(repo.path());
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            &passfile,
+        ],
+        repo.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "import over an active key must fail closed without --replace"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("an active GPG key already exists; pass --replace"),
+        "conflict message changed: {err}"
+    );
+    assert!(err.contains("LBR-CONFLICT-002"), "stable error code: {err}");
+
+    // The rejected import must not have replaced the active key.
+    let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
+    assert_ne!(
+        String::from_utf8_lossy(&source.stdout).trim(),
+        "imported",
+        "a rejected import must not flip the active source"
+    );
+}
+
+#[test]
+fn import_conflict_message_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    let passfile = write_fixture_passfile(repo.path());
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            &passfile,
+        ],
+        repo.path(),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("fatal: an active GPG key already exists; pass --replace to import a different key"),
+        "pinned conflict message changed: {err}"
+    );
+}
+
+#[test]
+fn config_import_gpg_key_protected_file_requires_passphrase() {
+    let repo = create_committed_repo_via_cli();
+    // A protected key with no --passphrase-file and a non-tty stdin must fail
+    // closed instead of importing an unusable key.
+    let out = run_libra_command(
+        &["config", "import-gpg-key", "--file", GPG_FIXTURE_SECRET],
+        repo.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "protected import without a passphrase must fail closed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no --passphrase-file given") && err.contains("supply --passphrase-file"),
+        "passphrase-required message changed: {err}"
+    );
+    let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
+    assert_ne!(
+        String::from_utf8_lossy(&source.stdout).trim(),
+        "imported",
+        "a failed import must leave no imported metadata"
+    );
+}
+
+#[test]
+fn config_import_gpg_key_outside_repository_reports_not_a_repo() {
+    let dir = tempdir().unwrap();
+    let out = run_libra_command(
+        &["config", "import-gpg-key", "--file", GPG_FIXTURE_SECRET],
+        dir.path(),
+    );
+    assert!(!out.status.success(), "import outside a repository must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not a libra repository"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.path().join(".libra").exists(),
+        "a failed import outside a repository must not create repository state"
+    );
+}
