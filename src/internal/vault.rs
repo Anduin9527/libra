@@ -3513,3 +3513,34 @@ mod gpg_remove_gate_tests {
         assert_imported_state_intact(&web, pubkey_before).await;
     }
 }
+
+#[cfg(test)]
+mod gpg_generated_name_gate_tests {
+    use super::*;
+    use crate::internal::config::ConfigKv;
+
+    /// plan-20260921 VG-04 (`generated_path_legacy_fallback_when_key_name_absent`):
+    /// repositories created before VG-14 carry no versioned `generated_key_name`,
+    /// so the reader must fall back to the legacy constant instead of failing.
+    #[tokio::test]
+    #[serial_test::serial(env, cwd)]
+    async fn generated_path_legacy_fallback_when_key_name_absent() {
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        // A recorded versioned name wins.
+        ConfigKv::set("vault.gpg.generated_key_name", "libra-signing-42", false)
+            .await
+            .expect("seed the versioned name");
+        assert_eq!(generated_key_name().await, "libra-signing-42");
+
+        // Legacy repository: the row is gone, so the pre-VG-14 constant is used.
+        ConfigKv::unset("vault.gpg.generated_key_name")
+            .await
+            .expect("drop the versioned name");
+        assert_eq!(generated_key_name().await, PGP_KEY_NAME);
+        assert_eq!(generated_key_name().await, "libra-signing");
+    }
+}

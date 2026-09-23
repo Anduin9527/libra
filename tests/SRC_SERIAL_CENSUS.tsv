@@ -2915,3 +2915,4 @@ src/internal/vault.rs	config_remove_gpg_key_inject_failure_history	lane:cwd+env	
 src/internal/vault.rs	config_remove_gpg_key_inject_failure_delete_imported	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-08);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
 src/internal/vault.rs	config_remove_gpg_key_inject_failure_restore_pubkey	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-08);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
 src/internal/vault.rs	config_remove_gpg_key_inject_failure_source	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-08);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/vault.rs	generated_path_legacy_fallback_when_key_name_absent	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-04);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
