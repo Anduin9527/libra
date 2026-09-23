@@ -4,14 +4,22 @@
 //! One tracing span per bridge request must carry stable, low-cardinality
 //! fields (method, request id, repository scope) and must never carry the raw
 //! request payload, prompt, token, or response body (GC-LB-08). Lives in its
-//! own integration-test binary so the thread-local `tracing` subscriber does
-//! not contend with sibling threads evaluating the same callsites.
+//! own integration-test binary so the span sink is not shared with other
+//! suites.
+//!
+//! The sink is installed as the **process-global** subscriber and the two cases
+//! are serialized. A thread-local default (`subscriber::with_default`) made the
+//! assertions flaky: `tracing` caches each callsite's interest, and when that
+//! cache was populated before a thread-local default existed — or from a worker
+//! thread without one — the span events were skipped everywhere and the capture
+//! came back empty (`span name missing on error path: `). Registering a global
+//! default rebuilds the interest cache, so the events are always recorded.
 
 #![cfg(unix)]
 
 use std::{
     io::Cursor,
-    sync::{Arc, Mutex},
+    sync::{Mutex, OnceLock},
 };
 
 use libra::{
@@ -23,11 +31,17 @@ use libra::{
 };
 use sea_orm::Database;
 
-#[derive(Clone, Default)]
-struct Sink(Arc<Mutex<Vec<u8>>>);
+/// Captured `tracing` output for the case currently running.
+static SINK: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Serializes the cases so neither observes the other's span events.
+static CASE_LOCK: Mutex<()> = Mutex::new(());
+
+struct Sink;
 impl std::io::Write for Sink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        SINK.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -37,47 +51,61 @@ impl std::io::Write for Sink {
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
     type Writer = Sink;
     fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+        Sink
     }
 }
 
+/// Install the process-global subscriber exactly once.
+fn install_subscriber() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(Sink)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("install the process-global span sink");
+    });
+}
+
 /// Build an in-memory store and drive one request batch through the bridge
-/// handler under a fake `tracing` subscriber, returning the captured output.
+/// handler under the fake `tracing` subscriber, returning the captured output.
 fn capture(input: &str, repo_id: &str) -> (String, String) {
-    let sink = Sink::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(sink.clone())
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .finish();
+    let _case = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_subscriber();
+    SINK.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 
     let mut out = Vec::new();
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // Build the DB + handler under the subscriber so the span is captured,
-    // then drive the transport synchronously.
-    tracing::subscriber::with_default(subscriber, || {
-        rt.block_on(async {
-            let db = Database::connect("sqlite::memory:").await.expect("connect");
-            run_builtin_migrations(&db).await.expect("apply migrations");
+    // Dispatch every request through the handler before reading the sink back.
+    rt.block_on(async {
+        let db = Database::connect("sqlite::memory:").await.expect("connect");
+        run_builtin_migrations(&db).await.expect("apply migrations");
 
-            let handler = IngressBridgeHandler::new(BridgeContext {
-                conn: db.clone(),
-                repository_id: repo_id.to_string(),
-                worktree_id: None,
-            });
-            run(
-                Cursor::new(input.as_bytes()),
-                &mut out,
-                &handler,
-                std::time::Duration::from_secs(30),
-            )
-            .await
-            .expect("transport runs");
+        let handler = IngressBridgeHandler::new(BridgeContext {
+            conn: db.clone(),
+            repository_id: repo_id.to_string(),
+            worktree_id: None,
         });
+        run(
+            Cursor::new(input.as_bytes()),
+            &mut out,
+            &handler,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("transport runs");
     });
 
-    let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).to_string();
+    let captured =
+        String::from_utf8_lossy(&SINK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+            .to_string();
     let stdout = String::from_utf8(out).expect("stdout utf8");
     (captured, stdout)
 }
