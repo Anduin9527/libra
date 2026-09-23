@@ -1868,6 +1868,79 @@ fn issuer_absent_candidate_allowed(tried: &mut usize) -> bool {
     true
 }
 
+/// plan-20260921 VG-05 G13/G14: verification is evaluated at the **signature's
+/// own creation time** (the hashed `SignatureCreationTime` subpacket) rather
+/// than at "now" — a signature made while the key was still valid stays
+/// acceptable even if the key was revoked or expired later, while a signature
+/// made after revocation/expiry is refused.
+fn signature_creation_time_secs(sig: &pgp::packet::Signature) -> Option<u64> {
+    use pgp::packet::SubpacketData;
+
+    sig.config()?
+        .hashed_subpackets()
+        .find_map(|sub| match &sub.data {
+            SubpacketData::SignatureCreationTime(stamp) => Some(u64::from(stamp.as_secs())),
+            _ => None,
+        })
+}
+
+/// Latest revocation time (epoch seconds) of the certificate itself, if any.
+fn key_revoked_at(key: &pgp::composed::SignedPublicKey) -> Option<u64> {
+    use pgp::packet::SignatureType;
+
+    let mut latest: Option<u64> = None;
+    for sig in &key.details.revocation_signatures {
+        if sig.typ() != Some(SignatureType::KeyRevocation) {
+            continue;
+        }
+        if let Some(at) = sig.config().and_then(|config| {
+            config.hashed_subpackets().find_map(|sub| match &sub.data {
+                pgp::packet::SubpacketData::SignatureCreationTime(stamp) => {
+                    Some(u64::from(stamp.as_secs()))
+                }
+                _ => None,
+            })
+        }) {
+            latest = Some(latest.map_or(at, |current: u64| current.max(at)));
+        }
+    }
+    latest
+}
+
+/// Latest revocation time (epoch seconds) of one subkey, if any.
+fn subkey_revoked_at(sub: &pgp::composed::SignedPublicSubKey) -> Option<u64> {
+    use pgp::packet::SignatureType;
+
+    let mut latest: Option<u64> = None;
+    for sig in &sub.signatures {
+        if sig.typ() != Some(SignatureType::SubkeyRevocation) {
+            continue;
+        }
+        if let Some(at) = sig.config().and_then(|config| {
+            config.hashed_subpackets().find_map(|sub| match &sub.data {
+                pgp::packet::SubpacketData::SignatureCreationTime(stamp) => {
+                    Some(u64::from(stamp.as_secs()))
+                }
+                _ => None,
+            })
+        }) {
+            latest = Some(latest.map_or(at, |current: u64| current.max(at)));
+        }
+    }
+    latest
+}
+
+/// Whether a revocation that happened at `revoked_at` must refuse a signature
+/// made at `signature_at`. Pure so both time orders are unit-tested.
+fn revocation_applies(revoked_at: Option<u64>, signature_at: u64) -> bool {
+    revoked_at.is_some_and(|revoked| revoked <= signature_at)
+}
+
+/// Whether a declared expiry must refuse a signature made at `signature_at`.
+fn expiry_applies(expiry: Option<u64>, signature_at: u64) -> bool {
+    expiry.is_some_and(|expires| expires <= signature_at)
+}
+
 fn issuer_matches(issuers: &[&pgp::types::KeyId], key_id: &pgp::types::KeyId) -> bool {
     issuers.is_empty() || issuers.contains(&key_id)
 }
@@ -1899,6 +1972,11 @@ pub fn verify_signature_hex(signature_hex: &str, data: &[u8], pubkey_armors: &[S
     // so the fallback fails closed.
     let issuer_absent = issuers.is_empty();
     let mut issuer_absent_candidates: usize = 0;
+    // ADR-VG-06 ⑤ / VG-05 G13–G14: evaluate revocation and expiry at the
+    // signature's creation time, falling back to "now" when the signature
+    // carries none.
+    let signature_at =
+        signature_creation_time_secs(&parsed.signature).unwrap_or_else(now_epoch_secs);
 
     for armor in pubkey_armors {
         let Ok((key, _)) = SignedPublicKey::from_armor_single(armor.as_bytes()) else {
@@ -1909,7 +1987,9 @@ pub fn verify_signature_hex(signature_hex: &str, data: &[u8], pubkey_armors: &[S
             if issuer_absent && !issuer_absent_candidate_allowed(&mut issuer_absent_candidates) {
                 return false;
             }
-            if parsed.verify(&key, data).is_ok() {
+            if !revocation_applies(key_revoked_at(&key), signature_at)
+                && parsed.verify(&key, data).is_ok()
+            {
                 return true;
             }
         }
@@ -1919,7 +1999,10 @@ pub fn verify_signature_hex(signature_hex: &str, data: &[u8], pubkey_armors: &[S
                 {
                     return false;
                 }
-                if parsed.verify(sub, data).is_ok() {
+                if !revocation_applies(subkey_revoked_at(sub), signature_at)
+                    && !expiry_applies(subkey_declared_expiry(&sub.signatures), signature_at)
+                    && parsed.verify(sub, data).is_ok()
+                {
                     return true;
                 }
             }
@@ -4036,6 +4119,93 @@ mod gpg_generate_failpoint_tests {
             .await
             .is_some(),
             "the imported key must be archived so its signatures stay verifiable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpg_verification_time_gate_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 VG-05 G13 (`revocation_is_evaluated_at_signature_creation_time`):
+    /// revocation is judged at the signature's own creation time — a signature
+    /// made *after* the revocation is refused, one made before stays acceptable.
+    #[test]
+    fn revocation_is_evaluated_at_signature_creation_time() {
+        // Pure predicate: both time orders.
+        assert!(
+            revocation_applies(Some(100), 200),
+            "revoked before signing must be refused"
+        );
+        assert!(
+            !revocation_applies(Some(300), 200),
+            "revoked after signing must stay acceptable"
+        );
+        assert!(
+            !revocation_applies(None, 200),
+            "never revoked stays acceptable"
+        );
+
+        // A real revoked certificate carries a revocation time; a signature made
+        // now is after it, while one made the second before is not.
+        use pgp::composed::Deserializable;
+        let (revoked, _) = pgp::composed::SignedPublicKey::from_armor_single(
+            fixture("revoked-key.asc").as_bytes(),
+        )
+        .expect("the revoked fixture parses");
+        let revoked_at = key_revoked_at(&revoked).expect("the fixture's revocation is detected");
+        assert!(
+            revocation_applies(Some(revoked_at), now_epoch_secs()),
+            "a signature made now is after the revocation"
+        );
+        assert!(
+            !revocation_applies(Some(revoked_at), revoked_at.saturating_sub(1)),
+            "a signature made the second before revocation stays acceptable"
+        );
+    }
+
+    /// plan-20260921 VG-05 G14 (`expiration_is_evaluated_at_signature_creation_time`):
+    /// expiry is judged at the signature's own creation time.
+    #[test]
+    fn expiration_is_evaluated_at_signature_creation_time() {
+        assert!(
+            expiry_applies(Some(100), 200),
+            "expired before signing must be refused"
+        );
+        assert!(
+            !expiry_applies(Some(300), 200),
+            "expiring after signing must stay acceptable"
+        );
+        assert!(
+            !expiry_applies(None, 200),
+            "no declared expiry stays acceptable"
+        );
+
+        use pgp::composed::Deserializable;
+        let (key, _) = pgp::composed::SignedPublicKey::from_armor_single(
+            fixture("expired-subkey.asc").as_bytes(),
+        )
+        .expect("the expired fixture parses");
+        let expiry = key
+            .public_subkeys
+            .iter()
+            .find_map(|sub| subkey_declared_expiry(&sub.signatures))
+            .expect("the fixture's expired subkey declares an expiry");
+        assert!(
+            expiry_applies(Some(expiry), now_epoch_secs()),
+            "a signature made now is after the expiry"
+        );
+        assert!(
+            !expiry_applies(Some(expiry), expiry.saturating_sub(1)),
+            "a signature made before the expiry stays acceptable"
         );
     }
 }
