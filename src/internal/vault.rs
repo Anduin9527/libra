@@ -1809,15 +1809,28 @@ fn sign_detached<K: pgp::types::SigningKey>(
     armored_to_signature_hex(&armored_sig)
 }
 
-/// Upper bound for the issuer-absent fallback (ADR-VG-06): verification must
-/// not scan an arbitrarily large key list when the signature names no issuer.
-const ISSUER_ABSENT_FALLBACK_CAP: usize = 3;
+/// Upper bound for the issuer-absent fallback (ADR-VG-06 ④): verification must
+/// not scan an arbitrarily large candidate set when the signature names no
+/// issuer. The plan fixes the bound at 16 candidate (sub)keys.
+const ISSUER_ABSENT_FALLBACK_CAP: usize = 16;
 
-/// Whether an issuer-absent signature may be checked against a key list of
-/// `candidate_count` entries. Callers refuse the whole list beyond the cap so
-/// that the fallback stays bounded and fails closed.
+/// Whether an issuer-absent signature may still be checked after
+/// `candidate_count` candidate (sub)keys. Attempts beyond the cap are refused
+/// outright so that the fallback stays bounded and fails closed.
 fn issuer_absent_fallback_allowed(candidate_count: usize) -> bool {
     candidate_count <= ISSUER_ABSENT_FALLBACK_CAP
+}
+
+/// Records one more issuer-absent candidate attempt and reports whether the
+/// attempt is still inside the cap (ADR-VG-06 ④). The counter only advances
+/// while the attempt is allowed, so the caller refuses from candidate
+/// `ISSUER_ABSENT_FALLBACK_CAP + 1` on.
+fn issuer_absent_candidate_allowed(tried: &mut usize) -> bool {
+    if !issuer_absent_fallback_allowed(tried.saturating_add(1)) {
+        return false;
+    }
+    *tried += 1;
+    true
 }
 
 fn issuer_matches(issuers: &[&pgp::types::KeyId], key_id: &pgp::types::KeyId) -> bool {
@@ -1844,32 +1857,33 @@ pub fn verify_signature_hex(signature_hex: &str, data: &[u8], pubkey_armors: &[S
     };
     let issuers = parsed.signature.issuer_key_id();
 
-    // ADR-VG-06: a signature without an issuer may fall back to trying the
-    // listed keys, but only within a bounded number of candidates — an
-    // unbounded scan would let a large key list amplify verification work. A
-    // list longer than the cap is refused outright (fail closed).
-    if issuers.is_empty() && !issuer_absent_fallback_allowed(pubkey_armors.len()) {
-        return false;
-    }
+    // ADR-VG-06 ④: a signature without an issuer may fall back to trying the
+    // candidate (sub)keys of the listed certificates, but only within a bounded
+    // number of candidates — an unbounded scan would let a long key list
+    // amplify verification work. The (cap + 1)-th candidate is refused outright
+    // so the fallback fails closed.
+    let issuer_absent = issuers.is_empty();
+    let mut issuer_absent_candidates: usize = 0;
 
     for armor in pubkey_armors {
         let Ok((key, _)) = SignedPublicKey::from_armor_single(armor.as_bytes()) else {
             continue;
         };
         let primary_id = key.primary_key.legacy_key_id();
-        if issuer_matches(&issuers, &primary_id) && parsed.verify(&key, data).is_ok() {
-            return true;
-        }
-        for sub in &key.public_subkeys {
-            if issuer_matches(&issuers, &sub.key.legacy_key_id())
-                && parsed.verify(sub, data).is_ok()
-            {
+        if issuer_matches(&issuers, &primary_id) {
+            if issuer_absent && !issuer_absent_candidate_allowed(&mut issuer_absent_candidates) {
+                return false;
+            }
+            if parsed.verify(&key, data).is_ok() {
                 return true;
             }
         }
-        // Issuer subpacket may be absent; retry the primary key regardless.
-        if issuers.is_empty() {
-            for sub in &key.public_subkeys {
+        for sub in &key.public_subkeys {
+            if issuer_matches(&issuers, &sub.key.legacy_key_id()) {
+                if issuer_absent && !issuer_absent_candidate_allowed(&mut issuer_absent_candidates)
+                {
+                    return false;
+                }
                 if parsed.verify(sub, data).is_ok() {
                     return true;
                 }
@@ -3015,6 +3029,22 @@ mod gpg_issuer_gate_tests {
             !verify_signature_hex("00", b"data", &oversized),
             "an oversized candidate list must fail closed"
         );
+
+        // The counter refuses exactly at the boundary, so the (cap + 1)-th
+        // candidate is never attempted.
+        let mut tried = 0usize;
+        for _ in 0..ISSUER_ABSENT_FALLBACK_CAP {
+            assert!(issuer_absent_candidate_allowed(&mut tried));
+        }
+        assert_eq!(tried, ISSUER_ABSENT_FALLBACK_CAP);
+        assert!(
+            !issuer_absent_candidate_allowed(&mut tried),
+            "candidates beyond the cap must be refused"
+        );
+        assert_eq!(
+            tried, ISSUER_ABSENT_FALLBACK_CAP,
+            "a refused attempt must not advance the counter"
+        );
     }
 
     /// plan-20260921 VG-13 G5 (`replace_never_deletes_history_rows`): replacing
@@ -3070,6 +3100,85 @@ mod gpg_issuer_gate_tests {
         assert!(
             history_after_second.len() >= history_after_first.len(),
             "history rows must never shrink on replacement"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpg_allowlist_gate_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 VG-05 G1 (`imported_key_verifies_own_signature`): a
+    /// certificate that went through the import pipeline must verify the
+    /// signature its signing subkey produced.
+    #[test]
+    fn imported_key_verifies_own_signature() {
+        let secret = fixture("secret-two-signing-subkeys.asc");
+        let material = prepare_imported_key(&secret, "").expect("fixture imports");
+        let data = b"imported-key verification payload";
+        let sig_hex = sign_with_armored_secret_key(&secret, &material.signing_key_id, data)
+            .expect("detached signature");
+
+        assert!(
+            verify_signature_hex(&sig_hex, data, std::slice::from_ref(&material.pubkey_armor)),
+            "an imported key must verify its own signature"
+        );
+    }
+
+    /// plan-20260921 VG-05 G2 (`verification_ignores_source_with_internal_fixture`):
+    /// the allowlist is built from `vault.gpg.pubkey` → `generated_pubkey` →
+    /// `history.*` only. An internal state fixture whose `vault.gpg.source`
+    /// metadata does not match the installed certificate must not change the
+    /// verdict, while the allowlist content still decides the outcome.
+    #[tokio::test]
+    #[serial_test::serial(env, cwd)]
+    async fn verification_ignores_source_with_internal_fixture() {
+        use crate::internal::config::ConfigKv;
+
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let secret = fixture("secret-two-signing-subkeys.asc");
+        let material = prepare_imported_key(&secret, "").expect("unprotected fixture imports");
+        ConfigKv::set("vault.gpg.pubkey", &material.pubkey_armor, false)
+            .await
+            .expect("install allowlist key");
+        // Internal state fixture: the recorded source contradicts the key that
+        // is actually installed, so reading it would flip the verdict.
+        ConfigKv::set("vault.gpg.source", "generated", false)
+            .await
+            .expect("record mismatching source");
+
+        let data = b"source independence payload";
+        let sig_hex = sign_with_armored_secret_key(&secret, &material.signing_key_id, data)
+            .expect("detached signature");
+        let verified = pgp_verify(std::path::Path::new("."), &[], data, &sig_hex)
+            .await
+            .expect("allowlist verification");
+        assert!(verified, "verification must not depend on vault.gpg.source");
+
+        // Control: the allowlist content still decides — a foreign certificate
+        // cannot verify the same signature.
+        let foreign = fixture("pubkey.asc");
+        ConfigKv::set("vault.gpg.pubkey", &foreign, false)
+            .await
+            .expect("swap allowlist key");
+        let rejected = pgp_verify(std::path::Path::new("."), &[], data, &sig_hex)
+            .await
+            .expect("allowlist verification");
+        assert!(
+            !rejected,
+            "a certificate that is not in the allowlist must not verify"
         );
     }
 }

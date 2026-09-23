@@ -4332,6 +4332,71 @@ fn import_conflict_message_is_pinned() {
 }
 
 #[test]
+fn protected_import_missing_passphrase_message_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    let out = run_libra_command(
+        &["config", "import-gpg-key", "--file", GPG_FIXTURE_SECRET],
+        repo.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "a protected import without a passphrase must fail closed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(
+            "imported key is protected but no --passphrase-file given and stdin is not a terminal; supply --passphrase-file"
+        ),
+        "pinned passphrase-required message changed: {err}"
+    );
+}
+
+#[test]
+fn import_signing_disabled_hint_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    // ADR-VG-12 §2: an explicit `vault.signing=false` is respected, and the
+    // import must say so instead of leaving the disabled state unexplained.
+    assert!(
+        run_libra_command(&["config", "vault.signing", "false"], repo.path())
+            .status
+            .success(),
+        "explicit vault.signing=false must be accepted"
+    );
+    let passfile = write_fixture_passfile(repo.path());
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            &passfile,
+            "--replace",
+        ],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "note: vault.signing is false, so commit signing stays disabled (set vault.signing true to enable)"
+        ),
+        "pinned signing-disabled hint changed: {stdout}"
+    );
+    let signing = run_libra_command(&["config", "vault.signing"], repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&signing.stdout).trim(),
+        "false",
+        "an explicit false must not be flipped by the import"
+    );
+}
+
+#[test]
 fn config_import_gpg_key_protected_file_requires_passphrase() {
     let repo = create_committed_repo_via_cli();
     // A protected key with no --passphrase-file and a non-tty stdin must fail
@@ -4552,6 +4617,26 @@ fn config_export_gpg_key_missing_public_key_fails_closed() {
 }
 
 #[test]
+fn gpg_key_export_missing_public_key_message_is_pinned() {
+    let dir = tempdir().unwrap();
+    assert!(
+        run_libra_command(&["init", "--vault", "false"], dir.path())
+            .status
+            .success()
+    );
+    let out = run_libra_command(&["config", "export-gpg-key"], dir.path());
+    assert!(
+        !out.status.success(),
+        "export without a key must fail closed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no active GPG public key to export (import or generate one first)"),
+        "pinned export message changed: {err}"
+    );
+}
+
+#[test]
 fn config_list_gpg_keys_reports_source_fingerprint_and_signing_key_id() {
     let repo = create_committed_repo_via_cli();
     import_fixture_key(repo.path());
@@ -4570,6 +4655,24 @@ fn config_list_gpg_keys_reports_source_fingerprint_and_signing_key_id() {
     assert!(
         !stdout.contains("BEGIN PGP PRIVATE"),
         "list must never print the secret key"
+    );
+}
+
+#[test]
+fn gpg_keys_list_imported_source_message_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let out = run_libra_command(&["config", "list", "--gpg-keys"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("source:       imported"),
+        "pinned source line changed: {stdout}"
     );
 }
 
@@ -4706,6 +4809,31 @@ fn config_get_reveal_list_hide_imported_secret() {
 }
 
 #[test]
+fn reveal_internal_gpg_key_is_refused_message_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let reveal = run_libra_command(
+        &["config", "get", "--reveal", "vault.gpg.seckey_enc"],
+        repo.path(),
+    );
+    assert!(
+        !reveal.status.success(),
+        "revealing a vault internal credential must be refused"
+    );
+    let err = String::from_utf8_lossy(&reveal.stderr);
+    assert!(
+        err.contains(
+            "key 'vault.gpg.seckey_enc' is a vault internal credential and cannot be revealed"
+        ),
+        "pinned reveal-refusal message changed: {err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&reveal.stdout).contains("BEGIN PGP"),
+        "a refused reveal must not print key material"
+    );
+}
+
+#[test]
 fn config_remove_gpg_key_and_force_message_is_pinned() {
     let repo = create_committed_repo_via_cli();
     import_fixture_key(repo.path());
@@ -4736,6 +4864,19 @@ fn config_remove_gpg_key_and_force_message_is_pinned() {
             .status
             .success(),
         "signing keeps working after removal"
+    );
+}
+
+#[test]
+fn gpg_key_remove_without_force_message_is_pinned() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let refused = run_libra_command(&["config", "remove-gpg-key"], repo.path());
+    assert!(!refused.status.success(), "removal needs --force");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("an imported GPG key is active; pass --force to remove it"),
+        "pinned removal message changed: {err}"
     );
 }
 

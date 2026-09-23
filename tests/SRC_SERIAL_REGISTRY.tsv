@@ -420,3 +420,4 @@ src/utils/util.rs	test_try_get_storage_path_accepts_valid_repo_under_ancestor_wi
 src/utils/util.rs	test_try_get_storage_path_ignores_global_libra_dir_without_repo_markers	lane:cwd	unkeyed+touch;cwd;callees:test_try_get_storage_path_ignores_global_libra_dir_without_repo_markers
 src/utils/util.rs	test_try_get_storage_path_rejects_libra_dir_with_only_hooks	lane:cwd	unkeyed+touch;cwd;callees:test_try_get_storage_path_rejects_libra_dir_with_only_hooks
 src/utils/util.rs	test_try_get_storage_path_rejects_libra_dir_with_only_objects	lane:cwd	unkeyed+touch;cwd;callees:test_try_get_storage_path_rejects_libra_dir_with_only_objects
+src/internal/vault.rs	verification_ignores_source_with_internal_fixture	lane:cwd+env	plan-20260921 VG-05 G2: sandboxes HOME/XDG (ConfigDbFixture) and cwd (ChangeDirGuard) to install an allowlist key and prove verification ignores vault.gpg.source
