@@ -597,6 +597,25 @@ fn build_push_certificate(
     cert
 }
 
+/// GPG-sign a push certificate body with the repository's active signing key.
+///
+/// Split out of the send-pack path so the payload/signature contract can be
+/// exercised without a remote that advertises `push-cert`.
+async fn sign_push_certificate(certificate: &str) -> Result<String, PushError> {
+    let unseal_key = crate::internal::vault::load_unseal_key()
+        .await
+        .ok_or(PushError::PushSignNoKey)?;
+    let sig_hex = crate::internal::vault::pgp_sign(
+        &crate::utils::util::storage_path(),
+        &unseal_key,
+        certificate.as_bytes(),
+    )
+    .await
+    .map_err(|e| PushError::PushSignFailed(e.to_string()))?;
+    crate::internal::vault::signature_to_armored(&sig_hex)
+        .map_err(|e| PushError::PushSignFailed(e.to_string()))
+}
+
 /// Frame a signed push certificate into the send-pack stream: the `push-cert`
 /// announcement (carrying the capability list), the signed certificate body,
 /// the armored signature, and the `push-cert-end` terminator, then a flush.
@@ -1182,18 +1201,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             chrono::Utc::now().timestamp()
         );
         let certificate = build_push_certificate(&pusher, &repo_url, &nonce, &commands);
-        let unseal_key = crate::internal::vault::load_unseal_key()
-            .await
-            .ok_or(PushError::PushSignNoKey)?;
-        let sig_hex = crate::internal::vault::pgp_sign(
-            &crate::utils::util::storage_path(),
-            &unseal_key,
-            certificate.as_bytes(),
-        )
-        .await
-        .map_err(|e| PushError::PushSignFailed(e.to_string()))?;
-        let armored = crate::internal::vault::signature_to_armored(&sig_hex)
-            .map_err(|e| PushError::PushSignFailed(e.to_string()))?;
+        let armored = sign_push_certificate(&certificate).await?;
         encode_push_cert_section(&capability, &certificate, &armored, &mut data);
     } else {
         for (index, (old_oid, new_oid, remote_ref)) in commands.iter().enumerate() {
@@ -5469,5 +5477,71 @@ old1 new1 refs/heads/main\n"
         assert_eq!(levenshtein("origni", "origin"), 2);
         assert_eq!(levenshtein("", "abc"), 3);
         assert_eq!(levenshtein("abc", ""), 3);
+    }
+}
+
+#[cfg(test)]
+mod push_certificate_signing_tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    const FIXTURE_PASSPHRASE: &str = "libra-test-fixture-passphrase";
+
+    /// plan-20260921 (`push_certificate_payload_uses_imported_signing_key`):
+    /// the certificate that goes on the wire must verify against the imported
+    /// GPG key, not against a generated fallback.
+    #[tokio::test]
+    #[serial(env)]
+    #[serial(cwd)]
+    async fn push_certificate_payload_uses_imported_signing_key() {
+        // Owns a temp HOME/XDG so the global vault cannot reach the real one.
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/fake-gpg/protected-secret.asc");
+        let armor = std::fs::read_to_string(&fixture).expect("fixture armor");
+        let material = crate::internal::vault::prepare_imported_key(&armor, FIXTURE_PASSPHRASE)
+            .expect("fixture key must unlock");
+        let unseal_key = crate::internal::vault::lazy_init_vault_for_scope("local")
+            .await
+            .expect("local vault");
+        crate::internal::vault::persist_imported_gpg_key(&unseal_key, &material)
+            .await
+            .expect("persist imported key");
+        crate::internal::config::ConfigKv::set("vault.gpg.source", "imported", false)
+            .await
+            .expect("record imported source");
+
+        // Isolation guard: the imported key must live in the sandbox HOME.
+        let sandbox_scope = crate::internal::vault::gpg_source().await;
+        assert_eq!(sandbox_scope.as_deref(), Some("imported"));
+
+        let certificate = build_push_certificate(
+            "Fixture <fixture@example.invalid> 1 +0000",
+            "file:///remote",
+            "nonce-1",
+            &[(
+                "0".repeat(40),
+                "1".repeat(40),
+                "refs/heads/main".to_string(),
+            )],
+        );
+        let armored = sign_push_certificate(&certificate)
+            .await
+            .expect("sign the push certificate");
+        let sig_hex = crate::internal::vault::armored_to_signature_hex(&armored)
+            .expect("armored signature round-trips");
+        assert!(
+            crate::internal::vault::verify_signature_hex(
+                &sig_hex,
+                certificate.as_bytes(),
+                std::slice::from_ref(&material.pubkey_armor),
+            ),
+            "the push certificate must verify against the imported key"
+        );
     }
 }

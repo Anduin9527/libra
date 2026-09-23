@@ -4122,8 +4122,15 @@ async fn config_imported_key_signs_commits_end_to_end() {
 
     std::fs::write(temp_path.path().join("signed.txt"), "signed\n").unwrap();
     let out = run_libra_command(&["add", "signed.txt"], temp_path.path());
-    assert!(out.status.success(), "add: {}", String::from_utf8_lossy(&out.stderr));
-    let out = run_libra_command(&["commit", "-m", "signed by imported key"], temp_path.path());
+    assert!(
+        out.status.success(),
+        "add: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_libra_command(
+        &["commit", "-m", "signed by imported key"],
+        temp_path.path(),
+    );
     assert!(
         out.status.success(),
         "signed commit must succeed with an imported key: {}",
@@ -4202,13 +4209,21 @@ fn config_import_gpg_key_rejects_global_and_system_scope() {
 fn import_scope_rejection_message_is_pinned() {
     let repo = create_committed_repo_via_cli();
     let out = run_libra_command(
-        &["config", "import-gpg-key", "--global", "--file", GPG_FIXTURE_SECRET],
+        &[
+            "config",
+            "import-gpg-key",
+            "--global",
+            "--file",
+            GPG_FIXTURE_SECRET,
+        ],
         repo.path(),
     );
     assert_eq!(out.status.code(), Some(129), "usage error exit code");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("import-gpg-key only supports the local scope; --global/--system are not supported"),
+        err.contains(
+            "import-gpg-key only supports the local scope; --global/--system are not supported"
+        ),
         "pinned message changed: {err}"
     );
 }
@@ -4244,7 +4259,10 @@ fn config_export_gpg_key_rejects_json_machine_and_quiet() {
     let repo = create_committed_repo_via_cli();
     for flag in ["--json", "--machine", "--quiet"] {
         let out = run_libra_command(&["config", "export-gpg-key", flag], repo.path());
-        assert!(!out.status.success(), "export-gpg-key {flag} must be rejected");
+        assert!(
+            !out.status.success(),
+            "export-gpg-key {flag} must be rejected"
+        );
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
             err.contains("does not support"),
@@ -4306,7 +4324,9 @@ fn import_conflict_message_is_pinned() {
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("fatal: an active GPG key already exists; pass --replace to import a different key"),
+        err.contains(
+            "fatal: an active GPG key already exists; pass --replace to import a different key"
+        ),
         "pinned conflict message changed: {err}"
     );
 }
@@ -4344,7 +4364,10 @@ fn config_import_gpg_key_outside_repository_reports_not_a_repo() {
         &["config", "import-gpg-key", "--file", GPG_FIXTURE_SECRET],
         dir.path(),
     );
-    assert!(!out.status.success(), "import outside a repository must fail");
+    assert!(
+        !out.status.success(),
+        "import outside a repository must fail"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("not a libra repository"),
         "stderr: {}",
@@ -4404,8 +4427,14 @@ fn config_export_gpg_key_default_stdout_armor() {
     let out = run_libra_command(&["config", "export-gpg-key"], repo.path());
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"), "{stdout}");
-    assert!(!stdout.contains("PRIVATE KEY"), "export must not leak the secret key");
+    assert!(
+        stdout.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("PRIVATE KEY"),
+        "export must not leak the secret key"
+    );
 }
 
 #[test]
@@ -4423,7 +4452,10 @@ fn config_export_gpg_key_fingerprint_conflicts_with_out() {
         ],
         repo.path(),
     );
-    assert!(!out.status.success(), "--out and --fingerprint must conflict");
+    assert!(
+        !out.status.success(),
+        "--out and --fingerprint must conflict"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("mutually exclusive"),
         "stderr: {}",
@@ -4438,7 +4470,12 @@ fn config_export_gpg_key_missing_parent_fails_closed() {
     import_fixture_key(repo.path());
     let target = repo.path().join("missing-dir").join("out.asc");
     let out = run_libra_command(
-        &["config", "export-gpg-key", "--out", &target.to_string_lossy()],
+        &[
+            "config",
+            "export-gpg-key",
+            "--out",
+            &target.to_string_lossy(),
+        ],
         repo.path(),
     );
     assert!(!out.status.success(), "missing parent must fail closed");
@@ -4458,13 +4495,26 @@ fn config_export_gpg_key_out_is_atomic_and_overwrites() {
     // Pre-existing unrelated content must be replaced, never merged.
     std::fs::write(&target, "stale-content").unwrap();
     let out = run_libra_command(
-        &["config", "export-gpg-key", "--out", &target.to_string_lossy()],
+        &[
+            "config",
+            "export-gpg-key",
+            "--out",
+            &target.to_string_lossy(),
+        ],
         repo.path(),
     );
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let written = std::fs::read_to_string(&target).unwrap();
     assert!(written.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
-    assert!(!written.contains("stale-content"), "overwrite must not append");
+    assert!(
+        !written.contains("stale-content"),
+        "overwrite must not append"
+    );
 
     // The atomic replace must leave no temporary sibling behind.
     let leftovers: Vec<String> = std::fs::read_dir(repo.path())
@@ -4473,7 +4523,10 @@ fn config_export_gpg_key_out_is_atomic_and_overwrites() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| name.contains("exported.asc") && name != "exported.asc")
         .collect();
-    assert!(leftovers.is_empty(), "no temp files expected, saw {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "no temp files expected, saw {leftovers:?}"
+    );
 }
 
 #[test]
@@ -4486,7 +4539,10 @@ fn config_export_gpg_key_missing_public_key_fails_closed() {
             .success()
     );
     let out = run_libra_command(&["config", "export-gpg-key"], dir.path());
-    assert!(!out.status.success(), "export without a key must fail closed");
+    assert!(
+        !out.status.success(),
+        "export without a key must fail closed"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("no active GPG public key to export"),
@@ -4503,7 +4559,10 @@ fn config_list_gpg_keys_reports_source_fingerprint_and_signing_key_id() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("imported"), "source: {stdout}");
-    assert!(stdout.contains(GPG_FIXTURE_FINGERPRINT), "fingerprint: {stdout}");
+    assert!(
+        stdout.contains(GPG_FIXTURE_FINGERPRINT),
+        "fingerprint: {stdout}"
+    );
     assert!(
         stdout.to_lowercase().contains("signing"),
         "signing key id must be reported: {stdout}"
@@ -4519,7 +4578,12 @@ fn config_list_gpg_keys_json_shape_is_additive() {
     let repo = create_committed_repo_via_cli();
     import_fixture_key(repo.path());
     let out = run_libra_command(&["--json", "config", "list", "--gpg-keys"], repo.path());
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let json = parse_json_stdout(&out);
     let text = json.to_string();
     assert!(text.contains(GPG_FIXTURE_FINGERPRINT), "json: {text}");
@@ -4543,7 +4607,9 @@ fn config_replace_keeps_history_verifiable() {
         "sign a tag with the generated key"
     );
     assert!(
-        run_libra_command(&["tag", "-v", "v1"], repo.path()).status.success(),
+        run_libra_command(&["tag", "-v", "v1"], repo.path())
+            .status
+            .success(),
         "generated-key tag verifies before replacement"
     );
 
@@ -4580,7 +4646,9 @@ fn config_replace_keeps_history_verifiable() {
         "sign a tag with the imported key"
     );
     assert!(
-        run_libra_command(&["tag", "-v", "v2"], repo.path()).status.success(),
+        run_libra_command(&["tag", "-v", "v2"], repo.path())
+            .status
+            .success(),
         "imported-key tag verifies"
     );
 }
@@ -4620,7 +4688,10 @@ fn config_get_reveal_list_hide_imported_secret() {
         &["config", "get", "--reveal", "vault.gpg.seckey_enc"],
         repo.path(),
     );
-    assert!(!reveal.status.success(), "reveal of the secret key is refused");
+    assert!(
+        !reveal.status.success(),
+        "reveal of the secret key is refused"
+    );
     assert!(
         !String::from_utf8_lossy(&reveal.stdout).contains("BEGIN PGP"),
         "a refused reveal must not print key material"
@@ -4648,7 +4719,12 @@ fn config_remove_gpg_key_and_force_message_is_pinned() {
     );
 
     let removed = run_libra_command(&["config", "remove-gpg-key", "--force"], repo.path());
-    assert_eq!(removed.status.code(), Some(0), "{}", String::from_utf8_lossy(&removed.stderr));
+    assert_eq!(
+        removed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
     let fp = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
     assert_ne!(
         String::from_utf8_lossy(&fp.stdout).trim(),
@@ -4688,14 +4764,25 @@ fn config_import_gpg_key_list_is_read_only() {
     let repo = create_committed_repo_via_cli();
     let fake = write_fake_gpg(repo.path(), GPG_FIXTURE_FINGERPRINT, "2.4.9");
     assert!(
-        run_libra_command(&["config", "gpg.program", &fake.to_string_lossy()], repo.path())
-            .status
-            .success()
+        run_libra_command(
+            &["config", "gpg.program", &fake.to_string_lossy()],
+            repo.path()
+        )
+        .status
+        .success()
     );
     let out = run_libra_command(&["config", "import-gpg-key", "--list"], repo.path());
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(GPG_FIXTURE_FINGERPRINT), "stub must be used: {stdout}");
+    assert!(
+        stdout.contains(GPG_FIXTURE_FINGERPRINT),
+        "stub must be used: {stdout}"
+    );
 
     // A read-only listing must not create or change any vault metadata.
     let listed = run_libra_command(&["config", "list"], repo.path());
@@ -4713,9 +4800,12 @@ fn gpg_program_precedence_and_gnupghome_validation() {
     let fake = write_fake_gpg(repo.path(), GPG_FIXTURE_FINGERPRINT, "2.4.9");
     // `gpg.program` must take precedence over any host gpg on PATH.
     assert!(
-        run_libra_command(&["config", "gpg.program", &fake.to_string_lossy()], repo.path())
-            .status
-            .success()
+        run_libra_command(
+            &["config", "gpg.program", &fake.to_string_lossy()],
+            repo.path()
+        )
+        .status
+        .success()
     );
     let out = run_libra_command(&["config", "import-gpg-key", "--list"], repo.path());
     assert!(
@@ -4742,9 +4832,12 @@ fn config_import_gpg_key_missing_gpg_maps_to_unsupported() {
     let repo = create_committed_repo_via_cli();
     let missing = repo.path().join("no-such-gpg");
     assert!(
-        run_libra_command(&["config", "gpg.program", &missing.to_string_lossy()], repo.path())
-            .status
-            .success()
+        run_libra_command(
+            &["config", "gpg.program", &missing.to_string_lossy()],
+            repo.path()
+        )
+        .status
+        .success()
     );
     let out = run_libra_command(&["config", "import-gpg-key", "--list"], repo.path());
     assert!(!out.status.success(), "a missing gpg must fail");
@@ -4761,9 +4854,12 @@ fn config_import_gpg_key_file_mode_bypasses_missing_gpg() {
     let repo = create_committed_repo_via_cli();
     let missing = repo.path().join("no-such-gpg");
     assert!(
-        run_libra_command(&["config", "gpg.program", &missing.to_string_lossy()], repo.path())
-            .status
-            .success()
+        run_libra_command(
+            &["config", "gpg.program", &missing.to_string_lossy()],
+            repo.path()
+        )
+        .status
+        .success()
     );
     let passfile = write_fixture_passfile(repo.path());
     let out = run_libra_command(
@@ -4785,7 +4881,10 @@ fn config_import_gpg_key_file_mode_bypasses_missing_gpg() {
         String::from_utf8_lossy(&out.stderr)
     );
     let fp = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
-    assert_eq!(String::from_utf8_lossy(&fp.stdout).trim(), GPG_FIXTURE_FINGERPRINT);
+    assert_eq!(
+        String::from_utf8_lossy(&fp.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT
+    );
 }
 
 #[test]
@@ -4801,14 +4900,20 @@ fn import_persists_encrypted_seckey_and_metadata() {
         "vault.gpg.imported_at",
         "vault.gpg.pubkey",
     ] {
-        assert!(keys.contains(expected), "missing metadata {expected}: {keys}");
+        assert!(
+            keys.contains(expected),
+            "missing metadata {expected}: {keys}"
+        );
     }
     assert!(
         !keys.contains("BEGIN PGP PRIVATE KEY BLOCK"),
         "the stored secret key must not be listed in the clear"
     );
     let fp = run_libra_command(&["config", "get", "vault.gpg.fingerprint"], repo.path());
-    assert_eq!(String::from_utf8_lossy(&fp.stdout).trim(), GPG_FIXTURE_FINGERPRINT);
+    assert_eq!(
+        String::from_utf8_lossy(&fp.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT
+    );
     let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
     assert_eq!(String::from_utf8_lossy(&source.stdout).trim(), "imported");
 }
@@ -4834,7 +4939,12 @@ fn import_keeps_explicit_false_signing_with_hint() {
         ],
         repo.path(),
     );
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let signing = run_libra_command(&["config", "get", "vault.signing"], repo.path());
     assert_eq!(
         String::from_utf8_lossy(&signing.stdout).trim(),
@@ -4853,7 +4963,11 @@ fn fresh_generation_records_versioned_key_name() {
     // Mint the key explicitly: `libra init` may lazily create the legacy
     // fixed-name key, while `generate-gpg-key` uses the versioned name.
     let dir = tempdir().unwrap();
-    assert!(run_libra_command(&["init", "--vault", "false"], dir.path()).status.success());
+    assert!(
+        run_libra_command(&["init", "--vault", "false"], dir.path())
+            .status
+            .success()
+    );
     for (key, value) in [
         ("user.name", "Test User"),
         ("user.email", "test@example.invalid"),
@@ -4873,20 +4987,29 @@ fn fresh_generation_records_versioned_key_name() {
         String::from_utf8_lossy(&generated.stderr)
     );
 
-    let name = run_libra_command(&["config", "get", "vault.gpg.generated_key_name"], dir.path());
+    let name = run_libra_command(
+        &["config", "get", "vault.gpg.generated_key_name"],
+        dir.path(),
+    );
     let name = String::from_utf8_lossy(&name.stdout).trim().to_string();
     assert!(
         name.starts_with("libra-signing-"),
         "generated keys must use the versioned name: {name}"
     );
     assert!(
-        name["libra-signing-".len()..].chars().all(|c| c.is_ascii_digit()),
+        name["libra-signing-".len()..]
+            .chars()
+            .all(|c| c.is_ascii_digit()),
         "the suffix must be the nanosecond stamp: {name}"
     );
 
     // A tag needs a commit to point at.
     std::fs::write(dir.path().join("g.txt"), "x\n").unwrap();
-    assert!(run_libra_command(&["add", "g.txt"], dir.path()).status.success());
+    assert!(
+        run_libra_command(&["add", "g.txt"], dir.path())
+            .status
+            .success()
+    );
     assert!(
         run_libra_command(&["commit", "--no-gpg-sign", "-m", "base"], dir.path())
             .status
@@ -4929,7 +5052,10 @@ fn replace_snapshots_generated_pubkey_into_history() {
     );
     // And the active key is the imported one.
     let after = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
-    assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), GPG_FIXTURE_FINGERPRINT);
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT
+    );
 }
 
 #[test]
@@ -4971,12 +5097,21 @@ fn commit_no_gpg_sign_wins_over_imported_key() {
         );
     }
     std::fs::write(repo.path().join("nostream.txt"), "x\n").unwrap();
-    assert!(run_libra_command(&["add", "nostream.txt"], repo.path()).status.success());
+    assert!(
+        run_libra_command(&["add", "nostream.txt"], repo.path())
+            .status
+            .success()
+    );
     let commit = run_libra_command(
         &["commit", "--no-gpg-sign", "-m", "unsigned on purpose"],
         repo.path(),
     );
-    assert_eq!(commit.status.code(), Some(0), "{}", String::from_utf8_lossy(&commit.stderr));
+    assert_eq!(
+        commit.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
     let raw = run_libra_command_with_stdin(&["cat-file", "--batch"], repo.path(), "HEAD\n");
     assert!(
         !String::from_utf8_lossy(&raw.stdout).contains("gpgsig"),
@@ -5000,14 +5135,20 @@ fn config_import_gpg_key_rejects_ambiguous_or_unknown_selector() {
     let repo = create_committed_repo_via_cli();
     let fake = write_two_candidate_fake_gpg(repo.path());
     assert!(
-        run_libra_command(&["config", "gpg.program", &fake.to_string_lossy()], repo.path())
-            .status
-            .success()
+        run_libra_command(
+            &["config", "gpg.program", &fake.to_string_lossy()],
+            repo.path()
+        )
+        .status
+        .success()
     );
 
     // Two candidates with no selector must be rejected (ADR-VG-01 rule 1).
     let no_selector = run_libra_command(&["config", "import-gpg-key"], repo.path());
-    assert!(!no_selector.status.success(), "two candidates need an explicit --key");
+    assert!(
+        !no_selector.status.success(),
+        "two candidates need an explicit --key"
+    );
     assert!(
         String::from_utf8_lossy(&no_selector.stderr).contains("multiple secret keys"),
         "stderr: {}",
@@ -5032,7 +5173,10 @@ fn config_import_gpg_key_rejects_ambiguous_or_unknown_selector() {
         &["config", "import-gpg-key", "--key", "shared-name"],
         repo.path(),
     );
-    assert!(!ambiguous.status.success(), "ambiguous --key must be rejected");
+    assert!(
+        !ambiguous.status.success(),
+        "ambiguous --key must be rejected"
+    );
     let err = String::from_utf8_lossy(&ambiguous.stderr);
     assert!(
         err.contains("multiple") || err.contains("ambiguous") || err.contains("matching"),
@@ -5053,7 +5197,10 @@ fn history_writes_are_idempotent_by_fingerprint() {
             .count()
     };
     let after_first = history_rows(&first_keys);
-    assert!(after_first >= 1, "history must record the replaced key: {first_keys}");
+    assert!(
+        after_first >= 1,
+        "history must record the replaced key: {first_keys}"
+    );
 
     // Re-importing the same key must not append further history rows.
     import_fixture_key(repo.path());
@@ -5071,7 +5218,12 @@ fn config_list_show_origin_redacts_imported_secret() {
     let repo = create_committed_repo_via_cli();
     import_fixture_key(repo.path());
     let out = run_libra_command(&["config", "list", "--show-origin"], repo.path());
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("vault.gpg.seckey_enc"),
@@ -5092,7 +5244,12 @@ fn tag_sign_uses_imported_key() {
     let repo = create_committed_repo_via_cli();
     import_fixture_key(repo.path());
     let out = run_libra_command(&["tag", "-s", "-m", "imported signer", "vsig"], repo.path());
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let body = run_libra_command(&["cat-file", "-p", "vsig"], repo.path());
     assert!(
         String::from_utf8_lossy(&body.stdout).contains("-----BEGIN PGP SIGNATURE-----"),
@@ -5125,9 +5282,18 @@ fn commit_uses_imported_gpg_key_when_vault_signing() {
         );
     }
     std::fs::write(repo.path().join("vaultsign.txt"), "x\n").unwrap();
-    assert!(run_libra_command(&["add", "vaultsign.txt"], repo.path()).status.success());
+    assert!(
+        run_libra_command(&["add", "vaultsign.txt"], repo.path())
+            .status
+            .success()
+    );
     let commit = run_libra_command(&["commit", "-m", "signed via vault.signing"], repo.path());
-    assert_eq!(commit.status.code(), Some(0), "{}", String::from_utf8_lossy(&commit.stderr));
+    assert_eq!(
+        commit.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
     let raw = run_libra_command_with_stdin(&["cat-file", "--batch"], repo.path(), "HEAD\n");
     assert!(
         String::from_utf8_lossy(&raw.stdout).contains("gpgsig"),
@@ -5139,7 +5305,9 @@ fn commit_uses_imported_gpg_key_when_vault_signing() {
 fn replace_writes_history_before_overwrite() {
     let repo = create_committed_repo_via_cli();
     let replaced = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
-    let replaced_fp = String::from_utf8_lossy(&replaced.stdout).trim().to_lowercase();
+    let replaced_fp = String::from_utf8_lossy(&replaced.stdout)
+        .trim()
+        .to_lowercase();
 
     import_fixture_key(repo.path());
 
@@ -5172,7 +5340,10 @@ fn replace_snapshots_generated_pubkey() {
         "history must exist after a replacement: {keys}"
     );
     let verify = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
-    assert_eq!(String::from_utf8_lossy(&verify.stdout).trim(), GPG_FIXTURE_FINGERPRINT);
+    assert_eq!(
+        String::from_utf8_lossy(&verify.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT
+    );
 }
 
 #[test]
@@ -5184,8 +5355,11 @@ fn history_invariant_covers_generated_keys() {
             .status
             .success()
     );
-    let generated_fp = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
-    let generated_fp = String::from_utf8_lossy(&generated_fp.stdout).trim().to_lowercase();
+    let generated_fp =
+        run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
+    let generated_fp = String::from_utf8_lossy(&generated_fp.stdout)
+        .trim()
+        .to_lowercase();
 
     import_fixture_key(repo.path());
 
@@ -5193,19 +5367,28 @@ fn history_invariant_covers_generated_keys() {
     // the imported one is active: the invariant distinguishes both.
     let listed = run_libra_command(&["config", "list"], repo.path());
     let keys = String::from_utf8_lossy(&listed.stdout).to_lowercase();
-    assert!(keys.contains(&generated_fp), "generated fingerprint must be archived: {keys}");
+    assert!(
+        keys.contains(&generated_fp),
+        "generated fingerprint must be archived: {keys}"
+    );
     assert!(
         !generated_fp.eq(&GPG_FIXTURE_FINGERPRINT.to_lowercase()),
         "the fixtures must differ for this invariant to mean anything"
     );
     let active = run_libra_command(&["config", "export-gpg-key", "--fingerprint"], repo.path());
-    assert_eq!(String::from_utf8_lossy(&active.stdout).trim(), GPG_FIXTURE_FINGERPRINT);
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        GPG_FIXTURE_FINGERPRINT
+    );
 }
 
 #[test]
 fn generated_verification_resolves_generated_key_name() {
     let repo = create_committed_repo_via_cli();
-    let name = run_libra_command(&["config", "get", "vault.gpg.generated_key_name"], repo.path());
+    let name = run_libra_command(
+        &["config", "get", "vault.gpg.generated_key_name"],
+        repo.path(),
+    );
     let name = String::from_utf8_lossy(&name.stdout).trim().to_string();
     if name.is_empty() {
         // A lazily initialised repository may use the legacy fixed name; mint a
@@ -5261,7 +5444,11 @@ fn merge_gpg_sign_uses_imported_key() {
             .success()
     );
     std::fs::write(repo.path().join("feature.txt"), "f\n").unwrap();
-    assert!(run_libra_command(&["add", "feature.txt"], repo.path()).status.success());
+    assert!(
+        run_libra_command(&["add", "feature.txt"], repo.path())
+            .status
+            .success()
+    );
     assert!(
         run_libra_command(&["commit", "-m", "feature change"], repo.path())
             .status
@@ -5273,7 +5460,11 @@ fn merge_gpg_sign_uses_imported_key() {
             .success()
     );
     std::fs::write(repo.path().join("main.txt"), "m\n").unwrap();
-    assert!(run_libra_command(&["add", "main.txt"], repo.path()).status.success());
+    assert!(
+        run_libra_command(&["add", "main.txt"], repo.path())
+            .status
+            .success()
+    );
     assert!(
         run_libra_command(&["commit", "-m", "main change"], repo.path())
             .status
@@ -5324,7 +5515,10 @@ fn tty_prompt_collects_passphrase() {
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("LIBRA_CONFIG_GLOBAL_DB", home.join(".libra").join("config.db"))
+        .env(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            home.join(".libra").join("config.db"),
+        )
         .env(
             "LIBRA_CONFIG_SYSTEM_DB",
             home.join(".libra").join("system-config.db"),
@@ -5471,11 +5665,7 @@ async fn generate_pgp_key_propagates_config_write_error() {
 
     // An account that can still write a 0444 file (typically root) cannot
     // exercise this fault, so skip instead of asserting a false result.
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .open(&db)
-        .is_ok()
-    {
+    if std::fs::OpenOptions::new().write(true).open(&db).is_ok() {
         std::fs::set_permissions(&db, original).unwrap();
         eprintln!("skipping: this account can write a read-only DB file");
         return;
@@ -5495,7 +5685,8 @@ async fn generate_pgp_key_propagates_config_write_error() {
     // acceptable — what matters is that the failure is surfaced, not swallowed.
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("failed to") && (err.contains("initialize vault") || err.contains("GPG key generation failed")),
+        err.contains("failed to")
+            && (err.contains("initialize vault") || err.contains("GPG key generation failed")),
         "the write failure must be surfaced with context: {err}"
     );
     assert!(
@@ -5523,7 +5714,10 @@ fn config_import_gpg_key_failure_leaves_no_metadata() {
         ],
         repo.path(),
     );
-    assert!(!out.status.success(), "a wrong passphrase must fail the import");
+    assert!(
+        !out.status.success(),
+        "a wrong passphrase must fail the import"
+    );
 
     let listed = run_libra_command(&["config", "list"], repo.path());
     let keys = String::from_utf8_lossy(&listed.stdout);
@@ -5538,5 +5732,98 @@ fn config_import_gpg_key_failure_leaves_no_metadata() {
         String::from_utf8_lossy(&source.stdout).trim(),
         "imported",
         "a failed import must not flip the active source"
+    );
+}
+
+/// Every `vault.gpg.*` row, read straight from the repository database.
+async fn gpg_config_rows(db_path: &Path) -> std::collections::BTreeMap<String, String> {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let mut opts = sea_orm::ConnectOptions::new(format!("sqlite://{}", db_path.display()));
+    opts.sqlx_logging(false);
+    let conn = Database::connect(opts).await.expect("open repo db");
+    let backend = conn.get_database_backend();
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT key, value FROM config_kv WHERE key LIKE 'vault.gpg.%' ORDER BY key",
+        ))
+        .await
+        .expect("query config_kv");
+    rows.into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "key").expect("key column"),
+                row.try_get::<String>("", "value").expect("value column"),
+            )
+        })
+        .collect()
+}
+
+/// Make writes to `key` abort, so the caller fails *mid-sequence*.
+async fn inject_config_write_failure(db_path: &Path, key: &str) {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let mut opts = sea_orm::ConnectOptions::new(format!("sqlite://{}", db_path.display()));
+    opts.sqlx_logging(false);
+    let conn = Database::connect(opts).await.expect("open repo db");
+    let backend = conn.get_database_backend();
+    for (name, event) in [("insert", "INSERT"), ("update", "UPDATE")] {
+        conn.execute_raw(Statement::from_string(
+            backend,
+            format!(
+                "CREATE TRIGGER injected_partial_failure_{name} BEFORE {event} ON config_kv \
+                 WHEN NEW.key = '{key}' BEGIN SELECT RAISE(ABORT, 'injected partial failure'); END"
+            ),
+        ))
+        .await
+        .expect("create the injection trigger");
+    }
+}
+
+/// plan-20260921 VG-02/VG-03 (`import_partial_failure_rolls_back`): a failure in
+/// the middle of the metadata write sequence must leave the repository exactly
+/// as it was — never half-switched to the imported key.
+#[tokio::test]
+#[serial(cwd)]
+async fn import_partial_failure_rolls_back() {
+    let repo = create_committed_repo_via_cli();
+    let _guard = test::ChangeDirGuard::new(repo.path());
+    let db = repo.path().join(".libra").join("libra.db");
+
+    let before = gpg_config_rows(&db).await;
+    assert!(
+        before.contains_key("vault.gpg.generated_pubkey")
+            || before.contains_key("vault.gpg.pubkey"),
+        "the repository must already have an active key: {before:?}"
+    );
+
+    // The trigger aborts the sensitive secret-key write, which happens *after*
+    // the identity rows (pubkey/fingerprint/signing_key_id/uid/imported_at).
+    inject_config_write_failure(&db, "vault.gpg.seckey_enc").await;
+
+    let passfile = write_fixture_passfile(repo.path());
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            passfile.as_str(),
+            "--replace",
+        ],
+        repo.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "the injected write failure must fail the import, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let after = gpg_config_rows(&db).await;
+    assert_eq!(
+        after, before,
+        "a partial import failure must not change any vault.gpg.* row"
     );
 }

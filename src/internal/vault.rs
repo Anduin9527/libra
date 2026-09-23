@@ -1616,6 +1616,17 @@ pub fn prepare_imported_key(armor: &str, passphrase: &str) -> Result<ImportedKey
         ));
     }
 
+    // ADR-VG-09 / VG-05 G7: a subkey is only eligible when its SubkeyBinding
+    // signature is verifiably issued by *this* certificate's primary key, so a
+    // forged certificate cannot smuggle in a foreign-bound signing subkey.
+    let public = skey.to_public_key();
+    let foreign_bound_subkeys: Vec<String> = public
+        .public_subkeys
+        .iter()
+        .filter(|sub| sub.verify_bindings(&public.primary_key).is_err())
+        .map(|sub| format!("{}", sub.key.legacy_key_id()))
+        .collect();
+
     let fingerprint = format!("{:X}", skey.primary_key.fingerprint());
     let uid = skey
         .details
@@ -1637,16 +1648,16 @@ pub fn prepare_imported_key(armor: &str, passphrase: &str) -> Result<ImportedKey
             .signatures
             .iter()
             .any(|s| s.typ() == Some(SignatureType::SubkeyRevocation));
+        let key_id = format!("{}", sub.key.legacy_key_id());
         if has_binding
             && !has_revocation
+            && !foreign_bound_subkeys.contains(&key_id)
             && algorithm_can_sign(sub.key.algorithm())
             && binding_signature_allows_signing(&sub.signatures)
-            && subkey_declared_expiry(&sub.signatures).is_none_or(|expiry| expiry > now_epoch_secs())
+            && subkey_declared_expiry(&sub.signatures)
+                .is_none_or(|expiry| expiry > now_epoch_secs())
         {
-            candidates.push((
-                format!("{}", sub.key.legacy_key_id()),
-                sub.key.created_at().as_secs(),
-            ));
+            candidates.push((key_id, sub.key.created_at().as_secs()));
         }
     }
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1815,11 +1826,22 @@ pub async fn persist_imported_gpg_key(
     unseal_key: &[u8],
     material: &ImportedKeyMaterial,
 ) -> Result<()> {
+    use sea_orm::TransactionTrait;
+
     use crate::internal::config::ConfigKv;
+
+    // ADR-VG-02/03: every write below is part of one transaction, so a failure
+    // at any step — including the sensitive secret-key write — leaves the
+    // repository exactly as it was instead of half-switched to the imported key.
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let txn = db
+        .begin()
+        .await
+        .context("failed to start the imported GPG key transaction")?;
 
     // VG-13 G1/G2: record the current active key (and a generated snapshot when
     // needed) before any overwrite.
-    snapshot_active_key_to_history().await?;
+    snapshot_active_key_to_history_with_conn(&txn).await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1830,26 +1852,35 @@ pub async fn persist_imported_gpg_key(
         material.rebuilt_armor.as_bytes(),
     )?);
 
-    ConfigKv::set("vault.gpg.pubkey", &material.pubkey_armor, false).await?;
-    ConfigKv::set("vault.gpg.fingerprint", &material.fingerprint, false).await?;
-    ConfigKv::set("vault.gpg.signing_key_id", &material.signing_key_id, false).await?;
-    ConfigKv::set("vault.gpg.uid", &material.uid, false).await?;
-    ConfigKv::set("vault.gpg.imported_at", &now, false).await?;
-    ConfigKv::set("vault.gpg.seckey_enc", &seckey_hex, true).await?;
+    ConfigKv::set_with_conn(&txn, "vault.gpg.pubkey", &material.pubkey_armor, false).await?;
+    ConfigKv::set_with_conn(&txn, "vault.gpg.fingerprint", &material.fingerprint, false).await?;
+    ConfigKv::set_with_conn(
+        &txn,
+        "vault.gpg.signing_key_id",
+        &material.signing_key_id,
+        false,
+    )
+    .await?;
+    ConfigKv::set_with_conn(&txn, "vault.gpg.uid", &material.uid, false).await?;
+    ConfigKv::set_with_conn(&txn, "vault.gpg.imported_at", &now, false).await?;
+    ConfigKv::set_with_conn(&txn, "vault.gpg.seckey_enc", &seckey_hex, true).await?;
     // source last: presence of `imported` is the commit point.
-    ConfigKv::set("vault.gpg.source", "imported", false).await?;
+    ConfigKv::set_with_conn(&txn, "vault.gpg.source", "imported", false).await?;
 
     // ADR-VG-12: first import with `vault.signing` unset enables signing; an
     // explicit `false` stays off (the caller prints the hint).
-    let signing = ConfigKv::get("vault.signing")
+    let signing = ConfigKv::get_with_conn(&txn, "vault.signing")
         .await
         .ok()
         .flatten()
         .map(|e| e.value);
     if signing.is_none() {
-        ConfigKv::set("vault.signing", "true", false).await?;
+        ConfigKv::set_with_conn(&txn, "vault.signing", "true", false).await?;
     }
 
+    txn.commit()
+        .await
+        .context("failed to commit the imported GPG key")?;
     Ok(())
 }
 
@@ -1857,26 +1888,40 @@ pub async fn persist_imported_gpg_key(
 /// by fingerprint). When `source == generated` and no `vault.gpg.generated_pubkey`
 /// snapshot exists yet, snapshot it first (ADR-VG-04 §4 / VG-13 G2).
 async fn snapshot_active_key_to_history() -> Result<()> {
+    let db = crate::internal::db::get_db_conn_instance().await;
+    snapshot_active_key_to_history_with_conn(&db).await
+}
+
+/// [`snapshot_active_key_to_history`] against a caller-provided connection, so
+/// the whole import sequence can run inside one transaction.
+async fn snapshot_active_key_to_history_with_conn<C>(db: &C) -> Result<()>
+where
+    C: sea_orm::ConnectionTrait,
+{
     use crate::internal::config::ConfigKv;
 
-    let active = match ConfigKv::get("vault.gpg.pubkey").await.ok().flatten() {
+    let active = match ConfigKv::get_with_conn(db, "vault.gpg.pubkey")
+        .await
+        .ok()
+        .flatten()
+    {
         Some(e) if !e.value.is_empty() => e.value,
         _ => return Ok(()),
     };
 
-    let source = ConfigKv::get("vault.gpg.source")
+    let source = ConfigKv::get_with_conn(db, "vault.gpg.source")
         .await
         .ok()
         .flatten()
         .map(|e| e.value);
     if source.as_deref() == Some("generated") {
-        let snapshot = ConfigKv::get("vault.gpg.generated_pubkey")
+        let snapshot = ConfigKv::get_with_conn(db, "vault.gpg.generated_pubkey")
             .await
             .ok()
             .flatten()
             .map(|e| e.value);
         if snapshot.is_none() {
-            ConfigKv::set("vault.gpg.generated_pubkey", &active, false).await?;
+            ConfigKv::set_with_conn(db, "vault.gpg.generated_pubkey", &active, false).await?;
         }
     }
 
@@ -1885,8 +1930,8 @@ async fn snapshot_active_key_to_history() -> Result<()> {
         return Ok(());
     }
     let key = format!("vault.gpg.history.{fp}.pubkey");
-    if ConfigKv::get(&key).await?.is_none() {
-        ConfigKv::set(&key, &active, false).await?;
+    if ConfigKv::get_with_conn(db, &key).await?.is_none() {
+        ConfigKv::set_with_conn(db, &key, &active, false).await?;
     }
     Ok(())
 }
@@ -2366,8 +2411,9 @@ mod gpg_passphrase_tests {
         ))
         .expect("fixture secret key");
 
-        let rebuilt = super::rebuild_unprotected_certificate(&armor, "libra-test-fixture-passphrase")
-            .expect("the fixture passphrase must unlock the certificate");
+        let rebuilt =
+            super::rebuild_unprotected_certificate(&armor, "libra-test-fixture-passphrase")
+                .expect("the fixture passphrase must unlock the certificate");
         assert!(
             rebuilt.contains("PRIVATE KEY"),
             "a rebuilt certificate must stay a secret key"
@@ -2399,7 +2445,9 @@ mod gpg_subkey_qualification_tests {
         let material = prepare_imported_key(&fixture("secret-encrypt-only-subkey.asc"), "")
             .expect("the certificate itself is importable");
         assert!(
-            !material.signing_key_id.eq_ignore_ascii_case("96D684119DA1BF1E"),
+            !material
+                .signing_key_id
+                .eq_ignore_ascii_case("96D684119DA1BF1E"),
             "the encryption-only subkey must not be selected, got {}",
             material.signing_key_id
         );
@@ -2447,7 +2495,9 @@ mod gpg_subkey_qualification_tests {
             "subkey choice must be deterministic"
         );
         assert!(
-            first.signing_key_id.eq_ignore_ascii_case("2522AF449D04EEF9"),
+            first
+                .signing_key_id
+                .eq_ignore_ascii_case("2522AF449D04EEF9"),
             "the newest signing subkey must win, got {}",
             first.signing_key_id
         );
@@ -2459,8 +2509,12 @@ mod gpg_subkey_qualification_tests {
         let material = prepare_imported_key(&fixture("secret-two-signing-subkeys.asc"), "")
             .expect("signing subkey fixture");
         assert!(
-            material.signing_key_id.eq_ignore_ascii_case("2522AF449D04EEF9")
-                || material.signing_key_id.eq_ignore_ascii_case("EC118D168417D1B9"),
+            material
+                .signing_key_id
+                .eq_ignore_ascii_case("2522AF449D04EEF9")
+                || material
+                    .signing_key_id
+                    .eq_ignore_ascii_case("EC118D168417D1B9"),
             "a subkey key id must be selected, got {}",
             material.signing_key_id
         );
@@ -2517,7 +2571,9 @@ mod gpg_detached_signing_tests {
         let second = prepare_imported_key(&armor, "").expect("second selection");
         assert_eq!(first.signing_key_id, second.signing_key_id);
         assert!(
-            first.signing_key_id.eq_ignore_ascii_case("2522AF449D04EEF9"),
+            first
+                .signing_key_id
+                .eq_ignore_ascii_case("2522AF449D04EEF9"),
             "the newest signing subkey must win deterministically, got {}",
             first.signing_key_id
         );
@@ -2571,7 +2627,9 @@ mod gpg_expiry_tests {
         let material = prepare_imported_key(&fixture("secret-expired-subkey.asc"), "")
             .expect("the certificate itself stays importable");
         assert!(
-            !material.signing_key_id.eq_ignore_ascii_case("A6688F6A48A7839B"),
+            !material
+                .signing_key_id
+                .eq_ignore_ascii_case("A6688F6A48A7839B"),
             "the expired signing subkey must not be selected, got {}",
             material.signing_key_id
         );
@@ -2605,7 +2663,9 @@ mod gpg_revoked_subkey_tests {
         let material = prepare_imported_key(&fixture("secret-revoked-subkey.asc"), "")
             .expect("the certificate itself stays importable");
         assert!(
-            !material.signing_key_id.eq_ignore_ascii_case("A7C42C5A0F208C7A"),
+            !material
+                .signing_key_id
+                .eq_ignore_ascii_case("A7C42C5A0F208C7A"),
             "the revoked signing subkey must not be selected, got {}",
             material.signing_key_id
         );
@@ -2616,5 +2676,76 @@ mod gpg_revoked_subkey_tests {
             "the primary key must sign instead, got {}",
             material.signing_key_id
         );
+    }
+}
+
+#[cfg(test)]
+mod gpg_binding_issuer_tests {
+    use super::prepare_imported_key;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 VG-05 G7 (acceptance: "binding 由本证书 primary 签发"): a
+    /// subkey whose binding signature was issued by a *different* primary key
+    /// must never be eligible for signing, even though its key flags say Sign.
+    #[test]
+    fn issuer_conflict_subkey_is_rejected() {
+        use pgp::{
+            composed::{ArmorOptions, Deserializable, SignedSecretKey},
+            types::KeyDetails,
+        };
+
+        let (mut host, _) =
+            SignedSecretKey::from_armor_single(fixture("secret-primary-only.asc").as_bytes())
+                .expect("host fixture parses");
+        let (donor, _) = SignedSecretKey::from_armor_single(
+            fixture("secret-two-signing-subkeys.asc").as_bytes(),
+        )
+        .expect("donor fixture parses");
+        assert!(
+            host.secret_subkeys.is_empty(),
+            "host fixture must start without subkeys"
+        );
+        assert!(
+            !donor.secret_subkeys.is_empty(),
+            "donor fixture must carry a signing subkey"
+        );
+
+        // Forge a certificate that carries the donor's signing subkey, whose
+        // SubkeyBinding signature still names the donor's primary key.
+        host.secret_subkeys.push(donor.secret_subkeys[0].clone());
+        let forged = host
+            .to_armored_string(ArmorOptions::default())
+            .expect("forged certificate re-armors");
+
+        let donor_subkey_id = format!("{}", donor.secret_subkeys[0].key.legacy_key_id());
+        let material = prepare_imported_key(&forged, "")
+            .expect("the certificate's own primary key stays importable");
+        assert_ne!(
+            material.signing_key_id, donor_subkey_id,
+            "the foreign-bound subkey must never be selected as the signing key"
+        );
+    }
+
+    /// Guard against over-strictness: certificates whose bindings *are* issued
+    /// by their own primary must keep importing, whatever their key flags.
+    #[test]
+    fn legitimate_subkey_bindings_still_pass() {
+        for (name, passphrase) in [
+            ("secret-primary-only.asc", ""),
+            ("secret-two-signing-subkeys.asc", ""),
+            ("secret-encrypt-only-subkey.asc", ""),
+            ("protected-secret.asc", "libra-test-fixture-passphrase"),
+        ] {
+            let material = prepare_imported_key(&fixture(name), passphrase)
+                .unwrap_or_else(|e| panic!("{name} must stay importable: {e}"));
+            assert!(!material.signing_key_id.is_empty(), "{name}: no key chosen");
+        }
     }
 }
