@@ -6436,3 +6436,32 @@ fn config_remove_gpg_key_without_generated_key_fails_signing() {
         "the failure must point at signing: {err}"
     );
 }
+
+/// plan-20260921 VG-06 (`history_count` = 去重后的 `vault.gpg.history.*` 指纹数，不显示密钥内容):
+/// the report counts archived fingerprints (deduplicated) and never prints key
+/// material.
+#[test]
+fn config_list_gpg_keys_history_count_is_deduplicated_and_hides_material() {
+    let repo = create_committed_repo_via_cli();
+    import_fixture_key(repo.path());
+    let first = run_libra_command(&["config", "list", "--gpg-keys"], repo.path());
+    assert_eq!(first.status.code(), Some(0));
+    let first_out = String::from_utf8_lossy(&first.stdout).to_string();
+    assert!(
+        first_out.contains("history:") && first_out.contains("1 archived key"),
+        "the first import archives exactly one key: {first_out}"
+    );
+    assert!(
+        !first_out.contains("BEGIN PGP"),
+        "the report must never print key material: {first_out}"
+    );
+
+    // A duplicate import is idempotent, so the archived count must not grow.
+    import_fixture_key(repo.path());
+    let second = run_libra_command(&["config", "list", "--gpg-keys"], repo.path());
+    let second_out = String::from_utf8_lossy(&second.stdout).to_string();
+    assert!(
+        second_out.contains("1 archived key"),
+        "re-importing the same fingerprint must not add a history row: {second_out}"
+    );
+}

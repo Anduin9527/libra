@@ -3544,3 +3544,120 @@ mod gpg_generated_name_gate_tests {
         assert_eq!(generated_key_name().await, "libra-signing");
     }
 }
+
+#[cfg(test)]
+mod gpg_history_order_gate_tests {
+    use super::*;
+    use crate::internal::config::ConfigKv;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 VG-13/VG-05 (`历史顺序确定` + `历史顺序/去重幂等`): the
+    /// verification allowlist is active → generated → history sorted by key,
+    /// and deduplicated by value (ADR-VG-03 §2).
+    #[tokio::test]
+    #[serial_test::serial(env, cwd)]
+    async fn history_public_keys_are_sorted_and_deduplicated() {
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let active = fixture("pubkey.asc");
+        let second = prepare_imported_key(&fixture("secret-two-signing-subkeys.asc"), "")
+            .expect("donor fixture imports")
+            .pubkey_armor;
+
+        ConfigKv::set("vault.gpg.pubkey", &active, false)
+            .await
+            .expect("install the active key");
+        // Deliberately seeded out of order, with the "ZZZ" row duplicating the
+        // active certificate so deduplication is observable too.
+        ConfigKv::set(
+            "vault.gpg.history.ZZZ0000000000000000000000000000000000000.pubkey",
+            &active,
+            false,
+        )
+        .await
+        .expect("seed duplicate history row");
+        ConfigKv::set(
+            "vault.gpg.history.AAA0000000000000000000000000000000000000.pubkey",
+            &second,
+            false,
+        )
+        .await
+        .expect("seed second history row");
+
+        let allowlist = verify_pubkey_allowlist().await.expect("allowlist");
+        assert_eq!(
+            allowlist.len(),
+            2,
+            "the duplicate of the active certificate must be deduplicated: {allowlist:?}"
+        );
+        assert_eq!(allowlist[0], active, "the active key comes first");
+        assert_eq!(
+            allowlist[1], second,
+            "history rows follow in fingerprint lexicographic order"
+        );
+    }
+
+    /// plan-20260921 VG-04/VG-13 (`source=generated` 且无 `generated_pubkey` 时先写入快照):
+    /// generating over a generated key with no snapshot records the active
+    /// certificate before anything else can overwrite it.
+    #[tokio::test]
+    #[serial_test::serial(env, cwd)]
+    async fn generated_snapshot_is_written_before_overwrite() {
+        use sea_orm::TransactionTrait;
+
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let active = fixture("pubkey.asc");
+        ConfigKv::set("vault.gpg.pubkey", &active, false)
+            .await
+            .expect("install the active key");
+        ConfigKv::set("vault.gpg.source", "generated", false)
+            .await
+            .expect("record generated source");
+        ConfigKv::unset("vault.gpg.generated_pubkey")
+            .await
+            .expect("drop any snapshot");
+
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let txn = db.begin().await.expect("transaction");
+        snapshot_active_key_to_history_with_conn(&txn)
+            .await
+            .expect("snapshot the active key");
+        txn.commit().await.expect("commit");
+
+        let snapshot = ConfigKv::get("vault.gpg.generated_pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        assert_eq!(
+            snapshot.as_deref(),
+            Some(active.as_str()),
+            "the missing generated snapshot must be written from the active key"
+        );
+        let fp = key_fingerprint_from_armor(&active).expect("fingerprint");
+        let history = ConfigKv::get(&format!("vault.gpg.history.{fp}.pubkey"))
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        assert_eq!(
+            history.as_deref(),
+            Some(active.as_str()),
+            "the active key must also be archived in history"
+        );
+    }
+}
