@@ -4179,6 +4179,33 @@ fn write_fixture_passfile(repo: &std::path::Path) -> String {
     passfile.to_string_lossy().into_owned()
 }
 
+/// Assert that some stderr line is **exactly** `expected`.
+///
+/// House style for user-facing message pins (`assert_eq!` on the whole
+/// message). Line-scoped at the CLI boundary so the pinned wording cannot be
+/// absorbed by surrounding envelope text: a prefix change, a reflowed sentence
+/// or a dropped clause trips this guard.
+#[track_caller]
+fn assert_stderr_line(err: &str, expected: &str) {
+    assert!(
+        err.lines().any(|line| line.trim() == expected.trim()),
+        "pinned message changed; expected an exact stderr line `{expected}`, got:\n{err}"
+    );
+}
+
+/// Assert that some stderr line **starts with** `prefix`.
+///
+/// For messages that legitimately append a variable detail (a path, an upstream
+/// error): the stable template is still pinned exactly up to that point.
+#[track_caller]
+fn assert_stderr_line_prefix(err: &str, prefix: &str) {
+    assert!(
+        err.lines()
+            .any(|line| line.trim_start().starts_with(prefix)),
+        "pinned message changed; expected an stderr line starting with `{prefix}`, got:\n{err}"
+    );
+}
+
 #[test]
 fn config_import_gpg_key_rejects_global_and_system_scope() {
     let repo = create_committed_repo_via_cli();
@@ -4220,11 +4247,9 @@ fn import_scope_rejection_message_is_pinned() {
     );
     assert_eq!(out.status.code(), Some(129), "usage error exit code");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains(
-            "import-gpg-key only supports the local scope; --global/--system are not supported"
-        ),
-        "pinned message changed: {err}"
+    assert_stderr_line(
+        &err,
+        "error: import-gpg-key only supports the local scope; --global/--system are not supported",
     );
 }
 
@@ -4343,11 +4368,9 @@ fn protected_import_missing_passphrase_message_is_pinned() {
         "a protected import without a passphrase must fail closed"
     );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains(
-            "imported key is protected but no --passphrase-file given and stdin is not a terminal; supply --passphrase-file"
-        ),
-        "pinned passphrase-required message changed: {err}"
+    assert_stderr_line_prefix(
+        &err,
+        "error: imported key is protected but no --passphrase-file given and stdin is not a terminal; supply --passphrase-file",
     );
 }
 
@@ -5987,12 +6010,12 @@ fn import_missing_gpg_message_is_pinned() {
     let out = run_libra_command(&["config", "import-gpg-key", "--list"], repo.path());
     assert!(!out.status.success(), "a missing gpg must fail");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("gpg is unavailable or failed"), "{err}");
-    assert!(
-        err.contains("hint: use --file to import a raw armored secret key, or install gpg >= 2.2"),
-        "{err}"
+    assert_stderr_line_prefix(&err, "fatal: gpg is unavailable or failed");
+    assert_stderr_line(
+        &err,
+        "hint: use --file to import a raw armored secret key, or install gpg >= 2.2",
     );
-    assert!(err.contains("Error-Code: LBR-UNSUPPORTED-001"), "{err}");
+    assert_stderr_line(&err, "Error-Code: LBR-UNSUPPORTED-001");
 }
 
 /// plan-20260921 VG-01 (`import_old_gpg_message_is_pinned`): a gpg older than
@@ -6013,11 +6036,11 @@ fn import_old_gpg_message_is_pinned() {
     let out = run_libra_command(&["config", "import-gpg-key", "--list"], repo.path());
     assert!(!out.status.success(), "an old gpg must fail");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("gpg must be >= 2.2 for HOME-based import; use --file to import a raw key"),
-        "{err}"
+    assert_stderr_line(
+        &err,
+        "fatal: gpg must be >= 2.2 for HOME-based import; use --file to import a raw key",
     );
-    assert!(err.contains("Error-Code: LBR-UNSUPPORTED-001"), "{err}");
+    assert_stderr_line(&err, "Error-Code: LBR-UNSUPPORTED-001");
 }
 
 /// plan-20260921 VG-05 G11 (`no_eligible_signing_key_message_is_pinned`):
@@ -6065,9 +6088,9 @@ fn no_eligible_signing_key_message_is_pinned() {
         String::from_utf8_lossy(&out.stdout)
     );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("no signing key id (vault.gpg.signing_key_id missing)"),
-        "unexpected message: {err}"
+    assert_stderr_line(
+        &err,
+        "fatal: failed to sign tag: vault PGP signing failed: no signing key id (vault.gpg.signing_key_id missing)",
     );
 }
 
