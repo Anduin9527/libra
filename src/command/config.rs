@@ -4260,3 +4260,49 @@ mod render_internal_key_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod acquire_passphrase_tests {
+    use super::*;
+
+    /// plan-20260921 GC-VG-01 / VG-03 G8: the passphrase buffer must be
+    /// self-wiping.
+    ///
+    /// The integration probe in `tests/zeroize_buffers_test.rs` can only replay
+    /// the *shape* of this function (it is private), so it would stay green if
+    /// the return type regressed to a plain `String`. Binding the real call's
+    /// result to `Zeroizing<String>` is a compile-time assertion that the
+    /// production reader hands the caller a buffer that wipes itself on drop.
+    #[test]
+    fn acquire_passphrase_returns_a_self_wiping_buffer() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("passphrase.txt");
+        std::fs::write(&path, "s3cret-passphrase\n").expect("write passphrase file");
+
+        let acquired: zeroize::Zeroizing<String> = acquire_passphrase(Some(&path))
+            .expect("read passphrase")
+            .expect("passphrase file yields a value");
+
+        assert_eq!(
+            &*acquired, "s3cret-passphrase",
+            "the trailing newline is trimmed from the passphrase buffer"
+        );
+    }
+
+    /// A missing passphrase file is a user-facing error, not a panic.
+    #[test]
+    fn acquire_passphrase_reports_a_missing_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing = dir.path().join("absent.txt");
+        let error = acquire_passphrase(Some(&missing)).expect_err("missing file must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to read passphrase file"),
+            "actionable message names the failed read: {message}"
+        );
+        assert!(
+            !message.contains("s3cret"),
+            "the error must never echo passphrase material: {message}"
+        );
+    }
+}
