@@ -184,7 +184,7 @@ Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并�
 
 `libra rebase` 与 `libra cherry-pick` 共用同一道校验与同一措辞，仅把 `merge` 换成 `rebase` / `cherry-pick`。
 
-Libra 仍未实现外部 merge strategy、`subtree`、显式 `-s octopus` 或上述列表之外的 strategy option。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
+Libra 仍未实现外部 merge strategy、`subtree`、显式 `-s octopus` 或上述列表之外的 strategy option。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。 验证接受仓库允许列表中的任一证书（活动密钥、生成的回退、归档的 `vault.gpg.history.<FPR>.pubkey`），并按**签名自身的创建时刻**判定吊销与过期。
 
 ### 重命名
 

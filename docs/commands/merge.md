@@ -345,7 +345,7 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 `libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
-Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, or strategy options outside the values listed above. Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported.
+Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, or strategy options outside the values listed above. Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported. Verification accepts any certificate in the repository allowlist (active key, generated fallback, archived `vault.gpg.history.<FPR>.pubkey` entries) and evaluates revocation and expiry at the **signature's own creation time**.
 
 Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
 
