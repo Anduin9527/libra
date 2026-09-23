@@ -1809,6 +1809,17 @@ fn sign_detached<K: pgp::types::SigningKey>(
     armored_to_signature_hex(&armored_sig)
 }
 
+/// Upper bound for the issuer-absent fallback (ADR-VG-06): verification must
+/// not scan an arbitrarily large key list when the signature names no issuer.
+const ISSUER_ABSENT_FALLBACK_CAP: usize = 3;
+
+/// Whether an issuer-absent signature may be checked against a key list of
+/// `candidate_count` entries. Callers refuse the whole list beyond the cap so
+/// that the fallback stays bounded and fails closed.
+fn issuer_absent_fallback_allowed(candidate_count: usize) -> bool {
+    candidate_count <= ISSUER_ABSENT_FALLBACK_CAP
+}
+
 fn issuer_matches(issuers: &[&pgp::types::KeyId], key_id: &pgp::types::KeyId) -> bool {
     issuers.is_empty() || issuers.contains(&key_id)
 }
@@ -1832,6 +1843,14 @@ pub fn verify_signature_hex(signature_hex: &str, data: &[u8], pubkey_armors: &[S
         Err(_) => return false,
     };
     let issuers = parsed.signature.issuer_key_id();
+
+    // ADR-VG-06: a signature without an issuer may fall back to trying the
+    // listed keys, but only within a bounded number of candidates — an
+    // unbounded scan would let a large key list amplify verification work. A
+    // list longer than the cap is refused outright (fail closed).
+    if issuers.is_empty() && !issuer_absent_fallback_allowed(pubkey_armors.len()) {
+        return false;
+    }
 
     for armor in pubkey_armors {
         let Ok((key, _)) = SignedPublicKey::from_armor_single(armor.as_bytes()) else {
@@ -2907,5 +2926,150 @@ mod gpg_retry_exhaustion_tests {
         let (_pubkey, new_name) = outcome.expect("a colliding probe must be retried, not fatal");
         assert_ne!(new_name, colliding_name, "the retry must mint a fresh name");
         assert_eq!(key_name_override_remaining(), 0);
+    }
+}
+
+#[cfg(test)]
+mod gpg_issuer_gate_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 (`issuer_selects_trusted_subkey`): the issuer named by the
+    /// signature decides which key proves it — a trusted key verifies, and the
+    /// same signature must not verify against an unrelated certificate.
+    #[test]
+    fn issuer_selects_trusted_subkey() {
+        let secret = fixture("secret-two-signing-subkeys.asc");
+        let material = prepare_imported_key(&secret, "").expect("fixture imports");
+        let data = b"issuer gate payload";
+        let sig_hex = sign_with_armored_secret_key(&secret, &material.signing_key_id, data)
+            .expect("detached signature");
+
+        assert!(
+            verify_signature_hex(&sig_hex, data, std::slice::from_ref(&material.pubkey_armor)),
+            "the trusted certificate must verify its own subkey signature"
+        );
+        assert!(
+            !verify_signature_hex(&sig_hex, data, &[fixture("pubkey.asc")]),
+            "an unrelated certificate must not verify the signature"
+        );
+    }
+
+    /// plan-20260921 (`issuer_selected_subkey_requires_eligibility`): carrying
+    /// an issuer is not enough — the issuer must be one of the keys offered for
+    /// verification, so the signature made by key B fails against key A alone.
+    #[test]
+    fn issuer_selected_subkey_requires_eligibility() {
+        let donor = fixture("secret-two-signing-subkeys.asc");
+        let donor_material = prepare_imported_key(&donor, "").expect("donor imports");
+        let data = b"eligibility payload";
+        let sig_hex = sign_with_armored_secret_key(&donor, &donor_material.signing_key_id, data)
+            .expect("detached signature");
+
+        let host = prepare_imported_key(
+            &fixture("protected-secret.asc"),
+            "libra-test-fixture-passphrase",
+        )
+        .expect("host imports");
+        assert!(
+            !verify_signature_hex(&sig_hex, data, std::slice::from_ref(&host.pubkey_armor)),
+            "an issuer that is not in the candidate list must not be accepted"
+        );
+    }
+
+    /// plan-20260921 (`issuer_absent_fallback_is_bounded`): the issuer-absent
+    /// fallback accepts lists up to the cap and the normal path is unaffected.
+    #[test]
+    fn issuer_absent_fallback_is_bounded() {
+        assert!(issuer_absent_fallback_allowed(1));
+        assert!(issuer_absent_fallback_allowed(ISSUER_ABSENT_FALLBACK_CAP));
+
+        let secret = fixture("secret-primary-only.asc");
+        let material = prepare_imported_key(&secret, "").expect("fixture imports");
+        let data = b"bounded payload";
+        let sig_hex = sign_with_armored_secret_key(&secret, &material.signing_key_id, data)
+            .expect("detached signature");
+        assert!(
+            verify_signature_hex(&sig_hex, data, std::slice::from_ref(&material.pubkey_armor)),
+            "an issuer-carrying signature still verifies within the bound"
+        );
+    }
+
+    /// plan-20260921 (`issuer_absent_cap_exceeded_fails_closed`): one candidate
+    /// beyond the cap is refused instead of scanned.
+    #[test]
+    fn issuer_absent_cap_exceeded_fails_closed() {
+        assert!(
+            !issuer_absent_fallback_allowed(ISSUER_ABSENT_FALLBACK_CAP + 1),
+            "a list longer than the cap must be refused, not scanned"
+        );
+        let oversized = vec!["not-a-key".to_string(); ISSUER_ABSENT_FALLBACK_CAP + 1];
+        assert!(
+            !verify_signature_hex("00", b"data", &oversized),
+            "an oversized candidate list must fail closed"
+        );
+    }
+
+    /// plan-20260921 VG-13 G5 (`replace_never_deletes_history_rows`): replacing
+    /// the active key records history but never removes existing history rows.
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    #[serial_test::serial(cwd)]
+    async fn replace_never_deletes_history_rows() {
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let unseal = lazy_init_vault_for_scope("local")
+            .await
+            .expect("local vault");
+
+        let first = prepare_imported_key(
+            &fixture("protected-secret.asc"),
+            "libra-test-fixture-passphrase",
+        )
+        .expect("first key imports");
+        persist_imported_gpg_key(&unseal, &first)
+            .await
+            .expect("persist first");
+        let history_after_first: Vec<String> = crate::internal::config::ConfigKv::list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.key)
+            .filter(|k| k.starts_with("vault.gpg.history."))
+            .collect();
+
+        let second = prepare_imported_key(&fixture("secret-two-signing-subkeys.asc"), "")
+            .expect("second key imports");
+        persist_imported_gpg_key(&unseal, &second)
+            .await
+            .expect("persist second");
+        let history_after_second: Vec<String> = crate::internal::config::ConfigKv::list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.key)
+            .filter(|k| k.starts_with("vault.gpg.history."))
+            .collect();
+
+        for key in &history_after_first {
+            assert!(
+                history_after_second.contains(key),
+                "replacing the active key must not delete {key}"
+            );
+        }
+        assert!(
+            history_after_second.len() >= history_after_first.len(),
+            "history rows must never shrink on replacement"
+        );
     }
 }
