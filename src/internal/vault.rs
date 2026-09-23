@@ -1523,6 +1523,31 @@ fn algorithm_can_sign(alg: pgp::crypto::public_key::PublicKeyAlgorithm) -> bool 
     )
 }
 
+/// ADR-VG-09: a subkey only qualifies as a signer when its hashed binding
+/// self-signature grants the `sign` key flag. An explicit flag set without
+/// `sign` (encryption-only subkeys) is rejected, while a binding signature that
+/// carries no key flags at all stays eligible on algorithm capability alone
+/// (older implementations do not always emit flags).
+fn binding_signature_allows_signing(signatures: &[pgp::packet::Signature]) -> bool {
+    use pgp::packet::{SignatureType, SubpacketData};
+
+    let mut explicit: Option<bool> = None;
+    for sig in signatures {
+        if sig.typ() != Some(SignatureType::SubkeyBinding) {
+            continue;
+        }
+        let Some(config) = sig.config() else {
+            continue;
+        };
+        for sub in config.hashed_subpackets() {
+            if let SubpacketData::KeyFlags(flags) = &sub.data {
+                explicit = Some(explicit.unwrap_or(false) || flags.sign());
+            }
+        }
+    }
+    explicit.unwrap_or(true)
+}
+
 /// Parse a (possibly protected) armored secret key, validate the passphrase,
 /// rebuild an unprotected transferable certificate, and select the signing
 /// (sub)key (ADR-VG-09 / ADR-VG-10).
@@ -1539,6 +1564,14 @@ pub fn prepare_imported_key(armor: &str, passphrase: &str) -> Result<ImportedKey
 
     let (skey, _headers) = SignedSecretKey::from_armor_single(armor.as_bytes())
         .context("failed to parse armored secret key")?;
+
+    // ADR-VG-09: a revoked certificate must never become the signing key. The
+    // key revocation signature lives on the primary key's details.
+    if !skey.details.revocation_signatures.is_empty() {
+        return Err(anyhow!(
+            "the certificate is revoked and cannot be imported as a signing key"
+        ));
+    }
 
     let fingerprint = format!("{:X}", skey.primary_key.fingerprint());
     let uid = skey
@@ -1561,7 +1594,11 @@ pub fn prepare_imported_key(armor: &str, passphrase: &str) -> Result<ImportedKey
             .signatures
             .iter()
             .any(|s| s.typ() == Some(SignatureType::SubkeyRevocation));
-        if has_binding && !has_revocation && algorithm_can_sign(sub.key.algorithm()) {
+        if has_binding
+            && !has_revocation
+            && algorithm_can_sign(sub.key.algorithm())
+            && binding_signature_allows_signing(&sub.signatures)
+        {
             candidates.push((
                 format!("{}", sub.key.legacy_key_id()),
                 sub.key.created_at().as_secs(),
@@ -2269,5 +2306,203 @@ mod tests {
         assert_eq!(actual, Some(expected));
 
         reset_db_conn_instance_for_path(&db_path).await;
+    }
+}
+
+#[cfg(test)]
+mod gpg_passphrase_tests {
+    /// plan-20260921 ADR-VG-10: a protected certificate unlocks with the
+    /// passphrase read from `--passphrase-file`, and a wrong passphrase is
+    /// rejected before any rebuild happens.
+    #[test]
+    fn protected_certificate_unlocks_with_passphrase_file() {
+        let armor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/fake-gpg/protected-secret.asc"
+        ))
+        .expect("fixture secret key");
+
+        let rebuilt = super::rebuild_unprotected_certificate(&armor, "libra-test-fixture-passphrase")
+            .expect("the fixture passphrase must unlock the certificate");
+        assert!(
+            rebuilt.contains("PRIVATE KEY"),
+            "a rebuilt certificate must stay a secret key"
+        );
+        assert!(
+            super::rebuild_unprotected_certificate(&armor, "wrong-passphrase").is_err(),
+            "a wrong passphrase must fail before rebuild"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpg_subkey_qualification_tests {
+    use super::prepare_imported_key;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 ADR-VG-09: a subkey without the signing flag must never be
+    /// selected as the signing key. The encrypt-only fixture must therefore
+    /// fall back to the primary key instead of the encryption subkey.
+    #[test]
+    fn signing_subkey_requires_sign_flag_and_valid_binding() {
+        let material = prepare_imported_key(&fixture("secret-encrypt-only-subkey.asc"), "")
+            .expect("the certificate itself is importable");
+        assert!(
+            !material.signing_key_id.eq_ignore_ascii_case("96D684119DA1BF1E"),
+            "the encryption-only subkey must not be selected, got {}",
+            material.signing_key_id
+        );
+    }
+
+    /// A disabled (non-signing) subkey is rejected as a candidate rather than
+    /// silently used; the import still succeeds through the primary key.
+    #[test]
+    fn disabled_subkey_is_rejected() {
+        let material = prepare_imported_key(&fixture("secret-encrypt-only-subkey.asc"), "")
+            .expect("primary fallback keeps the certificate importable");
+        assert!(
+            material
+                .signing_key_id
+                .eq_ignore_ascii_case("1B06C190D0A3B048"),
+            "the primary key must sign when no subkey qualifies, got {}",
+            material.signing_key_id
+        );
+    }
+
+    /// With no usable signing subkey the primary key signs (ADR-VG-09), so a
+    /// certify-only certificate is not silently rejected either.
+    #[test]
+    fn primary_key_signs_when_no_usable_signing_subkey() {
+        let material = prepare_imported_key(&fixture("secret-primary-only.asc"), "")
+            .expect("a certificate without subkeys stays importable");
+        assert!(
+            material
+                .signing_key_id
+                .eq_ignore_ascii_case("CDBB1C773B79D67E"),
+            "the primary key id must be used, got {}",
+            material.signing_key_id
+        );
+    }
+
+    /// With two valid signing subkeys the newest one is selected, and the
+    /// choice is deterministic across calls (ADR-VG-09).
+    #[test]
+    fn signing_subkey_selected_by_newest_valid_self_signature() {
+        let armor = fixture("secret-two-signing-subkeys.asc");
+        let first = prepare_imported_key(&armor, "").expect("two signing subkeys are usable");
+        let second = prepare_imported_key(&armor, "").expect("deterministic re-selection");
+        assert_eq!(
+            first.signing_key_id, second.signing_key_id,
+            "subkey choice must be deterministic"
+        );
+        assert!(
+            first.signing_key_id.eq_ignore_ascii_case("2522AF449D04EEF9"),
+            "the newest signing subkey must win, got {}",
+            first.signing_key_id
+        );
+    }
+
+    /// The selected signing material is a subkey, not the primary key.
+    #[test]
+    fn signing_subkey_material_is_used_when_present() {
+        let material = prepare_imported_key(&fixture("secret-two-signing-subkeys.asc"), "")
+            .expect("signing subkey fixture");
+        assert!(
+            material.signing_key_id.eq_ignore_ascii_case("2522AF449D04EEF9")
+                || material.signing_key_id.eq_ignore_ascii_case("EC118D168417D1B9"),
+            "a subkey key id must be selected, got {}",
+            material.signing_key_id
+        );
+        assert!(
+            !material.fingerprint.is_empty() && material.fingerprint != material.signing_key_id,
+            "the primary fingerprint and the signing subkey id are distinct"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpg_detached_signing_tests {
+    use super::{prepare_imported_key, sign_with_armored_secret_key, verify_signature_hex};
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 VG-04: with `source=imported` the signing material is the
+    /// imported certificate, and its detached signature verifies against the
+    /// imported public key through the verification allowlist.
+    #[test]
+    fn imported_source_signs_detached_payload() {
+        let secret = fixture("protected-secret.asc");
+        let material =
+            prepare_imported_key(&secret, "libra-test-fixture-passphrase").expect("imported key");
+        let rebuilt =
+            super::rebuild_unprotected_certificate(&secret, "libra-test-fixture-passphrase")
+                .expect("rebuilt certificate");
+
+        let payload = b"plan-20260921 detached payload";
+        let signature = sign_with_armored_secret_key(&rebuilt, &material.signing_key_id, payload)
+            .expect("detached signature");
+        assert!(
+            verify_signature_hex(&signature, payload, &[fixture("pubkey.asc")]),
+            "the imported key's detached signature must verify"
+        );
+        assert!(
+            !verify_signature_hex(&signature, b"other payload", &[fixture("pubkey.asc")]),
+            "a tampered payload must not verify"
+        );
+    }
+
+    /// Two calls must pick the same subkey for the same certificate (ADR-VG-09
+    /// determinism by key id), independent of iteration order.
+    #[test]
+    fn subkey_choice_is_deterministic_by_key_id() {
+        let armor = fixture("secret-two-signing-subkeys.asc");
+        let first = prepare_imported_key(&armor, "").expect("first selection");
+        let second = prepare_imported_key(&armor, "").expect("second selection");
+        assert_eq!(first.signing_key_id, second.signing_key_id);
+        assert!(
+            first.signing_key_id.eq_ignore_ascii_case("2522AF449D04EEF9"),
+            "the newest signing subkey must win deterministically, got {}",
+            first.signing_key_id
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpg_revocation_tests {
+    use super::prepare_imported_key;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/data/fake-gpg/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// plan-20260921 ADR-VG-09: a revoked certificate must not become the
+    /// signing key. This asserts the fail-closed behaviour for the whole-key
+    /// revocation case (`gpg 2.4.9` cannot revoke a lone subkey, so the subkey
+    /// variant stays unverified).
+    #[test]
+    fn revoked_key_is_rejected_at_selection_time() {
+        let result = prepare_imported_key(&fixture("secret-revoked-key.asc"), "");
+        assert!(
+            result.is_err(),
+            "a revoked certificate must not be importable as a signer; got {:?}",
+            result.map(|m| m.signing_key_id)
+        );
     }
 }

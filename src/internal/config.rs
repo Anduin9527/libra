@@ -3884,3 +3884,34 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod gpg_internal_key_tests {
+    use super::is_vault_internal_key;
+
+    /// plan-20260921 ADR-VG-02: the imported GPG secret slot is an internal
+    /// credential on every read path, while the public metadata stays readable.
+    #[test]
+    fn vault_gpg_seckey_enc_is_internal_key() {
+        for key in [
+            "vault.gpg.seckey_enc",
+            "VAULT.GPG.SECKEY_ENC",
+            "Vault.Gpg.Seckey_Enc",
+        ] {
+            assert!(is_vault_internal_key(key), "{key} must be internal");
+        }
+        for key in [
+            "vault.gpg.pubkey",
+            "vault.gpg.source",
+            "vault.gpg.fingerprint",
+            "vault.gpg.signing_key_id",
+            "vault.gpg.generated_key_name",
+            "vault.gpg.generated_pubkey",
+            "vault.gpg.history.ABC.pubkey",
+            "vault.gpg.imported_at",
+            "vault.gpg.uid",
+        ] {
+            assert!(!is_vault_internal_key(key), "{key} must stay readable");
+        }
+    }
+}

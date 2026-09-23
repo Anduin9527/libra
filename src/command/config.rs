@@ -4147,3 +4147,77 @@ mod args_tests {
         assert!(args.list);
     }
 }
+
+#[cfg(test)]
+mod render_get_value_tests {
+    use super::*;
+
+    fn entry(key: &str, value: &str, encrypted: bool) -> ConfigKvEntry {
+        ConfigKvEntry {
+            key: key.to_string(),
+            value: value.to_string(),
+            encrypted,
+        }
+    }
+
+    /// plan-20260921 ADR-VG-02: redaction is predicate-first, so an internal
+    /// key is masked even when it was stored as plaintext (the encrypted
+    /// early-return must never win over the internal-key check).
+    #[tokio::test]
+    async fn render_get_value_redacts_internal_key_before_encrypted_check() {
+        let ciphertext = entry("vault.gpg.seckey_enc", "deadbeef", true);
+        assert_eq!(
+            render_get_value(&ciphertext, true, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+
+        let plaintext_internal =
+            entry("vault.gpg.seckey_enc", "BEGIN PGP PRIVATE KEY BLOCK", false);
+        assert_eq!(
+            render_get_value(&plaintext_internal, true, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+
+        let readable = entry("user.name", "Test User", false);
+        assert_eq!(
+            render_get_value(&readable, false, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "Test User"
+        );
+
+        let encrypted_env = entry("vault.env.FOO", "deadbeef", true);
+        assert_eq!(
+            render_get_value(&encrypted_env, false, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+    }
+}
+
+#[cfg(test)]
+mod render_internal_key_tests {
+    use super::*;
+
+    /// plan-20260921 ADR-VG-02: even a plaintext-stored value under an internal
+    /// key is redacted by the list/get rendering path.
+    #[tokio::test]
+    async fn list_rendering_redacts_internal_key_even_when_plaintext_stored() {
+        let entry = ConfigKvEntry {
+            key: "vault.gpg.seckey_enc".to_string(),
+            value: "BEGIN PGP PRIVATE KEY BLOCK".to_string(),
+            encrypted: false,
+        };
+        assert_eq!(
+            render_get_value(&entry, false, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+    }
+}
