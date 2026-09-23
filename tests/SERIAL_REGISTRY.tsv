@@ -838,3 +838,4 @@ config_generate_gpg_key_after_import_resumes_idempotently	lane:cwd	runs in an is
 config_imported_key_signs_commits_end_to_end	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-04 imported-key commit signing)
 import_sets_vault_signing_true_when_unset	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 ADR-VG-12 first-import signing enable)
 import_keeps_signing_disabled_in_vault_false_repo	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 ADR-VG-12 vault=false branch)
+generate_pgp_key_propagates_config_write_error	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-14 config write failure propagation)

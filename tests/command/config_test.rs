@@ -5449,3 +5449,94 @@ async fn import_keeps_signing_disabled_in_vault_false_repo() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// plan-20260921 VG-14: a failing config write during key generation must
+/// surface as a command failure — never a swallowed error or a false success.
+#[tokio::test]
+#[serial(cwd)]
+async fn generate_pgp_key_propagates_config_write_error() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let db = temp_path.path().join(".libra").join("libra.db");
+    let original = std::fs::metadata(&db).unwrap().permissions();
+    let mut readonly = original.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        readonly.set_mode(0o444);
+    }
+    std::fs::set_permissions(&db, readonly).unwrap();
+
+    // An account that can still write a 0444 file (typically root) cannot
+    // exercise this fault, so skip instead of asserting a false result.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db)
+        .is_ok()
+    {
+        std::fs::set_permissions(&db, original).unwrap();
+        eprintln!("skipping: this account can write a read-only DB file");
+        return;
+    }
+
+    let out = run_libra_command(&["config", "generate-gpg-key"], temp_path.path());
+    // Restore write access before asserting so temp-dir cleanup can succeed.
+    std::fs::set_permissions(&db, original).unwrap();
+
+    assert!(
+        !out.status.success(),
+        "a failed config write must fail the command, got success: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // A fresh repository initialises its vault as part of generation, so the
+    // first blocked write is the vault's own persistence step; either stage is
+    // acceptable — what matters is that the failure is surfaced, not swallowed.
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("failed to") && (err.contains("initialize vault") || err.contains("GPG key generation failed")),
+        "the write failure must be surfaced with context: {err}"
+    );
+    assert!(
+        err.contains("LBR-INTERNAL-001"),
+        "a blocked persist must carry a stable error code: {err}"
+    );
+}
+
+/// plan-20260921 VG-03: a failed import must leave no imported metadata behind,
+/// so a later signing attempt cannot pick up a half-registered key.
+#[test]
+fn config_import_gpg_key_failure_leaves_no_metadata() {
+    let repo = create_committed_repo_via_cli();
+    let wrong = repo.path().join("wrong-pass.txt");
+    std::fs::write(&wrong, "definitely-not-the-passphrase").unwrap();
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            &wrong.to_string_lossy(),
+            "--replace",
+        ],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "a wrong passphrase must fail the import");
+
+    let listed = run_libra_command(&["config", "list"], repo.path());
+    let keys = String::from_utf8_lossy(&listed.stdout);
+    for absent in ["vault.gpg.seckey_enc", "vault.gpg.imported_at"] {
+        assert!(
+            !keys.contains(absent),
+            "a failed import must not persist {absent}: {keys}"
+        );
+    }
+    let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
+    assert_ne!(
+        String::from_utf8_lossy(&source.stdout).trim(),
+        "imported",
+        "a failed import must not flip the active source"
+    );
+}
