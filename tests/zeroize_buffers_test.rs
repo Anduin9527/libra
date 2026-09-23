@@ -121,8 +121,7 @@ fn scanning_allocator_detects_a_deliberate_leak() {
 /// block and fails.
 #[tokio::test]
 #[serial(env, cwd)]
-#[ignore = "plan-20260921 GC-VG-01 OPEN: the passphrase still reaches ~100 freed heap blocks; \
-            run with --ignored to reproduce, see the plan's zeroize finding"]
+#[ignore = "plan-20260921 GC-VG-01 OPEN: see the plan's zeroize finding; run with --ignored"]
 async fn passphrase_and_plaintext_buffers_are_zeroized() {
     use zeroize::Zeroize;
 
