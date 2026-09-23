@@ -223,6 +223,70 @@ fn test_tag_verify_accepts_own_signature() {
 }
 
 #[test]
+fn test_tag_verify_accepts_imported_key_signature() {
+    let repo = create_committed_repo_via_cli();
+
+    // Import a protected secret key. `import-gpg-key` stores the rebuilt
+    // unprotected certificate and flips `vault.gpg.source` to `imported`, which
+    // is what routes signing/verification through the imported key. A fresh repo
+    // already carries a generated active key, so the import must replace it
+    // (the replaced public key is archived to `vault.gpg.history`).
+    let secret = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/fake-gpg/protected-secret.asc"
+    );
+    let passfile = repo.path().join("gpg-pass.txt");
+    std::fs::write(&passfile, "libra-test-fixture-passphrase").unwrap();
+    let passfile_s = passfile.to_string_lossy().into_owned();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "import-gpg-key",
+                "--file",
+                secret,
+                "--passphrase-file",
+                &passfile_s,
+                "--replace",
+            ],
+            repo.path(),
+        ),
+        "config import-gpg-key --file --replace",
+    );
+    let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&source.stdout).trim(),
+        "imported",
+        "import must activate the imported key"
+    );
+
+    // `tag -s` dispatches by `source`, so this signature comes from the
+    // imported key rather than a generated one.
+    assert_cli_success(
+        &run_libra_command(
+            &["tag", "-s", "-m", "imported release", "v1.0"],
+            repo.path(),
+        ),
+        "tag -s with an imported key",
+    );
+    let show = run_libra_command(&["cat-file", "-p", "v1.0"], repo.path());
+    assert_cli_success(&show, "cat-file -p v1.0");
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("-----BEGIN PGP SIGNATURE-----"),
+        "tag -s must embed a PGP signature block"
+    );
+
+    // Verification resolves the imported key through the active allowlist.
+    let out = run_libra_command(&["tag", "-v", "v1.0"], repo.path());
+    assert_cli_success(&out, "tag -v with an imported key");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Good signature for tag 'v1.0'"),
+        "tag -v should accept the imported key's signature: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn test_tag_verify_rejects_unsigned_tag() {
     let repo = create_committed_repo_via_cli();
     assert_cli_success(

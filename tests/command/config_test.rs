@@ -4070,3 +4070,85 @@ async fn config_generate_gpg_key_after_import_resumes_idempotently() {
     );
     assert_eq!(get("vault.gpg.pubkey"), first_pubkey);
 }
+
+/// End-to-end: with `vault.gpg.source=imported`, commit signing must go through
+/// the imported key (dispatch is by source) and produce a real `gpgsig` block.
+#[tokio::test]
+#[serial(cwd)]
+async fn config_imported_key_signs_commits_end_to_end() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let secret = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/fake-gpg/protected-secret.asc"
+    );
+    let passfile = temp_path.path().join("pass.txt");
+    std::fs::write(&passfile, "libra-test-fixture-passphrase").unwrap();
+    let passfile_s = passfile.to_string_lossy().into_owned();
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            secret,
+            "--passphrase-file",
+            &passfile_s,
+            "--replace",
+        ],
+        temp_path.path(),
+    );
+    assert!(
+        out.status.success(),
+        "import-gpg-key: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Identity is required for commit creation, and `commit.gpgSign=true` forces
+    // the vault signing path instead of `InheritVault` policy.
+    for (key, value) in [
+        ("user.name", "Test User"),
+        ("user.email", "test@example.invalid"),
+        ("commit.gpgSign", "true"),
+    ] {
+        let out = run_libra_command(&["config", key, value], temp_path.path());
+        assert!(
+            out.status.success(),
+            "config {key}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    std::fs::write(temp_path.path().join("signed.txt"), "signed\n").unwrap();
+    let out = run_libra_command(&["add", "signed.txt"], temp_path.path());
+    assert!(out.status.success(), "add: {}", String::from_utf8_lossy(&out.stderr));
+    let out = run_libra_command(&["commit", "-m", "signed by imported key"], temp_path.path());
+    assert!(
+        out.status.success(),
+        "signed commit must succeed with an imported key: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Read the raw commit bytes: `cat-file -p` pretty-prints without the
+    // `gpgsig` header, so the signature is only observable via `--batch`.
+    let show = run_libra_command_with_stdin(&["cat-file", "--batch"], temp_path.path(), "HEAD\n");
+    assert!(
+        show.status.success(),
+        "cat-file --batch HEAD: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let body = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        body.contains("gpgsig"),
+        "commit must carry a gpgsig header: {body}"
+    );
+    assert!(
+        body.contains("-----BEGIN PGP SIGNATURE-----"),
+        "commit must embed an armored signature: {body}"
+    );
+
+    // Signing must not have flipped the active key away from the imported one.
+    let out = run_libra_command(&["config", "get", "vault.gpg.source"], temp_path.path());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "imported");
+}
