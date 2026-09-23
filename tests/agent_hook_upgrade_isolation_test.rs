@@ -62,6 +62,23 @@ struct InstallFixture {
     home: PathBuf,
 }
 
+/// Restore write access before the fields drop.
+///
+/// `make_install_readonly` makes `TempDir`'s recursive cleanup fail silently:
+/// the staged binary is a ~1 GB copy of the built `libra`, so every read-only
+/// case leaked that copy into the system temp dir. On a tmpfs `/tmp` those
+/// leaks accumulate across runs until unrelated tests start failing with
+/// `LBR-IO-001` (migrations) because the filesystem is full. `Drop::drop` runs
+/// before the fields are dropped, so the permissions are restored in time for
+/// the temp dir's own cleanup.
+impl Drop for InstallFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.install_dir, std::fs::Permissions::from_mode(0o755));
+        let _ =
+            std::fs::set_permissions(&self.installed_bin, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 impl InstallFixture {
     /// Stage the built binary as `<tempdir>/install/libra` and init a repo
     /// with the PLAIN binary (its own install context is `target/`, which
