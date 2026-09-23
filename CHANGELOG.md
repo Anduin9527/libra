@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.23.46] — 2026-09-23
+
+### GnuPG key import into the repository vault (plan-20260921)
+
+> This section records the plan-20260921 GPG family. Version sections
+> `0.23.37`–`0.23.45` were not written by the plans that shipped them, so the
+> log below is intentionally scoped to this family.
+
+- `libra config import-gpg-key [--list|--key <fpr>|--file <path>|--passphrase-file <path>|--replace]`
+  adopts an existing GnuPG secret key into the repository vault: the first
+  import enables `vault.signing` when it is unset, an explicit `false` is kept
+  with an actionable note, duplicate imports are idempotent, and replacing a
+  different active key archives the previous public key under
+  `vault.gpg.history.<FPR>.pubkey` so earlier signatures keep verifying.
+- `libra config export-gpg-key [--fingerprint|--out <path>]` exports only the
+  public half (`--out` replaces atomically; `--quiet`/`--json`/`--machine` are
+  refused) and `libra config remove-gpg-key [--force]` removes an imported key
+  as **one transaction** — a failure at any of its four steps rolls back and
+  leaves the imported key active exactly as it was.
+- `libra config list --gpg-keys` reports each entry's usage, key type, source
+  (`imported`/`generated`), fingerprint, signing key id, import time and
+  archived-history count; secret material is never printed (`vault.gpg.seckey_enc`
+  reads back as `<REDACTED>` and `--reveal` on a vault internal key is refused).
+- Verification (`libra tag -v`, `libra merge --verify-signatures`) accepts any
+  certificate in the repository allowlist (active key, generated fallback,
+  archived history) and evaluates revocation and expiry at the **signature's
+  own creation time**; signatures made by keys the repository never imported
+  are rejected.
+- Signing fails closed with a recovery hint when neither `vault.gpg.pubkey` nor
+  `vault.gpg.generated_pubkey` is published, instead of emitting a signature
+  the repository cannot verify.
+- `libra config generate-gpg-key` uses versioned vault key names
+  (`libra-signing-<unix-ns>`) with collision retries and a staged, resumable
+  migration when an imported key is active.
+
 ## [0.23.36] — 2026-09-21
 
 ### Operation v2 cutover and baseline stabilization
