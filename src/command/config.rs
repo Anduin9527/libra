@@ -3599,10 +3599,22 @@ async fn handle_import_gpg_key(
         .ok()
         .flatten()
         .map(|e| e.value);
-    let signing_off = signing
-        .as_deref()
-        .map(|v| v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false);
+
+    // ADR-VG-12 §1: a first import enables commit signing when the policy is
+    // unset, so an imported signing key is never silently unused. §2: an
+    // explicit value (true or false) is always respected, and the false branch
+    // keeps the actionable hint below.
+    let signing_off = match signing.as_deref() {
+        None => {
+            ConfigKv::set("vault.signing", "true", false)
+                .await
+                .map_err(|e| {
+                    config_write_cli_error(format!("failed to enable commit signing: {e}"))
+                })?;
+            false
+        }
+        Some(value) => value.eq_ignore_ascii_case("false"),
+    };
 
     if output.is_json() {
         emit_json_data(

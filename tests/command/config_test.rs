@@ -5354,3 +5354,98 @@ fn tty_prompt_collects_passphrase() {
     let source = run_libra_command(&["config", "get", "vault.gpg.source"], repo.path());
     assert_eq!(String::from_utf8_lossy(&source.stdout).trim(), "imported");
 }
+
+/// plan-20260921 ADR-VG-12 §1: a first import into a repository whose signing
+/// policy is unset enables `vault.signing`, so the imported key is actually
+/// used for commit signing instead of being silently ignored.
+#[tokio::test]
+#[serial(cwd)]
+async fn import_sets_vault_signing_true_when_unset() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    // Drop the policy row so the "unset" branch is exercised.
+    let _ = run_libra_command(&["config", "unset", "vault.signing"], temp_path.path());
+    let before = run_libra_command(&["config", "get", "vault.signing"], temp_path.path());
+    assert!(
+        !before.status.success(),
+        "precondition: vault.signing must be unset, got {}",
+        String::from_utf8_lossy(&before.stdout)
+    );
+
+    let passfile = write_fixture_passfile(temp_path.path());
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            &passfile,
+            "--replace",
+        ],
+        temp_path.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "import: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let after = run_libra_command(&["config", "get", "vault.signing"], temp_path.path());
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        "true",
+        "an unset policy must be enabled by the first import"
+    );
+}
+
+/// plan-20260921 ADR-VG-12 §2 for the `--vault=false` flavour: a repository
+/// initialised without the vault carries an explicit `false`, which the import
+/// must respect while still printing the actionable hint.
+#[tokio::test]
+#[serial(cwd)]
+async fn import_keeps_signing_disabled_in_vault_false_repo() {
+    let temp_path = tempdir().unwrap();
+    assert!(
+        run_libra_command(&["init", "--vault", "false"], temp_path.path())
+            .status
+            .success(),
+        "init --vault false"
+    );
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let passfile = write_fixture_passfile(temp_path.path());
+    // No active key exists in this repository, so --replace is not needed.
+    let out = run_libra_command(
+        &[
+            "config",
+            "import-gpg-key",
+            "--file",
+            GPG_FIXTURE_SECRET,
+            "--passphrase-file",
+            &passfile,
+        ],
+        temp_path.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "import into a --vault=false repo: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let signing = run_libra_command(&["config", "get", "vault.signing"], temp_path.path());
+    assert_eq!(
+        String::from_utf8_lossy(&signing.stdout).trim(),
+        "false",
+        "an explicit false must be respected"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("vault.signing is false"),
+        "the import must hint that signing stays disabled: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
