@@ -83,6 +83,14 @@ release() {
   jq -e --arg v "$V" --arg sha "$SHA" \
     '.status=="completed" and .conclusion=="success" and .event=="push" and .headBranch==("v"+$v) and .headSha==$sha' \
     /tmp/issue-vg/vg09/run.json >/dev/null || fail "run.json assertions failed"
+  # The documented eight-job set: four platform builds plus the four
+  # release-side jobs. A renamed, dropped or extra job fails this gate, so a
+  # silently skipped platform cannot ship as a green release.
+  local EXPECTED_JOBS='["build-and-upload (libra, aarch64-apple-darwin, darwin, arm64, macos-latest)","build-and-upload (libra, aarch64-unknown-linux-gnu, linux, arm64, ubuntu-24.04-arm)","build-and-upload (libra, x86_64-pc-windows-msvc, windows, amd64, windows-latest)","build-and-upload (libra, x86_64-unknown-linux-gnu, linux, amd64, ubuntu-latest)","upload-install-scripts","update-homebrew-tap","verify-homebrew-formula","request-stable-manifest"]'
+  jq -e --argjson exp "$EXPECTED_JOBS" \
+    '[.jobs[].name] | sort == ($exp | sort)' /tmp/issue-vg/vg09/run.json >/dev/null \
+    || fail "release run job set mismatch (expected the eight documented jobs)"
+  jq -r '[.jobs[].name] | sort | .[]' /tmp/issue-vg/vg09/run.json >/tmp/issue-vg/vg09/jobs.txt
   bash "$CDN_GATE" "$tag" | tee /tmp/issue-vg/vg09/cdn.log
   echo "RELEASE: complete for $tag"
 }
