@@ -197,7 +197,10 @@ bump() {
   sed -i.bak -E "s/^version = \"[0-9.]+\"/version = \"$next\"/" "$REPO/Cargo.toml" && rm -f "$REPO"/Cargo.toml.bak
   sed -i.bak -E "s/DEFAULT_VERSION=\"v[0-9.]+\"/DEFAULT_VERSION=\"v$next\"/" "$REPO/install.sh" && rm -f "$REPO"/install.sh.bak
   sed -i.bak -E 's/^(\$DefaultVersion = )"v[0-9.]+"/\1"v'"$next"'"/' "$REPO/install.ps1" && rm -f "$REPO"/install.ps1.bak
-  sed -i.bak -E "s/^## \[[0-9.]+\]/## \[$next\]/" "$REPO/CHANGELOG.md" && rm -f "$REPO"/CHANGELOG.md.bak
+  # Only the topmost heading is the release section; every older `## [x.y.z]`
+  # heading is history and must keep its version (sed would rewrite them all).
+  awk -v next_v="$next" '!done && /^## \[[0-9.]+\]/ { sub(/^## \[[0-9.]+\]/, "## [" next_v "]"); done = 1 } { print }' \
+    "$REPO/CHANGELOG.md" >"$REPO/CHANGELOG.md.tmp" && mv "$REPO/CHANGELOG.md.tmp" "$REPO/CHANGELOG.md"
   echo "bumped to $next:"
   grep -m1 '^version' "$REPO/Cargo.toml"
   grep -m1 'DEFAULT_VERSION=' "$REPO/install.sh"
