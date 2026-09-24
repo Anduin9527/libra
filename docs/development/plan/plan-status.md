@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-24（下次更新时替换）。
+> **当前快照：** 2026-09-25（下次更新时替换）。
 
 ---
 
@@ -26,6 +26,7 @@
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
+| [`plan-20260927.md`](plan-20260927.md) | 横切（六个大命令实现的模块拆分） | 已排期 | CM-01..CM-12 全部 `pending`；纯结构拆分，12 个独立 patch 发布切片；Claude R6 字面 `VERDICT: PASS`（0×P0/0×P1）；各卡开工仍须按写集避开在跑的 merge/worktree/status/diff/cloud/rebase 工作；`DEFER-CM-01` 暂不拆 fetch/push/maintenance |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | **已完成** | 原 `plan-20260919-gpg-import.md`；R29 双 PASS。**2026-09-24 收口：** 15/15 卡 `done`/`complete`（勾选 238/238）；操作者裁决 decision (ii) 家族面 + 管理面合并发布为 **`v0.23.65`**（run `35993926394` 8/8 success、CDN gate PASS、安装冒烟 PASS）；发布前合并上游 38 提交（`c71bee8`）并过门 55（fmt/clippy + nextest 8054/8054 + CI 附加段）。遗留：本仓 vault 签名未恢复（操作者裁决维持未签名发布）。 |
 | [`plan-20260926.md`](plan-20260926.md) | C（MEM-01/02 研发历程记忆 · 确定性投影） | 未启动 | 原 `plan-20260923.md`（2026-09-25 改名为 `plan-20260925.md`；2026-09-24 合并上游时因与上游 Session Capture 计划 `plan-20260925.md` 撞名，再改为 `plan-20260926.md`）。**取代 [`plan-20260819.md`](plan-20260819.md) 承担 MEM-01/02**（使用者 2026-09-23 要求在 `libra code` 拆除后独立重设计，不沿用 R30）。**13 卡**全部 `pending`：`DM-00`..`DM-09` + `DM-10`（迁移 B，自 DM-01 拆出）+ `DM-11`/`DM-12`（CLI 家族 `REL-DM-02` 的子卡与 `release` 发布点，自 DM-03 拆出）；全计划**无活动 `EX-*` 豁免**。`DM-09` 为唯一收口卡，AC 按 `DM-06` 的 go/no-go 结论分 A/B 两组；`NO-GO` 时 `DM-07`/`DM-08` 经规范性修订移入 `DEFER-DM-12`。发布周期：GO 分支 9 个、降级分支 7 个（R30 为 25 卡 / 约 25 周期）。**R04 范围收窄（使用者决策）：** 「未提交 Agent 工作按代码路径召回」实测不可实现（`agent_checkpoint.tree_oid` 是 traces 树、`ToolCallRecord.paths_written` 无生产者），已移入 `DEFER-DM-11`。**评审（findings 已改为直接记入计划正文的「Codex review log」章节，`*.review/` 目录已删除）：** Codex r01 `FAIL`（21×P1）、r02（18）、r03（9）、r04（13）、r05（8）、r06（11）、r07（12×P1/4×P2）；**`P0` 全程为 0，但七轮未收敛**。阻塞：`DEP-DM-06`（plan-20260924 拥有 `agent_session` 终态/resume 语义）阻塞 `DM-05`。**计划级评审未 PASS 前禁止开工** |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
@@ -93,6 +94,7 @@
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
 | [`plan-20260924.md`](plan-20260924.md) | ACF-01..ACF-09 | Claude 字面 `VERDICT: PASS`；ACF-01 重核 Entire/Libra pin 與 shared files clean |
+| [`plan-20260927.md`](plan-20260927.md) | CM-01..CM-12 全部 `pending` | 计划级 Claude Code R6 字面 `VERDICT: PASS` 已取得；各卡开工前按 G-10 核对同文件活跃写集；ER-12 串行发布 |
 | [`plan-20260926.md`](plan-20260926.md) | DM-00..DM-12（13 卡） | 计划级评审未取得字面 `VERDICT: PASS`（Codex r01–r07 均 `FAIL`，`P0` 全程为 0），**禁止开工**；另 `DEP-DM-06` 阻塞 `DM-05`（等 plan-20260924 的 `CTR-ACF-DM06-v1` 或 ACF-08 收口） |
 | [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | OG-00/04 以各自 review gate 為準；其余 production 卡等待 `DEP-ACF-MIRROR` |
 | [`plan-20260904.md`](plan-20260904.md) | 6 張 RG + 29 張已定義 CX 卡（共 35 卡） | CX-00/12 以原 Phase 0 gate 為準；其餘 33 張 production 卡等待 `DEP-ACF-MIRROR`；CX-30 另受 DEP-CLI-mirror |
@@ -317,6 +319,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 ### 5.4 其它计划
 
+- plan-20260927：`DEFER-CM-01` 暂不机械拆分 `fetch.rs`、`push.rs`、`maintenance.rs`；生产职责本身继续增长或真实任务反复跨职责修改时，先重审源码与测试归属，再另立日期计划。
 - plan-20260923: DEFER-CP-01 additional shells; DEFER-CP-02 network suggestions; DEFER-CP-03 unimplemented underlying capabilities. Existing local Libra capabilities may not be hidden by these deferrals.
 - plan-20260925：`DEFER-SCAP-01` 已按用户指示删除，ID 不再复用；`DEFER-SCAP-03` 不引入 Entire git phase；`DEFER-SCAP-04` 不改 `docs/development/tracing/agent.md`，也不向其它计划派发该文件。owner 的 SessionStart/TurnStart 豁免已经存在，本计划不改。
 
@@ -335,6 +338,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
+| DEP-CM-01 / DEP-CM-02 / DEP-CM-03 | 命令文件写集、发布窗口与 Cloud L3 环境 | plan-20260927 的 12 卡开工前核对在跑的 merge/worktree/status/diff/cloud/rebase 写集；发布按 ER-12 单一发布者串行；CM-10/11 须实际执行 D1/R2 live 用例 | 生效；全部 CM 卡 `pending`；Cloud 用例若因凭据跳过不得记 complete |
 | DEP-ACF-MIRROR / DEP-ACF-CAP | Agent Capture 架構前置 | 0902/0904/0905/0911 production 卡與 0916 CAP-07 必須等待 plan-20260924 ACF-09 `done/complete`；只允許各鏡像明列的 audit/source/CAP HTTP 例外先行 | 生效；ACF-01..09 全部 `pending` |
 | DEP-ACF-DM06 / DEP-DM-06 | Agent session 語義契約 | 0923 DM-05 須等待 0924 ACF-02 的 `CTR-ACF-DM06-v1` provider/CLI integration tests + consumer gate，或回落等待 ACF-08 complete 後重核 terminal、explicit CLI resume、live reactivation、import reactivation | 生效；DM-05 目前 `pending` 且不得開工，排期時仍未滿足才轉 `blocked` |
 | DEP-CP-01 / DEP-CP-07 | External prerequisites | Authorized backend cf documentation access; isolated env/nextest/five-shell validation | Unverified; block applicable acceptance, no access inferred from plan |
