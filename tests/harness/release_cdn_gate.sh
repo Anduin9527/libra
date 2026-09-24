@@ -10,6 +10,12 @@
 #
 # Usage: bash tests/harness/release_cdn_gate.sh <tag>      (e.g. v0.23.46)
 #
+# `LIBRA_CDN_BASE` redirects this script's own fetches (the manifest text, the
+# four artifacts, the installers), and `LIBRA_BIN` selects the CLI binary. The
+# signature check in step 1 (`libra upgrade --check`) deliberately uses that
+# CLI's *configured* release channel, so it always validates the real signed
+# manifest; pointing `LIBRA_CDN_BASE` at a mirror does not redirect it.
+#
 # Exit codes: 0 = all gates pass; 1 = a gate failed; 2 = usage error.
 set -euo pipefail
 
