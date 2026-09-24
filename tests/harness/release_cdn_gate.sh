@@ -41,14 +41,41 @@ trap 'rm -rf "$WORK"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# The stable manifest is a *signed envelope*:
+#   {"schema_version":1,"payload":"<base64 JSON>","signatures":[...]}
+# `libra upgrade --check` verifies the signature and the payload semantics; the
+# checks below need the version/artifact rows, which live inside the base64
+# payload, so decode it with the first available decoder (GNU coreutils, BSD
+# base64, openssl, python3).
+decode_base64() {
+  if base64 -d </dev/null >/dev/null 2>&1; then base64 -d
+  elif base64 -D </dev/null >/dev/null 2>&1; then base64 -D
+  elif command -v openssl >/dev/null 2>&1; then openssl base64 -d -A
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+  else return 1; fi
+}
+
 echo "== 1. signed stable manifest =="
 curl -fsSL --connect-timeout 10 --max-time 60 "$MANIFEST_URL" -o "$WORK/manifest.json" \
   || fail "manifest unreachable: $MANIFEST_URL"
 "$LIBRA_BIN" upgrade --check >"$WORK/upgrade-check.log" 2>&1 \
   || { cat "$WORK/upgrade-check.log" >&2; fail "libra upgrade --check rejected the release channel"; }
-jq -e --arg v "$VERSION" '.version == $v' "$WORK/manifest.json" >/dev/null \
+# Envelope-level sanity: the file really is a signed manifest.
+jq -e '.schema_version == 1' "$WORK/manifest.json" >/dev/null \
+  || fail "unexpected manifest schema_version (want 1)"
+jq -e '.signatures | type == "array" and length > 0' "$WORK/manifest.json" >/dev/null \
+  || fail "the manifest carries no signatures"
+jq -r '.payload' "$WORK/manifest.json" >"$WORK/payload.b64" \
+  || fail "the manifest envelope has no payload field"
+[ -s "$WORK/payload.b64" ] && [ "$(cat "$WORK/payload.b64")" != "null" ] \
+  || fail "the manifest payload is empty"
+decode_base64 <"$WORK/payload.b64" >"$WORK/payload.json" \
+  || fail "no usable base64 decoder (tried base64/openssl/python3)"
+jq -e . "$WORK/payload.json" >/dev/null 2>&1 || fail "the manifest payload is not JSON"
+jq -e --arg v "$VERSION" '.version == $v' "$WORK/payload.json" >/dev/null \
   || fail "the stable manifest does not name version $VERSION"
-jq -e --arg v "$VERSION" '.artifacts | type == "array" and length == 4' "$WORK/manifest.json" >/dev/null \
+jq -e --arg v "$VERSION" '.artifacts | type == "array" and length == 4' "$WORK/payload.json" >/dev/null \
   || fail "the manifest must carry exactly four artifacts"
 echo "OK: manifest verifies and names $VERSION"
 
@@ -58,8 +85,8 @@ for platform in $PLATFORMS; do
   curl -fsSL --connect-timeout 10 --max-time 300 "$url" -o "$WORK/libra-$platform" \
     || fail "artifact unreachable: $url"
 
-  want_sha="$(jq -r --arg p "$platform" '.artifacts[] | select(.platform == $p) | .sha256' "$WORK/manifest.json")"
-  want_size="$(jq -r --arg p "$platform" '.artifacts[] | select(.platform == $p) | .size' "$WORK/manifest.json")"
+  want_sha="$(jq -r --arg p "$platform" '.artifacts[] | select(.platform == $p) | .sha256' "$WORK/payload.json")"
+  want_size="$(jq -r --arg p "$platform" '.artifacts[] | select(.platform == $p) | .size' "$WORK/payload.json")"
   [ -n "$want_sha" ] && [ "$want_sha" != "null" ] || fail "manifest has no sha256 for $platform"
   [ -n "$want_size" ] && [ "$want_size" != "null" ] || fail "manifest has no size for $platform"
 
