@@ -703,6 +703,7 @@ async fn run_init_internal(
     set_hash_kind(match object_format.as_str() {
         "sha1" => HashKind::Sha1,
         "sha256" => HashKind::Sha256,
+        "blake3" => HashKind::Blake3,
         _ => HashKind::Sha1,
     });
 

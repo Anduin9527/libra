@@ -8,6 +8,7 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use clap::Parser;
@@ -33,6 +34,7 @@ use crate::{
         head::Head,
         protocol::DiscoveryResult,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        shallow::{ShallowError, ShallowSet},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -74,7 +76,9 @@ pub struct CloneArgs {
     #[clap(short = 'b', long, required = false)]
     pub branch: Option<String>,
 
-    /// Clone only one branch, HEAD or --branch
+    /// Clone only one branch, HEAD or --branch. Also implied by `--depth`,
+    /// `--shallow-since`, and `--shallow-exclude` unless `--no-single-branch`
+    /// (or `--mirror`) is given, matching `git clone`.
     #[clap(long, overrides_with = "no_single_branch")]
     pub single_branch: bool,
 
@@ -89,7 +93,8 @@ pub struct CloneArgs {
     #[clap(long)]
     pub bare: bool,
 
-    /// Create a shallow clone with history truncated to N commits (must be > 0)
+    /// Create a shallow clone with history truncated to N commits (must be > 0).
+    /// Implies `--single-branch` unless `--no-single-branch` is given.
     #[clap(long, value_name = "N", value_parser = validate_depth)]
     pub depth: Option<usize>,
 
@@ -134,14 +139,10 @@ pub struct CloneArgs {
     #[clap(long = "no-local", overrides_with = "local")]
     pub no_local: bool,
 
-    /// Fail if the clone would be a shallow repository that was not explicitly
-    /// requested — i.e. the source repository is shallow (matching
-    /// `git clone --reject-shallow`). Two narrowings vs Git: (1) for remotes
-    /// that can negotiate shallow boundaries, Libra cannot distinguish a shallow
-    /// source from `--depth`-induced shallowness, so passing `--depth`
-    /// suppresses the post-fetch check (Git would still reject); (2) local Libra
-    /// sources do not advertise shallow boundaries (declined by design, D20), so `--depth` fails
-    /// closed before this check.
+    /// Fail if the source repository is shallow (matching
+    /// `git clone --reject-shallow`). A local Git shallow source is inspected
+    /// before the destination is created. Local Libra sources do not advertise
+    /// shallow boundaries (D20), so `--depth` fails closed before this check.
     #[clap(long = "reject-shallow")]
     pub reject_shallow: bool,
 
@@ -184,13 +185,9 @@ pub struct CloneArgs {
     pub dissociate: bool,
 
     /// Set up a mirror of the source repository (Git's `--mirror`). Implies
-    /// `--bare`; maps the fetched branches into `refs/heads/*` and keeps tags in
-    /// `refs/tags/*` verbatim (no `refs/remotes/*` tracking refs), and records
-    /// `remote.<name>.mirror=true`. NARROWING vs Git: Libra mirrors only what it
-    /// fetches — `refs/notes/*` and other un-fetched namespaces are not mirrored,
-    /// and because fetch collapses `refs/mr/*` into the branch tracking namespace
-    /// any such refs become `refs/heads/mr/*`; the mirror marker is informational
-    /// (`libra fetch` is not yet mirror-aware).
+    /// `--bare`; maps advertised `refs/*` verbatim (no `refs/remotes/*` tracking
+    /// refs), and records `remote.<name>.mirror=true` plus
+    /// `remote.<name>.fetch=+refs/*:refs/*`.
     #[clap(long = "mirror")]
     pub mirror: bool,
 
@@ -281,6 +278,123 @@ fn object_alternates_warning(args: &CloneArgs) -> Option<String> {
 /// if also given). Each given flag produces its own explanatory warning so the
 /// user knows it had no effect — mirroring Git, which warns and falls back to a
 /// full clone when a server cannot honor `--filter`.
+const LOCAL_CLONE_DEPTH_WARNING: &str = "--depth is ignored in local clones; use file:// instead.";
+const LOCAL_CLONE_SHALLOW_SINCE_WARNING: &str =
+    "--shallow-since is ignored in local clones; use file:// instead.";
+const LOCAL_CLONE_SHALLOW_EXCLUDE_WARNING: &str =
+    "--shallow-exclude is ignored in local clones; use file:// instead.";
+const LOCAL_CLONE_FILTER_WARNING: &str =
+    "--filter is ignored in local clones; use file:// instead.";
+
+fn remote_spec_is_file_url(spec: &str) -> bool {
+    spec.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+}
+
+fn remote_spec_is_plain_local_path(spec: &str) -> bool {
+    if remote_spec_is_file_url(spec) || spec.contains("://") {
+        return false;
+    }
+    // scp-like `git@host:path` is a network remote, not a filesystem path.
+    if let Some((user, rest)) = spec.split_once('@')
+        && !user.is_empty()
+        && rest.contains(':')
+        && !Path::new(spec).exists()
+    {
+        return false;
+    }
+    true
+}
+
+/// Git `git_url_basename`: last path component, then drop `.git` / `.bundle`.
+fn clone_url_basename(url: &str) -> Option<String> {
+    let url = url.trim_end_matches('/');
+    if url.is_empty() {
+        return None;
+    }
+    let name = url.rsplit_once('/').map(|(_, name)| name).unwrap_or(url);
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    let name = name.strip_suffix(".bundle").unwrap_or(name);
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Default destination when the user omitted `[LOCAL_PATH]`.
+/// Bare/mirror clones append `.git` (ADR-CL-06).
+fn inferred_clone_destination(url: &str, bare: bool) -> Option<String> {
+    let name = clone_url_basename(url)?;
+    if bare {
+        Some(format!("{name}.git"))
+    } else {
+        Some(name)
+    }
+}
+
+/// A plain filesystem Git path uses Git's local-clone rules: `--depth`,
+/// `--shallow-since`, `--shallow-exclude`, and `--filter` are ignored.
+/// `file://` and `--no-local` keep transport semantics. A local Libra source
+/// stays on the fail-closed path (D20).
+fn uses_local_clone_semantics(args: &CloneArgs, remote_client: &fetch::RemoteClient) -> bool {
+    match remote_client {
+        fetch::RemoteClient::Bundle(_) => {
+            remote_spec_is_plain_local_path(&args.remote_repo) && !args.no_local
+        }
+        fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
+            // A shallow Git source must use the transport so its `.git/shallow`
+            // boundaries are copied (git `builtin/clone.c:1333-1340`).
+            if git_source_is_shallow(client.repo_path()) {
+                return false;
+            }
+            remote_spec_is_plain_local_path(&args.remote_repo) && !args.no_local
+        }
+        _ => false,
+    }
+}
+
+fn git_source_is_shallow(repo_path: &Path) -> bool {
+    ShallowSet::load_at(&repo_path.join("shallow"))
+        .map(|set| !set.oids().is_empty())
+        .unwrap_or(true)
+}
+
+fn inspect_local_git_shallow(
+    remote_client: &fetch::RemoteClient,
+) -> Result<ShallowSet, ShallowError> {
+    match remote_client {
+        fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
+            ShallowSet::load_at(&client.repo_path().join("shallow"))
+        }
+        _ => Ok(ShallowSet::empty()),
+    }
+}
+
+fn local_clone_ignored_option_warnings(args: &CloneArgs) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if args.depth.is_some() {
+        warnings.push(LOCAL_CLONE_DEPTH_WARNING.to_string());
+    }
+    if args.shallow_since.is_some() {
+        warnings.push(LOCAL_CLONE_SHALLOW_SINCE_WARNING.to_string());
+    }
+    if !args.shallow_exclude.is_empty() {
+        warnings.push(LOCAL_CLONE_SHALLOW_EXCLUDE_WARNING.to_string());
+    }
+    if args.filter.is_some() {
+        warnings.push(LOCAL_CLONE_FILTER_WARNING.to_string());
+    }
+    warnings
+}
+
+fn clone_fetch_option_warnings(args: &CloneArgs, local_clone: bool) -> Vec<String> {
+    if local_clone {
+        local_clone_ignored_option_warnings(args)
+    } else {
+        unsupported_fetch_optimization_warnings(args)
+    }
+}
+
 fn unsupported_fetch_optimization_warnings(args: &CloneArgs) -> Vec<String> {
     let mut warnings = Vec::new();
     if args.filter.is_some() {
@@ -305,6 +419,47 @@ fn unsupported_fetch_optimization_warnings(args: &CloneArgs) -> Vec<String> {
         );
     }
     warnings
+}
+
+impl CloneArgs {
+    /// Git `builtin/clone.c:1025-1028`: `--depth` / `--shallow-since` /
+    /// `--shallow-exclude` imply `--single-branch` unless `--no-single-branch`
+    /// wins. `--mirror` fetches every namespace, so it never implies a single
+    /// branch.
+    pub(crate) fn effective_single_branch(&self) -> bool {
+        if self.mirror || self.no_single_branch {
+            return false;
+        }
+        self.single_branch
+            || self.depth.is_some()
+            || self.shallow_since.is_some()
+            || !self.shallow_exclude.is_empty()
+    }
+}
+
+fn clone_fetch_branch(
+    args: &CloneArgs,
+    discovery: &DiscoveryResult,
+    single_branch: bool,
+) -> Option<String> {
+    if let Some(branch) = args.branch.clone() {
+        return Some(branch);
+    }
+    if !single_branch {
+        return None;
+    }
+    let remote_head = discovery
+        .refs
+        .iter()
+        .find(|reference| reference._ref == "HEAD")
+        .cloned();
+    let ref_heads = discovery
+        .refs
+        .iter()
+        .filter(|reference| reference._ref.starts_with("refs/heads/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    fetch::resolve_remote_default_branch(&discovery.capabilities, &ref_heads, remote_head.as_ref())
 }
 
 fn clone_should_reject_shallow(
@@ -398,8 +553,10 @@ pub enum CloneError {
     RestoreDirectory { path: PathBuf, source: io::Error },
     #[error("failed to initialize repository")]
     InitializeRepository { source: InitError },
-    #[error("source repository is shallow, reject to clone")]
+    #[error("source repository is shallow, reject to clone.")]
     RejectShallow,
+    #[error("failed to read source shallow metadata: {source}")]
+    SourceShallow { source: ShallowError },
     #[error("remote branch {branch} not found in upstream {remote}")]
     RemoteBranchNotFound { branch: String, remote: String },
     #[error("failed to inspect local branch state after fetch: {source}")]
@@ -460,6 +617,10 @@ impl From<CloneError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_exit_code(128)
                 .with_hint("the source is shallow; clone without --reject-shallow, or deepen the source first"),
+            CloneError::SourceShallow { source } => CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_exit_code(128)
+                .with_hint(source.hint()),
             CloneError::RemoteBranchNotFound {
                 ref branch,
                 ref remote,
@@ -935,6 +1096,10 @@ fn render_clone_result(result: &CloneOutput, output: &OutputConfig) -> CliResult
     if output.is_json() {
         return emit_json_data("clone", result, output);
     }
+    // Git still prints local-clone ignore warnings under `--quiet`.
+    for w in &result.warnings {
+        eprintln!("warning: {w}");
+    }
     if output.quiet {
         return Ok(());
     }
@@ -984,11 +1149,6 @@ fn render_clone_result(result: &CloneOutput, output: &OutputConfig) -> CliResult
         );
     }
 
-    // Warnings on stderr.
-    for w in &result.warnings {
-        eprintln!("warning: {w}");
-    }
-
     Ok(())
 }
 
@@ -1030,7 +1190,7 @@ async fn execute_clone_inner(
     let local_path = match &args.local_path {
         Some(path) => path.clone(),
         None => {
-            let repo_name = util::get_repo_name_from_url(&remote_repo)
+            let repo_name = inferred_clone_destination(&args.remote_repo, args.bare)
                 .ok_or((CloneError::CannotInferDestination, None))?;
             original_dir.join(repo_name).to_string_lossy().into_owned()
         }
@@ -1056,6 +1216,16 @@ async fn execute_clone_inner(
     let (remote_client, discovery) = fetch::discover_remote(&remote_repo)
         .await
         .map_err(|source| (CloneError::DiscoverRemote { source }, None))?;
+
+    // Inspect a local Git source's `.git/shallow` before creating the dest so
+    // `--reject-shallow` and corrupt metadata leave no partial clone behind.
+    match inspect_local_git_shallow(&remote_client) {
+        Ok(set) if !set.oids().is_empty() && args.reject_shallow => {
+            return Err((CloneError::RejectShallow, None));
+        }
+        Err(source) => return Err((CloneError::SourceShallow { source }, None)),
+        _ => {}
+    }
 
     // --- Step 3: Destination pre-checks ---
     if metadata_root.exists() && contains_initialized_repo(&metadata_root) {
@@ -1358,11 +1528,35 @@ async fn clone_into_destination(
     // Capture the fetch result so the clone can report transfer counts
     // (`objects_fetched`/`bytes_received`) in its structured output. `dry_run`
     // and `force` are always false for a clone into a fresh repository.
+    // `--depth` / `--shallow-*` imply `--single-branch` unless
+    // `--no-single-branch` (git `builtin/clone.c:1025-1028`). Resolve HEAD's
+    // branch so a flag-less `--single-branch` still writes one refspec.
+    let single_branch = args.effective_single_branch();
+    let fetch_branch = clone_fetch_branch(args, discovery, single_branch);
+    // A plain local Git path ignores `--depth` (git local-clone). `file://`
+    // and `--no-local` keep the transport depth.
+    let local_clone = uses_local_clone_semantics(args, remote_client);
+    let fetch_depth = if local_clone { None } else { args.depth };
+    if args.mirror {
+        let _ = ConfigKv::set(
+            &format!("remote.{remote_name}.url"),
+            &remote_config.url,
+            false,
+        )
+        .await;
+        let _ = ConfigKv::add(
+            &format!("remote.{remote_name}.fetch"),
+            "+refs/*:refs/*",
+            false,
+        )
+        .await;
+        let _ = ConfigKv::set(&format!("remote.{remote_name}.mirror"), "true", false).await;
+    }
     let fetch_result = fetch::fetch_repository_with_result(
         remote_config.clone(),
-        args.branch.clone(),
-        args.single_branch,
-        args.depth,
+        fetch_branch.clone(),
+        single_branch,
+        fetch_depth,
         false,
         Some(clone_tag_mode),
         false,
@@ -1388,12 +1582,22 @@ async fn clone_into_destination(
         eprintln!("Checking out working copy ...");
     }
 
-    let setup_result = setup_repository(
-        remote_config.clone(),
-        args.branch.clone(),
-        !args.bare && !args.no_checkout,
-    )
-    .await?;
+    let advertised_head = discovery
+        .refs
+        .iter()
+        .any(|reference| reference._ref == "HEAD");
+    let setup_result = if args.mirror {
+        setup_mirror_repository(&remote_config, discovery).await?
+    } else {
+        setup_repository(
+            remote_config.clone(),
+            fetch_branch,
+            !args.bare && !args.no_checkout,
+            single_branch,
+            advertised_head,
+        )
+        .await?
+    };
 
     // lore.md 2.11: auto-register the source as an object alternate for a LOCAL
     // LIBRA source (a Git source's `git gc` does not consult Libra's borrowers
@@ -1439,15 +1643,6 @@ async fn clone_into_destination(
         }
     }
 
-    // `--mirror`: turn the standard tracking-ref layout into a mirror — every
-    // fetched branch becomes a local `refs/heads/*` ref and the
-    // `refs/remotes/<name>/*` tracking refs are dropped — and record the
-    // informational `remote.<name>.mirror=true` marker (Libra's fetch is not yet
-    // mirror-aware, so refreshing the mirror is not automatic).
-    if args.mirror {
-        normalize_mirror_refs(&remote_name).await?;
-    }
-
     // `--reject-shallow`: if the fetch left a shallow boundary that the user did
     // not request via `--depth`, the source repository was shallow — refuse it
     // (matching `git clone --reject-shallow`). Local Libra sources with
@@ -1457,7 +1652,7 @@ async fn clone_into_destination(
     let is_shallow = std::fs::read_to_string(util::storage_path().join("shallow"))
         .map(|contents| !contents.trim().is_empty())
         .unwrap_or(false);
-    if clone_should_reject_shallow(args.reject_shallow, is_shallow, args.depth) {
+    if clone_should_reject_shallow(args.reject_shallow, is_shallow, fetch_depth) {
         // Restore the cwd before returning so the caller's cleanup can remove
         // the partially-created destination.
         let _ = env::set_current_dir(original_dir);
@@ -1467,7 +1662,7 @@ async fn clone_into_destination(
     let mut warnings = init_output.warnings.clone();
     warnings.extend(shared_warnings);
     warnings.extend(object_alternates_warning(args));
-    warnings.extend(unsupported_fetch_optimization_warnings(args));
+    warnings.extend(clone_fetch_option_warnings(args, local_clone));
     // lore.md 3.2: `--deps-of` — scope the fresh clone's sparse VIEW to the
     // forward dependency closure of the requested roots (the graph was imported
     // by the implied `--notes` fetch above). The working tree stays fully checked
@@ -1506,7 +1701,7 @@ async fn clone_into_destination(
         repo_id: init_output.repo_id,
         vault_signing: init_output.vault_signing,
         ssh_key_detected: init_output.ssh_key_detected,
-        shallow: args.depth.is_some(),
+        shallow: fetch_depth.is_some(),
         warnings,
         gitignore_converted,
         source_kind: None,
@@ -1526,27 +1721,75 @@ pub(crate) struct SetupResult {
     pub branch_name: Option<String>,
 }
 
-/// Normalize a freshly-cloned repository into a `--mirror` layout: promote every
-/// remote-tracking branch (`refs/remotes/<remote>/<name>`) to a verbatim local
-/// `refs/heads/<name>` branch, drop the tracking namespace, and record
-/// `remote.<remote>.mirror=true`. Tags (`refs/tags/*`) are already in place and
-/// are left untouched.
-///
-/// `setup_repository` has already created the default branch in `refs/heads/*`
-/// and pointed `HEAD` at it; this promotes the remaining branches and removes the
-/// remote-tracking refs that a mirror does not keep.
-///
-/// NARROWING vs Git: Git's `--mirror` mirrors `refs/*:refs/*` verbatim and makes
-/// future fetches force-update every ref. Libra mirrors only what its fetch
-/// transfers — every fetched tracking ref is promoted into `refs/heads/*` and
-/// tags are kept — so:
-/// - ref namespaces Libra does not fetch (e.g. `refs/notes/*`) are not mirrored;
-/// - because Libra's fetch collapses both `refs/heads/mr/*` and `refs/mr/*` into
-///   one `refs/remotes/<remote>/mr/*` tracking namespace, any such refs are
-///   promoted to `refs/heads/mr/*` (provenance is not preserved);
-/// - `mirror=true` is recorded only as a marker; `libra fetch` is not yet
-///   mirror-aware, so refreshing the mirror is not automatic (and no inert
-///   `+refs/*:refs/*` refspec is written).
+/// Configure HEAD after a `--mirror` fetch that already wrote refs verbatim.
+async fn setup_mirror_repository(
+    remote_config: &RemoteConfig,
+    discovery: &DiscoveryResult,
+) -> Result<SetupResult, CloneError> {
+    let _ = ConfigKv::set(
+        &format!("remote.{}.url", remote_config.name),
+        &remote_config.url,
+        false,
+    )
+    .await;
+
+    let remote_head = discovery
+        .refs
+        .iter()
+        .find(|reference| reference._ref == "HEAD")
+        .cloned();
+    let ref_heads = discovery
+        .refs
+        .iter()
+        .filter(|reference| reference._ref.starts_with("refs/heads/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_branch = fetch::resolve_remote_default_branch(
+        &discovery.capabilities,
+        &ref_heads,
+        remote_head.as_ref(),
+    );
+
+    let head = match (remote_head.as_ref(), default_branch) {
+        (Some(advertised), Some(name))
+            if ref_heads.iter().any(|reference| {
+                reference._ref == format!("refs/heads/{name}")
+                    && reference._hash == advertised._hash
+            }) =>
+        {
+            Head::Branch(name)
+        }
+        (Some(advertised), _) => {
+            let oid = ObjectHash::from_str(&advertised._hash).map_err(|error| {
+                CloneError::SetupFailed {
+                    message: format!(
+                        "mirror HEAD '{}' is not a valid object id: {error}",
+                        advertised._hash
+                    ),
+                }
+            })?;
+            Head::Detached(oid)
+        }
+        _ => {
+            return Ok(SetupResult { branch_name: None });
+        }
+    };
+    let branch_name = match &head {
+        Head::Branch(name) => Some(name.clone()),
+        Head::Detached(_) => None,
+    };
+    Head::update_result(head, None)
+        .await
+        .map_err(|error| CloneError::SetupFailed {
+            message: format!("failed to set mirror HEAD: {error}"),
+        })?;
+    Ok(SetupResult { branch_name })
+}
+
+/// Legacy promote-from-tracking helper retained for unit coverage of the
+/// pre-CL-12 layout transform (production `--mirror` uses
+/// [`setup_mirror_repository`] after a `+refs/*:refs/*` fetch).
+#[cfg(test)]
 async fn normalize_mirror_refs(remote_name: &str) -> Result<(), CloneError> {
     let db = get_db_conn_instance().await;
     let tracking = Branch::list_branches_result_with_conn(&db, Some(remote_name))
@@ -1615,16 +1858,19 @@ pub(crate) async fn setup_repository(
     remote_config: RemoteConfig,
     specified_branch: Option<String>,
     checkout_worktree: bool,
+    single_branch: bool,
+    advertised_head: bool,
 ) -> Result<SetupResult, CloneError> {
     let db = get_db_conn_instance().await;
     let remote_head = Head::remote_current_with_conn(&db, &remote_config.name).await;
 
     let branch_to_checkout = match specified_branch {
         Some(branch_name) => Some(branch_name),
-        None => match remote_head {
+        None if advertised_head => match remote_head {
             Some(Head::Branch(name)) => Some(name),
-            _ => None,
+            _ => default_tracked_branch(&db, &remote_config.name).await?,
         },
+        None => default_tracked_branch(&db, &remote_config.name).await?,
     };
 
     if let Some(branch_name) = branch_to_checkout {
@@ -1689,6 +1935,19 @@ pub(crate) async fn setup_repository(
                         false,
                     )
                     .await;
+                    if single_branch {
+                        let spec = format!(
+                            "+refs/heads/{branch_name}:refs/remotes/{}/{branch_name}",
+                            remote_config.name
+                        );
+                        let _ = ConfigKv::add_with_conn(
+                            txn,
+                            &format!("remote.{}.fetch", remote_config.name),
+                            &spec,
+                            false,
+                        )
+                        .await;
+                    }
                     Ok(())
                 })
             },
@@ -1731,18 +1990,28 @@ pub(crate) async fn setup_repository(
         )
         .await;
 
-        let default_branch = "main";
-        let merge_ref = format!("refs/heads/{}", default_branch);
-        let _ = ConfigKv::set(&format!("branch.{default_branch}.merge"), &merge_ref, false).await;
-        let _ = ConfigKv::set(
-            &format!("branch.{default_branch}.remote"),
-            &remote_config.name,
-            false,
-        )
-        .await;
-
         Ok(SetupResult { branch_name: None })
     }
+}
+
+/// When the remote advertised no HEAD, check out `main`/`master` only if that
+/// tracking ref exists (M-BUNDLE U3). Otherwise leave the clone without a
+/// local branch (U4).
+async fn default_tracked_branch(
+    db: &sea_orm::DatabaseConnection,
+    remote: &str,
+) -> Result<Option<String>, CloneError> {
+    for name in ["main", "master"] {
+        let tracking = format!("refs/remotes/{remote}/{name}");
+        if Branch::find_branch_result_with_conn(db, &tracking, Some(remote))
+            .await
+            .map_err(|source| CloneError::LocalBranchState { source })?
+            .is_some()
+        {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Unit tests for the clone module
@@ -1754,6 +2023,32 @@ mod tests {
 
     use super::*;
     use crate::utils::test::{ChangeDirGuard, ScopedEnvVar};
+
+    #[test]
+    fn inferred_clone_destination_follows_git_url_basename() {
+        assert_eq!(
+            inferred_clone_destination("/tmp/gdeep", false).as_deref(),
+            Some("gdeep")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/gdeep", true).as_deref(),
+            Some("gdeep.git")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/gdeep.git/", true).as_deref(),
+            Some("gdeep.git")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/b1.bundle", false).as_deref(),
+            Some("b1")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/b1.bundle", true).as_deref(),
+            Some("b1.git")
+        );
+        assert_eq!(inferred_clone_destination("/tmp/..", false), None);
+        assert_eq!(inferred_clone_destination("/tmp/.git", true), None);
+    }
 
     #[test]
     fn discover_remote_unauthorized_maps_to_auth_permission_denied() {
@@ -1880,6 +2175,106 @@ mod tests {
 
         assert_eq!(cli.stable_code(), StableErrorCode::RepoCorrupt);
         assert_eq!(cli.exit_code(), 128);
+    }
+
+    #[test]
+    fn depth_and_shallow_flags_imply_single_branch_unless_countermanded() {
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            CloneArgs::try_parse_from(std::iter::once("clone").chain(args.iter().copied()))
+                .expect("clone args should parse")
+        };
+
+        assert!(
+            parse(&["--depth", "1", "https://example.com/r.git"]).effective_single_branch(),
+            "S1: --depth implies --single-branch"
+        );
+        assert!(
+            parse(&["--single-branch", "https://example.com/r.git"]).effective_single_branch(),
+            "S2: explicit --single-branch"
+        );
+        assert!(
+            !parse(&[
+                "--depth",
+                "1",
+                "--no-single-branch",
+                "https://example.com/r.git"
+            ])
+            .effective_single_branch(),
+            "S3: --no-single-branch wins over --depth"
+        );
+        assert!(
+            parse(&["--shallow-since", "yesterday", "https://example.com/r.git"])
+                .effective_single_branch(),
+            "--shallow-since implies --single-branch even when ignored"
+        );
+        assert!(
+            parse(&["--shallow-exclude", "main", "https://example.com/r.git"])
+                .effective_single_branch(),
+            "--shallow-exclude implies --single-branch even when ignored"
+        );
+        assert!(
+            !parse(&["--mirror", "--depth", "1", "https://example.com/r.git"])
+                .effective_single_branch(),
+            "--mirror fetches every namespace"
+        );
+        assert!(
+            !parse(&["https://example.com/r.git"]).effective_single_branch(),
+            "default clone fetches all branches"
+        );
+    }
+
+    #[test]
+    fn plain_local_path_uses_local_clone_semantics_unless_no_local_or_file_url() {
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            CloneArgs::try_parse_from(std::iter::once("clone").chain(args.iter().copied()))
+                .expect("clone args should parse")
+        };
+
+        assert!(
+            remote_spec_is_plain_local_path("/tmp/src"),
+            "absolute path is a local clone source"
+        );
+        assert!(
+            remote_spec_is_plain_local_path("./src"),
+            "relative path is a local clone source"
+        );
+        assert!(
+            !remote_spec_is_plain_local_path("file:///tmp/src"),
+            "file:// uses transport"
+        );
+        assert!(
+            !remote_spec_is_plain_local_path("https://example.com/r.git"),
+            "https is not a local path"
+        );
+        assert!(
+            !remote_spec_is_plain_local_path("git@example.com:user/r.git"),
+            "scp-like URL is not a local path"
+        );
+
+        let plain = parse(&["--depth", "1", "/tmp/src"]);
+        assert!(
+            !plain.no_local && remote_spec_is_plain_local_path(&plain.remote_repo),
+            "L1: plain path + --depth selects local-clone ignore"
+        );
+        let no_local = parse(&["--no-local", "--depth", "2", "/tmp/src"]);
+        assert!(
+            no_local.no_local,
+            "L3: --no-local keeps transport semantics"
+        );
+        let local_flag = parse(&["-l", "--depth", "1", "/tmp/src"]);
+        assert!(
+            !local_flag.no_local,
+            "L3: -l restores local-clone semantics"
+        );
+        let file_url = parse(&["--depth", "1", "file:///tmp/src"]);
+        assert!(
+            remote_spec_is_file_url(&file_url.remote_repo),
+            "file:// stays on the transport path"
+        );
     }
 
     #[test]

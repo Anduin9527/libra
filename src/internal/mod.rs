@@ -40,6 +40,7 @@ pub mod metadata;
 pub mod model;
 pub mod mutable_state_ownership;
 pub mod notes;
+pub mod object_format;
 pub mod obliteration;
 pub mod operation;
 pub mod pack_writer;
@@ -51,6 +52,7 @@ pub mod reflog;
 pub mod repo_hooks;
 pub mod revision_ordinal;
 pub mod sequencer;
+pub mod shallow;
 #[cfg(test)]
 pub mod source_scan;
 pub mod sparse;

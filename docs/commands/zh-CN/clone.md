@@ -16,6 +16,8 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 
 对于裸克隆，不会执行工作树检出，仓库目录本身会直接成为对象存储。裸克隆不会创建 `.libraignore`。
 
+本地 Git v2 bundle 可作为源：排除仓库目录后依次尝试 `<path>.bundle` 与 `<path>`。默认目标目录名去掉 `.bundle` 后缀。`HEAD` 取自 bundle 的 `HEAD` 行；没有该行时，若 bundle 含默认分支则检出它，否则不创建本地分支。普通路径上的 `--depth` 会按本地克隆警告忽略。`remote.origin.url` 记录 bundle 的绝对路径。
+
 ## 全局配置 Schema 保护
 
 配置 schema 兼容性按角色判定。`libra clone` 在信任配置前，以只读方式检查 GlobalConfig 与 SystemConfig 元数据。真正的配置 future schema，或未注册／名称不匹配的迁移 receipt，在命令需要该作用域时以 `LBR-CONFIG-001` fail-closed。当前 manifest 已知的 Repository-only receipt（包括 `2026090801`）不会使配置库被误判为 future，受支持的配置值仍可读取。本 build 能识别 configuration-owned legacy-reader barrier；详见[配置兼容性](config.md#配置-schema-兼容性)。
@@ -42,7 +44,7 @@ libra clone /path/to/local/repo
 
 ### `[LOCAL_PATH]`
 
-可选目标目录。省略时，Libra 会从仓库 URL 推断目录名（例如从 `repo.git` 推断 `repo`）。如果无法推断，会返回错误，要求用户显式指定路径。
+可选目标目录。省略时，Libra 会从仓库 URL 推断目录名（例如从 `repo.git` 或 `repo.bundle` 推断 `repo`）。`--bare` 与 `--mirror` 使用 `<basename>.git`。空名与 `..` 会被拒绝。如果无法推断，会返回错误，要求用户显式指定路径。
 
 ```bash
 libra clone git@github.com:user/repo.git my-dir
@@ -58,7 +60,7 @@ libra clone -b develop git@github.com:user/repo.git
 
 ### `--single-branch`
 
-只获取通向单个分支 tip 的历史（HEAD，或 `-b` 给出的分支）。当大型仓库只需要一个分支时，可减少传输量。只有 Git 远程支持这种传输优化。
+只获取通向单个分支 tip 的历史（HEAD，或 `-b` 给出的分支）。当大型仓库只需要一个分支时，可减少传输量。`--depth`、`--shallow-since`、`--shallow-exclude` 在未给出 `--no-single-branch` 时隐含此标志（对齐 `git clone`）。单分支克隆会写入 `remote.<name>.fetch=+refs/heads/<branch>:refs/remotes/<name>/<branch>`。只有 Git 远程支持这种传输优化。
 
 ```bash
 libra clone --single-branch -b main git@github.com:user/repo.git
@@ -74,7 +76,7 @@ libra clone --single-branch --no-single-branch git@github.com:user/repo.git
 
 ### `--bare`
 
-创建没有工作树的裸仓库。目标目录会直接成为对象存储。适用于中心/服务端仓库。
+创建没有工作树的裸仓库。目标目录会直接成为对象存储。省略目标时默认名为 `<basename>.git`。Libra 把 `libra.db` 与 `objects` 放在目标根目录（不写 Git 风格的 `config`/`HEAD`/`refs` 文件）。裸克隆不写 index 与工作树文件。适用于中心/服务端仓库。
 
 ```bash
 libra clone --bare git@github.com:user/repo.git
@@ -82,13 +84,12 @@ libra clone --bare git@github.com:user/repo.git
 
 ### `--mirror`
 
-建立源仓库的镜像（类似 `git clone --mirror`）。隐含 `--bare`，把已获取的分支原样映射到 `refs/heads/*`、tag 保留在 `refs/tags/*`——不保留任何 `refs/remotes/*` tracking ref——并写入 `remote.<name>.mirror=true` 标记。适用于服务端托管或备份仓库。
-
-相对 Git 的收窄：(1) Git 原样镜像 `refs/*:refs/*`；Libra 只镜像其 fetch 传输的内容——每个已获取分支提升到 `refs/heads/*`、tag 保留，但 Libra 不获取的命名空间（如 `refs/notes/*`）不镜像。(2) 由于 Libra 的 fetch 把 `refs/heads/mr/*` 与 `refs/mr/*` 折叠进同一 tracking 命名空间，这类 ref 会被镜像为 `refs/heads/mr/*`（不保留出处）。(3) `mirror=true` 仅为标记——不写 `+refs/*:refs/*` refspec，且 `libra fetch` 尚不感知镜像，故刷新镜像不是自动的。
+建立源仓库的镜像（类似 `git clone --mirror`）。隐含 `--bare`，原样映射源广告的全部合法 ref（`refs/heads/*`、`refs/tags/*`、`refs/notes/*`、`refs/mr/*` 等），不保留 `refs/remotes/*` tracking ref，并写入 `remote.<name>.mirror=true` 与 `remote.<name>.fetch=+refs/*:refs/*`。适用于服务端托管或备份仓库。
 
 ```bash
 libra clone --mirror git@github.com:user/repo.git repo-mirror.git
 ```
+
 
 ### `--filter <spec>` / `--shallow-since <date>` / `--shallow-exclude <rev>`
 
@@ -101,7 +102,7 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 
 ### `-l, --local` / `--no-local`
 
-为 Git 兼容而接受，实质为 no-op。当源位于本地文件系统时，Git 的 `-l`/`--local` 请求本地优化（用复制/硬链接代替传输），`--no-local` 则强制走传输以避免硬链接。Libra **从不硬链接**对象——始终复制——且其读取本地路径源的方式由源类型决定、与这两个 flag 无关：本地 Libra 仓库直接读取对象，本地 Git 仓库经 `git-upload-pack` 获取。故两者均按 no-op 接受、不影响结果。两者互相覆盖，最后出现者生效。
+Libra **从不硬链接**对象——始终复制。普通文件系统 Git 路径按本地克隆处理：`--depth`、`--shallow-since`、`--shallow-exclude`、`--filter` 被忽略，并打印 Git 的本地克隆警告（`--depth is ignored in local clones; use file:// instead.`，其余标志有对应原文）。`--quiet` 仍会打印这些警告。`file://` 与 `--no-local` 保持传输浅化语义；`-l` / `--local` 恢复本地克隆路径。本地 Libra 源不变。两个标志互相覆盖，最后出现者生效。
 
 ```bash
 libra clone -l /path/to/source /path/to/dest
@@ -109,9 +110,11 @@ libra clone -l /path/to/source /path/to/dest
 
 ### `--depth <N>`
 
-创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。
+创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。除非给出 `--no-single-branch`，否则隐含 `--single-branch`（对齐 `git clone`）。
 只有 Git 远程支持浅传输。
 本地 Libra 源会以 `LBR-REPO-002` 拒绝 `--depth`：该传输路径不能声明 shallow boundary，若接受会留下缺父提交的克隆。此 fail-closed 行为是已接受的终态（开发兼容登记 D20 决策），不是待补缺口。
+普通文件系统 Git 路径会忽略 `--depth` 并告警（issues/474 CL-06）。
+通过 `file://` 或 `--no-local` 访问的本地 Git 源按各 want 的最短距离截断，再做一次边界计算：有父提交未被发送，或根提交恰好落在深度截止上时，该提交写入 `.libra/shallow`（issues/474 CL-04）。
 
 ```bash
 libra clone --depth 1 git@github.com:user/repo.git
@@ -120,9 +123,9 @@ libra clone --depth 50 git@github.com:user/repo.git
 
 ### `--reject-shallow`
 
-若克隆结果是你未请求的浅仓库（即源仓库本身是浅克隆），则失败，对齐 `git clone --reject-shallow`（exit 128）。只有在传输层能协商 shallow boundary 时，才允许与 `--depth` 同用；本地 Libra 源会在对象传输前拒绝 `--depth`，且不会留下已初始化的目标仓库。
+若**源**仓库是浅克隆则失败，对齐 `git clone --reject-shallow`（exit 128），且不留下目标目录。本地 Git 浅源在创建目标前检查；不带该标志克隆浅源时，会把源的 `.git/shallow` 边界并入 `.libra/shallow`，使 `log` / `fsck` 可遍历。本地 Libra 源带 `--depth` 仍在对象传输前以 `LBR-REPO-002` fail-closed。
 
-相对 Git 的两点收窄：(1) Libra 克隆本地路径源时会重取完整历史、不继承源的浅标记，故该检查主要在克隆浅 *remote* 时有意义；(2) 由于 Libra 无法区分“源是浅克隆”与“`--depth` 导致的浅克隆”，对支持 shallow 协商的远程，给出 `--depth` 会抑制 fetch 后的 `--reject-shallow` 检查（Git 即便带 `--depth` 也会拒绝浅源）。
+对能协商 shallow boundary 的网络远程，未请求 `--depth` 时仍会在 fetch 后拒绝意外的浅结果。
 
 ```bash
 libra clone --reject-shallow git@github.com:user/repo.git
@@ -322,7 +325,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 
 ### `--single-branch` 标志
 
-与 `--branch` 组合时，`--single-branch` 通过只获取指定分支的历史来减少 clone 期间传输的数据量。这对包含许多长期分支的大型仓库尤其有用，例如 CI 构建某个特定 release 分支时只需要一个分支。Git 也支持此能力；jj 不支持，因为它的 operation-log 模型按设计获取所有 refs。
+与 `--branch` 组合时，`--single-branch` 通过只获取指定分支的历史来减少 clone 期间传输的数据量。`--depth` / `--shallow-since` / `--shallow-exclude` 在未给出 `--no-single-branch` 时同样收窄。这对包含许多长期分支的大型仓库尤其有用，例如 CI 构建某个特定 release 分支时只需要一个分支。Git 也支持此能力；jj 不支持，因为它的 operation-log 模型按设计获取所有 refs。
 
 ## 参数对比：Libra vs Git vs jj
 
@@ -337,7 +340,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 浅克隆（depth） | `--depth <n>` | N/A | Git 远程支持；本地 Libra 源 fail-closed (`LBR-REPO-002`)；云端拒绝 |
 | 按日期浅克隆 | `--shallow-since=<date>` | N/A | Git 远程按 no-op 接受（忽略+告警；不应用、仅按 `--depth` 限定）；云端拒绝 |
 | 排除浅边界 | `--shallow-exclude=<rev>` | N/A | Git 远程按 no-op 接受（忽略+告警；不应用、仅按 `--depth` 限定）；云端拒绝 |
-| 镜像克隆 | `--mirror` | N/A | `--mirror`（隐含 `--bare`；把已获取分支映射到 `refs/heads/*`、保留 tag、无 tracking ref、设 `remote.<name>.mirror` 标记；收窄——仅 fetch 的分支/tag，刷新不感知镜像） |
+| 镜像克隆 | `--mirror` | N/A | `--mirror`（隐含 `--bare`；原样映射全部 `refs/*`，无 tracking ref，设 `remote.<name>.mirror` 与 `+refs/*:refs/*`） |
 | 引用仓库 | `--reference <repo>` / `--reference-if-able <repo>` | N/A | 接受式 no-op（Libra 总是拷贝对象、无 alternates）；`--reference` 告警，`--reference-if-able` 静默 |
 | 共享对象库 | `--shared` / `-s` | N/A | 接受式 no-op（总是拷贝）；告警 |
 | 从引用仓库脱离 | `--dissociate` | N/A | 接受式 no-op（已自包含）；静默 |

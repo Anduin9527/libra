@@ -21,18 +21,20 @@
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R8 字面 `VERDICT: PASS`（P0/P1/P2=0）；是 0902/0904/0905/0911 production、0916 CAP-07 與 0923 DM-05 session consumer contract 的前置 |
+| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿） |
+| [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；Phase 0 已收口（DEP 复核、`gpg 2.4.9` 证据、VG-00 GO、ADR-VG-01..12 Accepted）；VG-00 `done/complete`，其余 14 卡**已全部实施完成**（`locally-accepted`；门 22 全量 7944/7944 绿、门 23 三连收口，`../libra-backend` 五页已同步）；VG-09 发布与 REL-VG-01 证据待操作者授权。**（2026-09-24 刷新，取代此前「仅待授权」的粗口径）** 精确状态：VG-00 `done/complete`；**13 卡 `in-progress/locally-accepted`**（家族 9 + 管理面 4）；**VG-09 `pending`**（未发布）。发布前尚有**两类硬阻塞**：①需操作者授权 `libra push origin` + `gh release create`；②计划第 1198 行明文的**发布拓扑决策**（四张管理面卡先于 VG-09 合入 ⇒ 必须二选一：剥离四卡提交[事后不可行，同文件交错]、或修订计划接受合并发布[6 处修订草案已备]），**未选定前不得 bump/tag/push**。另：版本须在**发布时刻**选定（上游 24 小时内连发 8 版，`0.23.46`/`0.23.59` 相继被占；runbook 的 `bump`+`preflight` 负责判定）。**当前权威门：门 54 = 7985/7985（`FAIL=0`、`FLAKY=0`）。** |
-| [`plan-20260925.md`](plan-20260925.md) | C（MEM-01/02 研发历程记忆 · 确定性投影） | 未启动 | 原 `plan-20260923.md`（2026-09-25 改名）。**取代 [`plan-20260819.md`](plan-20260819.md) 承担 MEM-01/02**（使用者 2026-09-23 要求在 `libra code` 拆除后独立重设计，不沿用 R30）。**13 卡**全部 `pending`：`DM-00`..`DM-09` + `DM-10`（迁移 B，自 DM-01 拆出）+ `DM-11`/`DM-12`（CLI 家族 `REL-DM-02` 的子卡与 `release` 发布点，自 DM-03 拆出）；全计划**无活动 `EX-*` 豁免**。`DM-09` 为唯一收口卡，AC 按 `DM-06` 的 go/no-go 结论分 A/B 两组；`NO-GO` 时 `DM-07`/`DM-08` 经规范性修订移入 `DEFER-DM-12`。发布周期：GO 分支 9 个、降级分支 7 个（R30 为 25 卡 / 约 25 周期）。**R04 范围收窄（使用者决策）：** 「未提交 Agent 工作按代码路径召回」实测不可实现（`agent_checkpoint.tree_oid` 是 traces 树、`ToolCallRecord.paths_written` 无生产者），已移入 `DEFER-DM-11`。**评审（findings 已改为直接记入计划正文的「Codex review log」章节，`*.review/` 目录已删除）：** Codex r01 `FAIL`（21×P1）、r02（18）、r03（9）、r04（13）、r05（8）、r06（11）、r07（12×P1/4×P2）；**`P0` 全程为 0，但七轮未收敛**。阻塞：`DEP-DM-06`（plan-20260924 拥有 `agent_session` 终态/resume 语义）阻塞 `DM-05`。**计划级评审未 PASS 前禁止开工** |
+| [`plan-20260926.md`](plan-20260926.md) | C（MEM-01/02 研发历程记忆 · 确定性投影） | 未启动 | 原 `plan-20260923.md`（2026-09-25 改名为 `plan-20260925.md`；2026-09-24 合并上游时因与上游 Session Capture 计划 `plan-20260925.md` 撞名，再改为 `plan-20260926.md`）。**取代 [`plan-20260819.md`](plan-20260819.md) 承担 MEM-01/02**（使用者 2026-09-23 要求在 `libra code` 拆除后独立重设计，不沿用 R30）。**13 卡**全部 `pending`：`DM-00`..`DM-09` + `DM-10`（迁移 B，自 DM-01 拆出）+ `DM-11`/`DM-12`（CLI 家族 `REL-DM-02` 的子卡与 `release` 发布点，自 DM-03 拆出）；全计划**无活动 `EX-*` 豁免**。`DM-09` 为唯一收口卡，AC 按 `DM-06` 的 go/no-go 结论分 A/B 两组；`NO-GO` 时 `DM-07`/`DM-08` 经规范性修订移入 `DEFER-DM-12`。发布周期：GO 分支 9 个、降级分支 7 个（R30 为 25 卡 / 约 25 周期）。**R04 范围收窄（使用者决策）：** 「未提交 Agent 工作按代码路径召回」实测不可实现（`agent_checkpoint.tree_oid` 是 traces 树、`ToolCallRecord.paths_written` 无生产者），已移入 `DEFER-DM-11`。**评审（findings 已改为直接记入计划正文的「Codex review log」章节，`*.review/` 目录已删除）：** Codex r01 `FAIL`（21×P1）、r02（18）、r03（9）、r04（13）、r05（8）、r06（11）、r07（12×P1/4×P2）；**`P0` 全程为 0，但七轮未收敛**。阻塞：`DEP-DM-06`（plan-20260924 拥有 `agent_session` 终态/resume 语义）阻塞 `DM-05`。**计划级评审未 PASS 前禁止开工** |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS；CAP-01..06 可先行，CAP-07 受 `DEP-ACF-CAP` 阻塞 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 未启动 | FL-00..FL-07 全部 `pending`；前置 plan-20260907 未收口 |
 | [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | **已收口** | MB-01..MB-05、MB-07/08、MB-10/11 全部 `done/complete`（v0.23.37/.39/.40/.41/.42/.43/.44/.45/.46，各卡 ER-14 全量绿、D-MB-STD 远端 evidence 绿）；MB-06/09/12 墓碑 `done`（无对应子命令）；EX-MB-01/02（G-03）与 EX-MB-03（ER-07 签名）已登记；使用者 2026-09-21 双评审豁免已登记；完成判据全数勾选 |
 | [`plan-20260911.md`](plan-20260911.md) | B（pi capture / hook boundary） | 未启动 | PI-01..06 全部 `pending`；Claude Code 429 未给出 verdict且 `DEP-ACF-MIRROR` 未满足，**禁止 production 开工** |
 | [`plan-20260910.md`](plan-20260910.md) | 横切（数据库迁移作用域） | **已收口** | MIG-00..MIG-06、MIG-R01..R03 全部 `done/complete` |
-| [`plan-20260907.md`](plan-20260907.md) | 横切（BLAKE3 object format） | 未启动 | B3-00..B3-17 全部 `pending` |
+| [`plan-20260907.md`](plan-20260907.md) | 横切（BLAKE3 object format） | 执行中 | B3-00 `in-progress`（`object_format` 事实源 + Blake3 臂；pin 保持 `=0.10.2`）。下一卡 B3-11 |
 | [`plan-20260906.md`](plan-20260906.md) | 横切（安全扫描） | 未启动 | SC-01..SC-07、SC-CLOSE 全部 `pending` |
 | [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 未启动 | CC-00..CC-06 全部 `pending`；CC-00 可先行，CC-01..06 受 `DEP-ACF-MIRROR` 阻塞 |
 | [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 未启动 | 6 張 RG + 29 張已定義 CX 卡（共 35 卡）全部 `pending`；CX-00/CX-12 可先行，其餘 33 張 production 卡受 `DEP-ACF-MIRROR` 阻塞（無 CX-18/CX-21） |
@@ -61,19 +63,26 @@
 |---|---|---|---|
 | [`issues/470.md`](issues/470.md) | 工作树物化丢失可执行位与 mode 变化检测 | 未启动 | FM-01/02/05（3 卡） |
 | [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | 未启动 | IN-01..IN-12（12 卡） |
-| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 未启动 | CL-01..CL-15（15 卡） |
+| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `done`/`complete`（`v0.23.47`）；CL-02 `done`/`complete`（`v0.23.48`）；CL-03 C 组 `v0.23.49`（`compat-network-remotes` 重跑排队中）；CL-04..CL-11 `locally-accepted`（未 bump） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495 |
 | [`issues/478.md`](issues/478.md) | log/show/diff/grep/blame/notes/reflog 命令族 | 未启动 | LG-01..LG-25（25 卡） |
 | [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | 未启动 | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
-| [`issues/480.md`](issues/480.md) | remote/fetch/pull/push/credential/rerere 对齐 | 未启动 | HP-01..HP-16（16 卡） |
+| [`issues/480.md`](issues/480.md) | remote/fetch/pull/push/credential/rerere 对齐 | 未启动 | HP-01..HP-17（17 卡；HP-17 为 SSH 传输入口 host-key 校验，issue #560） |
 | [`issues/481.md`](issues/481.md) | 维护与杂项命令族对齐 | 未启动 | MX-01..MX-16（16 卡） |
 | [`issues/483.md`](issues/483.md) | `count-objects` 与预览命令零对象写入 | 未启动 | CO-01..CO-04（4 卡；CO-03/04 受 DEP-CO-04 / CX-30 `src/cli.rs` 串行约束） |
 | [`issues/486.md`](issues/486.md) | upstream ahead/behind 计数 | **已收口** | AB-01 `done/complete`（v0.22.31，已关闭） |
 | [`issues/487.md`](issues/487.md) | 本地 Git 转换挂死与中断恢复 | 未启动 | IG-01..IG-05（5 卡） |
 | [`issues/488.md`](issues/488.md) | `grep` 的 `--exclude-standard` 与子目录作用域 | 未启动 | GR-01/02（2 卡） |
 | [`issues/490.md`](issues/490.md) | skip-worktree 索引位与 `add` 稀疏路径诊断 | 未启动 | SW-01..SW-07（7 卡；SW-06 已迁至 plan-20260918） |
+| [`issues/496.md`](issues/496.md) | 本地路径 clone 停住（Fetching objects 0% CPU） | 未启动 | CLH-01..CLH-04（4 卡） |
+| [`issues/497.md`](issues/497.md) | 删除最后一个被跟踪文件后 commit 报 nothing to commit | 未启动 | CD-01..CD-04（4 卡） |
+| [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | 未启动 | TT-01..TT-04（4 卡；与 #533/#478 协调） |
+| [`issues/477b.md`](issues/477b.md) | 历史改写收口后续（#522/#523/#525/#526/#527/#533/#536；#528 并入 #495） | 未启动 | HW-01..HW-07（7 卡） |
+| [`issues/451.md`](issues/451.md) | RFC：version-aware M2 Episode memory | 未启动 | RFC-01..RFC-04（4 卡） |
+| [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
+| [`issues/500.md`](issues/500.md) | Feature：Centralized Storage for Libra Statistics Data | 未启动 | CS-01..CS-04（4 卡） |
 
 ---
 
@@ -84,10 +93,12 @@
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
 | [`plan-20260924.md`](plan-20260924.md) | ACF-01..ACF-09 | Claude 字面 `VERDICT: PASS`；ACF-01 重核 Entire/Libra pin 與 shared files clean |
-| [`plan-20260925.md`](plan-20260925.md) | DM-00..DM-12（13 卡） | 计划级评审未取得字面 `VERDICT: PASS`（Codex r01–r07 均 `FAIL`，`P0` 全程为 0），**禁止开工**；另 `DEP-DM-06` 阻塞 `DM-05`（等 plan-20260924 的 `CTR-ACF-DM06-v1` 或 ACF-08 收口） |
+| [`plan-20260926.md`](plan-20260926.md) | DM-00..DM-12（13 卡） | 计划级评审未取得字面 `VERDICT: PASS`（Codex r01–r07 均 `FAIL`，`P0` 全程为 0），**禁止开工**；另 `DEP-DM-06` 阻塞 `DM-05`（等 plan-20260924 的 `CTR-ACF-DM06-v1` 或 ACF-08 收口） |
 | [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | OG-00/04 以各自 review gate 為準；其余 production 卡等待 `DEP-ACF-MIRROR` |
 | [`plan-20260904.md`](plan-20260904.md) | 6 張 RG + 29 張已定義 CX 卡（共 35 卡） | CX-00/12 以原 Phase 0 gate 為準；其餘 33 張 production 卡等待 `DEP-ACF-MIRROR`；CX-30 另受 DEP-CLI-mirror |
 | [`plan-20260905.md`](plan-20260905.md) | CC-00..CC-06 | CC-00 以原 review gate 為準；CC-01..06 等待 `DEP-ACF-MIRROR`，且 reasoning 卡保留 RG 前置 |
+| [`plan-20260925.md`](plan-20260925.md) | SCAP-02、SCAP-01 | R9 对同一修订版 Codex 与 Claude 均为字面 `VERDICT: PASS` 且 P0/P1/P2 为 0。SCAP-02 的登记已在 `fba6cbc`，本卡只核对。SCAP-01 依赖该登记 |
+| [`plan-20260923.md`](plan-20260923.md) | CP-00..20 pending; expand bounded domain cards after inventory if needed | Audit handoff, required review PASS and DEP-CP-01..07; dynamic implementation requires CP-06 done/complete |
 | [`plan-20260906.md`](plan-20260906.md) | SC-01..SC-07、SC-CLOSE | — |
 | [`plan-20260907.md`](plan-20260907.md) | B3-00..B3-17 | Phase 0 冻结；是 plan-20260913 的前置 |
 | [`plan-20260911.md`](plan-20260911.md) | PI-01..PI-06 | **Claude Code 429 未出 verdict且 `DEP-ACF-MIRROR` 未满足，禁止 production 开工**；只讀 pin/source 重核可先行 |
@@ -170,6 +181,29 @@
 
 **阻塞登记：** PR #456（`Anduin9527:codex/memory-m2-core-draft-pr`）不可直接合并（距 main 296 commits、39 档冲突、依赖已删 Code SCC）；由 M2-16A 正向移植、M2-16E 收口关闭（ADR-M2-15）。
 
+### 3.7 issues/474（clone 浅克隆 / bundle / bare / mirror）
+
+发布窗口：CL-01 → … → CL-15。Phase 0 Codex R6 `PASS`（2026-09-23）。
+
+| 卡 | 状态 | 发布 |
+|---|---|---|
+| CL-01 fsck 断链检测与 shallow 豁免 | `done`/`complete` | v0.23.47（#510） |
+| CL-02 log/rev-list shallow helper | `done`/`complete` | v0.23.48（#511） |
+| CL-03 其余历史遍历 | `done`/`complete` | v0.23.49（#512） |
+| CL-04 本地 Git 浅边界 | `done`/`complete` | v0.23.50（#514） |
+| CL-05 `--depth` 隐含单分支 | `done`/`complete` | v0.23.51（#516） |
+| CL-06 普通路径忽略浅化参数 | `done`/`complete` | v0.23.52（#517） |
+| CL-07 shallow Git 源克隆 | `done`/`complete` | v0.23.53（#518） |
+| CL-08 bundle create 写入 HEAD | `done`/`complete` | v0.23.54（#520） |
+| CL-09 clone 接受 bundle 源 | `done`/`complete` | v0.23.57（#561） |
+| CL-10 以 bundle 为 remote 的 fetch/pull | `done`/`complete` | v0.23.58（#562） |
+| CL-11 bare/mirror 默认目录名与 bare 布局 | `done`/`complete` | v0.23.59（#563） |
+| CL-12 clone --mirror 全命名空间 | `done`/`complete` | v0.23.60（#564） |
+| CL-13 mirror-aware fetch/prune | `done`/`complete` | v0.23.61（#565） |
+| CL-14 depth 测试 + T5 live | `done`/`complete` | v0.23.62（#567） |
+| CL-15 branch -a/-r 远程显示 | `done`/`complete` | v0.23.63（#568 / `d00366b`） |
+| Closeout proxy hygiene | `in-progress` | v0.23.64（loopback `no_proxy`；DEFER-CL-ENV-*） |
+
 ### 3.6 issues/476（工作树命令族）
 
 发布窗口：WT-01 → WT-02 → WT-04 → WT-08 → WT-09 → WT-10 → WT-11 → WT-03。用户 2026-09-20 覆盖 ER-05（执行 Agent 自审）。
@@ -208,9 +242,10 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `issues/476` → `WT-01`（回归守卫），`done`/`remote-pending`，版本面三处 `0.23.35`（C 组提交/tag/`gh release` 进行中）。
-- **下一步（WT-01 C/D 落地后）：** `issues/476` → `WT-03` 仍等 DEP-WT-08 / ADR-WT-04；无其它未阻塞卡。
-- **并行窗口（不在本执行指针）：** `plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `stash.rs` 写集。
+- **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿）。
+- **SCAP-01 与 B3-00：** SCAP-01 已收口，`runtime.rs` 写集互斥结束；B3-00 继续在 `main` 上推进。
+- **下一步：** `issues/474` CL-01..CL-15 已全部 merge+release；收口中（loopback `no_proxy` FIX + DEFER-CL-ENV-*）；DEP-CL-07 待用户确认。B3-00 另轨。
+- **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---
 
@@ -224,7 +259,6 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260819`](plan-20260819.md) | M2-16A | #456 memory 模块正向移植到 R30 seam（审计已排除已删 Code SCC） | 无 | **未过**（r01–r37：**r37 同版雙 PASS 達成（2026-09-22，凍結 sha256 `4fbaf4bd…`）** — Codex P0/P1/P2=0、Claude P0/P1=0；實現門已開啟。殘餘 P2（不阻塞）：review log 輪次回填、`EX-M2-07` minor 重複計數（41→39）、`tests/INDEX.md` 20→22 描述刷新、未協商 minor 收斂規則 — 於 M2-16C 卡片修訂時一併處理） | **DEP-M2-ENV-01**：需已初始化 Libra checkout（`.libra/`）與 `.env.test`/`.env.live-test`；缺任一项即 `blocked` | ❌ 禁止开工（等双 PASS） |
 | [`plan-20260919`](plan-20260919.md) | GCX-02 | legacy 全局 config DB 首次使用自动迁移（锁+快照+校验+原子提交） | GCX-01（已 `done/complete`） | **本轮按操作者指示未评审** | DEP-GCX-02：与 plan-20260918 串行写 `COMPATIBILITY.md`/网站页（0918 未开工，写集 clean） | ✅ 已实现并本地验收（`locally-accepted`，未发布） |
 | [`plan-20260919`](plan-20260919.md) | GCX-04 | 用户级 hooks 文件路径对齐 XDG（macOS 只读回退，实现泛化到任何原生配置目录不同的平台） | GCX-01（已 `done`） | **本轮按操作者指示未评审** | DEP-GCX-01 不满足（本机无 `../libra-backend`），仅阻塞网站页；发布队列 GCX-02→GCX-03→GCX-04 | ✅ 已实现并本地验收（`locally-accepted`，未发布） |
-| [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal` 0.9.0 并引入 `object_format` 事实源 | 无 | **双评审已 PASS**（Grok R2 / Claude R40 / Codex R40） | 外部无；开工需 `cp .env.test.example .env.test` | ✅ |
 | [`plan-20260912`](plan-20260912.md) | MB-01 | 有界 mega2 tree transport 与 wire validation | 无 | **双评审已 PASS**（Codex R7 / Claude R5） | DEP-MB-01：mega2 `a1293686` tree API pin 现场重核（2026-09-21 已前推） | ✅ `done/complete`：v0.23.37（84f6bd8）；codeql + release.yml 8/8 jobs 全绿；CDN 产物 HTTP 200 |
 | [`plan-20260916`](plan-20260916.md) | CAP-01 | Agent Capture wire types、URL、uid、transport trait | 无 | **双评审已 PASS**（Codex R3 / Claude R3） | DEP-CAP-01：monoengine `2b8f365` capture HTTP pin 重核（ER-CAP-02） | ⚠️ 需重核 DEP-CAP-01 |
 | [`plan-20260924`](plan-20260924.md) | ACF-01 | Agent Capture validated ingress contract | `DEP-ACF-01`（來源/工作樹基線） | Claude R8 `VERDICT: PASS`（P0/P1/P2=0） | Entire `9c06bfb13` / Libra `c74813d` 比較 pin 與 shared files clean 須開工重核 | ⚠️ 需重核 DEP-ACF-01 |
@@ -234,9 +268,11 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260906`](plan-20260906.md) | SC-01 / SC-02（可并发） | SC-01 `base.yml` 最小权限加固；SC-02 会话入口 id 守卫 | 无 | **未定稿**（R2 PASS 已作废；R22 `FAIL`） | SC-04 受 DEP-SC-01/04/05/06；SC-07 受 DEP-SC-07 | ❌ 禁止开工 |
 | [`plan-20260902`](plan-20260902.md) | OG-00 | opencode 1.18.29 Hook/export 契约探测 | 无 | **未取得双 PASS**（Claude 限额，Codex 仍在 FAIL 循环） | 无（Phase 1 与 RG 六卡解耦） | ❌ 禁止开工 |
 | [`plan-20260911`](plan-20260911.md) | PI-01 | Repository-only `agent_kind=pi` migration | 无（DEP-PI-04 已满足：9/10 已收口） | **Claude Code 429 无 verdict，禁止开工** | DEP-PI-01/03 | ❌ 禁止开工 |
+| [`plan-20260925`](plan-20260925.md) | SCAP-01 | AgentTraces ingest 改调 `decide`。`v0.23.55` / `fa3849e` D 组全绿 | SCAP-02（登记已核对） | R9 双 `PASS` | 已收口 | `done`/`complete` |
+| [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal`（保持 `=0.10.2`）并引入 `object_format` 事实源 | 无 | **双评审已 PASS** | focused VER 绿；T-1 全量进行中 | `in-progress` |
 | [`issues/470`](issues/470.md) | FM-01 | 共享写入原语与 `restore` 系物化 | 无 | 尚未 Codex review | 关闭依赖 plan-20260918 FM-03/04（DEP-FM-06/07） | ❌ 禁止开工 |
 | [`issues/473`](issues/473.md) | IN-01 / IN-03 / IN-02 | 空模板自引用防护 / 存储路径前置检测 / 换格式 reinit fail-closed | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
-| [`issues/474`](issues/474.md) | CL-01 | fsck 断链检测与 shallow 豁免 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
+| [`issues/474`](issues/474.md) | CL-03 | 其余历史遍历尊重 shallow 边界 | CL-02 | **R6 `PASS`** | 无 | ✅ `locally-accepted`（C 组 `v0.23.49`） |
 | [`issues/475`](issues/475.md) | CF-02 / CF-01 | key/模式校验与退出码 / 带 value-pattern 的删除 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/476`](issues/476.md) | WT-03 | `init` 不再创建默认 `.libraignore` | DEP-WT-08、DEP-WT-05 | 用户 2026-09-20 覆盖：执行 Agent 自审 | DEP-WT-08（ADR-WT-04 用户评审）未满足 | ❌ 阻塞 |
 | [`issues/478`](issues/478.md) | LG-01 | `log`/`rev-list` `--grep` 模式类型与匹配范围 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
@@ -281,6 +317,9 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 ### 5.4 其它计划
 
+- plan-20260923: DEFER-CP-01 additional shells; DEFER-CP-02 network suggestions; DEFER-CP-03 unimplemented underlying capabilities. Existing local Libra capabilities may not be hidden by these deferrals.
+- plan-20260925：`DEFER-SCAP-01` 已按用户指示删除，ID 不再复用；`DEFER-SCAP-03` 不引入 Entire git phase；`DEFER-SCAP-04` 不改 `docs/development/tracing/agent.md`，也不向其它计划派发该文件。owner 的 SessionStart/TurnStart 豁免已经存在，本计划不改。
+
 - plan-20260830：`DEFER-SBX-06` 发布步延后（DEP-SBX-05 未就绪）。
 - plan-20260729：`DEFER-09`（CT3-07 转换轴）——已被 plan-20260825 TA-01/02 + plan-20260827 NP-00 承接关闭。
 - plan-20260819：`DEFER-M2-01..09`（含 `DEFER-M2-09`：AgentRun/session 终态适配，M2-16D 判定不可映射时启用）。
@@ -298,10 +337,19 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 |---|---|---|---|
 | DEP-ACF-MIRROR / DEP-ACF-CAP | Agent Capture 架構前置 | 0902/0904/0905/0911 production 卡與 0916 CAP-07 必須等待 plan-20260924 ACF-09 `done/complete`；只允許各鏡像明列的 audit/source/CAP HTTP 例外先行 | 生效；ACF-01..09 全部 `pending` |
 | DEP-ACF-DM06 / DEP-DM-06 | Agent session 語義契約 | 0923 DM-05 須等待 0924 ACF-02 的 `CTR-ACF-DM06-v1` provider/CLI integration tests + consumer gate，或回落等待 ACF-08 complete 後重核 terminal、explicit CLI resume、live reactivation、import reactivation | 生效；DM-05 目前 `pending` 且不得開工，排期時仍未滿足才轉 `blocked` |
+| DEP-CP-01 / DEP-CP-07 | External prerequisites | Authorized backend cf documentation access; isolated env/nextest/five-shell validation | Unverified; block applicable acceptance, no access inferred from plan |
+| DEP-CP-02 | File exclusion | Completion CLI edits join DEP-CLI-mirror reservations | Pending per-card reservation |
+| DEP-CP-03 | Read contract | Completion config reads must not trigger plan-20260919 migration | Pending read-only API and legacy-only fixture evidence |
+| DEP-CP-04 | Release/window exclusion | Respect plan-20260921 REL-VG-01 file reservation | Verify before intersecting edits, not only before version bump |
+| DEP-CP-05 | Contract/file exclusion | issues/476/478/480 command evolution and overlapping files | Refresh actual parameters and reserve conflicting files |
+| DEP-CP-06 | Agent read contract | plan-20260819 models and identity-scoped readers | Verify before CP-13..15; does not block static stage |
 | DEP-AD-12 / DEP-CLI-mirror | 跨计划写集互斥 | `src/cli.rs` 三态串行：plan-20260918 OI-05、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、issues/483 CO-03/04 | 生效；OI-05 开工前必须核对 |
 | DEP-GCX-02 | 跨计划写集互斥 | plan-20260919 与 plan-20260918 的 `COMPATIBILITY.md`/docs/网站页串行 | 生效 |
 | DEP-FL-04 | 跨计划前置 | plan-20260913 依赖 plan-20260907 完整收口 | plan-20260907 未启动 |
 | DEP-CC-05 | 跨计划前置 | plan-20260905 CC-02..06 依赖 plan-20260904 全部非延后卡完成 | plan-20260904 未启动 |
+| DEP-SCAP-01 | 跨计划前置 | 改变 AgentTraces ingest 的 state 字符串或 checkpoint 类别的卡，等待 plan-20260925 SCAP-01 `done`/`complete` 后改 `decide`。import 与 session stop/resume 不在此列 | SCAP-01 已 `done`/`complete`；后续采集卡可改 `decide` |
+| DEP-SCAP-03 | 跨计划写集 | OG-11、OG-05、CX-06、CX-28、CX-02、CX-07、CX-19、CX-09、CX-26、CC-02、CC-05、PI-04 在 SCAP-01 complete 前不得 in-progress | SCAP-01 已 `done`/`complete`；名单卡可开工（仍受各自计划门控） |
+| DEP-SCAP-04 | 跨计划写集互斥 | plan-20260925 SCAP-01 与 plan-20260907 B3-00 不得同时改 `runtime.rs`。SCAP-01 C 组落地后互斥放开 | SCAP-01 已收口；互斥解除 |
 | DEP-SBX-06 | 内部发布延后 | plan-20260830 SBX 发布步 | 未就绪 |
 | DEP-05 | 内部前置（已承接） | plan-20260822 v1-boundary runtime cutover（branch/sequencer/worktree repair/v1 op restore → v2 middleware）；由 OL-15A 承接，OL-15 依赖其完成 | PR #503 OL-15A 已完成 |
 | DEP-WT-09 | 跨计划前置 | issues/476 关闭依赖 plan-20260918 WT-05..07 完成 | plan-20260918 未到 WT |

@@ -22,8 +22,12 @@ one source ref and may map it to an exact local destination (`<src>:<dst>`). Whe
 explicit refspec is given, `remote.<name>.fetch` entries are honored; if none exist,
 all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
-Fetch supports SSH, HTTPS, local file, and `git://` transports. Vault-backed SSH keys
-are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
+Fetch supports SSH, HTTPS, local file, Git v2 bundle files, and `git://`
+transports. A remote URL that points at a bundle is re-read on every fetch
+(including `--prune` and `--dry-run`). When `remote.<name>.fetch` is
+`+refs/*:refs/*` (a `--mirror` clone), fetch updates those refs in place and
+`--prune` deletes mirrored refs the source no longer advertises. Vault-backed
+SSH keys are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
 
 ## Global Config Schema Guard
 
@@ -85,16 +89,20 @@ libra config set --add remote.origin.fetch \
   +refs/heads/*:refs/remotes/origin/*
 ```
 
-Explicit refspecs override configured mappings. `remote add -t` and `remote
+Explicit refspecs override configured mappings. A bare source such as `fetch origin dev`
+still downloads that ref and records it in `FETCH_HEAD`, but when `remote.<name>.fetch`
+is already set and does not map `dev`, no new remote-tracking branch is created
+(matching a single-branch clone; issues/474 CL-05). `remote add -t` and `remote
 set-branches` write concrete `remote.<name>.fetch` values that later fetches now enforce.
 Config variable names are case-insensitive, so spellings such as
 `remote.origin.Fetch` are honored. Destinations are currently limited to
-`refs/heads/*` and `refs/remotes/<remote>/*`; the reserved `HEAD` destination in
-either namespace, and every other namespace, fail before any write.
+`refs/heads/*` and `refs/remotes/<remote>/*` (reserved `HEAD` is refused);
+`+refs/*:refs/*` mirror refspecs also map other legal `refs/*` names.
 Multiple destination updates, their reflogs, and `refs/remotes/<name>/HEAD` are committed
 in one SQLite transaction; any rejected destination rolls back the complete ref update.
 Non-fast-forward updates require `+` on that mapping or `--force`. Fetching into the
-local branch checked out by any linked worktree is rejected. On a full fetch, a cached
+local branch checked out by any linked worktree is rejected (bare repositories with
+`core.bare=true` skip that check). On a full fetch, a cached
 remote HEAD is removed when the effective mapping no longer includes the remote's default
 source branch. Tag destinations remain controlled by `--tags` / `--no-tags`, not fetch
 refspec mappings.
@@ -116,7 +124,7 @@ libra config remote.origin.prune false  # but never for origin
 | `--no-tags` | Fetch no tags at all, not even tags reachable from fetched commits (overrides the default auto-follow). | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | Do not run a repacking/gc pass after fetching. Accepted no-op for Git parity: Libra's fetch never triggers an automatic gc, so there is nothing to disable. | `libra fetch origin --no-auto-gc` |
 | `--no-progress` | Do not show the progress meter (the "Receiving objects" spinner / remote progress) on stderr, matching `git fetch --no-progress`. | `libra fetch origin --no-progress` |
-| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` that are not live destinations of the effective configured refspec mapping. A one-off explicit refspec retains the configured mapped destinations, ordinary advertised scope, and its selected destination. Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched. With `--dry-run`, stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
+| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` that are not live destinations of the effective configured refspec mapping. On a `--mirror` remote (`+refs/*:refs/*`), delete mirrored refs the source no longer advertises (locked short names such as `main` are skipped). A one-off explicit refspec retains the configured mapped destinations, ordinary advertised scope, and its selected destination. Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched on a non-mirror fetch. With `--dry-run`, stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
 | `--no-prune` | Do not prune remote-tracking refs, overriding the `remote.<name>.prune` / `fetch.prune` config defaults (the built-in default is no pruning). `--prune`/`--no-prune` form a last-one-wins toggle: when both are given, the last on the command line wins (Git semantics). | `libra fetch origin --no-prune` |
 | `--notes` | Also import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from the remote over a dedicated side-channel. Default OFF (Git never auto-fetches notes). v1 travels notes only from a **local Libra source**; a network or plain-Git remote emits an honest "not supported yet" warning and imports no graph (deferred, D17). Import union-merges into any local edges and re-validates every endpoint, and is per-note fault-tolerant (a malformed note, or one whose commit is absent locally, is skipped with a warning, never aborting the fetch). Persist the opt-in per remote with `remote.<name>.fetchNotesDeps=true`. | `libra fetch origin --notes` |
 | `-f`, `--force` | Allow non-fast-forward updates and overwrite (clobber) a local tag that points elsewhere. Forced updates are marked `+` in `--porcelain` / `(forced update)` in human output. | `libra fetch origin --tags --force` |
@@ -185,6 +193,9 @@ so a typo never leaves a fetch with a zero or nonsensical timeout.
 
 `--depth <N>` is accepted only when the selected transport can return shallow
 boundary metadata. Local Git repositories and network Git remotes can do this.
+A local Git remote uses the same shortest-distance union as clone: a commit is
+a shallow boundary when a parent was not sent, or when a root sits exactly on
+the depth cutoff (issues/474 CL-04).
 Local Libra repositories cannot (the accepted end state — decision D20 in the
 development compatibility register), so `libra fetch <local-libra-remote>
 --depth <N>` fails before downloading objects or writing `.libra/shallow`,

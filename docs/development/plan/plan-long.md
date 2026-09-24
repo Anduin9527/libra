@@ -2,9 +2,9 @@
 
 ## 文档职责与维护协议
 
-本文是 Libra 不绑定具体发布日期和版本号的长期能力组合路线图。它回答「哪些能力值得长期投资、为什么、依赖什么、何时具备进入日期计划的条件」，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划或后续 RFC/ADR。上次审计基线为 2026-09-14（第十一次）；本轮只更新允许的审计快照与路线图状态。
+本文是 Libra 不绑定具体发布日期和版本号的长期能力组合路线图。它回答「哪些能力值得长期投资、为什么、依赖什么、何时具备进入日期计划的条件」，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划或后续 RFC/ADR。上次审计基线为 2026-09-17（第十二次）；本轮只更新允许的审计快照与路线图状态。
 
-**本次改版：2026-09-17（第十二次）竞品审计。** 审计机为 macOS（Darwin 26.6.2，`git 2.54.0`，`libra 0.22.45`），本轮以实际 `$LIBRA_REPO` / `$COMP_ROOT` 与 `SCRATCH=/Volumes/Data/competition/libra-competitor-audit-2026-09-17` 为准；第十、十一次的 Linux 机器路径（含 `/run/media/...`）只保留在历史记录。核心变化：快照更新为 44 个仓库（39 Git + 5 Libra 类型；crabbuild 五仓本地缺失，`Einsia/agent-git`、`akitaonrails/ai-memory`、`anomalyco/opencode` 首次纳入）；Libra 推进至 `v0.22.47`——SB-01 pkt-line 切片随 plan-20260901 收口，operation v2 restore/undo/redo 与 sidecar Change ID 模块合入（未发布），**LR-03 已排期→实施中、MEM-06 候选→已验证**。本轮无优先级（P 级）变化。
+**本次改版：2026-09-23（第十三次）竞品审计。** 审计机为 Linux（Ubuntu 24.04.5 LTS，`git 2.43.0`，`libra 0.23.48`），本轮以实际 `$LIBRA_REPO` / `$COMP_ROOT` 与 `SCRATCH=/media/eli/data/libra-competitor-audit-2026-09-23` 为准；第十二次 macOS 路径（`/Volumes/Data`）只保留在历史记录。核心变化：Libra 推进至 `v0.23.48`（**0.23.0 breaking 发布**移除 web/worker/`libra code`/Code 执行面，plan-20260920 closeout）；**LR-02 / LR-03 的 operation v2 与 sidecar Change ID 随 0.23.x 正式发布**；Code 时代 MCP 子系统移除、由确定性 `permission/` 权限引擎 + `sandbox` + `run_admission` 承接，**SB-02 生产信任边界显著落地**。快照为 42 个 Git 仓库（本机无 Libra 类型；crabbuild 五仓本地恢复，`Einsia/agent-git`、`akitaonrails/ai-memory`、`anomalyco/opencode`、`cursor/agent-trace`、`agenta-ai/agenta`、`entireio/cli-checkpoints`、`entireio/git-sync` 本轮本地缺失）。Memory（MEM-01..06）仍零实现。本轮无优先级（P 级）变化、无新增编号。
 
 > **产品状态校正（2026-09-23，优先于下方历史审计快照）：** `plan-20260715`、`plan-20260824`、`plan-20260825` 保留为历史完成/发布证据；其 `libra code`、Web Code UI、内部 AgentRuntime、内建 provider/control/MCP/usage 等产品面已由 [`plan-20260920.md`](plan-20260920.md) 拆除，不得作为现行能力或重启前置。当前 B 类路线只保留外部 Agent 观测、traces、hooks、bridge、review/investigate 只读运行与可追溯协作；任何旧审计段落、图表或完成证据若仍用现在时描述 Code，均按本段解释为历史事实。通用 WIO 与测试并行度成果继续有效，但新工作必须另立基于当前架构的日期计划。
 
@@ -40,91 +40,87 @@
 
 ## 本次竞品审计快照
 
-审计时间：**2026-09-17（第十二次）**。审计机：macOS（Darwin 26.6.2），`git 2.54.0`，`libra 0.22.45`；Libra 主仓 `/Volumes/Data/GitMono/libra`（HEAD `9da06b4bf700472781c2e76ec48e96815475caf3`，最新 tag `v0.22.47`），竞品根 `/Volumes/Data/competition`。范围严格限定为竞品根下直接两层仓库（**44 个：39 Git + 5 Libra 类型**；本轮无空一级目录）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时按本轮执行 `git fetch --prune` + `git merge --ff-only @{u}` 两步更新；Libra 类型竞品按 `libra pull --ff-only` 更新。本轮 15 个 fast-forward、15 个已是最新、14 个 blocked（10 `blocked-forced-update`、2 `blocked-network`（agenta、agent-trace）、1 `blocked-shallow`（cursor/cursor）、1 `blocked-local-ahead`（ledgermind，上游再次改写））。第十、十一轮在 Linux 机器执行；本机 clone 对 jj、gitbutler、dolt、git-ai 落后于其审计 revision 且被 forced-update 阻塞，这些仓本轮增量记 0（增量已由第 9–11 轮覆盖）；lore、letta-code、go-git 的本地 HEAD 在本轮前已领先其审计 revision（+14/+15/+9，本轮已按当前判据审读，标「未证明远端最新」）。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。仓库身份按规范化 remote 键匹配、目录名只作展示；集合变动见下附表。scratch 目录为 `/Volumes/Data/competition/libra-competitor-audit-2026-09-17`。
-上次快照：2026-09-14（第十一次）；本轮对照其 revision 增量，并以当前 checkout 的 Libra 代码、测试、文档与发布 tag 为事实源。
+审计时间：**2026-09-23（第十三次）**。审计机：Linux（Ubuntu 24.04.5 LTS），`git 2.43.0`，`libra 0.23.48`；Libra 主仓 `/media/eli/data/libra`（HEAD `c590840cfe3330d47db829f7b5c17bc244d0e600`，最新 tag `v0.23.48`，工作树 clean），竞品根 `/media/eli/data/competition`。范围严格限定为竞品根下直接两层仓库（**42 个 Git 仓库**，本机无 Libra 类型；`cursor/` 为唯一空一级目录）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时按本轮执行 `git fetch --prune` + `git merge --ff-only @{u}` 两步更新；本机无 Libra 类型竞品。本轮 8 个 fast-forward、18 个 up-to-date、16 个 blocked（14 `blocked-dirty`、2 `blocked-timeout`（lore、fava-trails））；ctx-open / dolt / go-git 本轮被 forced-update 阻塞（增量记 0 或按本地 revision 只读核对），sapling / deepseek / memorax / ledgermind 的上次审计 revision 不在本机历史（按「沿用」处理，标「可能过期」）。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。仓库身份按规范化 remote 键匹配、目录名只作展示；集合变动见下附表。scratch 目录为 `/media/eli/data/libra-competitor-audit-2026-09-23`。
+上次快照：2026-09-17（第十二次）；本轮对照其 revision 增量，并以当前 checkout 的 Libra 代码、测试、文档与发布 tag 为事实源。
 
 | 竞品（目录） | remote | 类型 | 归类 | 分支 | 上次 revision | 审计 revision | 更新结果 | 增量/覆盖 | 证据入口（≤80 字） |
 |---|---|---|---|---|---|---|---|---|---|
-| `facebook/sapling` | facebook/sapling | Git | 版本管理 | `main` | `8395cae28` | `f79bbabcc` | **fast-forward** | +458 / 层3 抽样（热区100%、主题<30%，未声称全量） | 崩溃重启陈旧 inode 元数据 `a3b03945ae9`（E2）；FUSE killpriv v2；pushrebase 冲突预计算 |
-| `jj-vcs/jj` | jj-vcs/jj | Git | 版本管理 | `main` | `c09b0c337` | `efe0cf178`（本地落后） | **blocked-forced-update** | +0 / 沿用（9–11 轮已覆盖） | immutable_heads 纳入 untracked remote tags `efe0cf178`（E2，上轮账本关闭） |
-| `GitButler/gitbutler` | gitbutlerapp/gitbutler | Git | 版本管理 | `master` | `32dd13413` | `6446b0662`（本地落后） | **blocked-forced-update** | +0 / 沿用（9–11 轮已覆盖） | reorder 单分支 tip 修复 `62c064e61f`（E2，上轮账本关闭） |
-| `GitButler/grit` | gitbutlerapp/grit | Git | 版本管理 | `main` | `dfb079967` | `dfb079967` | up-to-date | +0 / 沿用 | 上游 Git 套件兼容治理（CT-01 参照） |
-| `epicgames/lore` | epicgames/lore | Git | 版本管理 | `main` | `82dcce98e` | `fa606b087`（未证明远端最新） | **blocked-forced-update** | +14 / 层1，主题 100% | 拒绝同仓重叠 link 挂载 `a03a32a`（E2）；shutdown 后调用显式失败 `7ccb6a1`（E2）；JWT issuer 轮换 |
-| `git/git` | git/git | Git | 版本管理（参考基线） | `master` | `1630431f` | `47ce80527c` | **blocked-forced-update** | +58 / 层2，主题 100% | MIDX 引用已删 pack 的恢复 `8f909ff4e9`（E2）；worktree_basename 越界读 `997c1daf1d`（E2） |
-| `go-git/go-git` | go-git/go-git | Git | 版本管理（架构参考） | `main` | `52f84ef3e` | `e9e5820fe`（未证明远端最新） | **blocked-forced-update** | +9 / 层1，主题 100% | HTTP 传输 redirect 源校验/nil hop fail-closed `c9b1dc59`+`877a8f43`（E2） |
-| `go-git/go-billy` | go-git/go-billy | Git | 版本管理（架构参考） | `main` | `7bd0594` | `7bd0594` | **blocked-forced-update** | +0 / 沿用 | FS 抽象与 capability |
+| `facebook/sapling` | facebook/sapling | Git | 版本管理 | `main` | `f79bbabcc` | `85572b5c9`（上次 rev 不在本机历史） | **blocked-dirty** | +0 / 沿用（可能过期） | 崩溃重启陈旧 inode 元数据 `a3b03945ae9`（E2）；增量未重审 |
+| `jj-vcs/jj` | jj-vcs/jj | Git | 版本管理 | `main` | `efe0cf178` | `c09b0c337` | **blocked-dirty** | +9 / 层1，主题 100% | gerrit trailer 分歧告警 `08a18f450`（E1）；immutable_heads 沿用（E2） |
+| `gitbutlerapp/gitbutler` | gitbutlerapp/gitbutler | Git | 版本管理 | `master` | `6446b0662` | `32dd13413`（本地落后） | **blocked-dirty** | +0 / 沿用（9–12 轮已覆盖） | 未提交区 ID `zz`→`@` `a15c348f5b`+`4277c2345d`（E2，沿用） |
+| `gitbutlerapp/grit` | gitbutlerapp/grit | Git | 版本管理 | `main` | `dfb079967` | `dfb079967` | up-to-date | +0 / 沿用 | 上游 Git 套件兼容治理（CT-01 参照） |
+| `epicgames/lore` | epicgames/lore | Git | 版本管理 | `main` | `fa606b087` | `074eb0b0d` | **blocked-timeout** | +49 / 层1，主题 100% | 服务端 authorizer 分层 `94c6b2d`/`b421b20`/`657e05e`（E2）；缺 issuer/audience fail-closed `94c6b2d` |
+| `git/git` | git/git | Git | 版本管理（参考基线） | `master` | `47ce80527c` | `47ce80527c` | up-to-date | +0 / 沿用 | MIDX 引用已删 pack 恢复 `8f909ff4e9`（E2）；worktree_basename 越界 `997c1daf1d`（E2） |
+| `go-git/go-git` | go-git/go-git | Git | 版本管理（架构参考） | `main` | `e9e5820fe` | `29c4ef62f` | **blocked-forced-update** | +63 / 层1，主题 100% | 凭据按 origin/path 作用域 `7e5dcac9`+`21f75ab5`（E2）；URL 脱敏/界读 `5fa363d7`+`095ec9a3`（E2） |
+| `go-git/go-billy` | go-git/go-billy | Git | 版本管理（架构参考） | `main` | `7bd0594` | `7bd0594` | up-to-date | +0 / 沿用 | FS 抽象与 capability |
 | `entireio/forgemark` | entireio/forgemark | Git | 版本管理（协作参考） | `main` | `47f57bf` | `47f57bf` | up-to-date | +0 / 沿用 | Forge metadata |
-| `dolthub/dolt` | dolthub/dolt | Git | 版本管理（相邻） | `main` | `3ca268096` | `a8f5de154`（本地落后） | **blocked-forced-update** | +0 / 沿用（9–11 轮已覆盖） | prolly key 带外 GC 数据丢失（E2，沿用）；submodule 未更新 |
+| `dolthub/dolt` | dolthub/dolt | Git | 版本管理（相邻） | `main` | `a8f5de154` | `3ca268096`（本地落后） | **blocked-forced-update** | +0 / 沿用（9–12 轮已覆盖） | malformed adaptive value 报错 `d4a9c7624b`（E2，沿用）；submodule 未更新 |
 | `lorevcs/lore` | lorevcs/lore | Git | 版本管理（相邻） | `main` | `1fd2ea9` | `1fd2ea9` | up-to-date | +0 / 沿用 | intent 记录（单人项目） |
-| `nervosys/Lit` | nervosys/lit | Git | 版本管理（相邻） | `master` | `a930e44` | `a930e44` | up-to-date | +0 / 沿用 | CHANGELOG 1.6.0 加密声明未验证反例（沿用） |
-| `treeverse/lakeFS` | treeverse/lakefs | Git | 版本管理（相邻） | `master` | `4bb11638e` | `4bb11638e` | up-to-date | +0 / 沿用 | GHSA-gf2q-q6wc-x7fm（E3 沿用） |
-| `walgit/walgit` | tobi/walgit | Git | 版本管理（相邻） | `main` | `6d8fa54ba` | `80e9a20b2` | **fast-forward** | +39 / 层2，主题 100% | 退役前可达性守恒证明 `bf65c01`（E2）；空 pack push tips 校验 `d5e75ca`（E2）；OIDC 显式 issuer `202ebcc`（E1） |
-| `git-ai-project/git-ai` | git-ai-project/git-ai | Git | Agent 生成代码（相邻） | `main` | `f8e39c2c8` | `6fbc1ef0f`（本地落后） | **blocked-forced-update** | +0 / 沿用（9–11 轮已覆盖） | codex checkpoint 按 rollout 文件名键控 `7ace11b09`（E2，上轮账本关闭）；submodule 未更新 |
-| `xai-org/grok-build` | xai-org/grok-build | Git | Agent 生成代码 | `main` | `72a61251` | `482711333` | **fast-forward** | +3 / 层1，主题 100% | fast-worktree GC 集成测试 `37949780`（E2）；ACP line reader 收敛 |
-| `getcursor/cursor` | getcursor/cursor | Git | Agent 生成代码（相邻） | `main` | `654b1b4` | `654b1b4` | **blocked-shallow** | +0 / 沿用 | issue 信号源，无产品源码 |
+| `nervosys/Lit` | nervosys/lit | Git | 版本管理（相邻） | `master` | `a930e44` | `a930e44` | up-to-date | +0 / 沿用 | CHANGELOG 1.6.0 加密声明未验证反例（沿用）；`--trusted-proxy` `705981f`（E1） |
+| `treeverse/lakeFS` | treeverse/lakefs | Git | 版本管理（相邻） | `master` | `4bb11638e` | `4bb11638e` | up-to-date | +0 / 沿用 | GHSA-gf2q-q6wc-x7fm（E3 沿用）；移除 pluggable IAM `31663066a` |
+| `walgit/walgit` | tobi/walgit | Git | 版本管理（相邻） | `main` | `80e9a20b2` | `80e9a20b2` | up-to-date | +0 / 沿用 | 退役前可达性守恒证明 `bf65c01`（E2，沿用） |
+| `git-ai-project/git-ai` | git-ai-project/git-ai | Git | Agent 生成代码（相邻） | `main` | `6fbc1ef0f` | `f8e39c2c8`（本地落后） | **blocked-dirty** | +0 / 沿用（9–12 轮已覆盖） | 遥测/计费面 `5e56e8942`+`120f6ded5`（不采纳）；submodule 未更新 |
+| `xai-org/grok-build` | xai-org/grok-build | Git | Agent 生成代码 | `main` | `482711333` | `37949780`（本地领先） | **fast-forward** | +3 / 层1，主题 100% | monorepo sync；无新结论 |
+| `getcursor/cursor` | getcursor/cursor | Git | Agent 生成代码（相邻） | `main` | `654b1b4` | `654b1b4` | up-to-date | +0 / 沿用 | issue 信号源，无产品源码 |
 | `mainline-org/mainline` | mainline-org/mainline | Git | Agent 生成代码 | `main` | `5704305` | `5704305` | up-to-date | +0 / 沿用 | intent seal、preflight、hook 预算 |
-| `StepzeroLab/research-git` | stepzerolab/research-git | Libra | Agent 生成代码 | `main` | `62bcdf5` | `62bcdf5` | up-to-date（类型 Git→Libra） | +0 / 沿用 | Feature Capsule、recall/compose；LLM 承担 reapply 非确定性算法 |
-| `letta-ai/letta-code` | letta-ai/letta-code | Git | Agent 生成代码 | `main` | `e356d4068` | `1b5290bb9`（未证明远端最新） | **blocked-forced-update** | +15 / 层1，主题 100% | 慢 Bash 自动后台化并在完成时通知 `feb32e33`（E2）；in-flight 检索合并 |
-| `letta-ai/letta-agent-sdk` | letta-ai/letta-agent-sdk | Git | Agent 生成代码 | `main` | `9ae7b8792` | `9c8e854d9` | **fast-forward** | +11 / 层1，主题 100% | 保留 ephemeral worker lineage 与身份 `628bbc7`（E2） |
+| `StepzeroLab/research-git` | stepzerolab/research-git | Git | Agent 生成代码（类型变化：Libra→Git） | `main` | `62bcdf5` | `62bcdf5` | up-to-date（类型 Libra→Git） | +0 / 沿用 | Feature Capsule、recall/compose；LLM 承担 reapply 非确定性算法 |
+| `letta-ai/letta-code` | letta-ai/letta-code | Git | Agent 生成代码 | `main` | `1b5290bb9` | `1d506973`（未证明远端最新） | **blocked-dirty** | +107 / 层1，主题 100% | MemFS v2 预算强制 `170a6d19`（E2）；secrets 独立 endpoint `7fe0ea3f`（E2） |
+| `letta-ai/letta-agent-sdk` | letta-ai/letta-agent-sdk | Git | Agent 生成代码 | `main` | `9c8e854d9` | `f45ddfe2` | **fast-forward** | +5 / 层1，主题 100% | 保留 ephemeral worker lineage 与身份 `628bbc7`（E2，沿用） |
 | `letta-ai/trajectory` | letta-ai/trajectory | Git | Agent 生成代码 | `main` | `21ae92d` | `21ae92d` | up-to-date | +0 / 沿用 | transcript 归一化 |
-| `letta-ai/skills` | letta-ai/skills | Git | Agent 生成代码 | `main` | `16352df` | `b03323bfe` | **fast-forward** | +1 / 层1，主题 100% | 移除 letta-api-client skill（提示词仓，§1.3 排除路径） |
+| `letta-ai/skills` | letta-ai/skills | Git | Agent 生成代码 | `main` | `b03323bfe` | `b03323bfe` | up-to-date | +0 / 沿用 | 提示词仓（§1.3 排除路径） |
 | `letta-ai/agent-file` | letta-ai/agent-file | Git | Agent 生成代码 | `main` | `78212eb` | `78212eb` | up-to-date | +0 / 沿用 | `.af` 可移植格式 |
-| `anomalyco/opencode` | anomalyco/opencode | Git | Agent 生成代码（相邻，首次纳入） | `dev` | —（首次纳入） | `bbd72fb8b0` | **blocked-forced-update** | 窗口 90 天（1501 条）/ 层3 抽样 | 权限拒绝后停止 run `709af586`（E2）；home 相对权限路径展开 `fd9ee435`（E2） |
-| `deepseek-ai/deepseek-harness` | deepseek-ai/deepseek-harness | Git | Agent 生成代码（相邻） | `master` | `76fda7297` | `0d1f50007` | **fast-forward** | +1488 / 层3 抽样（热区100%、PR 标题抽样，未声称全量） | `SESSION_FORMAT_VERSION` 0→3（bridge 事件面未变，E2）；persistence format history 文档化 |
-| `diegoxtr/ctx-open` | diegoxtr/ctx-open | Git | Memory（相邻） | `main` | `862e12b` | `862e12b` | up-to-date | +0 / 沿用 | 认知对象版本化（source-available，概念参考） |
-| `memorax-ai/memorax-code` | memorax-ai/memorax-code | Git | Memory（相邻） | `main` | `acd6f1614` | `0e56e9a07` | **fast-forward** | +96 / 层2，主题 100% | cwd-less scope 迁移校验 `0a47119`（E2）；适配 session format 3 `abc98ac`（E2）；自动更新恢复仍无验签 |
-| `rekal-dev/rekal-cli` | rekal-dev/rekal-cli | Git | Memory | `main` | `aace7a29` | `4550e602e` | **fast-forward** | +3 / 层1，主题 100% | 安装器版本解析去 GitHub API 依赖；无新结论 |
+| `deepseek-ai/deepseek-harness` | deepseek-ai/deepseek-harness | Git | Agent 生成代码（相邻） | `master` | `0d1f50007` | `c291e7961`（上次 rev 不在本机历史） | **blocked-dirty** | +0 / 沿用（可能过期） | `SESSION_FORMAT_VERSION` 事件面未变（bridge 按方法分发，沿用 E2） |
+| `diegoxtr/ctx-open` | diegoxtr/ctx-open | Git | Memory（相邻） | `main` | `862e12b` | `862e12b` | **blocked-forced-update** | +0 / 沿用 | 认知对象版本化（source-available，概念参考） |
+| `memorax-ai/memorax-code` | memorax-ai/memorax-code | Git | Memory（相邻） | `main` | `0e56e9a07` | `1525c20f`（上次 rev 不在本机历史） | **blocked-dirty** | +0 / 沿用（可能过期） | cwd-less scope 迁移校验 `0a47119`（E2，沿用）；自动更新无验签 |
+| `rekal-dev/rekal-cli` | rekal-dev/rekal-cli | Git | Memory | `main` | `4550e602e` | `4550e602e` | up-to-date | +0 / 沿用 | 写前 secret 脱敏/home 匿名化（沿用） |
 | `rohitg00/agentmemory` | rohitg00/agentmemory | Git | Memory | `main` | `e04ba88` | `e04ba88` | up-to-date | +0 / 沿用 | 四层记忆、混合检索（主要证据源） |
-| `MachineWisdomAI/fava-trails` | machinewisdomai/fava-trails | Git | Memory | `main` | `6653f9f` | `10f689f74` | **fast-forward** | +69 / 层2，主题 100% | 持久化前拒绝明显秘密 `c91d644`（E2）；深嵌套 fail closed `094af6b`（E2）；紧凑 MCP 面 |
-| `ruvnet/agentic-flow` | ruvnet/agentic-flow | Git | Memory | `main` | `d3735a3` | `e993605b8` | **fast-forward** | +9 / 层1，主题 100% | jj bookmark 迁移修复；无新结论；submodule 未更新 |
+| `MachineWisdomAI/fava-trails` | machinewisdomai/fava-trails | Git | Memory | `main` | `10f689f74` | `10f689f74` | **blocked-timeout** | +0 / 沿用 | 持久化前拒绝明显秘密 `c91d644`（E2，沿用） |
+| `ruvnet/agentic-flow` | ruvnet/agentic-flow | Git | Memory | `main` | `e993605b8` | `d3735a3`（本地落后） | **fast-forward** | +0 / 沿用 | jj bookmark 迁移修复；无新结论；submodule 未更新 |
 | `graphwisdom/perstate` | graphwisdom/perstate | Git | Memory | `master` | `95e27e3` | `95e27e3` | up-to-date | +0 / 沿用 | 反例：push+rebase 重试非并发安全模型 |
-| `matrixorigin/Memoria` | matrixorigin/memoria | Git | Memory | `main` | `627934261` | `689f3f9ba` | **fast-forward** | +7 / 层1，主题 100% | 跨 schema 版本恢复保全数据 `a2e1e25`（E2）；owner-scoped master authority |
+| `matrixorigin/Memoria` | matrixorigin/memoria | Git | Memory | `main` | `689f3f9ba` | `689f3f9ba` | **fast-forward** | +2 / 层1，主题 100% | MCP 控制通知接受 `9962999`（E1→待验证）；storage compat `54566bc` |
 | `sachinsharma9780/memweave` | sachinsharma9780/memweave | Git | Memory | `main` | `2ff82df` | `2ff82df` | up-to-date | +0 / 沿用 | Markdown+SQLite 索引 |
-| `sl4m3/ledgermind` | sl4m3/ledgermind | Git | Memory（反例） | `main` | `99220d1`（本地） | `99220d1` | **blocked-local-ahead** | +0 / 上游再次改写 | 仍只当宣传材料（第 11 轮所见 4d7d35621 不在本机） |
+| `sl4m3/ledgermind` | sl4m3/ledgermind | Git | Memory（反例） | `main` | `99220d1`（本地） | `7e05e8db`（上游再次改写） | **fast-forward** | +0 / 上游再次改写 | 仍只当宣传材料（上次 rev 不在本机历史） |
 | `sqliteai/sqlite-memory` | sqliteai/sqlite-memory | Git | Memory | `main` | `0f0aede` | `0f0aede` | up-to-date | +0 / 沿用 | submodule 未更新；SQLite 混合检索 |
-| `Einsia/agent-git` | einsia/agent-git | Git | 版本管理（相邻，首次纳入；网页型转本地） | `main` | —（首次纳入） | `531bfcec0` | **fast-forward** | +24（总 168，首提交 2026-09-01）/ 层1，主题 100% | 会话观察落库前秘密保护 `8e222bc`（E2）；历史快照读隔离 `25acb65`（E2）；MIT |
-| `akitaonrails/ai-memory` | akitaonrails/ai-memory | Git | Memory（首次纳入） | `main` | —（首次纳入） | `a200127c5` | **fast-forward** | 窗口 200 条（总 1846，首提交 2026-05-21）/ 层2 抽样 | 跨 Agent 记忆（Rust）：hook 载荷 JSON 转义修复及 no-op 回归 `2be13836`+`c83076b3`（E2）；跨项目 inbox/queue `74bd791c`（E3，随 v2.3.0 发布） |
-| `cursor/agent-trace` | cursor/agent-trace | Git | Agent 生成代码（相邻，本地恢复） | `main` | `2754f07` | `2754f07` | **blocked-network** | +0 / 沿用 | 归因互操作格式（RFC 未复核，沿用） |
-| `entireio/cli` | github.com/entireio/cli | Libra | 版本管理（相邻，本地恢复） | `main` | 7d16639e（不在本地历史） | `ad42643a9` | **fast-forward**（基线重置） | 切片 435 / 层3 抽样 | secret patterns 在 git 失败时 fail closed `c8a8d16`（E1）；checkpoint push 拒因上浮 |
-| `entireio/cli-checkpoints` | github.com/entireio/cli-checkpoints | Libra | 版本管理（相邻，本地恢复） | `entire/checkpoints/v1` | `0204a02` | `0204a02` | up-to-date | +0 / 沿用 | refs checkpoint（沿用第 9 轮分析） |
-| `entireio/git-sync` | github.com/entireio/git-sync | Libra | 版本管理（相邻，本地恢复） | `main` | 3ee99835（不在本地历史） | `013012ac8` | **fast-forward**（基线重置） | +14 / 层1，主题 100% | bootstrap marker 按 branch 作用域收敛（E1）；沿用 pack relay 分析 |
-| `agenta-ai/agenta` | github.com/agenta-ai/agenta | Libra | 相邻参考（本地恢复） | `main` | `53717db` | `53717db` | **blocked-network** | +0 / 沿用 | prompt/workflow 版本化（沿用第 9 轮分析） |
+| `crabbuild/compass` | crabbuild/compass | Git | 版本管理（相邻，本地恢复） | `main` | —（本地恢复） | `5a9081f93` | up-to-date | +0 / 沿用 | 只读结构查询/CompassQL（README 沿用，不作实现证据） |
+| `crabbuild/crab` | crabbuild/crab | Git | 版本管理（相邻，本地恢复） | `main` | —（本地恢复） | `77a9dc868` | **blocked-dirty** | +0 / 沿用 | 大文件分块/对象存储（README 沿用） |
+| `crabbuild/prolly` | crabbuild/prolly | Git | 版本管理（相邻，本地恢复） | `main` | —（本地恢复） | `6ee959eae` | up-to-date | +0 / 沿用 | 不可变有序 KV 结构库（README 沿用） |
+| `crabbuild/silo` | crabbuild/silo | Git | 版本管理（相邻，本地恢复） | `main` | —（本地恢复） | `7f71a06b0` | up-to-date | +0 / 沿用 | 对象版本账本（README 沿用，作 SB-03/LR-02/09 参考） |
+| `crabbuild/trail` | crabbuild/trail | Git | 版本管理（相邻，本地恢复） | `main` | —（本地恢复） | `9823ed755` | up-to-date | +0 / 沿用 | Git 旁路 operation 账本（README 沿用，作 LR-01/02/07 参考） |
+| `entireio/cli` | entireio/cli | Git | 版本管理（相邻，本地恢复） | `main` | —（快照 Libra→Git 类型变化） | `9c06bfb1` | up-to-date | +0 / 沿用 | secret patterns fail-closed `c8a8d16`（E1，沿用）；类型 Libra→Git |
 
 | 变动类型 | 仓库（目录） | 上次 revision / 当前 HEAD | 说明 |
 |---|---|---|---|
-| 本地缺失 | `crabbuild/compass` | 5a9081f93 / — | 本地缺失（第 11 轮 5a9081f93；上游状态未验证），差距矩阵参照标「沿用（本地缺失）」 |
-| 本地缺失 | `crabbuild/crab` | 77a9dc868 / — | 本地缺失（第 11 轮 77a9dc868；上游状态未验证） |
-| 本地缺失 | `crabbuild/prolly` | 6ee959eae / — | 本地缺失（第 11 轮 6ee959eae；上游状态未验证） |
-| 本地缺失 | `crabbuild/silo` | 7f71a06b0 / — | 本地缺失（第 11 轮 7f71a06b0；上游状态未验证） |
-| 本地缺失 | `crabbuild/trail` | 9823ed755 / — | 本地缺失（第 11 轮 9823ed755；上游状态未验证） |
-| 目录改名 | `tobi/walgit` → `walgit/walgit` | 6d8fa54ba / 80e9a20b2 | 仅目录名；remote 键 tobi/walgit 一致 |
-| 目录改名 | `gitbutlerapp/gitbutler` → `GitButler/gitbutler` | 32dd13413 / 6446b0662 | 仅目录名（第 10 轮反向改名的回摆） |
-| 目录改名 | `gitbutlerapp/grit` → `GitButler/grit` | dfb079967 / dfb079967 | 仅目录名 |
-| 目录改名 | `mainline-org/mainline` → `mainline/mainline` | 5704305 / 5704305 | 仅目录名 |
-| 目录改名 | `EpicGames/lore` → `epicgames/lore` | 82dcce98e / fa606b087 | 仅大小写回摆 |
-| 目录改名 | `getcursor/cursor` → `cursor/cursor` | 654b1b4 / 654b1b4 | 仅目录名 |
-| 首次纳入 | `Einsia/agent-git` | — / 531bfcec0 | 网页型竞品转本地（§1.5 路径）：MIT；总 168 提交、首提交 2026-09-01；窗口=全部 168 条中本轮抽读近期主题，网页结论不继承 |
-| 首次纳入 | `akitaonrails/ai-memory` | — / a200127c5 | MIT；总 1846 提交、首提交 2026-05-21；窗口=最近 200 条，主题抽样 |
-| 首次纳入 | `anomalyco/opencode` | — / bbd72fb8b0 | 无 LICENSE 文件（仓库无产品级 LICENSE 标注）；总 15680 提交、首提交 2025-03-21；窗口=最近 90 天 1501 条，层 3 抽样 |
-| 类型变化 | `StepzeroLab/research-git` | 62bcdf5 / 62bcdf5 | 类型 Git→Libra（恢复第 9 轮形态）；revision 未变，仍可作增量基线 |
-| 本地恢复 | `agenta-ai/agenta` | 53717db / 53717db | 第 10–11 轮本地缺失后恢复；Libra 类型 clone，revision 与第 9 轮一致；本轮 `libra pull` blocked-network |
-| 本地恢复 | `entireio/cli` | 7d16639e / ad42643a9 | 第 10–11 轮本地缺失后恢复；Libra 类型 clone；上次 revision 不在本地历史（基线重置），以 `61dac01..ad42643a9` 切片兜底 |
-| 本地恢复 | `entireio/cli-checkpoints` | 0204a02 / 0204a02 | 第 10–11 轮本地缺失后恢复；Libra 类型 clone，revision 与第 9 轮一致 |
-| 本地恢复 | `entireio/git-sync` | 3ee99835 / 013012ac8 | 第 10–11 轮本地缺失后恢复；Libra 类型 clone；上次 revision 不在本地历史（基线重置），以 `5270fb0..013012ac8` 切片兜底 |
-| 本地恢复 | `cursor/agent-trace` | 2754f07 / 2754f07 | 第 10–11 轮本地缺失后恢复；Git 类型，revision 未变；本轮 fetch blocked-network |
+| 本地缺失 | `Einsia/agent-git` | 531bfcec0 / — | 本地缺失（第 12 轮 531bfcec0；上游状态未验证），差距矩阵参照标「沿用（本地缺失）」 |
+| 本地缺失 | `akitaonrails/ai-memory` | a200127c5 / — | 本地缺失（第 12 轮 a200127c5；上游状态未验证）；MEM-06 主要证据沿用在案 |
+| 本地缺失 | `anomalyco/opencode` | bbd72fb8b0 / — | 本地缺失（第 12 轮 bbd72fb8b0；上游状态未验证）；SB-02 权限证据沿用在案 |
+| 本地缺失 | `cursor/agent-trace` | 2754f07 / — | 本地缺失（第 12 轮 2754f07；上游状态未验证）；AG-ATTR 参照沿用在案 |
+| 本地缺失 | `agenta-ai/agenta` | 53717db / — | 本地缺失（第 12 轮 53717db；上游状态未验证） |
+| 本地缺失 | `entireio/cli-checkpoints` | 0204a02 / — | 本地缺失（第 12 轮 0204a02；上游状态未验证） |
+| 本地缺失 | `entireio/git-sync` | 013012ac8 / — | 本地缺失（第 12 轮 013012ac8；上游状态未验证） |
+| 本地恢复 | `crabbuild/compass` | — / 5a9081f93 | 第 12 轮本地缺失，本机已克隆恢复；Git 类型，revision 与第 12 轮记录一致 |
+| 本地恢复 | `crabbuild/crab` | — / 77a9dc868 | 同上恢复；Git 类型 |
+| 本地恢复 | `crabbuild/prolly` | — / 6ee959eae | 同上恢复；Git 类型 |
+| 本地恢复 | `crabbuild/silo` | — / 7f71a06b0 | 同上恢复；Git 类型 |
+| 本地恢复 | `crabbuild/trail` | — / 9823ed755 | 同上恢复；Git 类型 |
+| 本地恢复 | `entireio/cli` | — / 9c06bfb1 | 第 12 轮为 Libra 类型（ad42643a9），本机恢复为 Git 类型 clone（类型变化 Libra→Git）；revision 供下轮 |
+| 类型变化 | `StepzeroLab/research-git` | 62bcdf5 / 62bcdf5 | 类型 Libra→Git（本机为 Git clone）；revision 未变，仍可作增量基线 |
+| 空目录或普通目录 | `cursor/` | — / — | 空一级目录，不计入总数 |
 
 待验证账本索引（E1；全量在 `$SCRATCH/pending.tsv`）：
 
 | 关联编号 | repo@sha | 最小验证步骤 |
 |---|---|---|
 | SB-04 | deepseek@0d1f50007 | 比对 `packages/core/session/src/types.ts` SessionEvent 字段与 bridge ingress 解析面，确认外部宿主生命周期兼容性 |
-| SB-02 | walgit@202ebcc | 读 OIDC 显式 issuer diff，确认是否有测试与失败路径 |
-| LR-05 | sapling@fcfb7acf06a | 读 pushrebase 冲突预计算 diff，判是否可作 LR-05 判据 |
-| SB-01 | go-git@c9b1dc59 | 读 nil hop fail-closed diff 与同系列测试归属 |
-| MEM-04 | fava@6527b6c | 读紧凑 MCP 面的 tool 清单与 session-init 测量实现 |
+| SB-02 | lore@94c6b2d | 读 server 缺 issuer/audience fail-closed 启动 validation 的 diff 与测试归属 |
+| SB-01 | lore@b90d1ed | 读 `auth/jwk.rs:125` JWKS_MAX_RESPONSE_BYTES 界读实现与超界测试 |
+| SB-02 | go-git@21f75ab5 | 读「query 当凭据/按 path 作用域」diff 与同目录测试归属 |
+| MEM-01 | letta-code@170a6d19 | 读 MemFS v2 默认预算强制实现，判是否可直接作判据 |
+| MEM-06 | letta-code@ec48fd6d | 读 SendAgentMessage 与子 agent listener 面，判与 MEM-06 协调的对应程度 |
+| MEM-03 | Memoria@9962999 | 读 MCP 控制通知接受实现与错误账务测试 |
 
 | 审计日期 | 仓库数 | 更新摘要 | 路线图结论 |
 |---|---:|---|---|
+| 2026-09-23（第十三次） | 42（42 Git + 0 Libra） | 8 个 fast-forward、18 个 up-to-date、16 个 blocked（14 dirty、2 timeout）；集合变动 15 行（本地缺失 7：agent-git/ai-memory/opencode/agent-trace/agenta/cli-checkpoints/git-sync，本地恢复 6：crabbuild/*×5 + entireio/cli，类型变化 1：research-git Libra→Git，空目录 1：cursor/）；sapling/deepseek/memorax/ledgermind 上次 rev 不在本机历史 | **Libra 自身为主**：0.23.0 breaking 移除 web/worker/`libra code`/Code 执行面，**LR-02 / LR-03 的 operation v2 与 sidecar Change ID 随 0.23.x 正式发布**；Code 时代 MCP 子系统移除、由确定性 `permission/` 引擎 + `sandbox` + `run_admission` 承接，**SB-02 生产信任边界显著落地**。竞品侧 lore/go-git/letta-code 的安全与可靠性修复只补充既有 SB/MEM 判据；git-ai 全为遥测/计费面（不采纳）；Memory 仍零实现。无优先级（P 级）变化、无新增编号 |
 | 2026-09-17（第十二次） | 44（39 Git + 5 Libra） | 15 个 fast-forward、15 个 up-to-date、14 个 blocked（10 forced-update、2 network、1 shallow、1 local-ahead）；集合变动 20 行（本地缺失 5：crabbuild/*，目录改名 6，首次纳入 3：agent-git/ai-memory/opencode，类型变化 1：research-git Git→Libra，本地恢复 5）；jj/gitbutler/dolt/git-ai 本机落后于第 11 轮 revision 且被 forced-update 阻塞（增量 0） | **LR-03 已排期→实施中**（sidecar Change ID 模块合入未发布）、**MEM-06 候选→已验证**（ai-memory v2.3.0 inbox/queue，E3）；SB-01 pkt-line 切片收口（plan-20260901 完成，v0.22.47）；LR-02 显著缩小（v2 restore/undo/redo 合入）；SB-02/SB-04/LR-01/LR-09/MEM-01 补充判据；上轮待验证账本 6 项全部关闭；无优先级（P 级）变化、无新增编号 |
 | 2026-09-14（第十一次） | 41（41 Git + 0 Libra） | 14 个 fast-forward、21 个 up-to-date、6 个 `blocked-forced-update`（dolt、git-ai、git/git、gitbutler、go-billy、jj）；首次纳入 `crabbuild/*` 五仓 | Libra 已发布 `v0.22.19`；merge 主线、operation v2 foundation 与 FastCDC 相关差距缩小；竞品新增证据继续补强既有 SB-01..04、MEM-01 与 AG-ATTR，不新增编号、不改变优先级 |
 | 2026-09-03（第十次） | 36（36 Git + 0 Libra） | 9 个 fast-forward（sapling、gitbutler、lore、go-git、dolt、git-ai、grok-build、letta-code、letta-agent-sdk、memorax-code、Memoria、ledgermind 中 9 个达 fast-forward，其余 up-to-date）、25 个已是最新、2 个 `blocked-forced-update`（git/git、jj）；集合变动 12 行（本地缺失 5、目录改名 4、首次纳入 walgit、基线重置 ledgermind、类型变化 research-git、空目录 cursor/） | **UP-01、RT-01 推进为「已实现」（Libra 自身证据驱动）；LR-02、SB-02、SB-04 推进为「实施中」；SB 表新增状态列。** 竞品侧安全/可靠性证据面加厚（jj 并发写丢失、dolt 带 GC 数据丢失、git/git UAF、letta shell 解析绕过、git-ai 迁移原子化、walgit 授权缺口）全部映射到既有 SB-01/SB-02/SB-03/SB-04/MEM-01 补充判据，无新增编号、无优先级升降 |
@@ -135,100 +131,98 @@
 | 2026-08-07（第五次） | 26 | 1 个 fast-forward（Lore）、24 个已是最新、1 个 `blocked-dirty`（agenta）；首次按三类重组；新纳入 `letta-ai/*`（5）与 `rohitg00/agentmemory` | **结构重组。** Memory 升格为第一类长期能力（`MEM-*`）；CT-01 仍是版本管理类下一个执行任务；MEM-01 为 Memory 类首个验证任务。 |
 | 2026-08-02（第四次） | 20 | 9 个 fast-forward、10 个已是最新、1 个 blocked-dirty | 无优先级变化 |
 
-**本次结论：** 本轮最重要的变化再次来自 Libra 自身：SB-01 的 pkt-line 切片随 plan-20260901 收口（`PktFrameError` 校验 helper、7 个 unwrap 守卫、`LBR-NET-002` 文档化，v0.22.29..v0.22.47 发布），`9da06b4` 合入 operation v2 crash-safe restore/undo/redo/doctor 与 sidecar Change ID 模块（`src/internal/change/`，未发布）使 LR-02 显著缩小、LR-03 进入实施中。竞品侧：ai-memory `74bd791c`（随 v2.3.0 发布）证实跨 Agent 协调通道可行，MEM-06 推进为已验证；lore/git-git/walgit/go-git/opencode 的安全与可靠性修复只补充既有 SB/LR 判据。deepseek `SESSION_FORMAT_VERSION` 0→3 经复核不影响 bridge（按方法分发、不锁版本）。deepseek/sapling 两仓增量大、本轮仅完成抽样级审读（见覆盖率表），未声称全量。本轮无优先级（P 级）变化，无新增编号。
+**本次结论：** 本轮最重要的变化来自 Libra 自身：0.23.0 breaking 发布移除 web/worker/`libra code`/Code 执行面（plan-20260920 closeout `1e74d0c`），**LR-02 / LR-03 的 operation v2（`restore`/`undo`/`redo`/`doctor`/`reconcile`）与 sidecar Change ID 模块随 0.23.x 正式发布**，这两项差距显著缩小并进入验收收口阶段；Code 时代 MCP 子系统移除，由确定性 `permission/` 权限引擎 + `sandbox`/`run_admission` 承接，**SB-02 生产信任边界由「authorizer 未安装」落地为「具备 Allow/Deny/Ask + wildcard + 持久 approvals 的权限引擎」**，差距性质由「缺基础」转向「补跨源凭据作用域 / URL 脱敏 / 团队发布门禁」。竞品侧 lore（服务端 authorizer 分层 + OIDC jwks + fail-closed 启动校验）、go-git（凭据按 origin/path 作用域 + URL 脱敏 + 大量 fuzz/test）、letta-code（MemFS 预算强制 + secrets 独立 endpoint）补充既有 SB-01/SB-02/MEM-01 判据；git-ai 全为遥测/计费面（不采纳）。Memory（MEM-01..06）仍零实现，MEM-01/02 维持已排期，MEM-03..06 维持已验证/候选。本轮无优先级（P 级）变化，无新增编号。
 
 Top-5 最重要差距（两榜合成）：
 
 | 排名 | 榜 | 关联编号 | 差距一句话 | S/D/X/U/C/E | 分 | 竞品证据 | Libra 证据 | 动作 |
 |---|---|---|---|---|---:|---|---|---|
-| 1 | A | SB-02 | MCP authorizer 生产仍未安装（默认 None=不鉴权）、shell 写重定向非 fail-closed；权限路径匹配与拒绝后行为缺确定性规范 | 2/1/2/2/2/E3 | 8 | `anomalyco/opencode@709af586`（E2，拒绝后停止 run）+`fd9ee435`（E2，home 相对路径展开）；`MachineWisdomAI/fava-trails@094af6b`（E2，深嵌套 fail closed） | `src/internal/ai/mcp/server.rs:46-47`（authz 默认 None）；`src/internal/ai/tools/utils.rs` 写重定向 needs_human | 保持实施中；补充完成判据 ×2 |
-| 2 | A | SB-01 | pkt-line 切片已收口，但生产 panic 面未清零：`ToolRegistry::new()` 在 cwd 解析失败时 `panic!`，越界/下溢类解析防护需持续对齐 | 2/1/2/2/2/E4 | 8 | `git/git@997c1daf1d`（E2，worktree_basename 越界读修复） | `src/internal/ai/tools/registry.rs:100`（cwd panic）；pkt-line 已 fallible（`src/git_protocol.rs:227` `read_pkt_line` 返回 `Result`） | 保持实施中；补充完成判据 |
-| 3 | A | SB-04 | 测试隔离半边已落地，child scope / 中断清理 / shutdown 后行为仍未统一 | 1/1/2/2/2/E4 | 6 | `epicgames/lore@7ccb6a1`（E2，shutdown 后调用显式失败不挂起）；`letta-ai/letta-code@feb32e33`（E2，慢命令后台化） | `grep -rn ProcessScope src tests` = 0；`src/internal/process_terminate.rs:12` | 保持实施中；补充完成判据 |
-| 4 | B | MEM-01 | VCS-native Memory 存储与隐私基线仍无任何实现；竞品已在转义/作用域校验等隐私细节上出现真实修复波 | 1/1/3/3/1/E4 | 7 | `akitaonrails/ai-memory@2be13836`+`c83076b3`（E2，转义修复曾是 no-op 后跨实现回归） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 子命令 | 保持已排期 +补充完成判据 |
-| 5 | B | LR-02 | v1 已发布、v2 snapshot/view 已随 v0.22.44+ 发布，crash-safe restore/undo/redo 已合入未发布；restore 并发与发布验收未收口 | 0/1/3/3/1/E4 | 7 | `jj-vcs/jj@0a9b86970`（E2，沿用：合并后保留最新状态） | `src/internal/operation/store.rs:375`（RepoViewV2）；`9da06b4`（restore/undo/redo/doctor）；`src/command/op.rs:183-192`（restore_v2） | 保持实施中 +补充完成判据 |
+| 1 | A | SB-01 | 生产 panic/无界外部输入解析面未清零：`observed_agents/registry.rs:400` 等 `panic!`，外部输入（JWKS/错误体/路径）尺寸与边界解析须持续加界 | 2/1/2/2/2/E4 | 8 | `EpicGames/lore@b90d1ed` `auth/jwk.rs:125` `JWKS_MAX_RESPONSE_BYTES=1MiB` + issuer 校验（E2）；`go-git/go-git@095ec9a3` 界 error body（E2） | `src/git_protocol.rs:227` read_pkt_line 返回 `Result`（已收口）；`src/internal/ai/observed_agents/registry.rs:400` `panic!`；`automation/executor.rs:28` cwd fail-closed 回退 | 保持实施中；补充完成判据 |
+| 2 | A | SB-02 | 确定性权限引擎已落地，但跨源凭据作用域、URL/错误脱敏、写重定向 fail-closed 与团队发布门禁未完成 | 2/1/2/2/3/E4 | 8 | `EpicGames/lore@94c6b2d`+`b421b20`+`657e05e` 缺 issuer/audience fail-closed + authorizer 分层 + wildcard 合并（E2）；`go-git/go-git@7e5dcac9`+`21f75ab5` 凭据按 origin/path 作用域 + URL 脱敏（E2） | `src/internal/ai/permission/rule.rs`（Allow/Deny/Ask、wildcard、findLast）；`permission/evaluate.rs`（pre-filter）；`permission/approved.rs`（持久 approvals）；`sandbox/proxy.rs:133` LoopbackOnlyProxy；`run_admission.rs`（fail-closed） | 更新状态（去掉「生产未接线」表述）；补充完成判据 ×1 |
+| 3 | A | SB-03 | D1 迁移仍逐语句无事务账本，wrangler 第二套 runner 未收口（半迁移/数据丢失风险） | 1/2/1/2/2/E2 | 4.7 | `git-ai@1bc9d49e2` 迁移原子化（沿用，E2） | `src/utils/d1_client.rs` ensure_publish_schema 逐语句执行；`src/command/publish.rs` wrangler 两套 runner | 保持已验证；补充完成判据 |
+| 4 | B | MEM-01 | VCS-native Memory 存储与隐私基线仍为零实现；竞品已在预算强制/secrets 面出现真实加固 | 1/1/3/3/2/E4 | 8 | `letta-ai/letta-code@170a6d19` 默认 MemFS v2 预算强制（E2） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 命令；`grep -rni 'fts5\|bm25'` = 0 | 保持已排期；补充完成判据 ×1 |
+| 5 | B | MEM-02 | 无本地 FTS5/BM25 与有界 SessionStart 注入；Memory 召回仍缺 | 1/1/3/3/2/E4 | 8 | `rohitg00/agentmemory@e04ba88` hybrid 检索（沿用，E2） | `grep -rn 'fts5\|bm25' src sql Cargo.toml` = 0 | 保持已排期 |
 
 能力差距矩阵（本轮完整覆盖 `ids.old` 的 24 个编号）：
 
 | 编号 | 类别 A/B/C/SB | 状态（旧→新） | 最佳竞品参照 repo@sha path:line + 参照来源 | Libra 现状 file:line / test / 可复算命令 | 差距一句话 | 本轮变化 + 驱动方（Libra/竞品/双方） | 动作 | E |
 |---|---|---|---|---|---|---|---|---|
-| CT-01 | A | 实施中→实施中 | `gitbutlerapp/grit@dfb0799` `TESTING.md`（沿用） | `tests/command/t4_port_test.rs`（82 test）；`tests/compat-ledger/t4`（34 toml） | 部分 wave 已合入，S4 族 waves 与 S2 离线发现器仍未收口 | 不变（本轮核对：`ls tests/compat-ledger`） | 保持 | E4 |
-| UP-01 | A | 已实现→已实现 | `memorax-ai/memorax-code@1491fbb` update 恢复（E2反例，仍无验签） | `src/internal/upgrade/manifest.rs:194`；`upgrade_auto_test`；tags v0.22.1..v0.22.47 均经签名链发布 | 签名升级链已完成并持续发布；文档债（CHANGELOG 0.22.1..0.22.10）仍登记 | 不变（本轮核对：`libra tag \| sort -V \| tail -1` = v0.22.47） | 保持 | E4 |
-| LR-01 | A | 实施中→实施中 | `epicgames/lore@a03a32a` 拒绝同仓重叠 link 挂载（E2） | `src/command/worktree.rs:87`；`run_worktree_doctor`；`worktree_isolation_test`（119） | worktree 隔离/doctor 基础存在；挂载重叠拒绝、崩溃重启元数据一致性未成判据 | 扩大（竞品） | 补充完成判据 ×2 | E4 |
-| LR-02 | A | 实施中→实施中 | `jj-vcs/jj@0a9b86970` 合并后保留最新状态（E2，沿用） | `src/internal/operation/store.rs:375` RepoViewV2；`src/command/op.rs:183-192` restore_v2；`9da06b4` restore/undo/redo/doctor；`op_test`/`restore_test` | v2 snapshot/view 已发布，crash-safe restore/undo/redo 已合入未发布，restore 并发与发布验收未收口 | 缩小（Libra；`9da06b4`、v0.22.44+） | 更新竞品证据 | E4 |
-| LR-03 | A | 已排期→实施中 | `jj-vcs/jj@efe0cf178` immutable_heads 纳入 untracked tags（E2，账本关闭） | `src/internal/change/{identity,genealogy,store,resolve,builder,workflows}.rs`；`tests/command/change_revision_provenance_test.rs`；ADR-OL-04 sidecar-only | sidecar Change ID 与 rewrite genealogy 已合入（未发布），重写谱系与 immutable 边界未验收 | 缩小（Libra；`9da06b4`） | 更新状态（已排期→实施中） | E4 |
-| LR-04 | A | 已验证→已验证 | `gitbutlerapp/gitbutler@32dd134` hunk mutation（E2，沿用） | `src/command/apply.rs`；`apply_patch` 单测；`grep -rn 'HunkId\|hunk_assign' src` = 0 | 有只读 hunk 基础，非交互 assignment／stack mutation 缺失 | 不变（gitbutler 本机无新增量） | 保持 | E4 |
-| LR-05 | A | 实施中→实施中 | `EpicGames/lore@074eb0b` `lore-revision/src/merge`（E2，沿用） | `src/command/merge.rs`；`plan-20260903.md` MG-01..MG-21；cherry-pick 序列修复 `3128bc2`/`7190507`/`9be09fe`（v0.22.39-42） | merge 主线与序列一致性继续收敛；versioned conflict object / modeless sequencer 仍无 | 缩小（Libra） | 保持 | E4 |
-| LR-06 | A | 已验证→已验证 | `letta-ai/letta-agent-sdk@628bbc7` 保留 ephemeral worker lineage（E2） | `src/internal/ai/intentspec/`；`grep -rn 'seal\|intent_pin' src/internal/ai/intentspec` = 0 | intent／checkpoint 有基础，seal、pin 与 publication 边界缺失 | 不变 | 保持 | E4 |
-| LR-07 | A | 已验证→已验证 | `MachineWisdomAI/fava-trails@bb8580a` preflight MCP envelope（E2） | `src/internal/ai/intentspec/scope.rs:12`；`grep -rni 'preflight\|overlap' src/internal/ai/intentspec` = 0 | 缺确定性 pre-edit overlap gate | 不变 | 保持 | E4 |
-| LR-08 | A | 已验证→已验证 | `walgit/walgit@4ff4f7a` 原生 Git URI 供包（E2） | `grep -rn 'trait Forge\|pull_request\|check_runs' src` = 0 | 无 Forge／PR／CI 机器接口 | 不变 | 保持 | E4 |
-| LR-09 | A | 已验证→已验证 | `walgit/walgit@bf65c01` 退役前可达性守恒证明（E2） | `src/internal/sparse/mod.rs:26`；`src/utils/media/transfer.rs`；`media_fastcdc_test` | sparse／hydrate／FastCDC 有基础；partial clone/VFS 缺，对象退役无守恒证明 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
-| LR-10 | B | 已验证→已验证 | `StepzeroLab/research-git@62bcdf5` capsule／provenance（E2，沿用） | `src/internal/ai/capability_package/manifest.rs:62`；`src/cli.rs` 未注册 package | artifact／skill 有基础，capsule lifecycle／ablation 缺失 | 不变 | 保持 | E4 |
-| RT-01 | B | 已实现→历史封存 | `deepseek-ai/deepseek-harness@0d1f50007` session 事件面（E2） | 历史证据：`a643dfb`、v0.22.0、plan-20260715/0824；现行替代边界仅为 `libra agent bridge` 与外部 capture | Web-only runtime/SSE v2 曾发布，后由 plan-20260920 完整拆除；不影响保留的外部 bridge | 产品面拆除（Libra）；历史证据保留，不构成恢复授权 | 封存 | E4 |
-| AG-ATTR | B | 候选→候选 | `git-ai-project/git-ai@7ace11b09` 会话按 rollout 文件名键控（E2，账本关闭） | `src/internal/ai/agent_import.rs`；`grep -rn ai_edit_trace src sql` = 0 | 原生 transcript 导入存在，归一化行级归因仍缺 | 不变 | 保持 | E4 |
-| MEM-01 | C | 已排期→已排期 | `akitaonrails/ai-memory@2be13836`+`c83076b3` 载荷转义修复与 no-op 回归（E2） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 命令 | VCS-native storage／privacy baseline 未实现；竞品隐私细节修复波加剧时间压力 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
-| MEM-02 | C | 已排期→已排期 | `rohitg00/agentmemory@e04ba88` hybrid retrieval（E2，沿用）；`ai-memory` v2.3.0 多 provider embedding（E2） | `grep -rn 'fts5\|bm25' src sql Cargo.toml` = 0 | 无本地 FTS/BM25 与有界 SessionStart 注入 | 不变 | 保持 | E4 |
-| MEM-03 | C | 已验证→已验证 | `memorax-ai/memorax-code@80123b9` 拒绝 turn ID 冲突写记忆（E2，账本关闭）；`matrixorigin/Memoria@a2e1e25` 跨 schema 恢复保全数据（E2） | `src/internal/ai/history.rs:3487`；tombstone 迁移 `2026071403/04` | erase/tombstone 基础存在，consolidation／Trust Gate 未完成 | 不变 | 保持 | E4 |
-| MEM-04 | C | 已验证→已验证 | `MachineWisdomAI/fava-trails@6527b6c` 紧凑 MCP 面（E1，转待验证） | `src/internal/ai/mcp/authz.rs:96`；`server.rs:46-47` 默认 None | Memory MCP 生产 authorizer 尚未接线 | 不变 | 保持 | E4 |
+| CT-01 | A | 实施中→实施中 | `gitbutlerapp/grit@dfb0799` `TESTING.md`（沿用） | `tests/command/t4_port_test.rs`（82 test）；`tests/compat-ledger/t4`（12 toml + `_negative`） | 部分 wave 已合入，S4 族 waves 与 S2 离线发现器仍未收口 | 不变（本轮核对：`find tests/compat-ledger/t4 -name '*.toml'` = 12） | 保持 | E4 |
+| UP-01 | A | 已实现→已实现 | `memorax-ai/memorax-code@0a47119` cwd-less scope 校验（E2，沿用） | `src/internal/upgrade/trusted_keys.rs:37`；`upgrade_auto_test`；tags v0.23.1..v0.23.48 均经签名链发布 | 签名升级链已完成并持续发布；CHANGELOG 0.22.1..0.22.10 文档债仍登记 | 不变（本轮核对：`libra tag \| sort -V \| tail -1` = v0.23.48） | 保持 | E4 |
+| LR-01 | A | 实施中→实施中 | `go-git/go-git@1667acc8`+`5107342f` 保留前导符号链接路径、需 Git 2.32（E2） | `src/command/worktree.rs:87`；`run_worktree_doctor`；`worktree_isolation_test` | worktree 隔离/doctor 基础存在；并行 lanes、崩溃重启元数据一致性未成判据 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
+| LR-02 | A | 实施中→实施中 | `jj-vcs/jj@0a9b86970` 合并后保留最新状态（E2，沿用） | `src/internal/operation/view.rs:40` RepoViewV2、`:51` WorkspaceSnapshotV2；`restore.rs:112` RestoreEngine；`undo.rs:18` UndoEngine；`src/command/op.rs:72` Restore；`op_test`/`restore_test`；随 v0.23.48 发布 | v2 snapshot/view、crash-safe restore/undo/redo 已全部发布；剩余验收与并发矩阵细化 | 缩小（Libra；v0.23.x 发布） | 更新状态（实施中，验收收口） | E4 |
+| LR-03 | A | 实施中→实施中 | `jj-vcs/jj@efe0cf178` immutable_heads 纳入 untracked tags（E2，沿用） | `src/internal/change/{identity,workflows,resolve,store}.rs`；`tests/command/change_revision_provenance_test.rs`；ADR-OL-04 sidecar-only；随 v0.23.48 发布 | sidecar Change ID 与 rewrite genealogy 已发布；重写谱系与 immutable 边界未验收 | 缩小（Libra；v0.23.x 发布） | 保持 | E4 |
+| LR-04 | A | 已验证→已验证 | `gitbutlerapp/gitbutler@a15c348f5b`+`4277c2345d` 未提交区 ID `zz`→`@`（E2） | `src/command/apply.rs`；`grep -rn 'HunkId\|hunk_assign' src` = 0 | 有只读 hunk 基础，非交互 assignment／stack mutation 缺失 | 不变（gitbutler 本机无新增量） | 保持 | E4 |
+| LR-05 | A | 实施中→实施中 | `EpicGames/lore@074eb0b` `lore-revision/src/merge`（沿用） | `src/command/merge.rs`；`grep -rn 'ConflictObject' src` = 0 | merge 主线继续收敛；versioned conflict object / modeless sequencer 仍无 | 不变（Libra merge 继续收敛） | 保持 | E4 |
+| LR-06 | A | 已验证→已验证 | `letta-ai/letta-agent-sdk@628bbc7` 保留 lineage（E2，沿用） | `src/internal/ai/agent_run/`；`src/internal/model/ai_index_intent_*`、`ai_thread_intent.rs`；`grep -rn 'intent_pin\|seal' src`（除 commit/credential）= 0 | intent 存储/会话帧基础存在；seal、pin 与团队 publication 边界缺失 | 不变 | 保持 | E4 |
+| LR-07 | A | 已验证→已验证 | `MachineWisdomAI/fava-trails@bb8580a` preflight MCP envelope（E2，沿用） | `src/internal/ai/agent_run/context_pack.rs`；`grep -rni 'overlap_receipt\|OverlapReceipt' src` = 0 | 缺确定性 pre-edit overlap gate / review 注入 | 不变 | 保持 | E4 |
+| LR-08 | A | 已验证→已验证 | `walgit/walgit@bf65c01` 原生 Git URI 供包（E2，沿用） | `grep -rn 'trait Forge\|pull_request\|check_runs' src` = 0 | 无 Forge／PR／CI 机器接口 | 不变 | 保持 | E4 |
+| LR-09 | A | 已验证→已验证 | `go-git/go-git@5107342f`+`1667acc8` worktree symlink 保留（E2）；`walgit@bf65c01` 退役守恒（E2，沿用） | `src/internal/sparse/`；`src/command/clone.rs:199,277`（filter 被忽略）；`src/utils/media/transfer.rs` | sparse/hydrate/FastCDC 有基础；partial clone/promisor 仍被忽略，对象退役无守恒证明 | 不变 | 保持 | E4 |
+| LR-10 | B | 已验证→已验证 | `StepzeroLab/research-git@62bcdf5` capsule（E2，沿用） | `src/command/package.rs`（`src/cli.rs` 未注册）；`grep -rni 'capsule\|ablation' src` = 0 | artifact/skill 有基础，capsule lifecycle／ablation 缺失 | 不变 | 保持 | E4 |
+| RT-01 | B | 已实现→已实现 | `deepseek-ai/deepseek-harness@c291e7961` session 事件面（E2，沿用） | `src/internal/ai/agent_bridge/methods.rs`（51 method）；`src/internal/ai/agent_run/`；0.23.0 删除 web/worker/code 表面 | Web-only runtime 与 `libra code`/Publish/Worker 移除已完成；bridge 面未变 | 不变（本轮复核 bridge 事件面）；产品表面拆除已完成 | 保持 | E4 |
+| AG-ATTR | B | 候选→候选 | `git-ai-project/git-ai@7ace11b09` 会话键控（E2，沿用） | `src/internal/ai/agent_import.rs`（`libra agent import`）；`grep -rn 'ai_edit_trace' src sql` = 0 | 原生 transcript 导入存在，归一化行级归因仍缺 | 不变 | 保持 | E4 |
+| MEM-01 | C | 已排期→已排期 | `letta-ai/letta-code@170a6d19` 默认 MemFS v2 预算强制（E2） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 命令；`grep -rni 'fts5\|bm25'` = 0 | VCS-native storage／privacy baseline 未实现；竞品预算强制加剧时间压力 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
+| MEM-02 | C | 已排期→已排期 | `rohitg00/agentmemory@e04ba88` hybrid 检索（E2，沿用） | `grep -rn 'fts5\|bm25' src sql Cargo.toml` = 0 | 无本地 FTS/BM25 与有界 SessionStart 注入 | 不变 | 保持 | E4 |
+| MEM-03 | C | 已验证→已验证 | `memorax-ai/memorax-code@80123b9` 拒绝 turn ID 冲突（E2，沿用）；`matrixorigin/Memoria@689f3f9b`（E2） | `src/internal/ai/history.rs:3537` erase_session_local；`src/internal/obliteration/` | erase/tombstone 基础存在，consolidation／Trust Gate 未完成 | 不变 | 保持 | E4 |
+| MEM-04 | C | 已验证→已验证 | `EpicGames/lore@b421b20`+`94c6b2d` 服务端 authorizer 分层（E2，SB-02 共用参照） | `libra agent rpc.rs`；`src/internal/ai/automation/`；MCP 子系统已移除，机器面为 `libra agent`+runtime | Memory 无独立 MCP/机器面；生产 authorizer 走 permission 引擎，Memory 面未接线 | 扩大（竞品 + Libra 移除 MCP 需重新界定机器面） | 补充完成判据 ×1 | E4 |
 | MEM-05 | C | 候选→候选 | `letta-ai/agent-file@78212eb` `.af` format（E2，沿用） | `src/command/agent/skill.rs:37`；无 portable Memory export | portable export／skill projection 尚缺 | 不变 | 保持 | E4 |
-| MEM-06 | C | 候选→已验证 | `akitaonrails/ai-memory@74bd791c` 跨项目 agent inbox/queue（E3，随 v2.3.0 发布） | `grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0；`workspace.rs:211` WorkspaceLease 同构基础 | 协调通道问题域被竞品实证可行，Libra 侧实现为零 | 扩大（竞品） | 更新状态（候选→已验证） | E3 |
-| SB-01 | SB | 实施中→实施中 | `git/git@997c1daf1d` worktree_basename 越界读修复（E2） | `src/git_protocol.rs:227 read_pkt_line` 返回 `Result`（pkt-line 已收口）；`src/internal/ai/tools/registry.rs:100` cwd `panic!` | pkt-line 切片完成；生产 panic 面未清零（ToolRegistry 等），解析越界/下溢防护需持续对齐 | 缩小（Libra）+扩大（竞品）＝双方 | 更新判据 | E4 |
-| SB-02 | SB | 实施中→实施中 | `anomalyco/opencode@709af586` 拒绝后停止 run（E2） | `src/internal/ai/mcp/server.rs:46-47` authz 默认 None；`src/internal/ai/tools/utils.rs` 写重定向 needs_human | authorizer 生产接线与 shell fail-closed 仍缺；权限路径规范化与拒绝后行为缺规范 | 扩大（竞品） | 补充完成判据 ×2 | E4 |
-| SB-03 | SB | 已验证→已验证 | `walgit/walgit@bf65c01` 退役权限与守恒证明（E2，参照列同时服务 LR-09） | `ensure_publish_schema` 逐语句、无事务（**历史锚点：已随 plan-20260920 RC-35 删除**）；wrangler 第二套 runner | D1 runner 仍缺事务账本与单一迁移事实源 | 不变（本轮核对锚点行号） | 保持 | E2 |
-| SB-04 | SB | 实施中→实施中 | `epicgames/lore@7ccb6a1` shutdown 后调用显式失败（E2） | `grep -rn ProcessScope src tests` = 0；`src/internal/process_terminate.rs:12` ProcessTerminateGate；nextest CI `a8218ac` | 测试隔离已改善；child scope 抽象、中断清理与 shutdown 语义未统一 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
+| MEM-06 | C | 已验证→已验证 | `letta-ai/letta-code@ec48fd6d`+`99881fb7` SendAgentMessage/child 走各自 listener（E2） | `src/internal/workspace.rs:211` WorkspaceLease；`capture_scope.rs`；`grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0 | 协调通道问题域被竞品实证可行，Libra 侧实现为零（有 WorktreeLease 同构基础） | 扩大（竞品） | 补充完成判据 | E2 |
+| SB-01 | SB | 实施中→实施中 | `EpicGames/lore@b90d1ed` `auth/jwk.rs:125` JWKS_MAX_RESPONSE_BYTES=1MiB（E2）；`go-git@095ec9a3` 界 error body（E2） | `src/git_protocol.rs:227 read_pkt_line` 返回 `Result`（已收口）；`src/internal/ai/observed_agents/registry.rs:400` `panic!`；`automation/executor.rs:28` cwd fail-closed 回退 | pkt-line 切片完成；生产 panic/无界外部输入解析面未清零 | 缩小（Libra：automation cwd fail-closed）+扩大（竞品加界）＝双方 | 更新处置 | E4 |
+| SB-02 | SB | 实施中→实施中 | `EpicGames/lore@94c6b2d`+`b421b20`+`657e05e` 服务端 authorizer 分层＋缺 issuer/audience fail-closed（E2）；`go-git@7e5dcac9`+`21f75ab5` 凭据按 origin/path 作用域＋URL 脱敏（E2） | `src/internal/ai/permission/rule.rs`（Allow/Deny/Ask、wildcard、findLast）；`permission/evaluate.rs`（pre-filter）；`permission/approved.rs`；`sandbox/proxy.rs:133` LoopbackOnlyProxy；`run_admission.rs`（fail-closed） | **确定性权限引擎已落地**；剩余跨源凭据作用域、URL 脱敏与团队发布门禁 | 缩小（Libra 大进步：permission 引擎 + fail-closed） | 更新状态（保持实施中但不含「未接线」表述） | E4 |
+| SB-03 | SB | 已验证→已验证 | `git-ai@1bc9d49e2` 迁移原子化（E2，沿用） | `src/utils/d1_client.rs` ensure_publish_schema 逐语句；wrangler 第二套 runner | D1 runner 仍缺事务账本与单一迁移事实源 | 不变 | 保持 | E2 |
+| SB-04 | SB | 实施中→实施中 | `letta-ai/letta-code@d8a8a9b2`+`a1915299` 稳定 quota/subagent/Windows 测试与去定时竞争（E2）；`EpicGames/lore@c463200` 统一 temp dir 允许并行（E2） | `src/internal/process_terminate.rs:12` ProcessTerminateGate；`tests/SERIAL_REGISTRY.tsv`；nextest CI | 测试隔离/序列注册已落地；child scope 抽象、中断清理与 shutdown 语义未统一 | 扩大（竞品稳定化测试） | 保持 | E2 |
 
 不做 Top-3（按 (S+D+X) 从「不采纳/延后」候选中取）：
 
 | 排名 | 关联编号/来源 | 内容 | 理由 | E |
 |---|---|---|---|---|
-| 1 | 不采纳（memorax-code） | 8h 轮询 npm 自动更新并替换进程（`ca6c46d`/`fed82ea`/`073c006`；本轮 `1491fbb`/`45a6215` 只为该形态补崩溃恢复，仍无验签） | 无验签供应链形态；Libra 升级必须走 UP-01 签名通道 | E2 |
-| 2 | 不采纳（akitaonrails/ai-memory） | 首次 `run` 时自动安装 harness hooks + MCP（`da8d07dc`，默认开启 boot-time 回填 `c380278e`） | 运行时静默改写用户 harness 配置属供应链暴露；Libra 的 hook/skill 安装必须显式确认（SB-02） | E2 |
-| 3 | 不采纳（deepseek-harness） | 删除 SQLite persistence backend、改用 handle-based seam 的产品形态（`4553c9d957` 本轮验读关闭） | Libra operation log 以 SQLite 为状态真源（规划原则 1/5）；handle seam 只作接口参考 | E2 |
+| 1 | 不采纳（git-ai token-usage） | 遥测/计费重摄取面（`5e56e8942`、`120f6ded5`、`33482e696`） | 与 VCS 长期能力无关；Libra 已有 usage 统计 | E2 |
+| 2 | 不采纳（nervosys/Lit） | `lit sandbox` 非沙箱澄清 + `--trusted-proxy`（`705981f`）；UCAN token「不授权」警告 | 为作者澄清/文档，不增硬实现证据 | E1 |
+| 3 | 不采纳（ctx-open / Lit 加密声明 / agentic-flow 宣传） | 「agent-first / 后量子 / QuantumDAG」口径 | 无实现核验，不作为完成判据 | E1 |
 
 本轮竞品要点（更新增量审计）——6 类 × {发现数, 值得借鉴数, 进入 plan-long 数}：
 
 | 类别 | 发现 | 值得借鉴 | 进入 plan-long |
 |---|---:|---:|---:|
-| security | 17 | 10 | 4 |
-| reliability | 15 | 8 | 2 |
-| bugfix | 10 | 2 | 0 |
-| compat-migration | 5 | 2 | 0 |
-| improvement | 8 | 2 | 0 |
-| feature | 6 | 3 | 1 |
+| security | 12 | 8 | 3 |
+| reliability | 6 | 4 | 1 |
+| bugfix | 5 | 2 | 0 |
+| compat-migration | 3 | 1 | 0 |
+| improvement | 6 | 2 | 0 |
+| feature | 5 | 2 | 1 |
 
 本轮进入 plan-long 的竞品要点（≤12 条；对应差距矩阵动作 ≠ 保持的行）：
 
-- **LR-01** lore `a03a32a`：拒绝同一仓库的重叠 link 挂载（E2，含测试）——worktree/挂载入口必须显式拒绝重叠注册。
-- **LR-01** sapling `a3b03945ae9`：非正常关机后 overlay 陈旧 inode 元数据被新 inode 继承（fuzz 发现，E2）——崩溃重启后不得继承旧元数据。
-- **LR-09** walgit `bf65c01`：精确 pack 覆盖快照 + 持久退役权限，退役前证明索引守恒（E2）。
-- **MEM-01** ai-memory `2be13836`+`c83076b3`：hook 载荷 JSON 控制字符转义，修复在 BusyBox awk 上曾是 no-op，跨三种 awk 实现回归（E2）。
-- **MEM-06** ai-memory `74bd791c`：跨项目 agent inbox/queue + 启动通知（E3，随 v2.3.0 发布）——协调通道可行性实证。
-- **SB-01** git/git `997c1daf1d`：`worktree_basename()` 零长度路径越界读修复（E2）——边界解析须先判空。
-- **SB-02** opencode `709af586`：权限被拒绝后 run 必须停止而非继续（E2，10 个测试文件）。
-- **SB-02** opencode `fd9ee435`：home 相对权限路径先展开再匹配（E2）。
-- **SB-02** fava-trails `094af6b`：Trust Gate 扫描遇深嵌套 fail closed（E2）。
-- **SB-04** lore `7ccb6a1`：shutdown 后的调用显式失败而非挂起（E2）。
-- **SB-04** letta-code `feb32e33`：慢 Bash 命令自动后台化并在完成时通知（E2）——阻塞执行须有生命周期出口。
-- **SB-02** fava-trails `c91d644`：持久化与远端评审前拒绝明显秘密（E2）——秘密门在写入之前。
+- **SB-02** lore `94c6b2d`：配置了 `[server.auth]` 却缺 `jwt_audience`/`jwt_issuer` 时服务器拒绝启动（E2）——authorizer 缺关键配置必须 fail-closed。
+- **SB-02** lore `657e05e`/`b421b20`：三个 token claim 读取器语义不一致的活缺陷修复 + Authorizer 分层（Resource/Global）+ wildcard 权限合并（E2）。
+- **SB-02** go-git `7e5dcac9`+`21f75ab5`+`0b6bfbda`：HTTP 凭据按 origin/path 作用域、`CredentialsDroppedError` 显式失败（E2）——跨源跳转后凭据不得误用。
+- **SB-02** go-git `5fa363d7`+`c91ad269`+`51e943c6`：URL/错误携带的凭据 redact、界读（E2，重定向/诊断不泄漏）。
+- **SB-01** lore `b90d1ed`：`auth/jwk.rs` OIDC jwks discovery 的 `JWKS_MAX_RESPONSE_BYTES=1048576`（E2）+ issuer mismatch 显式报错、超界拒绝——外部不可信内容读取须加界。
+- **SB-01** go-git `095ec9a3`+`99e6b5e6`：HTTP error body/响应读取有界、关闭泄漏响应（E2）。
+- **SB-01** go-git `c1652253`：ref 名在存储与协议边界校验（`internal/pathutil`、`reference.go`，E2）；`receive_pack_test.go` 931 行 + updreq/ref 负向测试。
+- **LR-01** go-git `1667acc8`+`5107342f`+`9430ba68`：worktree 删除/清理保留带前导符号链接的路径与非空目录；symlink 移除比较需 Git 2.32（E2）。
+- **MEM-01** letta-code `170a6d19`：默认 MemFS v2 预算强制（E2）——memory 写入必须有可配置上限且在提交入口强制。
+- **MEM-01** letta-code `7fe0ea3f`：secrets 经专用 endpoint 水合（E2）——敏感面独立、可审计。
+- **MEM-06** letta-code `ec48fd6d`+`99881fb7`：SendAgentMessage 与子 agent 走各自 listener（E2）——并行多 Agent 协调的机器面参照。
+- **LR-01 / SB-04** letta-code `d8a8a9b2`+`a1915299`：quota/subagent/Windows 测试稳定化、去定时竞争（E2）——并行与资源生命周期测试可靠性。
 
-Libra 自身（HEAD `9da06b4bf700472781c2e76ec48e96815475caf3`，`Cargo.toml` version `0.22.47`，审计日期 2026-09-17；自上次审计基线 `1524ecab` 起 `libra log --oneline 1524ecab..HEAD` 共 91 条：feat 6 / fix 26 / test 4 / docs(plan) 48 / docs 2 / other+merge 5，已发布版本 = `v0.22.47`（本周期发布 v0.22.20..v0.22.47 共 28 个 tag），未发布提交 = `libra log --oneline v0.22.47..HEAD` 共 3 条）：
+Libra 自身（HEAD `c590840cfe3330d47db829f7b5c17bc244d0e600`，`Cargo.toml` version `0.23.48`，审计日期 2026-09-23；自上次审计基线 `9da06b4` 起 `libra log --oneline 9da06b4..HEAD` 共 159 条：feat 57 / fix 25 / docs(plan)+docs 59 / test 16 / chore(release) 10 / other+merge 其余，已发布版本 = `v0.23.48`（本周期发布 v0.22.48..v0.23.48 共 54 个 tag，含 0.23.0 breaking），未发布提交 = `libra log --oneline v0.23.48..HEAD` 共 0 条）：
 
-- **SB-01 / plan-20260901**：**pkt-line 切片已收口**——计划完成（`07ba2d9` docs(plan): complete pkt-line hardening plan； nineteen 卡、十六发布、v0.22.47）；代码 `read_pkt_line` 返回 `Result`（`src/git_protocol.rs:227`，`PktFrameError::LengthBelowHeader/LengthAboveMaximum`），异步帧校验（`6a8ce38`、`1edca32`、`6062118`、`fdcf979`）、discovery 错误传播（`3509b18`）、push 状态行归类（`842d2e6`、`da8237e`）、SSH stderr 脱敏（`2a8594d`、`560cbfc`）；文档 `docs/error-codes.md LBR-NET-002`；unwrap 守卫扩展为 7 个测试文件。**状态保持实施中**：`src/internal/ai/tools/registry.rs:100` 在 cwd 解析失败时 `panic!`，生产 panic 面未清零。
-- **LR-02**：显著缩小——operation v2 `RepoViewV2`/`WorkspaceSnapshotV2` 随 v0.22.44+ 发布（`libra ls-tree v0.22.44 -- src/internal/operation` 22 文件）；`9da06b4`（#485）合入 crash-safe restore engine、append-only undo/redo/revert、operation doctor 并关闭 M2/M3 operation 任务；`src/command/op.rs:183-192` 已有 `restore_v2` 事件面。状态保持实施中（未发布 + 发布验收未收口）。
-- **LR-03**：**已排期→实施中**——sidecar Change ID 模块 `src/internal/change/{identity,genealogy,store,resolve,builder,workflows}.rs` 与 `tests/command/change_revision_provenance_test.rs` 随 `9da06b4` 合入（HEAD，**未发布**，v0.22.47 无 `internal/change/`）；`plan-20260822.md:123` ADR-OL-04 冻结 sidecar-only（不写 commit header）。
-- **LR-05**：cherry-pick 序列一致性修复（`3128bc2` HF-01、`7190507`、`9be09fe`，v0.22.39-42）与 unmerged staging（`06d0840`）；merge 主线继续收敛，versioned conflict object 仍无，状态保持实施中。
-- **CT-01**：仍实施中；本轮 `tests/compat-ledger/t4` 仍 34 toml 无新 wave；DEFER-09 关闭表述沿用第 11 轮。
-- **UP-01**：保持已实现。**RT-01**：改列历史封存；其历史完成/发布证据保留，但 `libra code`/Web 执行器已由 plan-20260920 拆除，不再计入现行产品能力或执行队列。
-- **SB-02 / plan-20260830**：SBX-01..05 已合入维持；authorizer 生产仍未安装（`server.rs:46-47` 默认 None）。**SB-04 / plan-20260827**：nextest CI 与序列注册维持；`grep -rn ProcessScope src tests` = 0（child scope 仍缺）。
-- **Memory**：仍无实现——`ls src/internal/ai/memory` 不存在、`src/cli.rs` 无 memory 子命令、`grep -rn 'fts5\|bm25'` = 0、`grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0；MEM-01/02 维持已排期，MEM-06 本轮由竞品证据推进为已验证。
-- **未发布变更（v0.22.47..HEAD，3 条）**：`9da06b4` operation/change genealogy milestones（上两行）；`06d0840` add unmerged staging、`-u` pathspec 检查、literal-pathspecs（用户可见行为变更）；`07ba2d9` pkt-line 计划收口文档。CHANGELOG `[Unreleased]` 另有 isolated agent task 单一 `agent.task.sync-back` operation 语义与 operation-v2 HEAD pinning（触及「兼容与迁移」「数据正确性」门禁，须随发布补迁移/回滚证据）。
-- **stale facts 更正**：第 10 轮遗留的 `ssh.strictHostKeyChecking` 文档债已闭合（`COMPATIBILITY.md:617` 与 clone/config/fetch/push 命令文档均已记录）；plan-20260901 已完成（索引状态同步更新）。
-- **日期计划对账**：磁盘含 `plan-20260918.md`（`add` 收口，排在 `issues/477` 之后）与 `plan-20260917.md`（cargo-test 进程内剥落）；索引已补齐 `plan-20260902`..`plan-20260918`、[`plan-20260921.md`](plan-20260921.md)（原 `plan-20260919-gpg-import.md`，R29 双 PASS；Phase 0 已收口、VG-00 `done/complete`，其余 14 卡**已全部实施完成**（`locally-accepted`），全量回归门 22 为 7944/7944 全绿、门 23 三连收口，`../libra-backend` 五页已同步；仅 VG-09 发布与 REL-VG-01 证据待操作者授权）與 [`plan-20260924.md`](plan-20260924.md)（Agent Capture 通用協調/儲存前置，ACF-01..09 `pending`）；`plan-20260916.md` 的 CAP-01..06 HTTP client 可獨立，CAP-07 等待 ACF；`plan-20260901` 状态由实施中更新为已完成（其自述收口门与 DEFER-02 登记以其修订史为准）。
-- deepseek-harness bridge：`plan-20260818.md` 事实不变；本轮复核上游 `session/created|event|flush|disposed` 事件面仍在（deepseek 上游 `packages/core/session/src/index.ts` 的 50–81 行），bridge 按方法分发、不锁定 `SESSION_FORMAT_VERSION`（现 v3），事件面依赖成立；载荷字段级兼容列入待验证账本。
+- **0.23.0 breaking**：移除 `web/` Next.js Code UI、`worker/` Publish Worker、`libra code`/`publish`/`db`/`graph`/`usage` 等 Code-era 表面（`7dc8e19`、`7edc775`、`c208ff8`、`fa08ec0`、`6170072`、`4748c16`、`c13fccd`、`f898554`；plan-20260920 closeout `1e74d0c`、RC-32 `cca5c71`）。**RT-01 产品表面拆除完成**，runtime 工件迁至 `src/internal/ai/agent_run/`。
+- **LR-02**：**显著缩小并进入验收收口**——operation v2 `RepoViewV2`/`WorkspaceSnapshotV2`（`src/internal/operation/view.rs:40,51`）、`RestoreEngine`（`restore.rs:112`）、`UndoEngine`（`undo.rs:18`）、reconcile/doctor、`src/command/op.rs:72 Restore` 等随 v0.23.x 发布；plan-20260822 close out `795eba8`（#509）。剩余为发布验收与并发矩阵细化。
+- **LR-03**：**已发布**——sidecar Change ID 模块 `src/internal/change/{identity,genealogy,store,resolve,builder,workflows}.rs` 与 `change_revision_provenance_test.rs` 随 v0.23.x 发布（`libra ls-tree v0.23.48 -- src/internal/change` 7 文件）；ADR-OL-04 sidecar-only（`plan-20260822.md:123`）；重写谱系与 immutable 边界仍待验收。
+- **SB-02**：**生产信任边界由「未接线」转为「确定性权限引擎」**——Code 时代 MCP 子系统移除，`src/internal/ai/permission/{rule,evaluate,approved,runtime_cache}.rs` 构成 Allow/Deny/Ask + wildcard(findLast) + 持久 approvals + pre-filter 的权限引擎；`sandbox/{proxy,runtime}.rs`（`LoopbackOnlyProxy`、`env_clear`）、`run_admission.rs`（fail-closed）、`command_safety.rs`（shell 分类）落地。**剩余**：跨源凭据作用域、URL/错误脱敏、团队发布门禁。
+- **SB-01**：pkt-line 已收口（`src/git_protocol.rs:227` read_pkt_line → `Result`）；生产 panic 面未清零——`observed_agents/registry.rs:400` `panic!`、`builtin/claude_code.rs:768` `expect("home resolves")`；`automation/executor.rs:28` 与 `sandbox/mod.rs:3849` 已 cwd fail-closed 回退（第 12 轮 `tools/registry.rs:100` cwd panic 已迁移/缓解）。
+- **Memory**：仍零实现——`ls src/internal/ai/memory` 不存在、`src/cli.rs` 无 memory 子命令、`grep -rni 'fts5\|bm25'` = 0；MEM-01/02 维持已排期，MEM-03..06 维持已验证/候选。
+- **CT-01**：仍实施中；本轮 `tests/compat-ledger/t4` 为 12 toml + `_negative`，无新 wave；DEFER-09 关闭表述沿用。
+- **UP-01 / RT-01**：保持已实现；本周期 54 个 tag 均经签名链发布，属既有四证据持续兑现。
+- **日期计划对账**：磁盘 30 个 `plan-2026*.md` 全部被索引引用（无缺失）；plan-20260822（LR-02/03 closeout `795eba8`）、plan-20260912（mega2 全部 done）、plan-20260920（Code 移除 closeout `1e74d0c`）已推进为完成/收口；plan-20260919（XDG GCX-01 done `bf8e8e1`）实施中；plan-20260921（gpg import）仍已排期。
+- **stale facts 更正**：`src/internal/ai/intentspec/`、`src/internal/ai/capability_package/` 在 0.23.x 已移除——LR-06/07/10 锚点重定位至 `src/internal/ai/agent_run/` + `src/internal/model/ai_index_intent_*`（LR-06/07）与 `src/command/package.rs`（LR-10）。
 ---
 
 ## 逐竞品分析：功能重叠、Libra 优势与差异化
 
-本节以 **2026-09-17 第十二次审计快照**为比较基线，覆盖快照内 **44 个仓库（39 Git + 5 Libra 类型）**，并单列 **5 个本轮本地恢复的历史参照**；`crabbuild/*` 五仓自本轮起本地缺失，其下文各行仅保留第 11 轮历史分析。同一组织的仓库按职责分别分析，避免把 SDK、格式、基础库和完整产品视为同等竞争者。竞品 revision、更新限制与证据入口沿用上方快照及差距矩阵；这里的分析是该基线上的产品判断，不代表重新完成远端更新或全量实现审计。
+本节以 **2026-09-23 第十三次审计快照**为比较基线，覆盖快照内 **42 个 Git 仓库**（本机无 Libra 类型；crabbuild/* 五仓与 entireio/cli 本轮本地恢复，其下文各行沿用第 12 轮分析），并沿用第 12 轮关于本地缺失仓库（agent-git/ai-memory/opencode/agent-trace/agenta/cli-checkpoints/git-sync）的表述。同一组织的仓库按职责分别分析，避免把 SDK、格式、基础库和完整产品视为同等竞争者。竞品 revision、更新限制与证据入口沿用上方快照及差距矩阵；这里的分析是该基线上的产品判断，不代表重新完成远端更新或全量实现审计。
 
 **比较口径：**「高重叠」表示争取同一核心开发工作流；「中重叠」表示覆盖其中一个环节；「低重叠」表示相邻数据领域、基础组件或生态接口。重叠程度包含长期目标，表中会明确区分 Libra 当前能力与规划。**现有优势**只指已有功能组合带来的适用性；**潜在优势**必须等相应 LR/MEM/SB 完成后才能成立。功能更多不等于性能、可靠性、安全性或用户体验更好，本节没有跨产品基准测试，因而不作这类排名。
 
@@ -319,7 +313,6 @@ Crabbuild 五仓的功能定位补读入口均固定到本轮快照：[Compass R
 维护本节时，每个新增仓库都应补齐上述比较维度；每次将「潜在优势」改为「现有优势」须链接代码、测试、文档和发布证据。竞品功能宣告只有在完成实现核验后，才能用于调整差距等级与执行优先级。
 
 ---
-
 ## 三类能力总览
 
 | 类 | 最要完成（按执行优先） | 既有/新增编号 |
@@ -398,7 +391,7 @@ flowchart LR
 | **CT-01** | 上游 Git 套件驱动的兼容性证据账本 | P0 | 实施中 | 首个 t4 wave 与 FIX-01..05 B 段 waves 已合入并发布；**DEFER-09 已由 plan-20260825 TA-01/02 + plan-20260827 NP-00 承接关闭**（更正：非「转 blocked」）；测试并行度已落地（`a8218ac` nextest、`b6959e5`/`315132a` 序列注册）；剩余 S4 族 waves 与 S2 离线发现器（DEP-01 + SB-04 前置）；机制归 [`../gap/grit-gap.md`](../gap/grit-gap.md) GGT-00A |
 | **UP-01** | 官方签名自动升级链 | P0 | 已实现 | 四证据齐备：代码 `895589d`（手动 `libra upgrade`）+ `2ea10cc`/`a0cb725`/`4bb5672`/`fc9c203`；测试 `upgrade_auto_test`（31 fn）等；文档 `docs/commands/upgrade.md`、`COMPATIBILITY.md:118`、`docs/error-codes.md LBR-UPGRADE-001`、`release-signing-auto-upgrade.md`（D1–D10）；tags v0.22.1/2/6..10（D10 首签 v0.22.7，closeout `00bc815`）。残留 DEFER-02..06 与 CHANGELOG 0.22.1..0.22.10 条目文档债 |
 | **LR-01** | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | W1–W2/lease/list\|show/doctor（`run_worktree_doctor`、`begin_repair_operation`）已合入；缺 parallel lanes、挂载/注册重叠拒绝、崩溃矩阵完整性、capture/export ownership 复核 |
-| **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 实施中（PR #503 收口） | v1 已发布；v2 `RepoViewV2`/`WorkspaceSnapshotV2`、crash-safe restore/undo/redo/doctor 与多 worktree reconcile 已发布；[`plan-20260822.md`](plan-20260822.md) M2/M3/M6 已关；OL-14（Web 图）已取消；OL-15A runtime cutover 与 OL-15 v1 retirement 已在 PR #503 落地，等待远端兼容门禁 |
+| **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 实施中 | v1 已发布；v2 `RepoViewV2`/`WorkspaceSnapshotV2`、crash-safe restore/undo/redo/doctor 与多 worktree reconcile **已随 0.23.x 正式发布**（PR #503 收口）；[`plan-20260822.md`](plan-20260822.md) M2/M3/M6 已关；OL-14（Web 图）已取消；OL-15A runtime cutover 与 OL-15 v1 retirement 已在 PR #503 落地，等待远端兼容门禁与发布验收 |
 | **LR-03** | 稳定 Change ID 与历史重写谱系 | P0 | 实施中 | sidecar 模块 `src/internal/change/`（identity/genealogy/store/resolve/builder/workflows）+ `change_revision_provenance_test.rs` 已随 `9da06b4` 合入并随 v0.23.0 发布；ADR-OL-04 sidecar-only（`plan-20260822.md:123`） |
 | **LR-04** | 非交互 Hunk API、归属与 Stack 编辑 | P0 | 已验证 | 有只读 hunk；无稳定 ID、assignment、mutation；gitbutler 本轮把未提交区 ID `zz`→`@` 并支持 committed hunk mutation（Agent 面向 ID 契约变更，E1 线索） |
 | **LR-05** | 一等冲突对象与 Modeless Sequencer | P1 | 实施中 | merge 主路径、rename/D-F/octopus/mergetool/签名已随 `plan-20260903` 交付；versioned conflict object / descendant rebase 仍无 |
@@ -459,7 +452,7 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 | ID | 任务 | 优先级 | 状态 | 一句话缺口 |
 |---|---|---:|---|---|
-| **SB-02** | 统一外部 Agent ingress / bridge / sandbox 信任边界 | P1 | 实施中 | SBX-01..05 已合入（共享 SandboxManager transform、macOS seatbelt，plan-20260830）；外部入口授权、shell 写重定向 fail-closed、权限路径规范化与拒绝后行为仍缺统一规范 |
+| **SB-02** | 统一外部 Agent ingress / bridge / sandbox 信任边界 | P1 | 实施中 | 确定性权限引擎已落地（`src/internal/ai/permission/` Allow/Deny/Ask + wildcard + 持久 approvals + `sandbox`/`run_admission` fail-closed）；SBX-01..05 已合入（共享 SandboxManager transform、macOS seatbelt，plan-20260830）；剩余外部入口授权、跨源凭据作用域、URL 脱敏、写重定向 fail-closed 与团队发布门禁 |
 | **SB-04** | 测试与子进程资源生命周期隔离 | P1/P2 | 实施中 | nextest CI 与序列注册已落地（`a8218ac`、`315132a`）；child scope（ProcessScope 同类：closed-scope / late-spawn kill / PID-reuse 防护）、shutdown 后调用语义与阻塞任务后台化未统一 |
 | **LR-06** | Intent Seal、Intent-Commit Pin、安全团队发布 | P1 | 已验证 | 本地 Intent/Decision/checkpoint 有；seal/pin/白名单 publication 无 |
 | **LR-07** | 开工前意图检索与语义冲突 Preflight | P1 | 已验证 | 缺团队 intent projection、确定性 overlap receipt、pre-edit gate |
@@ -639,14 +632,14 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 | ID | 主题 | 优先级 | 状态 | 阻断范围 |
 |---|---|---:|---|---|
 | SB-01 | 消除生产路径可触发 panic | P1 | 实施中 | 网络协议、仓库打开、全部 CLI |
-| SB-02 | 统一外部 Agent、bridge、review/investigate、sandbox 信任边界 | P1 | 实施中 | agent hooks/import/bridge、review/investigate、sandbox、未来 Memory host |
+| SB-02 | 统一外部 Agent、bridge、review/investigate、sandbox 信任边界 | P1 | 实施中 | agent hooks/import/bridge、review/investigate、sandbox、automation、未来 Memory host |
 | SB-03 | D1 schema 迁移原子性与单一事实源 | P1 | 已验证 | cloud 与未来 D1 消费者；已删除的 Publish/Worker 仅作历史反例 |
 | SB-04 | 测试进程共享状态与资源生命周期隔离 | P1/P2 | 实施中 | CI、并行测试、Agent child 回收 |
 
 要点（完整修复要求仍以代码审计为准）：
 
-- **SB-01**：pkt-line / DB / HEAD / ToolRegistry 全面 fallible；生产 `unwrap`/`expect`/`panic!` CI 守卫；pack/delta 路径须环检测 + 深度上限 + 溢出防护（go-git `e258d68a` 循环 delta 栈溢出、git/git pack/delta `size_t` 宽化 `d50ac11724`/`58f35eea9b`）、对象/内容尺寸上限（lore `07b75f6`/`fd6d075`）、未检查返回值须显式处理（git/git Coverity 批次）、协议 v2 服务端解析须防 NULL 解引用（git/git `serve` NULL-deref 崩溃修复）；编码/引用外部对象时对「不在索引内的引用」显式报错，禁止静默写零值或 nil 解引用（go-git `2ef9e4b0`，E2）；带外引用值须在节点内自描述，防被 GC 误回收（dolt `01dea76505`，E2）。Libra 的 `src/utils/storage/load_cost/pack.rs:15` 已有 `MAX_DELTA_DEPTH` + 环检测 + `MAX_VALIDATED_DELTA_BYTES` + `checked_add`，写/`index-pack` 路径须保持同级别防护。**pkt-line 切片已收口**（plan-20260901 完成，v0.22.47：`read_pkt_line` 返回 `Result`、`PktFrameError` 下界/上界、`LBR-NET-002` 文档化）。**本轮新增**（聚合 ≤3）：① 生产 panic 面继续清零——`src/internal/ai/tools/registry.rs:100` 在 cwd 解析失败时 `panic!`，须改显式错误（E4）；② 字符串/路径边界解析须先判空再取切片，禁止 `name-1` 式越界读（git/git `997c1daf1d` worktree_basename 越界读，E2）；③ 并发合并共享结构后必须保留最新已保存状态，不得丢失新写入（jj `0a9b86970`，E2，沿用）。
-- **SB-02**：非 loopback MCP 强制认证；authorizer fail closed；shell `env_clear`；写权限对「无法提取目标的写重定向」（`> $OUT`）fail-closed（grok-build `shell_access.rs` `unextracted_write_redirect`）；shell 命令解析遇「不可解析片段」（如尾缀 `&&`/`||`）必须 fail-closed 拒绝而非放行（letta-code `3785e254`，E2）；破坏性操作的授权档位须独立于写权限（walgit `527c7d1` 仓库删除 require_admin，E2）；认证 token 不得接受来自 URL query string（memorax-code `request.ts` 反例，E2）；secret 集中管理面（letta-code `letta secret` `70955190`）；mutating tool 真审批；apply_patch TOCTOU 收敛。**本轮新增**（聚合 ≤3）：① 权限被拒绝后当前 run 必须停止，不得以降级模式继续执行后续工具（opencode `709af586` stop after declined permissions，E2）；② 权限/信任路径匹配前必须先展开与规范化 `~`/相对路径，再与受控目录比较（opencode `fd9ee435` home 相对权限路径展开，E2）；③ 持久化与外发前的秘密门必须在写入之前生效，且对不可解析的深嵌套结构 fail closed（fava-trails `c91d644`+`094af6b`，E2）。SBX-01..05 已合入（plan-20260830），authorizer 生产接线仍缺。
+- **SB-01**：pkt-line / DB / HEAD / ToolRegistry 全面 fallible；生产 `unwrap`/`expect`/`panic!` CI 守卫；pack/delta 路径须环检测 + 深度上限 + 溢出防护（go-git `e258d68a` 循环 delta 栈溢出、git/git pack/delta `size_t` 宽化 `d50ac11724`/`58f35eea9b`）、对象/内容尺寸上限（lore `07b75f6`/`fd6d075`）、未检查返回值须显式处理（git/git Coverity 批次）、协议 v2 服务端解析须防 NULL 解引用（git/git `serve` NULL-deref 崩溃修复）；编码/引用外部对象时对「不在索引内的引用」显式报错，禁止静默写零值或 nil 解引用（go-git `2ef9e4b0`，E2）；带外引用值须在节点内自描述，防被 GC 误回收（dolt `01dea76505`，E2）。Libra 的 `src/utils/storage/load_cost/pack.rs:15` 已有 `MAX_DELTA_DEPTH` + 环检测 + `MAX_VALIDATED_DELTA_BYTES` + `checked_add`，写/`index-pack` 路径须保持同级别防护。**pkt-line 切片已收口**（plan-20260901 完成，v0.22.47：`read_pkt_line` 返回 `Result`、`PktFrameError` 下界/上界、`LBR-NET-002` 文档化）。**本轮新增**（聚合 ≤3）：① 生产 panic 面继续清零——`src/internal/ai/observed_agents/registry.rs:400` `panic!("gemini must stay registered")` 与 `builtin/claude_code.rs:768` `expect("home resolves")` 须改显式错误；`automation/executor.rs:28`、`sandbox/mod.rs:3849` 已 fail-closed cwd 回退（第 12 轮 `tools/registry.rs:100` cwd panic 已迁移/缓解，E4）；② 外部不可信内容读取必须有界——`JWKS`/错误体/响应读取需设上限（lore `auth/jwk.rs:125` `JWKS_MAX_RESPONSE_BYTES`、go-git `095ec9a3`/`99e6b5e6` 界读，E2）；③ 并发合并共享结构后必须保留最新已保存状态，不得丢失新写入（jj `0a9b86970`，E2，沿用）。
+- **SB-02**：非 loopback 强制认证；authorizer fail closed；shell `env_clear`；写权限对「无法提取目标的写重定向」（`> $OUT`）fail-closed（grok-build `shell_access.rs` `unextracted_write_redirect`）；shell 命令解析遇「不可解析片段」（如尾缀 `&&`/`||`）必须 fail-closed 拒绝而非放行（letta-code `3785e254`，E2）；破坏性操作的授权档位须独立于写权限（walgit `527c7d1` 仓库删除 require_admin，E2）；认证 token 不得接受来自 URL query string（memorax-code `request.ts` 反例，E2）；secret 集中管理面（letta-code `letta secret` `70955190`）；mutating tool 真审批；apply_patch TOCTOU 收敛。**本轮权限引擎落地**：Code 时代 MCP 子系统移除，`src/internal/ai/permission/{rule,evaluate,approved,runtime_cache}.rs` 构成 Allow/Deny/Ask + wildcard(findLast) + 持久 approvals + pre-filter 的确定性权限引擎；`sandbox/{proxy,runtime}.rs`（`LoopbackOnlyProxy`、`env_clear`）、`run_admission.rs`（fail-closed）、`command_safety.rs`（shell 分类）落地。**本轮补充**（聚合 ≤3）：① authorizer 缺关键配置必须 fail-closed——配置了认证却缺 `jwt_audience`/`jwt_issuer` 时应拒绝启动（lore `94c6b2d`，E2）；② 凭据按 origin/path 作用域、跨源跳转后不带错凭据（go-git `7e5dcac9`+`21f75ab5`+`0b6bfbda`，E2）；③ URL/错误携带的凭据必须 redact 且界读（go-git `5fa363d7`+`c91ad269`+`51e943c6`，E2）。SBX-01..05 已合入（plan-20260830）；剩余为跨源凭据作用域、URL 脱敏、写重定向 fail-closed 与团队发布门禁。
 - **SB-03**：D1 迁移单一事实源；禁止逐语句半迁移窗口。迁移脚本必须逐脚本原子提交（崩溃后不得留下「半迁移永久失败」状态），且去重约束升级须先迁移存量数据（git-ai `1bc9d49e2`，E2）——`src/utils/d1_client.rs:3286` 逐语句执行正是其反面；wrangler 第二套 runner（`src/command/publish.rs:627`）须收口；退役/清理类维护操作须先证明守恒再执行（walgit `bf65c01`，E2，同 LR-09）。
 - **SB-04**：统一 env/CWD/DB/child/server fixture；对齐 Grok `ProcessScope` 的 closed-scope / late-spawn kill / PID-reuse 防护；中断/取消时清理阻塞子任务与流（letta-code `ff0e2158`/`356d54fb`/`46c23664`、`d490443f` silent stream 恢复）；连接/子进程断开不得在持锁状态下触发同步回调重入自死锁，断开后 pending 请求须显式失败并可诊断（sapling `bf0537023d6`，E2）。**本轮新增**：① shutdown 之后的调用必须显式失败（RESOURCE_EXHAUSTED 类错误）而非无限挂起（lore `7ccb6a1`，E2）；② 长阻塞命令须有后台化 + 完成通知的生命周期出口，不得占死交互会话（letta-code `feb32e33`/`cf3be1ec`，E2）。nextest CI 与序列注册已落地（`a8218ac`、`315132a`）；child scope 抽象仍缺。
 
@@ -658,9 +651,9 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 1. **CT-01 收尾**（版本管理）：CT4-01 发布卡已执行（v0.21.21）；DEFER-09 已承接关闭；剩余 CT 后续 S4 族 waves 与 S2 离线发现器（DEP-01 + SB-04 前置）。
 2. ~~**UP-01**（版本管理）~~：**已实现**（v0.22.10，四证据齐备）；残留 DEFER-02..06 与 CHANGELOG 文档债按各自条件处置，不再占据执行队列。
-3. **LR-02/LR-03**（版本管理）：按 [`plan-20260822.md`](plan-20260822.md) 执行；v2 `RepoViewV2`/`WorkspaceSnapshotV2`、crash-safe restore/undo/redo、多 worktree reconcile（OL-13）与 sidecar Change ID 已发布；OL-14 已取消，OL-15A runtime cutover 与 OL-15 v1 retirement 已由 PR #503 收口，剩余为远端兼容证据与计划记账。
+3. **LR-02/LR-03**（版本管理）：按 [`plan-20260822.md`](plan-20260822.md) 执行；v2 `RepoViewV2`/`WorkspaceSnapshotV2`、crash-safe restore/undo/redo、多 worktree reconcile（OL-13）与 sidecar Change ID **已随 0.23.x 正式发布**（plan-20260822 closeout `795eba8`）；OL-14 已取消，OL-15A runtime cutover 与 OL-15 v1 retirement 已由 PR #503 收口，剩余为远端兼容证据、发布验收与计划记账。
 4. ~~**RT-01 收尾**（历史 Code 产品线）~~：**历史封存**——plan-20260715/0824 的完成与发布证据保留；产品面已由 plan-20260920 拆除，全部 Code 专属 DEFER 已关闭或墓碑化，不再进入执行队列。
-5. **SB-01/SB-02/SB-04 收口**（横切）：SB-01 的 pkt-line 切片已随 plan-20260901 完成收口（v0.22.47），剩余生产 panic 面清零（如 `registry.rs:100` cwd panic）作为后续日期计划候选；SB-02 的 authorizer 生产接线与 SB-04 的 child scope 抽象是下一批日期计划候选。
+5. **SB-01/SB-02/SB-04 收口**（横切）：SB-01 的 pkt-line 切片已随 plan-20260901 完成收口（v0.22.47），剩余生产 panic 面清零（如 `observed_agents/registry.rs:400`、`claude_code.rs:768`）作为后续日期计划候选；**SB-02 的确定性权限引擎（`permission/`+`sandbox`+`run_admission`）已落地**，剩余跨源凭据作用域、URL 脱敏、写重定向 fail-closed 与团队发布门禁；SB-04 的 child scope 抽象是下一批日期计划候选。
 6. ~~**B 类 Code provider / 凭据 UX**~~：**历史封存**——plan-20260825 的 PS 完成证据保留，产品轴已随 plan-20260920 拆除；TA 测试并行度成果继续有效，通用测试 DEFER 须另立计划。
 7. **MEM-01/MEM-02**（Memory）：按 M2 计划 [`plan-20260819.md`](plan-20260819.md) 执行首个纵向切片；不得在 SB-02 完成前开放非 loopback Memory MCP。
 8. ~~deepseek-harness bridge（plan-20260818）按其任务卡排期执行~~：Libra 侧已完成（LB-01..LB-07，`v0.21.1`）；本轮复核 deepseek 上游 session 事件面未变，bridge 无需变更；TypeScript `@libra-tools/dsh-bundle` 在兄弟仓 `REL-TS-01`。M2 不得再抢 `agent bridge` 面。
@@ -733,6 +726,8 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 
 | 日期计划 | 主要归属 | 当前状态 | 说明 |
 |---|---|---|---|
+| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | 已收口 | SCAP-02 / SCAP-01 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组全绿）。下一卡为 B3-00 |
+| [`plan-20260923.md`](plan-20260923.md) | Cross-cutting CLI completion | 已排期 | Cover implemented Git-compatible and Libra-only capabilities; static acceptance before opt-in dynamic completion. CP-00..20 pending; capability inventory may add bounded cards. No implementation claimed. |
 | [`plan-20260708.md`](plan-20260708.md) | A（LR-04/05/09 相邻基础） | 已完成 | 主线记为历史完成，活跃残留另行排期；不关闭对应 LR |
 | [`plan-20260713.md`](plan-20260713.md) | B（LR-06/07/10 捕获前置） | 已完成 | 不覆盖 seal/preflight/capsule |
 | [`plan-20260714.md`](plan-20260714.md) | A（UP-01、LR-01）+ 横切 | 已完成 | Part A 已迁移至 plan-long UP-01（已实现）；Part C W1–W4 已勾选、Part D 残留由 LR-01/LR-02 承接 |
@@ -741,7 +736,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | 已完成 | `libra agent bridge --stdio` 唯一标准入站面；LB-01..LB-07 全部合入，protocol v1 的 20 个 method 自 `v0.21.1` 起全部实现（`v0.21.0` 首发）；不覆盖 MCP/旧工具服务器恢复，TypeScript 侧 `@libra-tools/dsh-bundle` 归兄弟仓 `REL-TS-01` |
 | [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02） | 已排期 | M2 研发历程记忆首个纵向切片（MemoryNote/MemoryEvent、MemoryWriter、FTS5/BM25、`libra memory` 命令面）；实现未开始；不覆盖 MCP 面、向量检索、团队同步与 MEM-03..06 |
 | [`plan-20260821.md`](plan-20260821.md) | A（UP-01） | 已完成 | 客户端与发布 CI 侧全部落地（trust table、generation floor、`release.yml` OIDC publish、install 验签）；closeout `00bc815`（2026-09-01）；D10 首签随 v0.22.7、v0.22.8 收全绿 run；残留 DEFER-02..06 与 CHANGELOG 0.22.1..0.22.10 文档债 |
-| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03） | 实施中（PR #503 收口） | OL-01..13、CH-01..04 全部 `done/complete`；**OL-14（Web 图）已取消**；OL-15A `done/complete`、OL-15 `done/remote-pending`（v1 runtime retirement 已实现，等待 compat-offline-core） |
+| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03） | 已完成 | OL-01..13、CH-01..04 全部 `done/complete`（closeout `795eba8` #509）；**OL-14（Web 图）已取消**；OL-15A `done/complete`、OL-15 `done/remote-pending`（v1 runtime retirement 已实现，等待 compat-offline-core）；LR-02/LR-03 已随 0.23.x 发布，剩余发布验收与计划记账 | |
 | [`plan-20260824.md`](plan-20260824.md) | B（历史：RT-01 延后项收口） | **历史完成/封存** | DF-01..DF-09 的完成/评审/发布证据保留；其 fix bridge、Code SSE、skill activation 消费面与 Code 专属 DEFER 已由 plan-20260920 拆除或墓碑化 |
 | [`plan-20260825.md`](plan-20260825.md) | B（历史：Code provider）+ 横切测试 | **历史完成/封存** | PS provider/凭据/provenance 产品轴的完成证据保留但产品面已拆除；TA-03/06/07 的测试并行度成果仍有效并由 plan-20260827 承接，通用测试 DEFER 只可另立计划 |
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度与序列注册） | 已完成 | NP-00..05 六卡全部 complete（nextest 离线 CI face `a8218ac`、串行注册 `315132a`、TA-03/06/07 承接）；D 组 CI 证据环境受阻部分按 backfill 窗口记录 |
@@ -759,8 +754,8 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 已排期 | 设计计划，任务卡尚未执行；Libra 侧以前置 `plan-20260907` 完整收口为准 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | CAP-01..06 HTTP client 可先行；CAP-07 local orchestration 受 plan-20260924 `DEP-ACF-CAP` 阻塞 |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | 已排期 | 收口与 nextest 分组无关的 `--lib` 串行锁对齐 + `command_test` 高并行 spawn；禁止改 nextest 成员 |
-| [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | 已完成（WT-06/WT-07 blocked） | 合并原 issues/469、484、489、491-494 及 490/476/470 的 add 卡。23/25 卡 `done`/`complete`（SW-06→v0.23.25/27、FM-03→v0.23.26/27、FM-04→v0.23.27、WT-05→v0.23.28，其余见各卡 D 组记录）；WT-06/WT-07 因 DEP-AD-11（[`issues/476.md`](issues/476.md) 全部 `pending`）按依赖失败策略保持 `blocked`。`add -p` 仍由 477 Phase 4 交付 |
-| [`plan-20260920.md`](plan-20260920.md) | 横切（拆除 `libra code` / Publish / Worker） | **已完成** | RC-00..RC-36 全部 `done/complete`；公开 Code/Publish、内部 SCC、Code UI 测试面与 `worker/` 已删除，三份 RT-01/Code provider 计划转为历史封存 |
+| [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | 已完成 | 合并原 issues/469、484、489、491-494 及 490/476/470 的 add 卡。23/25 卡 `done`/`complete`；WT-06/WT-07 因 DEP-AD-11（[`issues/476.md`](issues/476.md) 全部 `pending`）按依赖失败策略保持 `blocked`。`add -p` 仍由 477 Phase 4 交付 |
+| [`plan-20260920.md`](plan-20260920.md) | 横切（拆除 `libra code` / Publish / Worker） | **已完成** | RC-00..RC-36 全部 `done/complete`（closeout `1e74d0c`）；公开 Code/Publish 表面已随 0.23.0 删除，内部 SCC、leftover、Code UI 测试面与 `worker/` 已删除，三份 RT-01/Code provider 计划转为历史封存 |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁到 XDG） | 实施中 | 用户 2026-09-19 裁决：global config DB + 全域 vault unseal key 迁到 `<XDG_CONFIG_HOME\|~/.config>/libra`（macOS 同）；旧库首次使用自动迁移并保留备份；`~/.libra` 仍为 `LIBRA_HOME`；四个 `independent` 卡、`patch` 发布。**进度**：GCX-01 `done`（2026-09-19，`v0.23.1`）；GCX-02（首次使用自动迁移）/ GCX-03（全域 vault key 随迁）/ GCX-04（用户级 hooks 路径对齐）于 2026-09-22 完成实现+测试+文档，三卡 `locally-accepted`，版本 bump 与发布未执行。版本面本轮重核为**三处**（`web/package.json` 已随 `web/` 拆除）；DEP-GCX-01（`../libra-backend`）与 DEP-GCX-03（`.env.test`/`.env.live-test`）在本机均不满足 |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 2026-09-21 由 `plan-20260919-gpg-import.md` 改名。用户 2026-09-19 指示 Codex+Claude 双评审：**R29 同版双 `PASS`（P0/P1/P2 全 0）**；15 卡（家族 REL-VG-01 + 四张独立 patch VG-06/07/08/14）。**Phase 0 已收口（2026-09-20）**：`plan-long.md` 索引、`gpg --version` 证据（`gpg (GnuPG) 2.4.9`）、ADR-VG-01..12 Accepted（12/12）、VG-00 go 结论 **GO**、开工 DEP 复核完成。**进度（2026-09-23 收口，执行者实跑，无 Codex/Claude review）：** VG-00 `done/complete`；VG-01..VG-14 共 14 卡**全部实施完成**（`locally-accepted`；家族卡待 VG-09 发布后转 `done`）；权威全量回归门 20→22 逐轮全绿（7929→7931→**7944/7944, 0 FAIL, 0 FLAKY**），**门 23 → 门 37** 逐轮全绿（7954 → **7982/7982**）；**2026-09-23 补 15 张声明门**（VG-05 G8/G15、VG-08 G1–G12、VG-04 legacy fallback）并修复两项生产缺陷（`pgp_sign` 公钥双缺时 fail-closed；GPG 密钥移除改单事务，避免中途失败留半状态）；计划声明门 63 门全实现，审计追加的 13 个声明名中 **10 门已实现**、**3 门按 (B) 偏差登记**（见计划 §审计第 3 处盲区收口记录）；issuer-absent 候选上限已对齐 ADR 的 **16**（并改为按候选 (sub)key 计数）；`../libra-backend` 五页已同步（后端仓 `cf` 分支提交 `1bb46c0`，91+/3-）。**未完成（需操作者授权或环境恢复）：** VG-09 家族发布与 REL-VG-01 证据（需 `libra push origin` + `gh release create`，改写真实远端；**且先决于计划第 1198 行的发布拓扑决策**——四张管理面卡先于 VG-09 合入，需二选一后方可 bump/tag/push；版本须于发布时刻经 runbook `bump`+`preflight` 选定，上游已占用至 `0.23.59`）；本仓 vault unseal key 事故恢复（2026-09-23 08:14 被 lib 级注入测试覆写且无备份，现 `vault.signing=false`）。 |
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | 對標 Entire `main@9c06bfb13`；ACF-01..09 建立 validated ingress、純 reducer、snapshot、catalog/checkpoint store、coordinator、bounded finalizer 與獨立 handoff；是 0902/04/05/11 production、CAP-07 與 0923 DM-05 session consumer contract 前置 |

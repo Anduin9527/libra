@@ -16,9 +16,11 @@ libra bundle unbundle <file>
 
 - `create` writes a full, non-thin bundle. Explicit revisions may be combined
   with `--all`, `--branches`, or `--tags`; at least one selector is required.
-  Annotated tag heads retain the tag-object OID and the pack includes tag target
-  closure. Output uses a private temporary file, syncs it, then renames it into
-  place.
+  `--all` and an explicit `HEAD` revision advertise a `HEAD` line (detached
+  `HEAD` points at the detached commit; attached `HEAD` stays `HEAD`, not
+  `refs/heads/<branch>`). Annotated tag heads retain the tag-object OID and the
+  pack includes tag target closure. Output uses a private temporary file, syncs
+  it, then renames it into place.
 - `verify` validates the v2 header, local prerequisites, pack version, and the
   complete pack checksum.
 - `list-heads` prints the advertised `<oid> <ref>` lines without importing.
@@ -37,8 +39,8 @@ full-history only; prerequisite/thin/incremental range creation remains deferred
 
 | Option | Description |
 |---|---|
-| `<rev>...` | Include explicit revisions as advertised heads. |
-| `--all` | Include all local branches and tags. |
+| `<rev>...` | Include explicit revisions as advertised heads. `HEAD` is advertised as `HEAD`. |
+| `--all` | Include all local branches and tags, plus a `HEAD` line. |
 | `--branches` | Include all local branches. |
 | `--tags` | Include all local tags, preserving annotated objects. |
 
@@ -75,6 +77,7 @@ git clone repository.bundle restored
 | List heads | `libra bundle list-heads <f>` | `git bundle list-heads <f>` |
 | Import objects | `libra bundle unbundle <f>` | `git bundle unbundle <f>` |
 
-Deferred surfaces are prerequisite/thin/incremental bundle creation and cloning
-from a bundle through `libra clone`. `verify` checks checksum integrity but does
+Deferred surfaces are prerequisite/thin/incremental bundle creation.
+`libra clone <bundle>` reads a Git v2 bundle (directory first, then
+`<path>.bundle`, then `<path>`). `verify` checks checksum integrity but does
 not build a temporary index to exhaustively decode every pack entry.

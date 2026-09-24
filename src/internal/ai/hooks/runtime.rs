@@ -21,7 +21,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use git_internal::hash::{HashKind, set_hash_kind};
+use git_internal::hash::set_hash_kind;
 use serde_json::{Value, json};
 
 use super::{
@@ -185,8 +185,9 @@ pub struct HookEnvelopeInvalid(pub String);
 /// For [`HookTarget::AiIntent`] the function is exactly the historical
 /// behaviour (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the
 /// function runs the external-Agent capture ingest — stdin parse, validate,
-/// redact, upsert into `agent_session`, and (on `SessionEnd`) write an
-/// E4-libra checkpoint commit on `refs/libra/traces`.
+/// redact, and upsert into `agent_session`. Checkpoint class comes from
+/// `session_capture::decide` and covers `TurnEnd`, `SessionEnd`,
+/// `SubagentStart`, and `SubagentEnd`.
 pub async fn process_hook_event_with_target(
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -747,13 +748,7 @@ async fn ingest_agent_traces_payload_with_scope(
         }
     }
 
-    let new_state = match event.kind {
-        LifecycleEventKind::SessionStart => "active",
-        LifecycleEventKind::SessionEnd => "stopped",
-        LifecycleEventKind::Compaction => "condensed",
-        LifecycleEventKind::CompactionCompleted => "active",
-        _ => "active",
-    };
+    let new_state = super::session_capture::decide(event.kind).session_state;
 
     // UPSERT: insert a fresh row on first sight; otherwise just bump
     // `last_event_at`, `state`, and `redaction_report`. We key by
@@ -925,13 +920,9 @@ async fn ingest_agent_traces_payload_with_scope(
     // redacted transcript blob (now the agent's full on-disk transcript, see
     // the writer); events-blob inclusion remains a follow-up. Per-turn
     // checkpoints give `libra agent checkpoint rewind` turn-level granularity.
-    if matches!(
-        event.kind,
-        LifecycleEventKind::SessionEnd
-            | LifecycleEventKind::TurnEnd
-            | LifecycleEventKind::SubagentStart
-            | LifecycleEventKind::SubagentEnd
-    ) && let Some(repo) = repo_path
+    let checkpoint = super::session_capture::decide(event.kind).checkpoint;
+    if checkpoint != super::session_capture::CheckpointWrite::None
+        && let Some(repo) = repo_path
     {
         // AG-19 owner-race closure: the pre-upsert owner check above is a
         // fast path, but two providers racing on a fresh provider session
@@ -1005,10 +996,7 @@ async fn ingest_agent_traces_payload_with_scope(
         // `doctor` surface nested runs as first-class checkpoints instead of
         // leaving them as bounded `subagent_events` metadata on the main
         // checkpoint. `SessionEnd` / `TurnEnd` keep the `committed` path.
-        if matches!(
-            event.kind,
-            LifecycleEventKind::SubagentStart | LifecycleEventKind::SubagentEnd
-        ) {
+        if checkpoint == super::session_capture::CheckpointWrite::SubagentBoundary {
             write_subagent_checkpoint(
                 conn,
                 repo,
@@ -2995,21 +2983,34 @@ fn merge_redaction_report_into(
 /// Mirrors `cli::set_local_hash_kind_for_storage` but reads via the already-open
 /// connection that the hook runtime obtains. Defaults to `sha1` for repositories
 /// initialised before SHA-256 support landed.
+///
+/// Config **read errors** propagate (fail-closed). A missing key (`Ok(None)`)
+/// keeps the sha1 default so pre-objectformat repositories stay usable.
 async fn set_hash_kind_from_repo() -> Result<()> {
-    let object_format = ConfigKv::get("core.objectformat")
+    let lookup = ConfigKv::get("core.objectformat")
         .await
-        .ok()
-        .flatten()
-        .map(|e| e.value)
-        .unwrap_or_else(|| "sha1".to_string());
-
-    let hash_kind = match object_format.as_str() {
-        "sha1" => HashKind::Sha1,
-        "sha256" => HashKind::Sha256,
-        _ => bail!("unsupported object format: '{object_format}'"),
-    };
+        .map(|entry| entry.map(|e| e.value));
+    let hash_kind = hash_kind_from_object_format_lookup(lookup)?;
     set_hash_kind(hash_kind);
     Ok(())
+}
+
+/// Map a `core.objectformat` lookup onto [`HashKind`].
+///
+/// - `Ok(Some(value))` → [`object_format::parse_config_value`]
+/// - `Ok(None)` → `HashKind::Sha1` (legacy repos without the key)
+/// - `Err(_)` → propagated (fail-closed; never swallowed into sha1)
+fn hash_kind_from_object_format_lookup(
+    lookup: Result<Option<String>>,
+) -> Result<git_internal::hash::HashKind> {
+    let raw = match lookup {
+        Ok(Some(value)) => value,
+        Ok(None) => "sha1".to_string(),
+        Err(error) => {
+            return Err(error).context("failed to read core.objectformat from repository config");
+        }
+    };
+    crate::internal::object_format::parse_config_value(&raw)
 }
 
 /// Apply the canonical event together with bookkeeping into `session`.
@@ -3375,12 +3376,42 @@ impl SessionPhase {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::Map;
     use serial_test::serial;
 
     use super::*;
     use crate::internal::ai::hooks::providers::{claude_provider, codex_provider, gemini_provider};
+
+    /// B3-00: config read errors fail closed; missing key stays sha1; blake3 parses.
+    #[test]
+    fn runtime_config_read_error_fail_closed() {
+        let blake3 = hash_kind_from_object_format_lookup(Ok(Some("blake3".to_string())))
+            .expect("blake3 accepted via object_format helper");
+        assert_eq!(blake3, git_internal::hash::HashKind::Blake3);
+
+        let missing =
+            hash_kind_from_object_format_lookup(Ok(None)).expect("missing key defaults to sha1");
+        assert_eq!(missing, git_internal::hash::HashKind::Sha1);
+
+        let err =
+            hash_kind_from_object_format_lookup(Err(anyhow!("simulated config read failure")));
+        let message = format!("{:#}", err.expect_err("Err must propagate"));
+        assert!(
+            message.contains("failed to read core.objectformat"),
+            "expected contextual fail-closed message, got: {message}"
+        );
+        assert!(
+            message.contains("simulated config read failure"),
+            "expected underlying cause preserved, got: {message}"
+        );
+
+        let bad = hash_kind_from_object_format_lookup(Ok(Some("SHA256".to_string())));
+        assert!(
+            bad.is_err(),
+            "mixed-case objectformat must fail closed via parse_config_value"
+        );
+    }
 
     /// AG-21 metadata persistence (codex review R2 P1): the generic E6
     /// path (codex/opencode) must persist `subagent_token_usage` and
@@ -3674,7 +3705,7 @@ mod tests {
 
     const LEGACY_BOOTSTRAP_SQL: &str = include_str!("../../../../sql/sqlite_20260309_init.sql");
 
-    async fn ingest_fresh_conn() -> (TempDir, DatabaseConnection) {
+    pub(crate) async fn ingest_fresh_conn() -> (TempDir, DatabaseConnection) {
         let dir = tempfile::tempdir().expect("tempdir");
         // Use the canonical `libra.db` filename here so the Phase 3.5c
         // object_index queue (`enqueue_agent_blob_object_index_update`)
@@ -3715,7 +3746,7 @@ mod tests {
         (dir, conn)
     }
 
-    fn ingest_envelope(
+    pub(crate) fn ingest_envelope(
         hook_event_name: &str,
         session_id: &str,
         extra: serde_json::Value,

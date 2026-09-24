@@ -262,7 +262,9 @@ async fn test_fetch_invalid_remote() {
         eprintln!("skipped (LIBRA_TEST_GITHUB_TOKEN not set)");
         return;
     }
-    let temp_repo = init_temp_repo();
+    // Need a born `main` so `--set-upstream-to origin/main` can target it.
+    // A bare `init` leaves an unborn branch (`branch 'main' does not exist`).
+    let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
 
     eprintln!("Starting test: fetch from invalid remote");
@@ -2119,5 +2121,270 @@ fn test_fetch_refuses_local_upstream() {
         report.message.contains("remote '.' not found") || stderr.contains("remote '.' not found"),
         "explicit '.' must keep the existing remote-not-found path: {stderr} / {}",
         report.message
+    );
+}
+
+/// M-BOUND via fetch: a local Git remote honors `--depth` on an explicit want.
+#[test]
+fn test_fetch_depth_local_git_boundaries() {
+    use super::{
+        assert_cli_success, create_gdeep_git_repo, init_repo_via_cli, read_shallow_oids,
+        run_libra_command,
+    };
+
+    let gdeep = create_gdeep_git_repo();
+    let source = format!("file://{}", gdeep.dir.path().display());
+    let dest = tempdir().expect("fetch dest");
+    init_repo_via_cli(dest.path());
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", &source], dest.path()),
+        "remote add",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "fetch",
+                "origin",
+                "--depth",
+                "1",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            dest.path(),
+        ),
+        "fetch --depth 1",
+    );
+    assert_eq!(
+        read_shallow_oids(dest.path()),
+        vec![gdeep.c3.clone()],
+        "fetch depth 1 boundary"
+    );
+
+    let dest2 = tempdir().expect("fetch dest2");
+    init_repo_via_cli(dest2.path());
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", &source], dest2.path()),
+        "remote add dest2",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "fetch",
+                "origin",
+                "--depth",
+                "2",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            dest2.path(),
+        ),
+        "fetch --depth 2",
+    );
+    assert_eq!(
+        read_shallow_oids(dest2.path()),
+        vec![gdeep.c2.clone()],
+        "fetch depth 2 boundary"
+    );
+}
+
+fn rev_parse_cli(repo: &Path, rev: &str) -> String {
+    let output = run_libra_command(&["rev-parse", rev], repo);
+    assert_cli_success(&output, &format!("rev-parse {rev}"));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn commit_file_via_cli(repo: &Path, name: &str, contents: &str, message: &str) {
+    fs::write(repo.join(name), contents).expect("write commit file");
+    assert_cli_success(
+        &run_libra_command(&["add", name], repo),
+        &format!("add {name}"),
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", message, "--no-verify"], repo),
+        message,
+    );
+}
+
+/// M-BFETCH H1–H4: fetch against a bundle remote.
+#[test]
+fn test_fetch_from_bundle_remote_matrix() {
+    let src = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "dev"], src.path()),
+        "branch dev",
+    );
+    let parent = tempdir().expect("bundle parent");
+    let bundle = parent.path().join("remote.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "create bundle",
+    );
+    let dest = parent.path().join("cloned");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", bundle.to_str().unwrap(), dest.to_str().unwrap()],
+            parent.path(),
+        ),
+        "clone from bundle",
+    );
+
+    let h1 = run_libra_command(&["fetch"], dest.as_path());
+    assert_cli_success(&h1, "H1 fetch after clone");
+
+    let old_main = rev_parse_cli(&dest, "refs/remotes/origin/main");
+    assert_cli_success(
+        &run_libra_command(&["rev-parse", "refs/remotes/origin/dev"], &dest),
+        "H4 origin/dev exists before prune",
+    );
+
+    commit_file_via_cli(src.path(), "next.txt", "next\n", "next");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "replace bundle with new commit",
+    );
+    let new_src = rev_parse_cli(src.path(), "HEAD");
+
+    let dry = run_libra_command(&["fetch", "--dry-run"], dest.as_path());
+    assert_cli_success(&dry, "H4 fetch --dry-run");
+    assert_eq!(
+        rev_parse_cli(&dest, "refs/remotes/origin/main"),
+        old_main,
+        "H4 dry-run must not update tracking"
+    );
+
+    let h2 = run_libra_command(&["fetch"], dest.as_path());
+    assert_cli_success(&h2, "H2 fetch after bundle replace");
+    assert_eq!(
+        rev_parse_cli(&dest, "refs/remotes/origin/main"),
+        new_src,
+        "H2 tracking must move to the new bundle tip"
+    );
+
+    // Recreate a main-only bundle so origin/dev is no longer advertised.
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "main"],
+            src.path(),
+        ),
+        "replace bundle without dev",
+    );
+    let prune = run_libra_command(&["fetch", "--prune"], dest.as_path());
+    assert_cli_success(&prune, "H4 fetch --prune");
+    let pruned = run_libra_command(&["rev-parse", "refs/remotes/origin/dev"], &dest);
+    assert!(!pruned.status.success(), "H4 prune must drop origin/dev");
+
+    fs::remove_file(&bundle).expect("delete bundle");
+    let h3 = run_libra_command(&["fetch"], dest.as_path());
+    assert!(!h3.status.success(), "H3 missing bundle");
+    let h3_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&h3.stdout),
+        String::from_utf8_lossy(&h3.stderr)
+    );
+    assert!(
+        h3_text.contains("does not exist") && h3_text.to_ascii_lowercase().contains("bundle"),
+        "H3 must say the bundle does not exist: {h3_text}"
+    );
+}
+
+/// M-MFETCH Q1–Q4: fetch into a `--mirror` clone updates and prunes verbatim refs.
+#[test]
+fn test_fetch_into_mirror_updates_and_prunes_all_refs() {
+    use super::{
+        assert_cli_success, create_gdeep_git_repo, git_rev_parse, git_success, run_libra_command,
+    };
+
+    let gdeep = create_gdeep_git_repo();
+    git_success(gdeep.dir.path(), &["config", "user.email", "t@t"]);
+    git_success(gdeep.dir.path(), &["config", "user.name", "t"]);
+    let parent = tempdir().expect("mirror parent");
+    let dest = parent.path().join("mirror");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--mirror",
+                gdeep.dir.path().to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "clone --mirror",
+    );
+
+    git_success(gdeep.dir.path(), &["checkout", "-b", "feature2"]);
+    fs::write(gdeep.dir.path().join("f2.txt"), "f2\n").expect("f2");
+    git_success(gdeep.dir.path(), &["add", "f2.txt"]);
+    git_success(gdeep.dir.path(), &["commit", "-m", "feature2"]);
+    git_success(gdeep.dir.path(), &["tag", "v2"]);
+    let feature2 = git_rev_parse(gdeep.dir.path(), "HEAD");
+    git_success(gdeep.dir.path(), &["update-ref", "refs/mr/2", &feature2]);
+
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], dest.as_path()),
+        "Q1 fetch new refs",
+    );
+    let refs = String::from_utf8_lossy(&run_libra_command(&["show-ref"], &dest).stdout).to_string();
+    assert!(refs.contains("refs/heads/feature2"), "Q1 feature2: {refs}");
+    assert!(refs.contains("refs/tags/v2"), "Q1 tag v2: {refs}");
+    assert!(refs.contains("refs/mr/2"), "Q1 mr/2: {refs}");
+    assert!(
+        !refs.contains("refs/remotes/"),
+        "Q1 must not create tracking refs: {refs}"
+    );
+
+    fs::write(gdeep.dir.path().join("f2.txt"), "rewritten\n").expect("rewrite");
+    git_success(gdeep.dir.path(), &["add", "f2.txt"]);
+    git_success(gdeep.dir.path(), &["commit", "--amend", "--no-edit"]);
+    let rewritten = git_rev_parse(gdeep.dir.path(), "HEAD");
+    assert_ne!(rewritten, feature2);
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], dest.as_path()),
+        "Q3 force fetch",
+    );
+    let after = run_libra_command(&["rev-parse", "refs/heads/feature2"], &dest);
+    assert_cli_success(&after, "Q3 rev-parse feature2");
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        rewritten,
+        "Q3 must force-update the mirrored branch"
+    );
+
+    git_success(gdeep.dir.path(), &["checkout", "main"]);
+    git_success(gdeep.dir.path(), &["branch", "-D", "feature2"]);
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--prune", "origin"], dest.as_path()),
+        "Q2 fetch --prune",
+    );
+    let pruned = run_libra_command(&["rev-parse", "refs/heads/feature2"], &dest);
+    assert!(
+        !pruned.status.success(),
+        "Q2 prune must drop refs/heads/feature2"
+    );
+
+    let src = create_committed_repo_via_cli();
+    let normal = parent.path().join("normal");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                src.path().to_str().unwrap(),
+                normal.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "Q4 clone",
+    );
+    commit_file_via_cli(src.path(), "extra.txt", "e\n", "extra");
+    let extra = rev_parse_cli(src.path(), "HEAD");
+    assert_cli_success(&run_libra_command(&["fetch"], normal.as_path()), "Q4 fetch");
+    assert_eq!(
+        rev_parse_cli(&normal, "refs/remotes/origin/main"),
+        extra,
+        "Q4 non-mirror fetch still updates tracking"
     );
 }

@@ -46,6 +46,7 @@ use crate::{
         model::reference as ref_model,
         protocol::{
             DiscRef, DiscoveryResult, FetchStream, ProtocolClient,
+            bundle_client::BundleClient,
             git_client::GitClient,
             https_client::HttpsClient,
             local_client::LocalClient,
@@ -86,6 +87,7 @@ pub(crate) enum RemoteClient {
     Local(LocalClient),
     Git(GitClient),
     Ssh(SshClient),
+    Bundle(BundleClient),
 }
 
 impl RemoteClient {
@@ -114,9 +116,7 @@ impl RemoteClient {
                     let path = url
                         .to_file_path()
                         .map_err(|_| format!("invalid file url: {spec}"))?;
-                    let client = LocalClient::from_path(path)
-                        .map_err(|e| format!("invalid local repository '{}': {}", spec, e))?;
-                    Ok(Self::Local(client))
+                    local_or_bundle_client(path, spec)
                 }
                 "git" => {
                     if url.host_str().is_none() {
@@ -138,12 +138,32 @@ impl RemoteClient {
             } else {
                 normalized
             };
-            let client = LocalClient::from_path(normalized)
-                .map_err(|e| format!("invalid local repository '{}': {}", spec, e))?;
-            Ok(Self::Local(client))
+            local_or_bundle_client(PathBuf::from(normalized), spec)
         }
     }
+}
 
+/// A local filesystem spec is a Git/Libra repo first; otherwise a bundle file
+/// (`<path>.bundle`, then `<path>`), matching git clone's recognition order.
+fn local_or_bundle_client(path: PathBuf, spec: &str) -> Result<RemoteClient, String> {
+    match LocalClient::from_path(&path) {
+        Ok(client) => Ok(RemoteClient::Local(client)),
+        Err(error) => match BundleClient::open_resolved(&path) {
+            Ok(client) => Ok(RemoteClient::Bundle(client)),
+            Err(bundle_error) => {
+                if looks_like_missing_bundle(&path, spec) {
+                    Err(format!("bundle file does not exist: {spec}"))
+                } else if path.is_file() {
+                    Err(format!("invalid local repository '{spec}': {bundle_error}"))
+                } else {
+                    Err(format!("invalid local repository '{spec}': {error}"))
+                }
+            }
+        },
+    }
+}
+
+impl RemoteClient {
     pub(crate) fn with_network_timeouts(
         self,
         connect_timeout: Duration,
@@ -168,7 +188,7 @@ impl RemoteClient {
         self,
         remote: Option<&str>,
     ) -> Result<Self, String> {
-        let is_local = matches!(self, Self::Local(_));
+        let is_local = matches!(self, Self::Local(_) | Self::Bundle(_));
         if is_local {
             return Ok(self);
         }
@@ -211,6 +231,7 @@ impl RemoteClient {
             RemoteClient::Local(client) => client.discovery_reference(service).await,
             RemoteClient::Git(client) => client.discovery_reference(service).await,
             RemoteClient::Ssh(client) => client.discovery_reference(service).await,
+            RemoteClient::Bundle(client) => client.discovery_reference(service).await,
         }
     }
 
@@ -226,6 +247,7 @@ impl RemoteClient {
             RemoteClient::Local(client) => client.fetch_objects(have, want, shallow, depth).await,
             RemoteClient::Git(client) => client.fetch_objects(have, want, shallow, depth).await,
             RemoteClient::Ssh(client) => client.fetch_objects(have, want, shallow, depth).await,
+            RemoteClient::Bundle(client) => client.fetch_objects(have, want, shallow, depth).await,
         }
     }
 }
@@ -762,6 +784,10 @@ struct FetchRefPlan {
     reference: DiscRef,
     destination: String,
     force: bool,
+    /// When false, objects and FETCH_HEAD still update, but no tracking ref is
+    /// written. `git fetch <remote> <ref>` does this when the remote's
+    /// configured refspec does not map the requested ref (single-branch clone).
+    update_tracking: bool,
 }
 
 /// Typed classification for [`FetchError::InvalidRemoteSpec`] so that callers
@@ -1403,7 +1429,27 @@ pub(crate) async fn discover_remote_with_name(
 
 /// Classify a remote-spec construction failure into a typed kind and a
 /// human-readable reason string.
+fn looks_like_missing_bundle(path: &Path, spec: &str) -> bool {
+    let mut with_suffix = path.as_os_str().to_os_string();
+    with_suffix.push(".bundle");
+    let with_suffix = PathBuf::from(with_suffix);
+    let named_bundle =
+        path.extension().is_some_and(|ext| ext == "bundle") || spec.contains(".bundle");
+    named_bundle && !path.is_file() && !with_suffix.is_file()
+}
+
 fn classify_remote_spec_error(remote_spec: &str, message: &str) -> (RemoteSpecErrorKind, String) {
+    if message.starts_with("bundle file does not exist") {
+        let display = if remote_spec == "/" {
+            "/".to_string()
+        } else {
+            remote_spec.trim_end_matches('/').to_string()
+        };
+        return (
+            RemoteSpecErrorKind::MissingLocalRepo,
+            format!("bundle '{display}' does not exist"),
+        );
+    }
     if message.starts_with("invalid local repository") {
         let display = if remote_spec == "/" {
             "/".to_string()
@@ -1460,7 +1506,19 @@ fn default_fetch_destination(remote: &str, source: &str) -> Result<String, Fetch
     })
 }
 
+fn is_mirror_wildcard_refspec(source: &str, destination: &str) -> bool {
+    source == "refs/*" && destination == "refs/*"
+}
+
 fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), FetchError> {
+    if is_mirror_wildcard_refspec("refs/*", destination)
+        || (refspec.contains("refs/*:refs/*")
+            && destination.starts_with("refs/")
+            && destination != "HEAD"
+            && !destination.ends_with("/HEAD"))
+    {
+        return Ok(());
+    }
     if destination.starts_with("refs/tags/") {
         return Err(FetchError::InvalidRefspec {
             refspec: refspec.to_string(),
@@ -1536,6 +1594,13 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
                     .to_string(),
         });
     }
+    if is_mirror_wildcard_refspec(&source, &destination) {
+        return Ok(FetchRefspec {
+            source,
+            destination,
+            force,
+        });
+    }
     validate_fetch_destination(&destination, raw)?;
 
     Ok(FetchRefspec {
@@ -1579,7 +1644,12 @@ fn expand_refspec(
                 reason: "destination wildcard is missing".to_string(),
             })?;
         for reference in refs {
-            if reference._ref.ends_with("^{}") {
+            if reference._ref.ends_with("^{}") || reference._ref == "HEAD" {
+                continue;
+            }
+            if is_mirror_wildcard_refspec(&spec.source, &spec.destination)
+                && reference._ref.starts_with("refs/tags/")
+            {
                 continue;
             }
             if let Some(middle) = reference
@@ -1604,6 +1674,7 @@ fn expand_refspec(
                     reference: reference.clone(),
                     destination,
                     force: spec.force,
+                    update_tracking: true,
                 });
             }
         }
@@ -1612,6 +1683,7 @@ fn expand_refspec(
             reference: reference.clone(),
             destination: spec.destination.clone(),
             force: spec.force,
+            update_tracking: true,
         });
     } else {
         return Err(FetchError::RemoteBranchNotFound {
@@ -1628,12 +1700,10 @@ async fn build_fetch_ref_plans(
     branch: Option<&str>,
     single_branch: bool,
 ) -> Result<Vec<FetchRefPlan>, FetchError> {
-    let specs = if single_branch {
-        branch
-            .map(|branch| parse_fetch_refspec(branch, remote).map(|spec| vec![spec]))
-            .transpose()?
-            .unwrap_or_default()
-    } else if branch.is_some() {
+    if single_branch {
+        return single_branch_fetch_plans(remote, refs, branch).await;
+    }
+    let specs = if branch.is_some() {
         Vec::new()
     } else {
         configured_fetch_refspecs(remote).await?
@@ -1648,6 +1718,7 @@ async fn build_fetch_ref_plans(
                         reference: reference.clone(),
                         destination,
                         force: true,
+                        update_tracking: true,
                     })
             })
             .collect::<Vec<_>>()
@@ -1660,6 +1731,56 @@ async fn build_fetch_ref_plans(
     };
 
     deduplicate_fetch_ref_plans(plans)
+}
+
+/// `git fetch <remote> <ref>` on a single-branch clone: when the configured
+/// refspec maps the requested ref, update that tracking ref. When it does not,
+/// still fetch the objects and record FETCH_HEAD, but do not create a new
+/// remote-tracking branch.
+async fn single_branch_fetch_plans(
+    remote: &str,
+    refs: &[DiscRef],
+    branch: Option<&str>,
+) -> Result<Vec<FetchRefPlan>, FetchError> {
+    let Some(raw) = branch else {
+        return Ok(Vec::new());
+    };
+    let parsed = parse_fetch_refspec(raw, remote)?;
+    if raw.contains(':') {
+        return expand_refspec(&parsed, refs, remote);
+    }
+    let configured = configured_fetch_refspecs(remote).await?;
+    if configured.is_empty() {
+        return expand_refspec(&parsed, refs, remote);
+    }
+    let Some(reference) = refs
+        .iter()
+        .find(|reference| reference._ref == parsed.source)
+        .cloned()
+    else {
+        return Err(FetchError::RemoteBranchNotFound {
+            branch: parsed.source,
+            remote: remote.to_string(),
+        });
+    };
+    let requested = [reference.clone()];
+    let mut plans = Vec::new();
+    for spec in &configured {
+        match expand_refspec(spec, &requested, remote) {
+            Ok(expanded) => plans.extend(expanded),
+            Err(FetchError::RemoteBranchNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if plans.is_empty() {
+        plans.push(FetchRefPlan {
+            reference,
+            destination: parsed.destination,
+            force: false,
+            update_tracking: false,
+        });
+    }
+    Ok(plans)
 }
 
 fn deduplicate_fetch_ref_plans(plans: Vec<FetchRefPlan>) -> Result<Vec<FetchRefPlan>, FetchError> {
@@ -1688,6 +1809,7 @@ fn mapped_remote_tracking_branch_names(remote: &str, plans: &[FetchRefPlan]) -> 
     let prefix = format!("refs/remotes/{remote}/");
     plans
         .iter()
+        .filter(|plan| plan.update_tracking)
         .filter_map(|plan| plan.destination.strip_prefix(&prefix).map(str::to_owned))
         .collect()
 }
@@ -1706,6 +1828,7 @@ pub(crate) async fn configured_remote_tracking_branch_names(
                         reference: reference.clone(),
                         destination,
                         force: true,
+                        update_tracking: true,
                     })
             })
             .collect()
@@ -1734,6 +1857,7 @@ pub(crate) fn normalize_remote_url(remote_input: &str, remote_client: &RemoteCli
             remote_input.to_string()
         }
         RemoteClient::Local(client) => client.repo_path().to_string_lossy().to_string(),
+        RemoteClient::Bundle(client) => client.path().to_string_lossy().to_string(),
     }
 }
 
@@ -1940,7 +2064,13 @@ pub(crate) async fn fetch_repository_with_result(
         // `--dry-run --prune`: report the stale refs that would be removed, but
         // write nothing.
         let pruned = if prune {
-            prune_stale_remote_refs(&remote_config.name, &prune_branch_names, true).await?
+            prune_after_fetch(
+                &remote_config.name,
+                &prune_branch_names,
+                &discovery.refs,
+                true,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -1968,7 +2098,13 @@ pub(crate) async fn fetch_repository_with_result(
         )
         .await?;
         let pruned = if prune {
-            prune_stale_remote_refs(&remote_config.name, &prune_branch_names, false).await?
+            prune_after_fetch(
+                &remote_config.name,
+                &prune_branch_names,
+                &discovery.refs,
+                false,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -2095,9 +2231,16 @@ pub(crate) async fn fetch_repository_with_result(
     // `--prune`/`-p`: after the fetch has updated tracking refs, delete any
     // `refs/remotes/<name>/*` the remote no longer advertises (transactionally,
     // with an audit reflog entry). Only stale tracking refs for *this* remote
-    // are touched.
+    // are touched. Mirror remotes (`+refs/*:refs/*`) prune mirrored refs
+    // instead — see `prune_after_fetch`.
     let pruned = if prune {
-        prune_stale_remote_refs(&remote_config.name, &prune_branch_names, false).await?
+        prune_after_fetch(
+            &remote_config.name,
+            &prune_branch_names,
+            &discovery.refs,
+            false,
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -2722,7 +2865,7 @@ fn shallow_file_path() -> Result<PathBuf, FetchError> {
 /// with this one about what counts as a boundary, which is precisely the
 /// disagreement that turns a shallow clone's GC into a corruption report.
 pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
-    read_shallow_boundaries_at(&shallow_file_path()?)
+    crate::internal::shallow::boundary_oids().map_err(shallow_read_error)
 }
 
 /// [`read_shallow_boundaries`] against an EXPLICIT shallow file (§C.4.2) —
@@ -2731,36 +2874,13 @@ pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> 
 pub(crate) fn read_shallow_boundaries_at(
     path: &std::path::Path,
 ) -> Result<BTreeSet<String>, FetchError> {
-    let path = path.to_path_buf();
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(source) => {
-            return Err(FetchError::LocalState {
-                message: format!(
-                    "failed to read shallow metadata '{}': {source}",
-                    path.display()
-                ),
-            });
-        }
-    };
+    crate::internal::shallow::boundary_oids_at(path).map_err(shallow_read_error)
+}
 
-    let mut boundaries = BTreeSet::new();
-    for (line_no, line) in content.lines().enumerate() {
-        let oid = line.trim();
-        if oid.is_empty() {
-            continue;
-        }
-        ObjectHash::from_str(oid).map_err(|source| FetchError::LocalState {
-            message: format!(
-                "invalid shallow metadata entry at '{}:{}': {source}",
-                path.display(),
-                line_no + 1
-            ),
-        })?;
-        boundaries.insert(oid.to_string());
+fn shallow_read_error(error: crate::internal::shallow::ShallowError) -> FetchError {
+    FetchError::LocalState {
+        message: error.to_string(),
     }
-    Ok(boundaries)
 }
 
 fn write_shallow_boundaries(boundaries: &BTreeSet<String>) -> Result<(), FetchError> {
@@ -2827,8 +2947,15 @@ async fn compute_fetch_ref_preview(
     let db = crate::internal::sequencer::request_db_checked()
         .await
         .map_err(|message| FetchError::LocalState { message })?;
-    let checked_out_branches = checked_out_local_branches_with_conn(&db).await?;
+    let checked_out_branches = if repository_is_bare().await {
+        HashSet::new()
+    } else {
+        checked_out_local_branches_with_conn(&db).await?
+    };
     for plan in plans {
+        if !plan.update_tracking {
+            continue;
+        }
         let (storage_name, remote_scope) =
             fetch_destination_storage(&plan.destination, &remote_config.name)?;
         let old_oid = Branch::find_branch_result(&storage_name, remote_scope.as_deref())
@@ -2886,6 +3013,15 @@ async fn checked_out_local_branches_with_conn<C: ConnectionTrait>(
         })
 }
 
+async fn repository_is_bare() -> bool {
+    ConfigKv::get("core.bare")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|entry| crate::internal::config::parse_git_bool(&entry.value))
+        .unwrap_or(false)
+}
+
 fn reject_checked_out_destination(
     plan: &FetchRefPlan,
     remote_scope: Option<&str>,
@@ -2922,9 +3058,13 @@ fn fetch_destination_storage(
             return Ok((destination.to_string(), Some(remote)));
         }
     }
+    if destination.starts_with("refs/") && destination != "HEAD" && !destination.ends_with("/HEAD")
+    {
+        return Ok((destination.to_string(), None));
+    }
     Err(FetchError::InvalidRefspec {
         refspec: destination.to_string(),
-        reason: "destination must be under refs/heads/* or refs/remotes/<remote>/*".to_string(),
+        reason: "destination must be under refs/heads/*, refs/remotes/<remote>/*, or another refs/* name".to_string(),
     })
 }
 
@@ -3154,6 +3294,108 @@ async fn prune_stale_remote_refs(
     Ok(pruned)
 }
 
+async fn prune_after_fetch(
+    remote_name: &str,
+    remote_branch_names: &HashSet<String>,
+    advertised: &[DiscRef],
+    dry_run: bool,
+) -> Result<Vec<FetchPruneEntry>, FetchError> {
+    let specs = configured_fetch_refspecs(remote_name).await?;
+    if specs
+        .iter()
+        .any(|spec| is_mirror_wildcard_refspec(&spec.source, &spec.destination))
+    {
+        let live = advertised
+            .iter()
+            .filter(|reference| {
+                reference._ref.starts_with("refs/") && !reference._ref.ends_with("^{}")
+            })
+            .map(|reference| reference._ref.clone())
+            .collect::<HashSet<_>>();
+        prune_stale_mirror_refs(&live, dry_run).await
+    } else {
+        prune_stale_remote_refs(remote_name, remote_branch_names, dry_run).await
+    }
+}
+
+async fn prune_stale_mirror_refs(
+    live: &HashSet<String>,
+    dry_run: bool,
+) -> Result<Vec<FetchPruneEntry>, FetchError> {
+    let local =
+        Branch::list_branches_result(None)
+            .await
+            .map_err(|error| FetchError::UpdateRefs {
+                message: format!("failed to list mirrored refs for prune: {error}"),
+            })?;
+    let pruned: Vec<FetchPruneEntry> = local
+        .into_iter()
+        .filter(|branch| {
+            // Skip locked short names (`main`, AI capture refs). Fully-qualified
+            // `refs/...` names are still eligible so a mirror can drop extras.
+            !crate::internal::branch::is_locked_branch(&branch.name)
+                || branch.name.starts_with("refs/")
+        })
+        .filter_map(|branch| {
+            let dest = if branch.name.starts_with("refs/") {
+                branch.name.clone()
+            } else {
+                format!("refs/heads/{}", branch.name)
+            };
+            (!live.contains(&dest)).then(|| FetchPruneEntry {
+                remote_ref: dest,
+                branch: branch.name.clone(),
+                old_oid: Some(branch.commit.to_string()),
+            })
+        })
+        .collect();
+    if dry_run {
+        return Ok(pruned);
+    }
+
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
+    let to_delete = pruned.clone();
+    let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+    crate::internal::db::write_transaction(&db, |txn| {
+        Box::pin(async move {
+            for entry in &to_delete {
+                let context = ReflogContext {
+                    old_oid: entry.old_oid.clone().unwrap_or_else(|| zero.clone()),
+                    new_oid: zero.clone(),
+                    action: ReflogAction::Fetch,
+                };
+                Reflog::insert_single_entry(txn, &context, &entry.remote_ref)
+                    .await
+                    .map_err(|source| FetchError::UpdateRefs {
+                        message: format!(
+                            "failed to record prune reflog for '{}': {source}",
+                            entry.remote_ref
+                        ),
+                    })?;
+                Branch::delete_branch_result_with_conn(txn, &entry.branch, None)
+                    .await
+                    .map_err(|source| FetchError::UpdateRefs {
+                        message: format!(
+                            "failed to prune mirrored ref '{}': {source}",
+                            entry.remote_ref
+                        ),
+                    })?;
+            }
+            Ok::<_, FetchError>(())
+        })
+    })
+    .await
+    .map_err(|source| FetchError::UpdateRefs {
+        message: match source {
+            TransactionError::Connection(error) => error.to_string(),
+            TransactionError::Transaction(error) => error.to_string(),
+        },
+    })?;
+    Ok(pruned)
+}
+
 async fn update_references(
     remote_config: &RemoteConfig,
     plans: &[FetchRefPlan],
@@ -3169,11 +3411,19 @@ async fn update_references(
     let remote_config = remote_config.clone();
     let plans = plans.to_vec();
     let ref_heads = ref_heads.to_vec();
+    let bare_repo = repository_is_bare().await;
     crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
-            let checked_out_branches = checked_out_local_branches_with_conn(txn).await?;
+            let checked_out_branches = if bare_repo {
+                HashSet::new()
+            } else {
+                checked_out_local_branches_with_conn(txn).await?
+            };
             for plan in &plans {
+                if !plan.update_tracking {
+                    continue;
+                }
                 let (storage_name, remote_scope) =
                     fetch_destination_storage(&plan.destination, &remote_config.name)?;
                 let old_oid = Branch::find_branch_result_with_conn(
@@ -3258,7 +3508,7 @@ async fn update_references(
             let mapped_branch = remote_default_branch.as_ref().and_then(|branch_name| {
                 let source_ref = format!("refs/heads/{branch_name}");
                 plans.iter().find_map(|plan| {
-                    (plan.reference._ref == source_ref)
+                    (plan.update_tracking && plan.reference._ref == source_ref)
                         .then(|| plan.destination.strip_prefix(&tracking_prefix))
                         .flatten()
                 })
@@ -4284,6 +4534,38 @@ mod tests {
         );
         // 4. No branches at all -> None.
         assert_eq!(resolve_remote_default_branch(&[], &[], None), None);
+    }
+
+    #[test]
+    fn mirror_wildcard_refspec_expands_all_non_tag_refs() {
+        use super::DiscRef;
+        let dr = |oid: &str, name: &str| DiscRef {
+            _hash: oid.to_string(),
+            _ref: name.to_string(),
+        };
+        let spec =
+            super::parse_fetch_refspec("+refs/*:refs/*", "origin").expect("mirror refspec parses");
+        assert!(super::is_mirror_wildcard_refspec(
+            &spec.source,
+            &spec.destination
+        ));
+        let advertised = vec![
+            dr("aaa", "refs/heads/main"),
+            dr("bbb", "refs/mr/1"),
+            dr("ccc", "refs/notes/commits"),
+            dr("ddd", "refs/tags/v1"),
+            dr("eee", "HEAD"),
+        ];
+        let dests: Vec<String> = super::expand_refspec(&spec, &advertised, "origin")
+            .expect("mirror refspec expands")
+            .into_iter()
+            .map(|plan| plan.destination)
+            .collect();
+        assert!(dests.contains(&"refs/heads/main".to_string()));
+        assert!(dests.contains(&"refs/mr/1".to_string()));
+        assert!(dests.contains(&"refs/notes/commits".to_string()));
+        assert!(!dests.iter().any(|dest| dest.starts_with("refs/tags/")));
+        assert!(!dests.iter().any(|dest| dest == "HEAD"));
     }
 
     #[test]
@@ -5350,5 +5632,26 @@ mod tests {
         // Reject: unknown object type (5 is reserved, not 1..=4 / 6 / 7).
         let entry = [0x50_u8]; // 0b0_101_0000 = type 5
         assert_eq!(parse_pack_entry_data_offset(&entry, 0, 20), None);
+    }
+
+    #[test]
+    fn missing_bundle_path_is_an_invalid_local_repository() {
+        use super::{RemoteSpecErrorKind, classify_remote_spec_error, local_or_bundle_client};
+
+        let missing = std::env::temp_dir().join("libra-missing-b4.bundle");
+        let error = match local_or_bundle_client(missing.clone(), missing.to_str().unwrap()) {
+            Ok(_) => panic!("missing bundle must not open"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("bundle file does not exist"),
+            "unexpected spec error: {error}"
+        );
+        let (kind, reason) = classify_remote_spec_error(missing.to_str().unwrap(), &error);
+        assert_eq!(kind, RemoteSpecErrorKind::MissingLocalRepo);
+        assert!(
+            reason.contains("does not exist"),
+            "U2 must report repository does not exist: {reason}"
+        );
     }
 }
