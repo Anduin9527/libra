@@ -3618,6 +3618,56 @@ mod gpg_remove_gate_tests {
         let _ = &web.repo;
     }
 
+    /// plan-20260921 故障恢复矩陣「`remove --force` 误删风险」的**移除路径**：移除活动
+    /// 导入键**不得**触及既有的 `vault.gpg.history.*` 归档行（替换路径已由
+    /// `replace_never_deletes_history_rows` 覆盖，矩阵该行原先只对 `generated_pubkey`
+    /// 有断言）。
+    #[tokio::test]
+    #[serial(env, cwd)]
+    async fn removal_preserves_existing_history_rows() {
+        let web = imported_key_repo().await;
+        let history_rows = || async {
+            ConfigKv::list_all()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| entry.key)
+                .filter(|key| key.starts_with("vault.gpg.history."))
+                .collect::<Vec<String>>()
+        };
+        let before = history_rows().await;
+        assert!(
+            !before.is_empty(),
+            "the fixture must already archive a replaced key, otherwise this check is vacuous"
+        );
+
+        remove_imported_gpg_key().await.expect("removal succeeds");
+
+        let after = history_rows().await;
+        for row in &before {
+            assert!(
+                after.contains(row),
+                "removal must not delete an existing history row ({row}); before={before:?} after={after:?}"
+            );
+        }
+        // The removed key's own public half is archived so signatures it already
+        // made keep verifying: exactly one new row, naming the removed key.
+        let archived_removal = format!(
+            "vault.gpg.history.{}.pubkey",
+            web.fingerprint.to_uppercase()
+        );
+        assert!(
+            after.contains(&archived_removal),
+            "removal must archive the removed key's public half ({archived_removal}); after={after:?}"
+        );
+        assert_eq!(
+            after.len(),
+            before.len() + 1,
+            "removal must add exactly the removed key's archived row; before={before:?} after={after:?}"
+        );
+        let _ = &web.unseal;
+    }
+
     /// plan-20260921 VG-08 G9 (`config_remove_gpg_key_inject_failure_history`):
     /// a failure while archiving the active key must leave the import untouched.
     #[tokio::test]
