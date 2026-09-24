@@ -30,6 +30,13 @@ preflight() {
   # published; the *guard test* `compat_version_surface_sync` is authoritative.
   echo "  (authoritative check: cargo nextest run --test compat_version_surface_sync)"
 
+  echo "== Cargo.lock agrees with the manifest version =="
+  local lock_v
+  lock_v="$(awk '/^name = "libra"$/ {getline; if ($1=="version") {gsub(/"/,"",$3); print $3; exit}}' "$REPO/Cargo.lock")"
+  [ -n "$lock_v" ] || fail "Cargo.lock has no 'libra' package version (run any cargo command to refresh it)"
+  [ "$lock_v" = "$cargo_v" ] \
+    || fail "Cargo.lock pins libra $lock_v but Cargo.toml says $cargo_v - run a cargo command and commit the lock"
+
   echo "== the intended tag must be unreleased upstream =="
   # `LIBRA_RELEASE_TAG` lets the collision/ordering guard itself be exercised
   # (e.g. LIBRA_RELEASE_TAG=v0.23.58 must fail: that tag is already published).
