@@ -92,6 +92,16 @@ release() {
     || fail "release run job set mismatch (expected the eight documented jobs)"
   jq -r '[.jobs[].name] | sort | .[]' /tmp/issue-vg/vg09/run.json >/tmp/issue-vg/vg09/jobs.txt
   bash "$CDN_GATE" "$tag" | tee /tmp/issue-vg/vg09/cdn.log
+  # The release workflow's Homebrew job degrades to a warning (exit 0) when its
+  # token, the sha256 artifacts or the tap clone are missing, so a green run does
+  # not prove the formula moved. Report the tap state explicitly instead.
+  local TAP_HEAD
+  TAP_HEAD="$(gh api repos/libra-tools/homebrew-libra/commits --jq '.[0].commit.message' 2>/dev/null | head -1)"
+  if printf '%s' "$TAP_HEAD" | grep -q "$V"; then
+    echo "  homebrew tap: updated (${TAP_HEAD})"
+  else
+    echo "  homebrew tap: WARNING - no commit mentioning $V yet (latest: ${TAP_HEAD:-unavailable})" >&2
+  fi
   echo "RELEASE: complete for $tag"
 }
 
