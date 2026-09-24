@@ -41,10 +41,15 @@ preflight() {
   else
     LATEST="$(printf '%s\n' "$REMOTE_TAGS" | awk '{print $2}' | sed 's#refs/tags/##; s/\^{}$//' \
       | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -u -V | tail -1)"
+    # Upstream releases move quickly, so a failed check should say what to use next.
+    local NEXT=""
+    if [ -n "$LATEST" ]; then
+      NEXT="v$(printf '%s' "${LATEST#v}" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')"
+    fi
     printf '%s\n' "$REMOTE_TAGS" | awk '{print $2}' | sed 's#refs/tags/##; s/\^{}$//' \
-      | grep -qx "$TAG" && fail "tag $TAG already exists upstream - bump the three version surfaces"
+      | grep -qx "$TAG" && fail "tag $TAG already exists upstream - bump the three version surfaces${NEXT:+ (next free: $NEXT)}"
     if [ -n "$LATEST" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$TAG" | sort -V | tail -1)" != "$TAG" ]; then
-      fail "$TAG is behind the latest published tag $LATEST - bump the three version surfaces"
+      fail "$TAG is behind the latest published tag $LATEST - bump the three version surfaces${NEXT:+ (next free: $NEXT)}"
     fi
     echo "  $TAG is unreleased; latest published tag: ${LATEST:-unknown}"
   fi
