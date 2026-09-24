@@ -40,7 +40,7 @@ libra tag -d <name>
 | | `--sort` | `<key>` | 按键排序列表（`refname`、`-refname`、`creatordate`、`-creatordate`——`creatordate` 以对象哈希序近似）。优先于 `tag.sort` 配置默认（严格 local → global → system 级联；无效配置值以 `LBR-CLI-002`、local/global 配置库不可读以 `LBR-IO-001`，均在任何列表输出前 fail-closed——例外：schema 比二进制新的全局配置库会在一次性警告后被跳过（见 `LBR-CONFIG-001`）；重复配置值只应用胜出 scope 的最后一个——Git 会叠成多键排序）。标志与配置都未设置时按 `refname` 升序列出（Git 默认）。配置的 `tag.sort` 不会把创建标签变成列表操作 |
 | `-s` | `--sign` | | 用 vault PGP 密钥为附注标签签名（需要 `-m`；不与 Git GPG 互操作）。 |
 | | `--no-sign` | | 不签名标签，撤销先前的 `-s`/`--sign`（命令行最后出现者生效）。标签默认不签名，故单独使用时为 no-op。 |
-| `-v` | `--verify` | | 验证具名附注标签的 vault PGP 签名。 |
+| `-v` | `--verify` | | 验证具名附注标签的 vault PGP 签名（**退出码：0＝良好、1＝不良**）。 |
 
 ### 标志示例
 

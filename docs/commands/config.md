@@ -497,6 +497,8 @@ Export the active GPG public key. Secrets are never exported.
 | `--fingerprint` | Print only the primary fingerprint |
 | `--out <path>` | Write the armored public key to a file atomically instead of stdout |
 
+Secret material is never exported, and the machine-output flags are refused: `--json`, `--machine` and `--quiet` all fail with `LBR-CLI-002`, so `export-gpg-key` is always plain armored text (stdout or `--out`).
+
 ```bash
 libra config export-gpg-key            # armored public key to stdout
 libra config export-gpg-key --fingerprint
@@ -506,6 +508,8 @@ libra config export-gpg-key --out pubkey.asc
 #### `remove-gpg-key`
 
 Remove the active imported GPG key and fall back to the generated key (never deletes history or generated-key metadata). The removed key's own public half is **archived** first, as `vault.gpg.history.<FPR>.pubkey`, so signatures it already made keep verifying; the result is therefore one extra history row and no other change to the archive. The removal runs as **one transaction**: if any of its four steps fails, the imported key stays active exactly as it was.
+
+**`--force` is required** to remove the active key: without it the command refuses and names the flag (a guard against accidental deletion).
 
 ```bash
 libra config remove-gpg-key --force
@@ -674,6 +678,8 @@ libra config list --gpg-keys
 
 Supported `--usage` values are `signing` and `encrypt`.
 
+`libra config list --gpg-keys` reports, per entry: its usage, key type, `source` (`imported` or `generated`), fingerprint, signing key id, import time and the count of archived history keys — with secret material redacted (`vault.gpg.seckey_enc` reads back as `<REDACTED>`).
+
 Existing OpenPGP keys can be imported from the GnuPG home or an armored file:
 
 ```bash
@@ -684,7 +690,7 @@ libra config export-gpg-key --fingerprint
 libra config remove-gpg-key --force
 ```
 
-The imported secret key is persisted encrypted (`vault.gpg.seckey_enc`) and redacted on every read path; `config get --reveal` refuses it. Signing selects the key recorded in `vault.gpg.signing_key_id`, verification uses a fixed allowlist of the active, generated, and historical public keys.
+The imported secret key is persisted encrypted (`vault.gpg.seckey_enc`) and redacted on every read path; `config get --reveal` refuses it. Signing **fails closed** when neither `vault.gpg.pubkey` nor `vault.gpg.generated_pubkey` is published: the command errors with a recovery hint instead of emitting an unsigned commit/tag. Signing selects the key recorded in `vault.gpg.signing_key_id`, verification uses a fixed allowlist of the active, generated, and historical public keys.
 
 ## Scope
 

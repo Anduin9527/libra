@@ -414,6 +414,8 @@ libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
 | `--fingerprint` | 仅打印主指纹 |
 | `--out <path>` | 原子写入 armored 公钥到文件，而不是 stdout |
 
+**拒绝机器输出旗标：** `--json`/`--machine`/`--quiet` 一律以 `LBR-CLI-002` 失败，故 `export-gpg-key` 始终输出纯 armored 文本（stdout 或 `--out`）。
+
 ```bash
 libra config export-gpg-key            # armored 公钥到 stdout
 libra config export-gpg-key --fingerprint
@@ -425,6 +427,8 @@ libra config export-gpg-key --out pubkey.asc
 移除活动导入的 GPG key 并回退到生成的 key（绝不删除历史或生成 key 元数据）。被移除的 key 自身的公钥会**先归档**为 `vault.gpg.history.<FPR>.pubkey`，使它此前签出的签名仍可验证；因此归档面只会**新增一行**，其余不变。移除是**单个事务**：四步中任一步失败，导入的 key 会原样保持活动。
 
 归档公钥存放于 `vault.gpg.history.<FPR>.pubkey`。显式丢弃单行就是普通的 config unset —— `libra config unset vault.gpg.history.<FPR>.pubkey` 只删除该指纹的快照，其它指纹不受影响。**后果：** 被丢弃密钥签出的签名将不再被 `libra tag -v` / `libra merge --verify-signatures` 接受——这正是归档要避免的情形，故仅在这些签名已无意义时才删除该行。
+
+**移除活动 key 必须带 `--force`**：不带时命令会拒绝并点明该旗标（防误删保护）。
 
 ```bash
 libra config remove-gpg-key --force
