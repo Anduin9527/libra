@@ -30,6 +30,25 @@ preflight() {
   # published; the *guard test* `compat_version_surface_sync` is authoritative.
   echo "  (authoritative check: cargo nextest run --test compat_version_surface_sync)"
 
+  echo "== the intended tag must be unreleased upstream =="
+  # `LIBRA_RELEASE_TAG` lets the collision/ordering guard itself be exercised
+  # (e.g. LIBRA_RELEASE_TAG=v0.23.58 must fail: that tag is already published).
+  local TAG="${LIBRA_RELEASE_TAG:-v$cargo_v}" LATEST
+  if ! REMOTE_TAGS="$(timeout 90 libra ls-remote --tags origin 2>/dev/null)"; then
+    echo "  WARNING: could not reach origin; skipping the upstream tag check"
+  elif [ -z "$REMOTE_TAGS" ]; then
+    echo "  WARNING: origin returned no tags; skipping the upstream tag check"
+  else
+    LATEST="$(printf '%s\n' "$REMOTE_TAGS" | awk '{print $2}' | sed 's#refs/tags/##; s/\^{}$//' \
+      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -u -V | tail -1)"
+    printf '%s\n' "$REMOTE_TAGS" | awk '{print $2}' | sed 's#refs/tags/##; s/\^{}$//' \
+      | grep -qx "$TAG" && fail "tag $TAG already exists upstream - bump the three version surfaces"
+    if [ -n "$LATEST" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$TAG" | sort -V | tail -1)" != "$TAG" ]; then
+      fail "$TAG is behind the latest published tag $LATEST - bump the three version surfaces"
+    fi
+    echo "  $TAG is unreleased; latest published tag: ${LATEST:-unknown}"
+  fi
+
   echo "== CHANGELOG carries the version section =="
   grep -q "^## \[$cargo_v\]" "$REPO/CHANGELOG.md" \
     || fail "CHANGELOG.md has no '## [$cargo_v]' section (the release-notes assertion would fail)"
