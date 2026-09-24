@@ -503,7 +503,7 @@ libra config export-gpg-key --out pubkey.asc
 
 #### `remove-gpg-key`
 
-Remove the active imported GPG key and fall back to the generated key (never deletes history or generated-key metadata). The removal runs as **one transaction**: if any of its four steps fails, the imported key stays active exactly as it was.
+Remove the active imported GPG key and fall back to the generated key (never deletes history or generated-key metadata). The removed key's own public half is **archived** first, as `vault.gpg.history.<FPR>.pubkey`, so signatures it already made keep verifying; the result is therefore one extra history row and no other change to the archive. The removal runs as **one transaction**: if any of its four steps fails, the imported key stays active exactly as it was.
 
 ```bash
 libra config remove-gpg-key --force
