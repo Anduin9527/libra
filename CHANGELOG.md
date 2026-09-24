@@ -1,6 +1,12 @@
 # Changelog
 
-## [0.23.46] — 2026-09-23
+## [0.23.59] — 2026-09-24
+
+> **Version note (2026-09-24):** this family was prepared as `0.23.46`, but that
+> number is already published upstream (`v0.23.46`), and upstream `main` has since
+> reached `0.23.58`. The three release surfaces (`Cargo.toml`, `install.sh`,
+> `install.ps1`) and this section were bumped to `0.23.59` so the tag is unique and
+> the stable channel moves forward instead of regressing.
 
 ### GnuPG key import into the repository vault (plan-20260921)
 

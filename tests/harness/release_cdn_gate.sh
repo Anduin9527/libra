@@ -8,7 +8,7 @@
 #   3. windows amd64: the suffixless object and its `.exe` twin are identical
 #   4. the bucket-root installers pin this tag as their default version
 #
-# Usage: bash tests/harness/release_cdn_gate.sh <tag>      (e.g. v0.23.46)
+# Usage: bash tests/harness/release_cdn_gate.sh <tag>      (e.g. v0.23.59)
 #
 # `LIBRA_CDN_BASE` redirects this script's own fetches (the manifest text, the
 # four artifacts, the installers), and `LIBRA_BIN` selects the CLI binary. The
