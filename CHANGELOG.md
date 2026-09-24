@@ -1,6 +1,12 @@
 # Changelog
 
-## [0.23.59] — 2026-09-24
+## [0.23.60] — 2026-09-24
+
+> **Version note (2026-09-24, revised):** this family was prepared as `0.23.46`, which was
+> already published upstream; it was then bumped to `0.23.59`, which upstream tagged and began
+> releasing while this branch was still unmerged. Upstream releases move quickly, so the version
+> is bumped again to `0.23.60`. **Merge upstream before tagging** and let
+> `tests/harness/release-runbook.sh preflight` confirm the intended tag is still free.
 
 > **Version note (2026-09-24):** this family was prepared as `0.23.46`, but that
 > number is already published upstream (`v0.23.46`), and upstream `main` has since
