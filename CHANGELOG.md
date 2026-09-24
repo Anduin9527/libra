@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.23.60] — 2026-09-24
+## [0.23.65] — 2026-09-24
 
 ### GnuPG key import into the repository vault (plan-20260921)
 
