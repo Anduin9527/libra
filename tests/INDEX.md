@@ -144,6 +144,11 @@
 | `workspace_lease_test` | 1 | plan-20260714 §C.8 W4 workspace association/lease store: DB-arbitrated single winner per linked `(repo_id, worktree_id)` including a proven two-connection overlap (contender with a 50ms busy timeout must hit the uncommitted writer's lock, then lose to the index on retry) and failpoint-windowed takeovers (a parked doctor reports only the fence it wrote), canonical-path alias refusal (`.`/`..`, trailing separator, symlink, symlinked-parent `..` traversal, dangling-symlink parent) across kinds, repository identity resolved from `libra.repoid` (never the caller; padded/empty values refused as corrupt, write and read paths pinned to the same value, a rewrite with live rows fails closed) and cross-repository isolation, owner+monotonic-fence conditional renew/release/activate/abandon with stale-owner refusal (`LBR-AGENT-023`), no implicit steal of an expired lease, doctor reclaim only after expiry (`LBR-AGENT-022`) with successive cross-connection fence advancement and superseded-holder release refusal, provisioning→active publication (an `active` record requires an existing directory), released/orphaned identity release, foreign-identity recovery (bounded keyset listing plus adopt, with identity-drift refusals), bounded expired-lease sweep, keyset listing, and the association-IDs-only column pin | `src/internal/workspace.rs`, `sql/migrations/2026072501_workspace_record.sql` |
 | `zeroize_buffers_test` | 1 | plan-20260921 GC-VG-01 / VG-03 G8: a scanning global allocator proves the imported GPG passphrase never survives in a freed heap block while the real CLI runs in-process; a calibration test fails if the detector is blind | `src/command/config.rs`, `src/internal/vault.rs` |
 
+| `compat_agent_bridge_schema` | 1 | guard pinning the agent-bridge request/response schema contract | `src/internal/ai/agent_bridge` |
+| `compat_format_patch_flag_surface` | 1 | surface contract for the `format-patch` flags | `src/command/format_patch.rs` |
+| `compat_pseudo_ref_surface` | 1 | the pseudo-ref surface is declared, not implied | `src/command/rev_parse.rs` |
+| `compat_pull_strategy_flags_surface` | 1 | surface contract for the `pull` strategy flags | `src/command/pull.rs` |
+| `compat_worktree_docs_v2_layout` | 1 | named regression `worktree_docs_match_v2_layout` | `docs/commands/worktree.md`, `src/command/worktree.rs` |
 ## Wave 2 — Code UI & local automation
 
 RC-23/RC-30 removed the `libra code` Web harness, its deterministic
@@ -196,6 +201,11 @@ dedicated feature-on steps.
 | `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations; plan-20260821 A1-06 Backend B1-02 transition contract vectors (cross-implementation verify, anti-vv placeholder) (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs`, `tests/data/up01-transition-vectors-v1.json` |
 | `install_smoke_test` | 2 | plan-20260821 A1-05 installer verification smoke: twenty-four `install.sh` scenarios (signed install, tampered signature/payload, sha/size mismatch, expired/paused/revoked, stale-replay floor, zero-size, min_key_generation + bounded-numeric grammar, key validity window, non-canonical/trailing-artifact serialization, calendar-invalid dates, pretty-printed envelope acceptance, oversized-response cutoff, multi-line payload smuggling, oversized SemVer components, manifest-404 and verifier-unavailable transitions ± `LIBRA_ALLOW_FALLBACK`) plus twenty-two `install.ps1` scenarios when `pwsh` exists; needs bash+python3+openssl, otherwise prints skipped | `install.sh`, `install.ps1`, `tests/data/install-smoke/` |
 
+| `auth_keyring_backend` | 1F | keyring-backend lifecycle over the in-process mock store (`keyring`) | `src/utils/client_storage.rs` |
+| `otlp_telemetry` | 1F | OTLP wire test with a mock exporter (`otlp`) | `src/utils/telemetry.rs` |
+| `compat_fastcdc_feature_gate_guard` | 1F | pins the feature gating of the `media` command (`fastcdc`) | `src/cli.rs` |
+| `compat_keyring_feature_gate_guard` | 1F | pins the keyring backend's feature gating (`keyring`) | `src/cli.rs` |
+| `compat_otlp_feature_gate_guard` | 1F | pins OTLP telemetry's feature gating (`otlp`) | `src/cli.rs` |
 ## Wave 4 — Live AI (test-live-ai / DEEPSEEK_API_KEY)
 
 | target | wave | one-line purpose | relevant src |
