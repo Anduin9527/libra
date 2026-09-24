@@ -112,9 +112,12 @@ release() {
       # missing, but verify-homebrew-formula then cannot find the
       # formula-commit-sha artifact and fails -- reddening the whole run even
       # though the four platform artifacts and the CDN are fine.
-      local failed_jobs
+      local failed_jobs failed_jobs_csv
       failed_jobs="$(jq -r '[.jobs[] | select(.conclusion != "success") | .name] | join(", ")' /tmp/issue-vg/vg09/run.json)"
-      case ",$failed_jobs," in
+      # Sorted, comma-separated without spaces: the `case` below matches the two
+      # known Homebrew jobs by exact list, so the separator must be stable.
+      failed_jobs_csv="$(jq -r '[.jobs[] | select(.conclusion != "success") | .name] | sort | join(",")' /tmp/issue-vg/vg09/run.json)"
+      case ",$failed_jobs_csv," in
         ",update-homebrew-tap,"|",verify-homebrew-formula,"|",update-homebrew-tap,verify-homebrew-formula,")
           echo "  note: the run failed only in the Homebrew jobs: $failed_jobs" >&2
           if [ "${LIBRA_ALLOW_TAP_ONLY_FAILURE:-0}" != "1" ]; then
