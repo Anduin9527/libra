@@ -106,7 +106,30 @@ release() {
     --json status,conclusion,jobs,event,headBranch,headSha >/tmp/issue-vg/vg09/run.json
   jq -e --arg v "$V" --arg sha "$SHA" \
     '.status=="completed" and .conclusion=="success" and .event=="push" and .headBranch==("v"+$v) and .headSha==$sha' \
-    /tmp/issue-vg/vg09/run.json >/dev/null || fail "run.json assertions failed"
+    /tmp/issue-vg/vg09/run.json >/dev/null || {
+      # Distinguish a tap-only failure from a real artifact failure. The tap job
+      # degrades to a warning (exit 0) when its token or the sha256 artifacts are
+      # missing, but verify-homebrew-formula then cannot find the
+      # formula-commit-sha artifact and fails -- reddening the whole run even
+      # though the four platform artifacts and the CDN are fine.
+      local failed_jobs
+      failed_jobs="$(jq -r '[.jobs[] | select(.conclusion != "success") | .name] | join(", ")' /tmp/issue-vg/vg09/run.json)"
+      case ",$failed_jobs," in
+        ",update-homebrew-tap,"|",verify-homebrew-formula,"|",update-homebrew-tap,verify-homebrew-formula,")
+          echo "  note: the run failed only in the Homebrew jobs: $failed_jobs" >&2
+          if [ "${LIBRA_ALLOW_TAP_ONLY_FAILURE:-0}" != "1" ]; then
+            fail "a Homebrew-only failure still fails the run; inspect the tap token, then re-run with LIBRA_ALLOW_TAP_ONLY_FAILURE=1 to accept it (the CDN gate still verifies the published artifacts)"
+          fi
+          echo "  accepted: Homebrew-only failure (LIBRA_ALLOW_TAP_ONLY_FAILURE=1)" >&2
+          jq -e --arg v "$V" --arg sha "$SHA" \
+            '.status=="completed" and .event=="push" and .headBranch==("v"+$v) and .headSha==$sha' \
+            /tmp/issue-vg/vg09/run.json >/dev/null || fail "run fields mismatch beyond conclusion"
+          ;;
+        *)
+          fail "release run failed in: ${failed_jobs:-<unknown>}"
+          ;;
+      esac
+    }
   # The documented eight-job set: four platform builds plus the four
   # release-side jobs. A renamed, dropped or extra job fails this gate, so a
   # silently skipped platform cannot ship as a green release.
