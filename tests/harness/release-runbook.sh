@@ -162,8 +162,53 @@ release() {
   echo "RELEASE: complete for $tag"
 }
 
+# Bump the three version surfaces (and the CHANGELOG heading) to the first free
+# patch version above the latest published tag. Upstream releases move fast, so
+# the version is chosen at release time rather than weeks in advance.
+bump() {
+  local dry="${1:-}"
+  local latest next cur
+  # NOTE: with `set -euo pipefail` a failing pipeline inside a plain assignment
+  # aborts the function *silently*; guard it so the caller gets a reason.
+  if ! latest="$(timeout 90 libra ls-remote --tags origin 2>/dev/null | awk '{print $2}' \
+      | sed 's#refs/tags/##; s/\^{}$//' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -u -V | tail -1)"; then
+    fail "could not read origin's tags (is the remote reachable?)"
+  fi
+  [ -n "$latest" ] || fail "origin advertises no vX.Y.Z tags; refusing to guess the next version"
+  next="$(printf '%s' "${latest#v}" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')"
+  cur="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+  echo "latest published: $latest   current: $cur   next free: $next"
+  # Idempotent and corrective: every surface is written to `next` regardless of
+  # its own current value, so a half-bumped tree converges instead of drifting
+  # (a previous run's partial edit, or a surface bumped by hand, both heal).
+  local sh_v ps1_v head_v
+  sh_v="$(grep -m1 -oE 'DEFAULT_VERSION="v[0-9.]+"' "$REPO/install.sh" | sed -E 's/.*"v([0-9.]+)"/\1/')"
+  ps1_v="$(grep -m1 -oE '\$DefaultVersion = "v[0-9.]+"' "$REPO/install.ps1" | sed -E 's/.*"v([0-9.]+)"/\1/')"
+  head_v="$(grep -m1 -oE '^## \[[0-9.]+\]' "$REPO/CHANGELOG.md" | sed -E 's/^## \[([0-9.]+)\]/\1/')"
+  if [ "$cur" = "$next" ] && [ "$sh_v" = "$next" ] && [ "$ps1_v" = "$next" ] && [ "$head_v" = "$next" ]; then
+    echo "nothing to do: all four surfaces already carry $next"
+    return 0
+  fi
+  echo "surfaces: Cargo.toml=$cur install.sh=v${sh_v:-?} install.ps1=v${ps1_v:-?} CHANGELOG=[${head_v:-?}] -> target $next"
+  if [ "$dry" = "--dry-run" ]; then
+    echo "would set Cargo.toml/install.sh/install.ps1 and the CHANGELOG heading to $next"
+    return 0
+  fi
+  sed -i.bak -E "s/^version = \"[0-9.]+\"/version = \"$next\"/" "$REPO/Cargo.toml" && rm -f "$REPO"/Cargo.toml.bak
+  sed -i.bak -E "s/DEFAULT_VERSION=\"v[0-9.]+\"/DEFAULT_VERSION=\"v$next\"/" "$REPO/install.sh" && rm -f "$REPO"/install.sh.bak
+  sed -i.bak -E 's/^(\$DefaultVersion = )"v[0-9.]+"/\1"v'"$next"'"/' "$REPO/install.ps1" && rm -f "$REPO"/install.ps1.bak
+  sed -i.bak -E "s/^## \[[0-9.]+\]/## \[$next\]/" "$REPO/CHANGELOG.md" && rm -f "$REPO"/CHANGELOG.md.bak
+  echo "bumped to $next:"
+  grep -m1 '^version' "$REPO/Cargo.toml"
+  grep -m1 'DEFAULT_VERSION=' "$REPO/install.sh"
+  grep -m1 'DefaultVersion = ' "$REPO/install.ps1"
+  grep -m1 "^## \[" "$REPO/CHANGELOG.md"
+  echo "next: run \`cargo nextest run --test compat_version_surface_sync\`, commit all four files, then run this script's preflight"
+}
+
 case "${1:-}" in
   preflight) preflight ;;
   release) shift; release "${1:-}" "${2:-}" ;;
-  *) echo "usage: release-runbook.sh preflight | release <tag> --i-authorize-remote-writes" >&2; exit 2 ;;
+  bump) bump "${2:-}" ;;
+  *) echo "usage: release-runbook.sh preflight | bump [--dry-run] | release <tag> --i-authorize-remote-writes" >&2; exit 2 ;;
 esac
