@@ -103,12 +103,20 @@ release() {
     >/tmp/issue-vg/vg09/release-notes.md
   grep -q "^## \[$V\]" /tmp/issue-vg/vg09/release-notes.md || fail "version section missing in release notes"
   gh release create "$tag" -R libra-tools/libra --verify-tag --notes-file /tmp/issue-vg/vg09/release-notes.md
-  local RID
-  RID="$(gh run list -R libra-tools/libra --workflow release.yml --limit 10 \
-    --json databaseId,headBranch,event \
-    -q ".[] | select(.event==\"push\" and .headBranch==\"$tag\") | .databaseId" | head -1)"
+  # The tag push registers its release run asynchronously, so poll briefly
+  # instead of failing on the first empty listing.
+  local RID="" attempt
+  for attempt in $(seq 1 24); do
+    RID="$(gh run list -R libra-tools/libra --workflow release.yml --limit 10 \
+      --json databaseId,headBranch,event \
+      -q ".[] | select(.event==\"push\" and .headBranch==\"$tag\") | .databaseId" | head -1)"
+    [ -n "$RID" ] && break
+    sleep 5
+  done
   [ -n "$RID" ] || fail "no matching release run"
-  gh run watch "$RID" -R libra-tools/libra --exit-status
+  # A failed job must reach the run.json assertions below (they distinguish a
+  # Homebrew-only failure), so `set -e` must not abort on the watch's status.
+  gh run watch "$RID" -R libra-tools/libra --exit-status || true
   gh run view "$RID" -R libra-tools/libra \
     --json status,conclusion,jobs,event,headBranch,headSha >/tmp/issue-vg/vg09/run.json
   jq -e --arg v "$V" --arg sha "$SHA" \
