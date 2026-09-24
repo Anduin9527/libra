@@ -98,13 +98,13 @@ mod shell_tests {
             &bin.join("brew"),
             r#"#!/bin/bash
 set -euo pipefail
-[[ "${HOMEBREW_NO_AUTO_UPDATE:-}" == 1 && "${HOMEBREW_NO_INSTALL_UPGRADE:-}" == 1 ]]
+[[ "${HOMEBREW_NO_AUTO_UPDATE:-}" == 1 && "${HOMEBREW_NO_INSTALL_UPGRADE:-}" == 1 ]] || exit 1
 echo "brew $*" >> "$CALL_LOG"
 case "$1" in
   tap) [[ "$FAIL_STEP" != tap && "$2" == libra-tools/libra ]] ;;
-  --repo) [[ "$FAIL_STEP" != tap-path ]]; [[ "$FAIL_STEP" == empty-tap-path ]] || printf '%s\n' "$TAP_DIR" ;;
+  --repo) [[ "$FAIL_STEP" != tap-path ]] || exit 1; [[ "$FAIL_STEP" == empty-tap-path ]] || printf '%s\n' "$TAP_DIR" ;;
   install) [[ "$FAIL_STEP" != install && "$2" == libra-tools/libra/libra ]] ;;
-  --prefix) [[ "$FAIL_STEP" != prefix && "$2" == --installed && "$3" == libra-tools/libra/libra ]]; [[ "$FAIL_STEP" == empty-prefix ]] || printf '%s\n' "$FORMULA_PREFIX" ;;
+  --prefix) [[ "$FAIL_STEP" != prefix && "$2" == --installed && "$3" == libra-tools/libra/libra ]] || exit 1; [[ "$FAIL_STEP" == empty-prefix ]] || printf '%s\n' "$FORMULA_PREFIX" ;;
   *) exit 99 ;;
 esac
 "#,
@@ -114,12 +114,12 @@ esac
             r#"#!/bin/bash
 set -euo pipefail
 echo "git $*" >> "$CALL_LOG"
-[[ "$1" == -C && "$2" == "$TAP_DIR" ]]
+[[ "$1" == -C && "$2" == "$TAP_DIR" ]] || exit 1
 case "$3" in
   fetch) [[ "$FAIL_STEP" != fetch && "$4" == --depth=1 && "$5" == origin && "$6" == "$FORMULA_SHA" ]] ;;
   checkout) [[ "$FAIL_STEP" != checkout && "$4" == --detach && "$5" == "$FORMULA_SHA" ]] ;;
   rev-parse)
-    [[ "$FAIL_STEP" != rev-parse && "$4" == HEAD ]]
+    [[ "$FAIL_STEP" != rev-parse && "$4" == HEAD ]] || exit 1
     if [[ "$FAIL_STEP" == wrong-commit ]]; then echo 2222222222222222222222222222222222222222; else echo "$FORMULA_SHA"; fi ;;
   *) exit 99 ;;
 esac
@@ -130,7 +130,7 @@ esac
             r#"#!/bin/bash
 set -euo pipefail
 echo "installed-libra $*" >> "$CALL_LOG"
-[[ "$1" == --version && "$FAIL_STEP" != version ]]
+[[ "$1" == --version && "$FAIL_STEP" != version ]] || exit 1
 if [[ "$FAIL_STEP" == wrong-version ]]; then echo 'libra 0.0.0'; else echo 'libra 9.8.7'; fi
 "#,
         );

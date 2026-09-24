@@ -50,6 +50,9 @@ impl MockTreeServer {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking mock connection");
                         use std::io::{Read, Write};
                         let mut buf = [0u8; 8192];
                         let _ = stream.read(&mut buf);

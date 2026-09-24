@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -40,6 +40,40 @@ struct MockMutateServer {
     join: Option<thread::JoinHandle<()>>,
 }
 
+fn read_request(stream: &mut TcpStream) -> Option<String> {
+    const MAX_REQUEST_BYTES: usize = 64 * 1024;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 || bytes.len() + n > MAX_REQUEST_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = std::str::from_utf8(&bytes[..head_end]).ok()?;
+        let content_length = head
+            .split("\r\n")
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        let request_end = head_end.checked_add(4)?.checked_add(content_length)?;
+        if request_end > MAX_REQUEST_BYTES {
+            return None;
+        }
+        if bytes.len() >= request_end {
+            return String::from_utf8(bytes).ok();
+        }
+    }
+}
+
 impl MockMutateServer {
     /// `status_for` decides the response per request body; `None` means 200.
     fn start(status_for: Option<fn(&serde_json::Value) -> u16>) -> Self {
@@ -56,9 +90,12 @@ impl MockMutateServer {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = vec![0u8; 32 * 1024];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking mock connection");
+                        let Some(raw) = read_request(&mut stream) else {
+                            continue;
+                        };
                         let (head, body) = raw
                             .split_once("\r\n\r\n")
                             .map(|(h, b)| (h.to_string(), b.to_string()))

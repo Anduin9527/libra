@@ -54,19 +54,14 @@ impl RepairFixture {
         let scratch_parent = if let Some(path) = env::var_os("LIBRA_TEST_SCRATCH_DIR") {
             let path = PathBuf::from(path);
             fs::create_dir_all(&path).unwrap();
-            #[cfg(unix)]
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             path
         } else {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(env::temp_dir)
+            env::temp_dir()
         };
-        let scratch_root = scratch_parent.join(".libra-test-scratch");
-        fs::create_dir_all(&scratch_root).unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&scratch_root, fs::Permissions::from_mode(0o700)).unwrap();
-        let temp = tempfile::tempdir_in(scratch_root).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix(".libra-test-scratch-")
+            .tempdir_in(scratch_parent)
+            .unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         set_private_mode(&root, 0o700);
         let home = root.join("home");

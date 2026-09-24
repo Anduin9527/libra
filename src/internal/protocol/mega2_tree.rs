@@ -537,6 +537,9 @@ mod tests {
                 while !stop_clone.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            stream
+                                .set_nonblocking(false)
+                                .expect("blocking mock connection");
                             let mut buf = vec![0u8; 64 * 1024];
                             let mut head = Vec::new();
                             let mut pending = String::new();
@@ -556,7 +559,17 @@ mod tests {
                                 .expect("requests poisoned")
                                 .push(String::from_utf8_lossy(&head).into_owned());
                             if !stall {
-                                stream.write_all(canned.as_bytes()).expect("mock write");
+                                if let Err(error) = stream.write_all(canned.as_bytes()) {
+                                    // An oversized response is intentionally abandoned by the client.
+                                    let expected_disconnect = canned.len() > MAX_RESPONSE_BYTES
+                                        && matches!(
+                                            error.kind(),
+                                            std::io::ErrorKind::BrokenPipe
+                                                | std::io::ErrorKind::ConnectionReset
+                                                | std::io::ErrorKind::ConnectionAborted
+                                        );
+                                    assert!(expected_disconnect, "mock write: {error}");
+                                }
                             } else {
                                 // Hold the connection open without a response to
                                 // exercise the client-side total timeout.

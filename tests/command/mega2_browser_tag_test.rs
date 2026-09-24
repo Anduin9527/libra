@@ -8,7 +8,7 @@
 
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     process::Command,
     sync::{
@@ -39,6 +39,67 @@ struct Captured {
     body: serde_json::Value,
 }
 
+fn read_request(stream: &mut TcpStream) -> Option<Captured> {
+    const MAX_REQUEST_BYTES: usize = 32 * 1024;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(end) = buf.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break end;
+        }
+        let remaining = MAX_REQUEST_BYTES.checked_sub(buf.len())?;
+        if remaining == 0 {
+            return None;
+        }
+        let read_len = remaining.min(chunk.len());
+        let n = stream.read(&mut chunk[..read_len]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    let mut lines = head.split("\r\n");
+    let mut parts = lines.next()?.split_whitespace();
+    let method = parts.next()?.to_string();
+    let target = parts.next()?.to_string();
+    let mut headers = std::collections::HashMap::new();
+    for header in lines {
+        if let Some((name, value)) = header.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    let body_end = body_start.checked_add(content_length)?;
+    if body_end > MAX_REQUEST_BYTES {
+        return None;
+    }
+    while buf.len() < body_end {
+        let remaining = MAX_REQUEST_BYTES - buf.len();
+        let read_len = remaining.min(chunk.len());
+        let n = stream.read(&mut chunk[..read_len]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body =
+        serde_json::from_slice(&buf[body_start..body_end]).unwrap_or(serde_json::Value::Null);
+    Some(Captured {
+        method,
+        target,
+        headers,
+        body,
+    })
+}
+
 struct MockTagServer {
     addr: SocketAddr,
     requests: Arc<AtomicUsize>,
@@ -62,35 +123,22 @@ impl MockTagServer {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = vec![0u8; 32 * 1024];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let raw = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let (head, raw_body) = raw
-                            .split_once("\r\n\r\n")
-                            .map(|(h, b)| (h.to_string(), b.to_string()))
-                            .unwrap_or_default();
-                        let mut lines = head.split("\r\n");
-                        let line = lines.next().unwrap_or_default().to_string();
-                        let mut parts = line.split_whitespace();
-                        let method = parts.next().unwrap_or_default().to_string();
-                        let target = parts.next().unwrap_or_default().to_string();
-                        let mut headers = std::collections::HashMap::new();
-                        for header in lines {
-                            if let Some((name, value)) = header.split_once(':') {
-                                headers.insert(
-                                    name.trim().to_ascii_lowercase(),
-                                    value.trim().to_string(),
-                                );
-                            }
+                        if stream.set_nonblocking(false).is_err()
+                            || stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .is_err()
+                            || stream
+                                .set_write_timeout(Some(Duration::from_secs(5)))
+                                .is_err()
+                        {
+                            continue;
                         }
-                        let body =
-                            serde_json::from_str(&raw_body).unwrap_or(serde_json::Value::Null);
-                        last_clone.lock().expect("lock").push(Captured {
-                            method: method.clone(),
-                            target: target.clone(),
-                            headers,
-                            body,
-                        });
+                        let Some(captured) = read_request(&mut stream) else {
+                            continue;
+                        };
+                        let method = captured.method.clone();
+                        let target = captured.target.clone();
+                        last_clone.lock().expect("lock").push(captured);
                         requests_clone.fetch_add(1, Ordering::SeqCst);
 
                         let payload = if method == "GET" && target.contains("/list") {

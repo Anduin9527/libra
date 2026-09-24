@@ -51,6 +51,9 @@ impl MockTreeServer {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking mock connection");
                         let mut buf = [0u8; 8192];
                         let _ = stream.read(&mut buf);
                         let request = String::from_utf8_lossy(&buf);

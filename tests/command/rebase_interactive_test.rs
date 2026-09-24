@@ -1270,7 +1270,7 @@ fn test_rebase_i_combinations_matrix() {
     let captured = root.join(".q5.todo");
     let editor = write_capture_editor(root, &captured);
     let q5 = run_libra_command_with_env(
-        &["rebase", "-i", "--exec", "/bin/true", "HEAD~3"],
+        &["rebase", "-i", "--exec", "true", "HEAD~3"],
         root,
         &[("GIT_SEQUENCE_EDITOR", editor.as_str())],
     );
@@ -1286,13 +1286,10 @@ fn test_rebase_i_combinations_matrix() {
             .find(&pick)
             .unwrap_or_else(|| panic!("Q5 missing {pick}: {todo}"));
         let after = &todo[pos + pick.len()..];
-        assert!(
-            after.contains("exec /bin/true"),
-            "Q5 exec after {pick}: {todo}"
-        );
+        assert!(after.contains("exec true"), "Q5 exec after {pick}: {todo}");
     }
     assert_eq!(
-        todo.matches("exec /bin/true").count(),
+        todo.matches("exec true").count(),
         3,
         "Q5 exec count: {todo}"
     );

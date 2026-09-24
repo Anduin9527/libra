@@ -60,6 +60,9 @@ impl MockEntryServer {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking mock connection");
                         if !delay.is_zero() {
                             thread::sleep(delay);
                         }

@@ -2270,8 +2270,14 @@ mod tests {
     mod gpg_import {
         use super::super::*;
 
-        const SECRET: &str = "tests/data/fake-gpg/protected-secret.asc";
-        const PUBLIC: &str = "tests/data/fake-gpg/pubkey.asc";
+        const SECRET: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/fake-gpg/protected-secret.asc"
+        );
+        const PUBLIC: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/fake-gpg/pubkey.asc"
+        );
         const PASSPHRASE: &str = "libra-test-fixture-passphrase";
 
         #[test]

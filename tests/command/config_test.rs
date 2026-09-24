@@ -5669,10 +5669,12 @@ fn tty_prompt_collects_passphrase() {
         env!("CARGO_BIN_EXE_libra"),
         GPG_FIXTURE_SECRET
     );
-    let mut child = std::process::Command::new("script")
-        .arg("-qec")
-        .arg(&inner)
-        .arg("/dev/null")
+    let mut script = std::process::Command::new("script");
+    #[cfg(target_os = "linux")]
+    script.args(["-qec", &inner, "/dev/null"]);
+    #[cfg(not(target_os = "linux"))]
+    script.args(["-qe", "/dev/null", "/bin/sh", "-c", &inner]);
+    let mut child = script
         .current_dir(repo.path())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -5696,15 +5698,46 @@ fn tty_prompt_collects_passphrase() {
         .spawn()
         .expect("spawn the CLI under a pty");
 
-    {
-        let stdin = child.stdin.as_mut().expect("pty stdin");
-        std::io::Write::write_all(stdin, b"libra-test-fixture-passphrase\n").unwrap();
+    let stdout = child.stdout.take().expect("pty stdout");
+    let (prompt_tx, prompt_rx) = std::sync::mpsc::sync_channel(1);
+    let output_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut stdout = stdout;
+        let mut output = Vec::new();
+        let mut byte = [0];
+        let mut prompt_sent = false;
+        while std::io::Read::read(&mut stdout, &mut byte)? != 0 {
+            output.push(byte[0]);
+            if !prompt_sent && output.ends_with(b"Enter passphrase for GPG key: ") {
+                let _ = prompt_tx.send(());
+                prompt_sent = true;
+            }
+        }
+        Ok(output)
+    });
+    if let Err(error) = prompt_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let output = output_reader
+            .join()
+            .expect("join pty reader")
+            .expect("read pty");
+        panic!(
+            "tty import did not prompt ({error}): {}",
+            String::from_utf8_lossy(&output)
+        );
     }
+    let mut stdin = child.stdin.take().expect("pty stdin");
+    std::io::Write::write_all(&mut stdin, b"libra-test-fixture-passphrase\n").unwrap();
     let out = child.wait_with_output().unwrap();
+    drop(stdin);
+    let stdout = output_reader
+        .join()
+        .expect("join pty reader")
+        .expect("read pty");
     assert!(
         out.status.success(),
         "tty import must succeed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 
