@@ -30,7 +30,9 @@
   public half (`--out` replaces atomically; `--quiet`/`--json`/`--machine` are
   refused) and `libra config remove-gpg-key [--force]` removes an imported key
   as **one transaction** — a failure at any of its four steps rolls back and
-  leaves the imported key active exactly as it was.
+  leaves the imported key active exactly as it was. The removed key's own public
+  half is archived as `vault.gpg.history.<FPR>.pubkey` first, so signatures it
+  already made keep verifying while the archive only ever gains a row.
 - `libra config list --gpg-keys` reports each entry's usage, key type, source
   (`imported`/`generated`), fingerprint, signing key id, import time and
   archived-history count; secret material is never printed (`vault.gpg.seckey_enc`
