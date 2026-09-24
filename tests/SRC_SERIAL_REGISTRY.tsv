@@ -436,3 +436,6 @@ src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_
 src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_e	lane:cwd+env	plan-20260921 VG-14 G1–G6: sandboxes HOME/XDG + cwd to inject a failure after one staged migration step and assert the documented residue/convergence
 src/internal/vault.rs	history_public_keys_verify_replaced_key_signatures	lane:cwd+env	plan-20260921 VG-05 G3: sandboxes HOME/XDG + cwd to prove an archived (replaced) key still verifies its own signatures
 src/internal/vault.rs	removal_preserves_existing_history_rows	lane:env+cwd	plan-20260921 故障恢复矩陣「remove --force 误删风险」: ConfigDbFixture 隔离 HOME/XDG + ChangeDirGuard 隔离 cwd；断言移除会归档被移除 key 的公钥、且既有 vault.gpg.history.* 行只增不删（矩阵该行此前只对 generated_pubkey 有断言）
+src/internal/vault.rs	config_generate_gpg_key_after_import_same_nanosecond_collision_retries	lane:cwd+env	plan-20260921 VG-14：ConfigDbFixture 隔离 HOME/XDG + ChangeDirGuard 隔离 cwd；纳秒键名碰撞重试
+src/internal/vault.rs	generate_pgp_key_retry_exhaustion_fails_closed	lane:cwd+env	plan-20260921 VG-14 G6：重试耗尽时 fail-closed（隔离 HOME/XDG 与 cwd）
+src/internal/vault.rs	replace_never_deletes_history_rows	lane:cwd+env	plan-20260921 VG-13 G5：替换活动键不得删除既有 vault.gpg.history.* 行（隔离 HOME/XDG 与 cwd）
