@@ -397,6 +397,8 @@ libra config get vault.gpg.pubkey
 | `--passphrase-file <path>` | 从文件读取 key 口令（非交互下受保护 key 必填） |
 | `--replace` | 替换活动 key，先将当前公钥归档到历史 |
 
+**`libra init` 已经生成并启用了一把签名 key**（`source: generated`、`vault.signing=true`），因此在默认仓库里导入自己的 key **必须带 `--replace`**；否则导入会 fail-closed 报 `LBR-CONFLICT-002`（`an active GPG key already exists; pass --replace`）。被替换的 key 的公钥会先归档，使它此前签出的签名仍可验证。
+
 ```bash
 libra config import-gpg-key --list
 libra config import-gpg-key --key ABCDEF...

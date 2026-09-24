@@ -480,10 +480,12 @@ Import an existing OpenPGP signing key from the local GnuPG home or an armored f
 | `--passphrase-file <path>` | Read the key passphrase from a file (required for protected keys in non-interactive use) |
 | `--replace` | Replace the active key, archiving the current public key into history first |
 
+**`libra init` already mints an active signing key** (`source: generated`, `vault.signing=true`), so adopting your own key on a default repository requires `--replace`; without it the import fails closed with `LBR-CONFLICT-002` ("an active GPG key already exists; pass `--replace`"). The replaced key's public half is archived, so signatures it already made keep verifying.
+
 ```bash
-libra config import-gpg-key --list
-libra config import-gpg-key --key ABCDEF...
-libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
+libra config import-gpg-key --list                                   # discover candidates (no writes)
+libra config import-gpg-key --key ABCDEF... --replace                # adopt one by fingerprint
+libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt --replace
 ```
 
 #### `export-gpg-key`
