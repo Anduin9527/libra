@@ -2,23 +2,13 @@
 
 ## [0.23.60] — 2026-09-24
 
-> **Version note (2026-09-24, revised):** this family was prepared as `0.23.46`, which was
-> already published upstream; it was then bumped to `0.23.59`, which upstream tagged and began
-> releasing while this branch was still unmerged. Upstream releases move quickly, so the version
-> is bumped again to `0.23.60`. **Merge upstream before tagging** and let
-> `tests/harness/release-runbook.sh preflight` confirm the intended tag is still free.
-
-> **Version note (2026-09-24):** this family was prepared as `0.23.46`, but that
-> number is already published upstream (`v0.23.46`), and upstream `main` has since
-> reached `0.23.58`. The three release surfaces (`Cargo.toml`, `install.sh`,
-> `install.ps1`) and this section were bumped to `0.23.59` so the tag is unique and
-> the stable channel moves forward instead of regressing.
-
 ### GnuPG key import into the repository vault (plan-20260921)
 
-> This section records the plan-20260921 GPG family. Version sections
-> `0.23.37`–`0.23.45` were not written by the plans that shipped them, so the
-> log below is intentionally scoped to this family.
+> This section records the plan-20260921 GPG family. The key-import family and
+> its management-plane commands (`export-gpg-key`, `remove-gpg-key`,
+> `list --gpg-keys`, and versioned generated-key names) ship together in this
+> one release. Upstream versions `0.23.37`–`0.23.64` were published without
+> CHANGELOG sections, so the log below is intentionally scoped to this family.
 
 - `libra config import-gpg-key [--list|--key <fpr>|--file <path>|--passphrase-file <path>|--replace]`
   adopts an existing GnuPG secret key into the repository vault: the first
