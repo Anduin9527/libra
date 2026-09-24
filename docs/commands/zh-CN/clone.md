@@ -102,7 +102,7 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 
 ### `-l, --local` / `--no-local`
 
-Libra **从不硬链接**对象——始终复制。普通文件系统 Git 路径按本地克隆处理：`--depth`、`--shallow-since`、`--shallow-exclude`、`--filter` 被忽略，并打印 Git 的本地克隆警告（`--depth is ignored in local clones; use file:// instead.`，其余标志有对应原文）。`--quiet` 仍会打印这些警告。`file://` 与 `--no-local` 保持传输浅化语义；`-l` / `--local` 恢复本地克隆路径。本地 Libra 源不变。两个标志互相覆盖，最后出现者生效。
+对齐 Git：对**普通本地 Git 路径**选择「本地克隆」还是传输。普通路径默认走本地克隆（`-l`/`--local` 也恢复该语义）：`--depth`、`--shallow-since`、`--shallow-exclude`、`--filter` 被忽略，并输出 Git 原文警告（`warning: --depth is ignored in local clones; use file:// instead.` 及其对应行）。`--no-local` 或 `file://` 走传输并尊重 `--depth`。Libra 仍从不硬链接，始终复制对象。两 flag 互相覆盖，最后出现者生效。本地 Libra 源不变：普通路径与 `file://` 上的 `--depth` 都以 `LBR-REPO-002` fail-closed。
 
 ```bash
 libra clone -l /path/to/source /path/to/dest

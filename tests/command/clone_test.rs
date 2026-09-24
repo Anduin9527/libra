@@ -913,9 +913,9 @@ fn origin_flag_names_the_remote() {
     }
 }
 
-/// `--local` / `--no-local` / `-l` are accepted for Git compatibility and are
-/// effectively no-ops: Libra's clone of a local-path source already reads its
-/// objects directly. Cloning a local source succeeds with any of them.
+/// This test covers the accepted `--local` / `--no-local` / `-l` spellings
+/// when the source is a local Libra repository. Git-source transport semantics
+/// are covered by `test_clone_local_path_ignores_shallow_options_matrix`.
 #[test]
 fn test_clone_local_flag_accepted_for_local_source() {
     use super::run_libra_command;

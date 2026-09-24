@@ -124,18 +124,16 @@ pub struct CloneArgs {
     #[clap(short = 'o', long = "origin", value_name = "NAME")]
     pub origin: Option<String>,
 
-    /// Request local optimizations for a filesystem source (Git's `-l`/`--local`
-    /// copies/hardlinks instead of using the transport). Accepted for
-    /// compatibility and is a no-op: Libra never hardlinks (it always copies),
-    /// and how it reads a local-path source is determined by the source type
-    /// (a local Libra repo is read directly; a local Git repo is fetched via
-    /// git-upload-pack), not by this flag.
+    /// Request local-clone semantics for a filesystem source (Git's `-l`/`--local`).
+    /// Libra still copies objects (it never hardlinks), but a plain local Git
+    /// path then ignores `--depth` / `--shallow-*` / `--filter` with Git's
+    /// warnings. Last one wins with `--no-local`.
     #[clap(short = 'l', long, overrides_with = "no_local")]
     pub local: bool,
 
-    /// Force the regular transport even for a local source (Git's `--no-local`,
-    /// which avoids hardlinks). Accepted for compatibility and is a no-op:
-    /// Libra never hardlinks objects, so there is nothing to disable.
+    /// Use the regular transport even for a local filesystem source (Git's
+    /// `--no-local`). A plain local Git path then honors `--depth` the same way
+    /// `file://` does. Last one wins with `-l`/`--local`.
     #[clap(long = "no-local", overrides_with = "local")]
     pub no_local: bool,
 

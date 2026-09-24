@@ -177,9 +177,9 @@ fn rev_parse_reports_shallow_repository_boolean() {
     assert_eq!(String::from_utf8_lossy(&after.stdout), "true\n");
 }
 
-/// Local Git `--depth 1` must produce a walkable clone (issues/474 CL-04).
+/// A plain local Git path with `--no-local --depth 1` must produce a walkable clone.
 #[test]
-fn clone_depth_from_local_git_source_is_walkable() {
+fn clone_depth_no_local_from_local_git_path_is_walkable() {
     let fixture = CliFixture::new();
     let source = fixture.path("git-source");
     fs::create_dir_all(&source).expect("create git source");
@@ -213,7 +213,6 @@ fn clone_depth_from_local_git_source_is_walkable() {
     }
 
     let dest = fixture.path("git-clone");
-    let remote = format!("file://{}", source.display());
     fixture.success(
         &fixture.root,
         &[
@@ -221,8 +220,8 @@ fn clone_depth_from_local_git_source_is_walkable() {
             "--depth",
             "1",
             "--single-branch",
-            "--no-tags",
-            &remote,
+            "--no-local",
+            source.to_str().expect("utf8 source"),
             dest.to_str().expect("utf8 dest"),
         ],
     );

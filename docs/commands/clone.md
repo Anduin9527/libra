@@ -168,17 +168,15 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 
 ### `-l, --local` / `--no-local`
 
-Accepted for Git compatibility and effectively no-ops. Git's `-l`/`--local` asks
-for local optimizations (copy/hardlink instead of the transport) when the source
-is on the local filesystem, and `--no-local` forces the transport to avoid
-hardlinks. Libra **never hardlinks** objects — it always copies. A plain filesystem Git
-path is a local clone: `--depth`, `--shallow-since`, `--shallow-exclude`, and
-`--filter` are ignored, and Libra prints Git's warning
-(`--depth is ignored in local clones; use file:// instead.`, and the matching
-texts for the other flags). `--quiet` still prints those warnings. `file://`
-and `--no-local` keep transport shallow semantics. `-l` / `--local` restores
-the local-clone path. A local Libra source is unchanged. The two flags override
-each other; the last one given wins.
+Match Git's local-clone vs transport choice for a **plain filesystem Git path**.
+A plain path defaults to local-clone semantics (also restored by `-l`/`--local`):
+`--depth`, `--shallow-since`, `--shallow-exclude`, and `--filter` are ignored
+and Git's warning text is printed (`warning: --depth is ignored in local clones;
+use file:// instead.` and the matching `--shallow-*` / `--filter` lines).
+`--no-local` (or a `file://` URL) uses the transport and honors `--depth`.
+Libra still never hardlinks — it always copies objects. The two flags override
+each other; the last one given wins. A local Libra source is unchanged: `--depth`
+fails closed with `LBR-REPO-002` on both a plain path and `file://`.
 
 ```bash
 libra clone -l /path/to/source /path/to/dest
