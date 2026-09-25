@@ -143,6 +143,39 @@ fn test_init_from_git_repository_converts_repo() {
 }
 
 #[test]
+fn test_init_from_git_repository_preserves_non_main_source_head() {
+    let (temp_root, git_dir) = create_simple_git_repo();
+    run_git_success(&["switch", "-c", "feature"], &git_dir);
+    fs::write(git_dir.join("feature.txt"), "feature branch\n").unwrap();
+    run_git_success(&["add", "feature.txt"], &git_dir);
+    run_git_success(&["commit", "-m", "feature commit"], &git_dir);
+
+    let libra_dir = temp_root.path().join("libra-repo");
+    fs::create_dir_all(&libra_dir).unwrap();
+
+    let conversion = libra_command(&libra_dir)
+        .args(["init", "--from-git-repository", git_dir.to_str().unwrap()])
+        .output()
+        .expect("failed to execute libra init");
+    assert!(
+        conversion.status.success(),
+        "libra init failed: {}",
+        String::from_utf8_lossy(&conversion.stderr)
+    );
+
+    let branch = libra_command(&libra_dir)
+        .args(["branch", "--show-current"])
+        .output()
+        .expect("failed to inspect converted HEAD");
+    assert!(branch.status.success());
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "feature");
+    assert_eq!(
+        fs::read_to_string(libra_dir.join("feature.txt")).unwrap(),
+        "feature branch\n"
+    );
+}
+
+#[test]
 fn test_init_from_git_repository_converts_all_gitignore_files() {
     let temp_root = tempdir().unwrap();
     let git_dir = temp_root.path().join("git-src");

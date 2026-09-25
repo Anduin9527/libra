@@ -922,7 +922,7 @@ fn loose_object_file(repo: &std::path::Path, oid: &str) -> std::path::PathBuf {
 /// blob reachable from a commit keeps both its object and its row;
 /// `--dry-run` only counts, and a second run is a no-op.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn agent_object_gc_findings_reachability() {
     let repo = create_committed_repo_via_cli();
 
@@ -1142,6 +1142,23 @@ fn gc_stops_at_a_shallow_boundary_instead_of_reporting_corruption() {
     assert_cli_success(
         &run_libra_command(&["reflog", "expire", "--expire=all", "--all"], root),
         "expire reflog roots the graft would not have",
+    );
+
+    // The change projection is a mandatory GC root too. A real shallow clone
+    // cannot contain a projection for an object it never received, so remove
+    // the synthetic row before deleting the grafted-away parent object.
+    let db = root.join(".libra/libra.db");
+    let cleanup = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import sqlite3\nc = sqlite3.connect({db:?})\nc.execute(\"DELETE FROM change_revision WHERE commit_oid = ?\", ({cut:?},))\nc.commit()\n"
+        ))
+        .output()
+        .expect("run python3 sqlite3");
+    assert!(
+        cleanup.status.success(),
+        "remove synthetic change projection: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
     );
 
     fs::write(root.join(".libra").join("shallow"), format!("{boundary}\n"))

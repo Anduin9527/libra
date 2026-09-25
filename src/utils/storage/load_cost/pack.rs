@@ -688,6 +688,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn batch_probe_opens_one_index_and_charges_the_delta_chain() {
         set_hash_kind(HashKind::Sha1);
         let temp = tempfile::tempdir().expect("create pack fixture");
@@ -717,6 +718,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn aggregate_limit_stops_before_probing_later_pack_objects() {
         set_hash_kind(HashKind::Sha1);
         let temp = tempfile::tempdir().expect("create pack fixture");
@@ -762,6 +764,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn malformed_delta_instruction_is_rejected_without_reconstruction() {
         let mut encoded = Vec::new();
         {
@@ -780,6 +783,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn metadata_varints_reject_overflow_without_panicking() {
         let mut pack_header =
             io::Cursor::new([0xb0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
@@ -791,6 +795,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn delta_cost_charges_oversized_base_and_instruction_payloads() {
         let oversized_base = LoadCost {
             result_size: 40 * 1024 * 1024,
@@ -809,6 +814,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn oversized_delta_declaration_is_rejected_before_reading_its_base() {
         set_hash_kind(HashKind::Sha1);
         let temp = tempfile::tempdir().expect("create pack fixture");
@@ -839,6 +845,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn non_delta_probe_rejects_oversized_declaration_before_decoding_payload() {
         let declared = crate::utils::preview_object::MAX_OBJECT_BYTES + 1;
         let error = validate_zlib_payload(

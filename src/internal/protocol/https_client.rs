@@ -8,7 +8,7 @@ use reqwest::{RequestBuilder, Response, StatusCode, header::CONTENT_TYPE};
 use url::Url;
 
 use super::{
-    DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content,
+    DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content_with_capabilities,
     parse_discovered_references,
 };
 use crate::{
@@ -277,7 +277,7 @@ impl HttpsClient {
         read_timeout: Duration,
     ) -> Result<Self, String> {
         let url = normalize_url(url);
-        let client = build_client(connect_timeout, read_timeout)?;
+        let client = build_client(connect_timeout, read_timeout, url_is_loopback(&url))?;
         Ok(Self { url, client })
     }
 
@@ -286,7 +286,7 @@ impl HttpsClient {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<Self, String> {
-        self.client = build_client(connect_timeout, read_timeout)?;
+        self.client = build_client(connect_timeout, read_timeout, url_is_loopback(&self.url))?;
         Ok(self)
     }
 
@@ -418,13 +418,39 @@ impl HttpsClient {
         shallow: &[String],
         depth: Option<usize>,
     ) -> Result<FetchStream, IoError> {
+        let discovery = self
+            .discovery_reference(ServiceType::UploadPack)
+            .await
+            .map_err(|error| {
+                IoError::other(format!(
+                    "failed to discover HTTPS upload-pack capabilities: {error}"
+                ))
+            })?;
+        self.fetch_objects_with_capabilities(have, want, shallow, depth, &discovery.capabilities)
+            .await
+    }
+
+    pub(crate) async fn fetch_objects_with_capabilities(
+        &self,
+        have: &[String],
+        want: &[String],
+        shallow: &[String],
+        depth: Option<usize>,
+        advertised_capabilities: &[String],
+    ) -> Result<FetchStream, IoError> {
         // POST $GIT_URL/git-upload-pack HTTP/1.0
         // INVARIANT: "git-upload-pack" is a valid relative URL onto self.url.
         let url = self
             .url
             .join("git-upload-pack")
             .expect("'git-upload-pack' is a valid relative URL");
-        let body = generate_upload_pack_content(have, want, shallow, depth);
+        let body = generate_upload_pack_content_with_capabilities(
+            have,
+            want,
+            shallow,
+            depth,
+            advertised_capabilities,
+        )?;
         tracing::debug!("fetch_objects with body: {:?}", body);
 
         let res = BasicAuth::send(|| async {
@@ -517,15 +543,35 @@ pub(crate) fn no_downgrade_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// Loopback must bypass the OS/system HTTP proxy.
+///
+/// `Cargo.toml` sets `reqwest` `default-features = false`, but feature
+/// unification with other crates re-enables `system-proxy`. Without this
+/// guard, macOS system proxies (e.g. Clash/mihomo on `127.0.0.1:7897`)
+/// intercept mock-server tests and return `502 Bad Gateway`.
+pub(crate) fn url_is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 fn build_client(
     connect_timeout: Duration,
     read_timeout: Duration,
+    bypass_proxy: bool,
 ) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .http1_only()
         .redirect(no_downgrade_redirect_policy())
         .connect_timeout(connect_timeout)
-        .read_timeout(read_timeout)
+        .read_timeout(read_timeout);
+    if bypass_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(|e| format!("failed to build HTTPS client: {e}"))
 }

@@ -34,6 +34,41 @@ Before computing staged changes or writing tree/commit objects, `commit` validat
 index entries for missing or mistyped blob/tree objects. A corrupt index entry fails closed
 with `LBR-REPO-002` and leaves `HEAD` unchanged.
 
+An unresolved index (stage 1/2/3 without a stage-0 resolution) blocks a real
+commit with `LBR-CONFLICT-001`, including `--amend`, `--allow-empty`, and
+`--no-verify`. This also applies after a conflicted `merge --squash`, which has
+no merge lifecycle state. Resolve the named paths and stage them with
+`libra add <path>` before committing. Rejection happens
+before hooks and tree/commit writes and preserves `HEAD`, index, and worktree.
+Like Git, `-a` first stages the current contents or deletion of conflicted
+regular files and symlinks, then checks the resulting index; it does not inspect
+file contents for conflict markers. Unresolved gitlinks require an explicit
+resolution (for example `libra update-index --cacheinfo 160000,<commit>,<path>`):
+Libra does not materialize submodules, so `-a` cannot infer deletion from an
+absent submodule directory. Dry-run and porcelain previews preserve the live
+index, `HEAD`, and worktree, including when `-a` previews a resolution.
+A successful non-`--dry-run` commit that updates HEAD also
+clears a stopped single-commit cherry-pick or revert (or a sequence sitting on
+its last item). A multi-commit sequence is kept and the stopped item is
+recorded as concluded. `--dry-run` and `--porcelain` leave that state unchanged.
+
+When a merge is in progress, `commit` finishes it: the new commit has HEAD plus
+the recorded merge target(s) as parents, the message defaults to the saved merge
+message (editor mode strips `# Conflicts:` comments; `--no-edit` keeps them;
+`-m`/`-F` override), then merge state is cleared and a held autostash is
+applied. `--amend` during a merge is refused (exit 128). `--dry-run` writes
+nothing, keeps merge state, and prints a preview instead of a fake
+`[branch hash]` line. After `merge --squash`, the following commit is
+single-parent, prefills `SQUASH_MSG`, and deletes that file. Partial
+`commit <path>` / `commit -o <path>` remains a usage error (exit 129; Git
+exits 128).
+
+For a deleted conflict, use `commit -a` only when all tracked changes belong in
+the commit. A parent replaced by a file or symlink makes its tracked children
+deletions; `-a` never reads through that symlink. Replacing a conflicted file with
+a directory containing `.git` or `.libra` metadata also requires an explicit
+gitlink resolution, rather than being automatically staged as a deletion.
+
 Author identity comes from `--author`, then `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`, then
 configured `user.name`/`user.email`; committer identity comes from
 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, then config. Git environment variables
@@ -61,6 +96,12 @@ message is the initial buffer). Conflicts with `--no-edit`.
 libra commit -e -m "Draft message"
 ```
 
+### `--allow-empty-message`
+
+Allow a commit whose message is empty after cleanup. This also bypasses the
+unedited-template abort. It does **not** imply `--allow-empty` (an empty index
+still needs that flag). A `commit-msg` hook can still reject the empty file.
+
 ### `-t, --template <FILE>`
 
 Use the contents of `FILE` as the initial commit message. With the editor open (the default
@@ -69,7 +110,9 @@ used directly. When the `-t` flag is unset, the `commit.template` config (a file
 leading `~/` expanded to `$HOME`) is consulted. The template is **ignored** when a message
 source (`-m`/`-F`/`-C`/`-c`/`--fixup`/`--squash`) is given — that source wins and the template
 file is not even read. As in Git, if the editor leaves the template unchanged the commit is
-aborted ("you did not edit the message"); `--no-edit` bypasses that check.
+aborted ("you did not edit the message"); a template that cleans to an empty message
+(comment-only under `strip`/`default`) reports `aborting commit due to empty commit message`
+instead. `--no-edit` bypasses the unedited-template check.
 
 ```bash
 libra commit -t .libra/commit-template.txt
@@ -147,6 +190,9 @@ libra commit -m "fix(auth): handle expired tokens" --conventional
 
 Automatically stage tracked files that have been modified or deleted before committing.
 Equivalent to running `libra add -u` before `libra commit`. Does not add new untracked files.
+File modes follow `core.filemode`: with `true` (the Unix default) a mode-only change to a
+tracked regular file is committed too, while `false` ignores it (an invalid value fails the
+commit closed).
 
 ```bash
 libra commit -a -m "Fix typo"
@@ -367,6 +413,10 @@ matching `git commit --no-gpg-sign`. Vault signing runs when `vault.signing=true
 with the repository vault key and `false` disables signing. `--no-gpg-sign` has
 highest precedence and suppresses either configuration. Git's positive
 `-S`/`--gpg-sign` is not exposed.
+
+When `vault.gpg.source=imported` (set by `libra config import-gpg-key`), commit
+signing uses the imported signing key instead of the generated vault key; removal
+(`libra config remove-gpg-key --force`) falls back to the generated key.
 
 ```bash
 libra commit --no-gpg-sign -m "message"
@@ -666,10 +716,13 @@ candidate OIDs while holding that fence through the prune transaction. With
 
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
+| Unresolved index conflicts | `LBR-CONFLICT-001` | 128 | Resolve and stage files with `libra add`; stage deleted conflicts with `commit -a` only when all tracked changes are intended |
 | Index corrupted | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
 | Index object missing or wrong type | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | Failed to save index | `LBR-IO-002` | 128 | -- |
 | Nothing to commit (clean) | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
+| Nothing added (untracked only) | `LBR-REPO-003` | 128 | "use 'libra add' to track files" |
+| No changes added (unstaged tracked) | `LBR-REPO-003` | 128 | "use 'libra add' and/or 'libra commit -a'" |
 | Nothing to commit (no tracked) | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |
 | Author identity missing | `LBR-AUTH-001` | 128 | "run 'libra config user.name ...' and 'libra config user.email ...'" |
 | No commit to amend | `LBR-REPO-003` | 128 | "create a commit before using --amend" |
@@ -681,7 +734,7 @@ candidate OIDs while holding that fence through the prune transaction. With
 | Message file unreadable | `LBR-IO-001` | 128 | -- |
 | Empty commit message | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree creation failed | `LBR-INTERNAL-001` | 128 | Issues URL |
-| Object storage failed | `LBR-IO-002` | 128 | -- |
+| Object storage failed | `LBR-IO-002` | 128 | When the cause is cloud object-index marker registration, the canonical message applies: payloads were stored safely, no paths were staged, and a direct retry reuses them without lock-file cleanup; lock timeouts name the holder and lock files must never be deleted |
 | Parent commit missing | `LBR-REPO-002` | 128 | "the parent commit is missing or corrupted" |
 | HEAD update failed | `LBR-IO-002` | 128 | -- |
 | Blocking repository hook failed | `LBR-REPO-003` | 128 | "use --no-verify to bypass repository hooks" |
@@ -699,3 +752,12 @@ candidate OIDs while holding that fence through the prune transaction. With
 - jj does not have a traditional `commit` command with staging; `jj commit` finalizes the working copy commit
 - `--fixup` and `--squash` are supported (autosquash markers); `--cleanup=<mode>` controls comment/scissors stripping
 - Vault signing replaces the external keyring; `commit.gpgSign` is honored while `user.signingkey` remains vault-managed
+- Change identity is stored in the sidecar projection (`change_identity`/`change_revision`); Libra does not write a `change-id` commit header. Existing headers are import-compatible metadata only.
+- Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-p`/`--patch`/`--interactive`, D15). Stage paths with `libra add <pathspec>` then commit.
+
+## Issue #477 notes
+
+concludes an in-progress merge with a two-parent commit
+no changes added to commit (use "libra add" and/or "libra commit -a")
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
+records a commit whose message is empty

@@ -75,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn env_parse_accepts_positive_and_rejects_invalid() {
         let previous = std::env::var_os("LIBRA_MAX_CONNECTIONS");
         // SAFETY: single-threaded under #[serial]; restored below.

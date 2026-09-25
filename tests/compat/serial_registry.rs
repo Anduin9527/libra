@@ -58,11 +58,18 @@ fn registry() -> BTreeMap<String, (String, String)> {
 }
 
 fn classify_raw() -> String {
-    let out = Command::new("sh")
-        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+    classify_raw_on_tree(None)
+}
+
+fn classify_raw_on_tree(tree: Option<&str>) -> String {
+    let mut cmd = Command::new("sh");
+    cmd.arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
         .current_dir(repo_root())
-        .output()
-        .expect("run tests/SERIAL_CLASSIFY.sh");
+        .env_remove("SERIAL_CLASSIFY_TREE");
+    if let Some(tree) = tree {
+        cmd.env("SERIAL_CLASSIFY_TREE", tree);
+    }
+    let out = cmd.output().expect("run tests/SERIAL_CLASSIFY.sh");
     assert!(
         out.status.success(),
         "SERIAL_CLASSIFY.sh failed: {}",
@@ -230,16 +237,14 @@ fn serial_attrs_in_braces(text: &str, open: usize) -> usize {
 /// plan-20260824 DF-05).
 #[test]
 fn site_rows_point_at_real_attribute_sites() {
-    let mut sites = 0;
     for (key, _) in registry() {
         let Some(inner) = key.strip_prefix("<site:").and_then(|k| k.strip_suffix('>')) else {
             continue;
         };
-        sites += 1;
         assert!(
-            !inner
+            inner
                 .rsplit_once(':')
-                .is_some_and(|(_, tail)| tail.parse::<usize>().is_ok()),
+                .is_none_or(|(_, tail)| tail.parse::<usize>().is_err()),
             "site key {key} is line-anchored; TA-02 bans line numbers in keys"
         );
         if let Some((path, rest)) = inner.split_once(":macro:") {
@@ -291,7 +296,9 @@ fn site_rows_point_at_real_attribute_sites() {
             panic!("site key {key}: neither :macro: nor :orphan# form");
         }
     }
-    assert!(sites > 0, "expected at least one macro-body site row");
+    // RC-23 deleted the Code UI matrix macros that used to supply every
+    // production `<site:…:macro:…>` row. Zero remaining sites is valid;
+    // the loop above still checks any future site key that reappears.
 }
 
 /// TA-03 standing invariant (ADR-TA-02): after the mechanical conversion,
@@ -325,6 +332,34 @@ fn classifier_is_deterministic() {
         classify_raw(),
         classify_raw(),
         "SERIAL_CLASSIFY.sh is not deterministic"
+    );
+}
+
+/// plan-20260917 SH-01: the default face is tests/, and an explicit
+/// `SERIAL_CLASSIFY_TREE=tests` must not change a byte of stdout.
+#[test]
+fn classify_tree_default_matches_tests_baseline() {
+    assert_eq!(
+        classify_raw(),
+        classify_raw_on_tree(Some("tests")),
+        "SERIAL_CLASSIFY_TREE=tests must match the default (unset) face"
+    );
+}
+
+/// plan-20260917 SH-01: unknown TREE values fail closed with exit 2.
+#[test]
+fn classify_tree_rejects_unknown_value() {
+    let out = Command::new("sh")
+        .arg(repo_root().join("tests/SERIAL_CLASSIFY.sh"))
+        .current_dir(repo_root())
+        .env("SERIAL_CLASSIFY_TREE", "bogus")
+        .output()
+        .expect("run tests/SERIAL_CLASSIFY.sh");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bogus TREE must exit 2, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -1817,6 +1852,120 @@ fn classifier_ignores_string_literals_and_reads_same_line_attributes() {
     );
 }
 
+fn nextest_external_members(config: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let parsed: toml::Value = toml::from_str(config).map_err(|error| error.to_string())?;
+    let overrides = parsed
+        .get("profile")
+        .and_then(|profile| profile.get("default"))
+        .and_then(|default| default.get("overrides"))
+        .and_then(toml::Value::as_array)
+        .ok_or("profile.default.overrides must be an array")?;
+    let mut fns = Vec::new();
+    let mut binaries = Vec::new();
+    for entry in overrides {
+        let table = entry.as_table().ok_or("override must be a table")?;
+        let Some(group) = table.get("test-group") else {
+            // nextest resolves each property independently: a timeout-only
+            // rule is not group membership, even when its filter overlaps.
+            continue;
+        };
+        if group.as_str().ok_or("test-group must be a string")? != "external" {
+            continue;
+        }
+        let filter = table
+            .get("filter")
+            .and_then(toml::Value::as_str)
+            .ok_or("external override filter must be a string")?;
+        let (members, name) = if let Some(name) = filter
+            .strip_prefix("test(/(^|::)")
+            .and_then(|rest| rest.strip_suffix("$/)"))
+        {
+            (&mut fns, name)
+        } else if let Some(name) = filter
+            .strip_prefix("binary(=")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            (&mut binaries, name)
+        } else {
+            return Err(format!("unknown external filter: {filter}"));
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!("invalid external filter identifier: {filter}"));
+        }
+        // Do not deduplicate: the exact registry comparison must catch duplicates.
+        members.push(name.to_owned());
+    }
+    fns.sort();
+    binaries.sort();
+    Ok((fns, binaries))
+}
+
+#[test]
+fn nextest_group_membership_ignores_timeout_only_overrides() {
+    let fixture = r#"
+[[profile.default.overrides]]
+slow-timeout = { grace-period = '10s', terminate-after = 10, period = '120s' }
+filter = "binary(=fixture_binary) & (test(=test_fixture_binary) | test(=test_web_only_sigterm_releases_ports))"
+
+[[profile.default.overrides]]
+test-group = "external"
+filter = 'test(/(^|::)external_case$/)'
+
+[[profile.default.overrides]]
+filter = "binary(=fixture_binary)"
+test-group = 'external'
+"#;
+    let expected = (vec!["external_case".into()], vec!["fixture_binary".into()]);
+    assert_eq!(
+        nextest_external_members(fixture).expect("valid fixture"),
+        expected
+    );
+    assert_ne!(
+        nextest_external_members(&fixture.replace("external_case", "wrong_case"))
+            .expect("valid mutated member"),
+        expected,
+        "a changed member must remain visible to the bidirectional guard"
+    );
+    let duplicate = format!(
+        "{fixture}\n[[profile.default.overrides]]\nfilter = 'binary(=fixture_binary)'\ntest-group = 'external'\n"
+    );
+    assert_eq!(
+        nextest_external_members(&duplicate)
+            .expect("valid duplicate")
+            .1
+            .len(),
+        2
+    );
+    assert_ne!(
+        nextest_external_members(&duplicate).expect("valid duplicate"),
+        expected
+    );
+    let missing = fixture.replace("test-group = 'external'", "test-group = 'another-group'");
+    assert_ne!(
+        nextest_external_members(&missing).expect("other group"),
+        expected
+    );
+    for invalid in [
+        fixture.replace("test-group = 'external'", "test-group = 42"),
+        fixture.replace("filter = 'test(/(^|::)external_case$/)'", "filter = 42"),
+        fixture.replace("filter = 'test(/(^|::)external_case$/)'", ""),
+        fixture.replace("test(/(^|::)external_case$/)", "test(=external_case)"),
+        fixture.replace(
+            "binary(=fixture_binary)\"",
+            "binary(=fixture_binary) | all()\"",
+        ),
+    ] {
+        assert!(
+            nextest_external_members(&invalid).is_err(),
+            "must reject invalid external membership: {invalid}"
+        );
+    }
+}
+
 /// plan-20260827 NP-01 (ADR-NP-01): `.config/nextest.toml` is a generated
 /// artifact — regenerating it from `tests/SERIAL_REGISTRY.tsv` must reproduce
 /// the committed file byte for byte, and the `external` union group must hold
@@ -1891,18 +2040,8 @@ fn nextest_groups_toml_matches_generator_and_registry() {
     expected_fns.sort();
     expected_bins.sort();
 
-    let mut toml_fns: Vec<String> = committed
-        .lines()
-        .filter_map(|l| l.strip_prefix("filter = 'test(/(^|::)"))
-        .map(|l| l.trim_end_matches("$/)'").to_string())
-        .collect();
-    let mut toml_bins: Vec<String> = committed
-        .lines()
-        .filter_map(|l| l.strip_prefix("filter = 'binary(="))
-        .map(|l| l.trim_end_matches(")'").to_string())
-        .collect();
-    toml_fns.sort();
-    toml_bins.sort();
+    let (toml_fns, toml_bins) = nextest_external_members(&committed)
+        .expect("valid structural external-group membership in .config/nextest.toml");
 
     assert_eq!(
         toml_fns, expected_fns,
@@ -1914,6 +2053,247 @@ fn nextest_groups_toml_matches_generator_and_registry() {
         "external group binary(=..) members must equal the pure-global site \
          rows' host targets"
     );
-    assert_eq!(toml_fns.len(), 210, "union fn member count drifted");
-    assert_eq!(toml_bins.len(), 7, "site host target count drifted");
+    // DEFER-NP-02 (executed 2026-09-17, user-directed): the TA-03 fail-closed
+    // expansions carry only the in-process closed set {cwd, env, hash_kind},
+    // so the union group holds exactly the genuinely external rows — the
+    // hand-keyed cloud_live (9 after RC-35 dropped publish_live) and
+    // workspace_failpoints (1) tests. A count drift here means a new test was
+    // keyed with an external resource (fine, but deliberate) or a fail-closed
+    // body was re-widened by hand (not fine).
+    assert_eq!(toml_fns.len(), 10, "union fn member count drifted");
+    // RC-23 deleted the seven Code UI matrix binaries that used to host
+    // pure-global macro site rows. The external group now has no binary filters.
+    assert_eq!(toml_bins.len(), 0, "site host target count drifted");
+}
+
+/// DEFER-NP-02 standing invariant: no `tests/**` attribute may carry the
+/// pre-narrowing TA-03 expansion (`cloud_live` and `workspace_failpoints`
+/// alongside the in-process set). Those two keys were never resource evidence
+/// for a fail-closed body — the classifier can only prove cwd/env/hash_kind
+/// pollution — and carrying them serialized ~150 default-build tests inside
+/// the single-threaded nextest `external` group. A body that genuinely touches
+/// an external resource names that key alone (`#[serial(cloud_live)]`), never
+/// the whole universe.
+#[test]
+fn no_full_universe_expansion_remains() {
+    fn keys_of(attr_line: &str) -> Option<Vec<&str>> {
+        let inner = attr_line
+            .trim_start()
+            .strip_prefix("#[serial_test::serial(")
+            .or_else(|| attr_line.trim_start().strip_prefix("#[serial("))?;
+        let inner = inner.strip_suffix(")]")?;
+        Some(inner.split(',').map(str::trim).collect())
+    }
+    let mut offenders = Vec::new();
+    let mut stack = vec![repo_root().join("tests")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read tests/ dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read test source");
+                for (n, line) in text.lines().enumerate() {
+                    if let Some(keys) = keys_of(line)
+                        && keys.contains(&"cloud_live")
+                        && keys.contains(&"workspace_failpoints")
+                    {
+                        offenders.push(format!("{}:{}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "full-universe #[serial] expansion found (narrow it to the lanes the body \
+         really needs, e.g. #[serial(cwd, env, hash_kind)]): {offenders:?}"
+    );
+}
+
+fn serial_keys_of(attr_line: &str) -> Option<Vec<String>> {
+    let inner = attr_line
+        .trim_start()
+        .strip_prefix("#[serial_test::serial(")
+        .or_else(|| attr_line.trim_start().strip_prefix("#[serial("))?;
+    let inner = inner.strip_suffix(")]")?;
+    Some(inner.split(',').map(|k| k.trim().to_string()).collect())
+}
+
+fn attr_keys_before_fn(lines: &[&str], idx: usize) -> (Vec<String>, bool) {
+    let mut keys = Vec::new();
+    let mut is_test = false;
+    for prev in lines[..idx].iter().rev() {
+        let text = prev.trim();
+        if text.is_empty() || text.starts_with("//") || text.starts_with("///") {
+            continue;
+        }
+        if let Some(found) = serial_keys_of(prev) {
+            keys.extend(found);
+            continue;
+        }
+        if text.starts_with("#[") {
+            if text.starts_with("#[test") || text.starts_with("#[tokio::test") {
+                is_test = true;
+            }
+            continue;
+        }
+        break;
+    }
+    (keys, is_test)
+}
+
+fn fn_is_test(source: &str, fn_name: &str) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let sig = format!("fn {fn_name}(");
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let is_fn = trimmed.starts_with("fn ") || trimmed.starts_with("async fn ");
+        if !is_fn || !trimmed.contains(&sig) {
+            continue;
+        }
+        if attr_keys_before_fn(&lines, idx).1 {
+            return true;
+        }
+    }
+    false
+}
+
+fn serial_keys_on_fn(source: &str, fn_name: &str) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let sig = format!("fn {fn_name}(");
+    let mut fallback = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let is_fn = trimmed.starts_with("fn ") || trimmed.starts_with("async fn ");
+        if !is_fn || !trimmed.contains(&sig) {
+            continue;
+        }
+        let (keys, is_test) = attr_keys_before_fn(&lines, idx);
+        if is_test {
+            return keys;
+        }
+        if fallback.is_empty() {
+            fallback = keys;
+        }
+    }
+    fallback
+}
+
+/// plan-20260917 SH-02: every census `touches!=none` src test holds those lanes.
+#[test]
+fn src_process_global_tests_hold_matching_lanes() {
+    let census = std::fs::read_to_string(repo_root().join("tests/SRC_SERIAL_CENSUS.tsv"))
+        .expect("read SRC_SERIAL_CENSUS.tsv");
+    let mut missing = Vec::new();
+    for (n, line) in census.lines().enumerate() {
+        if n == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert!(cols.len() >= 4, "census line {}", n + 1);
+        let (file, fn_name, touches) = (cols[0], cols[1], cols[3]);
+        if touches == "none" {
+            continue;
+        }
+        let source = std::fs::read_to_string(repo_root().join(file)).expect(file);
+        // Census indexes serial-adjacent helpers (and doc comments that mention
+        // `#[serial]`). Those are not rustc tests; putting serial_test on them
+        // rewrites the helper into a 0-arg test and breaks callers.
+        if !fn_is_test(&source, fn_name) {
+            continue;
+        }
+        let keys = serial_keys_on_fn(&source, fn_name);
+        for lane in touches.split('+') {
+            if matches!(lane, "env" | "cwd" | "hash_kind") && !keys.iter().any(|k| k == lane) {
+                missing.push(format!("{file}::{fn_name} missing {lane} (have {keys:?})"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "src process-global tests missing lanes: {missing:?}"
+    );
+}
+
+/// plan-20260917 SH-02: src/ must not keep the five-key universe expansion.
+#[test]
+fn no_full_universe_expansion_remains_in_src() {
+    let mut offenders = Vec::new();
+    let mut stack = vec![repo_root().join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/ dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read src");
+                for (n, line) in text.lines().enumerate() {
+                    if let Some(keys) = serial_keys_of(line)
+                        && keys.iter().any(|k| k == "cloud_live")
+                        && keys.iter().any(|k| k == "workspace_failpoints")
+                    {
+                        offenders.push(format!("{}:{}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "src/ still has full-universe #[serial] expansion: {offenders:?}"
+    );
+}
+
+/// plan-20260917 SH-02: SRC_SERIAL_REGISTRY.tsv lists file+fn for converted rows
+/// and agrees with SERIAL_CLASSIFY_TREE=src on (fn, lane) multisets.
+#[test]
+fn src_serial_registry_matches_src_classifier() {
+    let text = std::fs::read_to_string(repo_root().join("tests/SRC_SERIAL_REGISTRY.tsv"))
+        .expect("read SRC_SERIAL_REGISTRY.tsv");
+    let mut registry: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        if n == 0 {
+            assert_eq!(line, "file\tfn\tlane\treason", "src registry header");
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 4, "src registry line {}", n + 1);
+        let prior = registry.insert(
+            (cols[0].to_string(), cols[1].to_string()),
+            cols[2].to_string(),
+        );
+        assert!(
+            prior.is_none(),
+            "duplicate src registry row {} {}",
+            cols[0],
+            cols[1]
+        );
+    }
+    assert!(!registry.is_empty(), "src registry is empty");
+
+    let classified = classify_raw_on_tree(Some("src"));
+    let mut class_fns: BTreeMap<String, usize> = BTreeMap::new();
+    for line in classified.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (fn_name, _verdict) = line.split_once('\t').expect("src classify fn\\tverdict");
+        *class_fns.entry(fn_name.to_string()).or_insert(0) += 1;
+    }
+    let mut missing = Vec::new();
+    for (_, fn_name) in registry.keys() {
+        if !class_fns.contains_key(fn_name) {
+            missing.push(fn_name.clone());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "SRC_SERIAL_REGISTRY fns missing from TREE=src classify: {missing:?}"
+    );
 }

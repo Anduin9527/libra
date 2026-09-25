@@ -58,7 +58,6 @@ pub(crate) use error::MemoryDamagePoint;
 pub(crate) use error::{MemoryWriterError, MemoryWriterErrorKind};
 pub(crate) use evidence::EvidenceOmissionReason;
 pub(crate) use fts_sql::validate_plain_text_query;
-pub(crate) use job::schedule_observer_repair;
 pub(crate) use policy::AuthenticatedMemoryContext;
 pub(crate) use query::{EpisodePathFilter, EpisodeQueryV1, MAX_CANDIDATES, MAX_RESULT_LIMIT};
 #[cfg(test)]
@@ -69,7 +68,6 @@ pub(crate) use reader::tests::{
 pub(crate) use reader::{
     EpisodeReadItemV1, EpisodeReader, EpisodeReaderError, EpisodeReaderErrorKind,
 };
-pub(crate) use runtime::{MemoryRuntime, MemoryRuntimeErrorKind};
 pub(crate) use view::ResolvedMemoryViewV1;
 #[cfg(test)]
 pub(crate) use writer::tests::fixture as memory_test_fixture;

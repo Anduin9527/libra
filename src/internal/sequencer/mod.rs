@@ -26,7 +26,9 @@
 //!    any *new* one with `LBR-CONFLICT-002` — never blocking the in-progress
 //!    op's own continue/abort/skip (those paths do not call the guard).
 
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use std::{path::Path, time::Duration};
+
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 use crate::utils::{
     error::{CliError, CliResult, StableErrorCode},
@@ -50,6 +52,16 @@ impl SequenceKind {
             SequenceKind::Revert => "revert",
             SequenceKind::CherryPick => "cherry_pick",
             SequenceKind::Rebase => "rebase",
+        }
+    }
+
+    /// CLI spelling used in durable operation records. The storage token
+    /// remains cherry_pick, while operation names follow the invoked command.
+    #[cfg(test)]
+    fn command_name(self) -> &'static str {
+        match self {
+            SequenceKind::CherryPick => "cherry-pick",
+            _ => self.as_str(),
         }
     }
 
@@ -238,6 +250,140 @@ pub async fn load_for_scope(
     }))
 }
 
+/// Capture a sequencer row from an explicit storage path. Facet capture runs
+/// synchronously behind a snapshot trait, so it must not borrow the parent's
+/// cached async pool from a newly-created runtime thread; doing so can wait
+/// forever when the parent runtime is blocked in that trait call.
+pub(crate) async fn load_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<serde_json::Value>, String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(stored) = load_stored_with_conn(&db, scope.storage_key()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::json!({
+        "present": true,
+        "kind": stored.kind,
+        "head_name": stored.head_name,
+        "head_orig": stored.head_orig,
+        "current_oid": stored.current_oid,
+        "todo": stored.todo,
+        "payload": stored.payload,
+    })))
+}
+
+/// Restore a facet against an explicitly resolved storage path. StateFacet's
+/// synchronous API runs its helper future on a short-lived runtime, so using
+/// the ambient cached pool here can deadlock when the caller is already
+/// blocking that pool's parent runtime.
+pub(crate) async fn restore_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin sequence_state transaction: {error}"))?;
+    let (kind, state) = parse_snapshot_state(value)?;
+    save_fields_for_scope(
+        &txn,
+        scope.storage_key(),
+        SequenceStateFields {
+            kind: &kind,
+            head_name: &state.head_name,
+            head_orig: &state.head_orig,
+            current_oid: &state.current_oid,
+            todo: &state.todo,
+            payload: &state.payload,
+        },
+    )
+    .await
+    .map_err(|error| format!("failed to restore sequence_state: {error}"))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("failed to commit sequence_state transaction: {error}"))?;
+    Ok(())
+}
+
+pub(crate) async fn clear_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<(), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE worktree_id = ?",
+        [scope.storage_key().into()],
+    ))
+    .await
+    .map_err(|error| format!("failed to clear sequence_state: {error}"))?;
+    Ok(())
+}
+
+fn parse_snapshot_state(value: &serde_json::Value) -> Result<(String, AmSequenceState), String> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("sequencer kind missing")?
+        .to_string();
+    let state = AmSequenceState {
+        head_name: string_value(value, "head_name")?,
+        head_orig: string_value(value, "head_orig")?,
+        current_oid: string_value(value, "current_oid")?,
+        todo: value
+            .get("todo")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("sequencer todo missing")?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        payload: string_value(value, "payload")?,
+    };
+    if kind != "am" && SequenceKind::from_token(&kind).is_none() {
+        return Err(format!("unknown sequencer kind '{kind}'"));
+    }
+    Ok((kind, state))
+}
+
+fn string_value(value: &serde_json::Value, key: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("sequencer field '{key}' missing"))
+}
+
 pub(crate) async fn load_am() -> Result<Option<AmSequenceState>, String> {
     let Some(stored) = load_stored().await? else {
         return Ok(None);
@@ -321,199 +467,6 @@ async fn claim_fields(
     }
 }
 
-/// Open the operation-log boundary for one sequencer control action
-/// (§C.9, §C.11 W1).
-///
-/// The digest is the invocation's argv, which is what makes two worktrees
-/// running the identical `--continue` distinguishable only by scope — the
-/// case the scope-aware dedup key exists for. It also makes a repeated
-/// `--continue` in the SAME worktree, while the first is still running,
-/// refusable: the claim is a unique index, not a check.
-///
-/// Returns `None` when the repository has no operation log to write to (a
-/// command run outside a repository is refused long before this, but the
-/// helper must not turn a missing repo id into a control-action failure).
-pub(crate) async fn begin_control_operation(
-    control: SequencerControl,
-    argv: &[String],
-) -> CliResult<Option<crate::internal::operation_wrapper::OperationBoundary>> {
-    use crate::internal::operation_wrapper::{OperationMeta, OperationScope, begin_operation};
-
-    // The enumeration is the authority on what a control action IS: anything
-    // entering the operation log must be one of the declared ones, or the
-    // §C.9 list has drifted from the code it describes.
-    debug_assert!(
-        SequencerControl::ALL.contains(&control),
-        "undeclared sequencer control entered the operation log: {control:?}"
-    );
-    let (command_name, description) = control.describe_operation();
-    // Fail CLOSED: without an identity there is no boundary, and without a
-    // boundary there is no worktree-wide control mutex.
-    let repo_id = control_repo_id().await.map_err(|message| {
-        CliError::fatal(message).with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
-    let meta = OperationMeta {
-        command_name,
-        description,
-        actor: control_actor().await,
-        repo_id,
-        args_digest: Some(control_args_digest(argv, &control_position(control).await)),
-    };
-    // A boundary-recorded operation is never restorable, so snapshotting every
-    // branch and workspace pointer would write rows nothing can ever read —
-    // per control action, on the hot path of a `bisect` that marks dozens of
-    // candidates. Record the head pointer, which is what `op log`/`op show`
-    // display, and nothing else (§C.14).
-    let scope = OperationScope {
-        include_refs: false,
-        include_workspace: false,
-        // No control action is subject to the five-second succeeded-window.
-        //
-        // The window guesses that an identical command repeated within five
-        // seconds is an accidental double submission. That guess does not hold
-        // for a sequence, in either direction, and the suite proves both:
-        //
-        //   * a RESUMPTION legitimately repeats at an unchanged position —
-        //     `test_rebase_empty_drop_survives_conflict_resume` drives two
-        //     `rebase --continue` calls where the first dropped an empty
-        //     commit, so the position never moved;
-        //   * a fresh START legitimately repeats too —
-        //     `readded_worktree_does_not_inherit_bisect_session` removes and
-        //     re-adds a worktree and starts the same bisect again, and
-        //     `bisect reset` followed by `bisect start <same args>` is simply
-        //     how a user starts over.
-        //
-        // Nothing is lost by dropping it: a genuine double start is refused by
-        // the start-time mutex and the atomic claim, with a message that says
-        // what is actually wrong ("a bisect is already in progress") instead of
-        // "duplicate operation". Overlap is excluded by the worktree-wide
-        // control slot, which is a real mutex rather than a heuristic.
-        duplicate_window: false,
-        ..OperationScope::default()
-    };
-    match begin_operation(meta, scope).await {
-        Ok(boundary) => Ok(Some(boundary)),
-        Err(err) => Err(
-            CliError::fatal(format!("cannot start this operation: {err}"))
-                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-                .with_hint(
-                    "another identical command is running or just completed in this worktree; \
-             wait for it to finish, or inspect it with `libra op log`",
-                ),
-        ),
-    }
-}
-
-/// SHA-256 over the invocation's argv AND the sequence position it acts on,
-/// NUL-separated so no two payloads can collide by concatenation.
-///
-/// The position is what keeps duplicate suppression honest. `libra bisect
-/// good` twice in a row is the NORMAL way to drive a bisect, and the two
-/// invocations have byte-identical argv — without the position, the second
-/// would land inside the five-second succeeded-window and be refused as a
-/// repeat of the first. Two runs that act on the SAME position really are the
-/// same operation; two that act on different ones are not.
-fn control_args_digest(argv: &[String], position: &str) -> String {
-    let payload = format!("{}\0@{position}", argv.join("\0"));
-    let digest = ring::digest::digest(&ring::digest::SHA256, payload.as_bytes());
-    format!("sha256:{}", hex::encode(digest.as_ref()))
-}
-
-/// Where this worktree's sequence currently stands, as the dedup identity sees
-/// it: the commit a sequence stopped on, or the bisect candidate checked out.
-/// `"none"` when nothing is in progress — which is right for a start, where
-/// two racers genuinely ARE the same operation.
-async fn control_position(control: SequencerControl) -> String {
-    // The position is a log label now that no control enters thefive-second
-    // window, so a read that races the slot cannot affect exclusion.
-    if control.is_fresh_start() {
-        return "none".to_string();
-    }
-    let position = match control {
-        SequencerControl::BisectStart
-        | SequencerControl::BisectMark
-        | SequencerControl::BisectSkip
-        | SequencerControl::BisectReset
-        | SequencerControl::BisectRun => scoped_bisect_position().await,
-        _ => load_stored()
-            .await
-            .ok()
-            .flatten()
-            .map(|stored| stored.current_oid),
-    };
-    position
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-/// The candidate this worktree's bisect currently has checked out.
-async fn scoped_bisect_position() -> Option<String> {
-    let Ok(db) = request_db_checked().await else {
-        // The position is a LOG LABEL, not an exclusion key (§C.9): the control
-        // slot is what excludes. A database we cannot open is reported by the
-        // command's own path a moment later with actionable context, so this
-        // must not abort — it just has no position to record.
-        return None;
-    };
-    let scope_key = current_scope_key();
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT current FROM bisect_state WHERE worktree_id = ? LIMIT 1",
-            [scope_key.into()],
-        ))
-        .await
-        .ok()??;
-    row.try_get_by_index::<Option<String>>(0).ok()?
-}
-
-async fn control_actor() -> String {
-    crate::internal::config::ConfigKv::get("user.name")
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.value)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "libra-user".to_string())
-}
-
-/// The repository id, WITHOUT creating one: a control action must not be the
-/// thing that first writes `libra.repoid`.
-///
-/// Read through the REQUEST-BOUND connection (§C.4.2) and fallible: the ambient
-/// `ConfigKv::get` opens the cwd's database and aborts if it cannot, and an
-/// absent or unreadable identity used to mean "no boundary" — which silently
-/// dropped the worktree-wide control mutex, letting a concurrent `--continue`
-/// and `--abort` run together.
-async fn control_repo_id() -> Result<String, String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-
-    let db = request_db_checked().await?;
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT `value` FROM `config_kv` WHERE `key` = 'libra.repoid' \
-             ORDER BY `id` DESC LIMIT 1",
-            [],
-        ))
-        .await
-        .map_err(|error| format!("cannot read this repository's identity: {error}"))?;
-    let value: Option<String> = match row {
-        Some(row) => row
-            .try_get_by_index(0)
-            .map_err(|error| format!("this repository's identity is unreadable: {error}"))?,
-        None => None,
-    };
-    value
-        .filter(|value| !value.trim().is_empty() && value != "unknown-repo")
-        .ok_or_else(|| {
-            "this repository has no recorded identity (`libra.repoid`), so a sequencer control \
-             action cannot claim its worktree's control slot — run `libra status` once to \
-             record one, or `libra worktree doctor` to inspect the repository"
-                .to_string()
-        })
-}
-
 /// Whether a database error is the PRIMARY KEY/UNIQUE violation that means
 /// "someone else claimed this scope first" rather than a real failure.
 pub(crate) fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
@@ -562,6 +515,174 @@ where
         &state.payload,
     )
     .await
+}
+
+/// Outcome of concluding a stopped sequence item from outside the sequencer
+/// (#477 HF-01): `reset` (and later `commit`) ends the stopped item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalConclusion {
+    /// No cherry-pick row in this worktree: nothing to conclude.
+    NotInProgress,
+    /// The stopped item was the whole sequence (nothing left to pick), so the
+    /// row is gone.
+    Cleared,
+    /// A multi-commit sequence keeps its remaining `todo`; the stopped item is
+    /// marked concluded by an additive `stop_concluded` flag inside the
+    /// existing `payload` column (ADR-HF-03 item 3 — no schema change).
+    Marked,
+    /// The row changed between the read and the write — a concurrent `--quit`
+    /// plus a fresh start owns the sequence now. The conclusion is dropped and
+    /// the new owner's row is left exactly as it is (#477 HF-01, Codex R5).
+    Superseded,
+}
+
+/// Read the current sequence only when it belongs to the requested command.
+/// The snapshot does not mutate the row; pass it to [`conclude_stopped_sequence`].
+pub async fn snapshot_stopped_sequence(
+    kind: SequenceKind,
+) -> Result<Option<SequenceState>, String> {
+    let Some(state) = load().await? else {
+        return Ok(None);
+    };
+    if state.kind != kind {
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+/// End the sequence item a stopped run is sitting on, because a later `reset`
+/// concluded it (ADR-HF-03 items 1 and 4, #477 HF-01).
+///
+/// Clears the row when nothing remains, otherwise keeps `current_oid`, `todo`
+/// and the row shape and lets the owning command mark the payload
+/// (`mark_payload`). The marker is an additive payload field, so a row written
+/// here still loads on binaries that predate it (ER-HF-02).
+///
+/// `mark_payload` is fallible: a payload this binary cannot read must surface
+/// as an error so the caller warns about the row it left behind, never as a
+/// silent "already marked" (the unchanged-payload shortcut below would
+/// otherwise swallow it).
+///
+/// Conclude exactly the `snapshot` the caller observed.
+///
+/// Taking the snapshot as an argument is what keeps `reset` honest (Codex R6):
+/// the row is read BEFORE the reset moves the tree, so a sequence started after
+/// the reset finished can never be concluded by it — the fence below simply
+/// misses and reports [`ExternalConclusion::Superseded`].
+pub async fn conclude_stopped_sequence(
+    snapshot: SequenceState,
+    mark_payload: impl Fn(&str) -> Result<String, String>,
+) -> Result<ExternalConclusion, String> {
+    let state = snapshot;
+    let payload = if state.todo.is_empty() {
+        None
+    } else {
+        let marked = mark_payload(&state.payload)?;
+        if marked == state.payload {
+            // Already concluded by an earlier reset; nothing more to mark.
+            return Ok(ExternalConclusion::Marked);
+        }
+        Some(marked)
+    };
+    reclaim_race_seam().await?;
+    // Fenced write: the DELETE/UPDATE only fires while every column still holds
+    // the snapshot this conclusion read. A `--quit` racing us, followed by a new
+    // pick, therefore keeps its own row instead of losing it to a stale write.
+    match payload {
+        None if clear_if_unchanged(&state).await? => Ok(ExternalConclusion::Cleared),
+        Some(payload) if mark_if_unchanged(&state, &payload).await? => {
+            Ok(ExternalConclusion::Marked)
+        }
+        _ => Ok(ExternalConclusion::Superseded),
+    }
+}
+
+/// `LIBRA_TEST`-gated seam that replaces this worktree's row between the
+/// conclusion's read and its fenced write, so the quit/reclaim race is a
+/// deterministic test rather than a timing hope (#477 HF-01, Codex R5).
+async fn reclaim_race_seam() -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    let Some(payload) = std::env::var_os("LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE") else {
+        return Ok(());
+    };
+    let reclaimed = SequenceState {
+        kind: SequenceKind::CherryPick,
+        head_name: "master".to_string(),
+        head_orig: "0".repeat(40),
+        current_oid: "9".repeat(40),
+        todo: vec!["8".repeat(40)],
+        payload: payload.to_string_lossy().into_owned(),
+    };
+    save(&reclaimed).await
+}
+
+/// Delete this worktree's row only while it still matches `snapshot`.
+async fn clear_if_unchanged(snapshot: &SequenceState) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM sequence_state WHERE worktree_id = ? AND kind = ? AND head_name = ? \
+             AND head_orig = ? AND current_oid = ? AND todo = ? AND payload = ?",
+            fence_values(snapshot),
+        ))
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Rewrite only the payload of this worktree's row, and only while every other
+/// column still matches `snapshot`.
+async fn mark_if_unchanged(snapshot: &SequenceState, payload: &str) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let mut values = vec![payload.to_string().into()];
+    values.extend(fence_values(snapshot));
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE sequence_state SET payload = ?, updated_at = CURRENT_TIMESTAMP \
+             WHERE worktree_id = ? AND kind = ? AND head_name = ? AND head_orig = ? \
+             AND current_oid = ? AND todo = ? AND payload = ?",
+            values,
+        ))
+        .await
+        .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// The snapshot columns both fenced statements compare against, in WHERE order.
+fn fence_values(snapshot: &SequenceState) -> Vec<sea_orm::Value> {
+    vec![
+        current_scope_key().into(),
+        snapshot.kind.as_str().into(),
+        snapshot.head_name.clone().into(),
+        snapshot.head_orig.clone().into(),
+        snapshot.current_oid.clone().into(),
+        snapshot.todo.join("\n").into(),
+        snapshot.payload.clone().into(),
+    ]
+}
+
+/// Clear this worktree's row of `kind` only while its payload still contains
+/// `needle` (#477 HF-31): a run releasing its own claim after an early refusal
+/// must not erase a row another start claimed after a concurrent `--quit`.
+/// Returns whether a row was removed.
+pub(crate) async fn clear_if_payload_contains(
+    kind: SequenceKind,
+    needle: &str,
+) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ? AND instr(payload, ?) > 0",
+            [kind.as_str().into(), current_scope_key().into(), needle.into()],
+        ))
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// The FIRST write of a starting `am`, as an atomic claim (§C.4.4) — see
@@ -625,17 +746,49 @@ async fn save_fields<C>(
 where
     C: ConnectionTrait,
 {
+    let scope_key = current_scope_key();
+    save_fields_for_scope(
+        db,
+        &scope_key,
+        SequenceStateFields {
+            kind,
+            head_name,
+            head_orig,
+            current_oid,
+            todo,
+            payload,
+        },
+    )
+    .await
+}
+
+struct SequenceStateFields<'a> {
+    kind: &'a str,
+    head_name: &'a str,
+    head_orig: &'a str,
+    current_oid: &'a str,
+    todo: &'a [String],
+    payload: &'a str,
+}
+
+async fn save_fields_for_scope<C>(
+    db: &C,
+    scope_key: &str,
+    fields: SequenceStateFields<'_>,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
     // Part C W1 (§C.4.2): replace only THIS worktree's row. An unscoped
     // `DELETE FROM sequence_state` would wipe every other worktree's
     // in-progress sequence.
-    let scope_key = current_scope_key();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE worktree_id = ?",
-        [scope_key.clone().into()],
+        [scope_key.to_string().into()],
     ))
     .await?;
-    let todo = todo.join("\n");
+    let todo = fields.todo.join("\n");
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO sequence_state \
@@ -643,12 +796,12 @@ where
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
             scope_key.into(),
-            kind.to_string().into(),
-            head_name.to_string().into(),
-            head_orig.to_string().into(),
-            current_oid.to_string().into(),
+            fields.kind.to_string().into(),
+            fields.head_name.to_string().into(),
+            fields.head_orig.to_string().into(),
+            fields.current_oid.to_string().into(),
             todo.into(),
-            payload.to_string().into(),
+            fields.payload.to_string().into(),
         ],
     ))
     .await?;
@@ -1155,11 +1308,10 @@ pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
 /// §C.9 asks W1 for exactly this: "`worktree add/move/remove/repair/migrate`
 /// 与 sequencer start/continue/skip/abort 声明 mutation scope，为 LR-02
 /// wrapper coverage guard 提供枚举" — the declaration, so LR-02's coverage
-/// guard has a complete list to check the wrapper against. Entering the
-/// operation wrapper itself is LR-02 work: `with_operation_log` runs its
-/// business closure INSIDE a `DatabaseTransaction`, while these actions
-/// check out files and open their own pooled transactions, which the
-/// `_with_conn` contract in `internal/branch.rs` documents as a deadlock.
+/// middleware coverage guard has a complete list to check the mutation
+/// boundary against. These actions run inside the v2 operation middleware;
+/// their checkout/file work and pooled transactions are kept in the
+/// `_with_conn` contract in `internal/branch.rs` to avoid deadlocks.
 ///
 /// The match in [`SequencerControl::mutation_scope`] is exhaustive with no
 /// wildcard, so a new control action does not compile until it declares.
@@ -1169,6 +1321,7 @@ pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
 // listed here — rather than derived later from whatever the commands happen to
 // do — precisely so that guard has something authoritative to check against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum SequencerControl {
     Start(SequenceKind),
     Continue(SequenceKind),
@@ -1198,6 +1351,7 @@ pub(crate) enum SequencerControl {
 
 /// What a control action mutates (§C.9 / §C.4.1.1 inventory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ControlMutationScope {
     /// THIS worktree's HEAD, index or working files.
     pub(crate) worktree_state: bool,
@@ -1207,6 +1361,7 @@ pub(crate) struct ControlMutationScope {
     pub(crate) sequencer_state: bool,
 }
 
+#[cfg(test)]
 impl SequencerControl {
     pub(crate) fn mutation_scope(self) -> ControlMutationScope {
         match self {
@@ -1259,29 +1414,16 @@ impl SequencerControl {
         }
     }
 
-    /// Whether this control BEGINS a sequence, as opposed to driving or
-    /// ending one already in progress.
-    ///
-    /// `bisect run` is NOT one: it requires an existing session and drives it,
-    /// so re-running a script the user just fixed is a continuation and must
-    /// not be refused as a repeat.
-    pub(crate) fn is_fresh_start(self) -> bool {
-        matches!(
-            self,
-            SequencerControl::Start(_) | SequencerControl::AmStart | SequencerControl::BisectStart
-        )
-    }
-
     /// The operation-log identity of this control: the command name recorded
     /// in `operation`, and its human description.
     pub(crate) fn describe_operation(self) -> (String, String) {
         let (command, action) = match self {
-            SequencerControl::Start(kind) => (kind.as_str(), "start"),
-            SequencerControl::Continue(kind) => (kind.as_str(), "continue"),
-            SequencerControl::Skip(kind) => (kind.as_str(), "skip"),
-            SequencerControl::Abort(kind) => (kind.as_str(), "abort"),
-            SequencerControl::Quit(kind) => (kind.as_str(), "quit"),
-            SequencerControl::Restart(kind) => (kind.as_str(), "restart"),
+            SequencerControl::Start(kind) => (kind.command_name(), "start"),
+            SequencerControl::Continue(kind) => (kind.command_name(), "continue"),
+            SequencerControl::Skip(kind) => (kind.command_name(), "skip"),
+            SequencerControl::Abort(kind) => (kind.command_name(), "abort"),
+            SequencerControl::Quit(kind) => (kind.command_name(), "quit"),
+            SequencerControl::Restart(kind) => (kind.command_name(), "restart"),
             SequencerControl::AmStart => ("am", "start"),
             SequencerControl::AmContinue => ("am", "continue"),
             SequencerControl::AmSkip => ("am", "skip"),
@@ -1482,47 +1624,16 @@ impl WorktreeControl {
 /// continue/abort/skip, so the in-progress op can still be concluded. The
 /// error names the blocking op and how to conclude or abort it.
 pub async fn ensure_none_in_progress(next: SequenceKind) -> CliResult<()> {
-    ensure_none_for_control(SequencerControl::Start(next)).await
-}
-
-/// The mutex, entered by a DECLARED control action (§C.9).
-///
-/// Only controls whose declared `mutation_scope` includes `sequencer_state`
-/// are subject to it — that declaration is what makes an action a sequencer
-/// control rather than an ordinary command, and reading it here keeps the
-/// enumeration honest instead of decorative.
-pub(crate) async fn ensure_none_for_control(control: SequencerControl) -> CliResult<()> {
-    debug_assert!(
-        control.mutation_scope().sequencer_state,
-        "only sequencer-state controls enter the mutex: {control:?}"
-    );
-    let next = match control {
-        SequencerControl::Start(kind)
-        | SequencerControl::Continue(kind)
-        | SequencerControl::Skip(kind)
-        | SequencerControl::Abort(kind)
-        | SequencerControl::Quit(kind)
-        | SequencerControl::Restart(kind) => ActiveSequenceKind::Known(kind),
-        SequencerControl::AmStart
-        | SequencerControl::AmContinue
-        | SequencerControl::AmSkip
-        | SequencerControl::AmAbort => ActiveSequenceKind::Am,
-        SequencerControl::BisectStart
-        | SequencerControl::BisectMark
-        | SequencerControl::BisectSkip
-        | SequencerControl::BisectReset
-        | SequencerControl::BisectRun => ActiveSequenceKind::Bisect,
-    };
-    ensure_none_for(next).await
+    ensure_none_for(ActiveSequenceKind::Known(next)).await
 }
 
 pub(crate) async fn ensure_none_for_am() -> CliResult<()> {
-    ensure_none_for_control(SequencerControl::AmStart).await
+    ensure_none_for(ActiveSequenceKind::Am).await
 }
 
 /// The bisect side of the symmetric mutex (§C.4.4).
 pub(crate) async fn ensure_none_for_bisect() -> CliResult<()> {
-    ensure_none_for_control(SequencerControl::BisectStart).await
+    ensure_none_for(ActiveSequenceKind::Bisect).await
 }
 
 async fn ensure_none_for(next: ActiveSequenceKind) -> CliResult<()> {
@@ -1560,12 +1671,14 @@ mod tests {
     /// `rebase-merge` directory could be reported as the pinned repository's
     /// in-progress rebase — blocking a sequence that has nothing to resume,
     /// or resuming against another repository's files.
+    // The later bare attribute wraps the named one: retain legacy test
+    // exclusion while also holding resource lanes, with the legacy lock first.
     #[tokio::test]
+    #[serial_test::serial(env, cwd, hash_kind)]
     #[serial_test::serial]
     async fn detection_probes_the_pinned_repository_not_the_cwd() {
         let quiet = tempfile::tempdir().expect("quiet repo");
         let noisy = tempfile::tempdir().expect("noisy repo");
-        let original = std::env::current_dir().expect("cwd");
         for repo in [quiet.path(), noisy.path()] {
             let _cd = crate::utils::test::ChangeDirGuard::new(repo);
             crate::utils::test::setup_with_new_libra_in(repo).await;
@@ -1578,12 +1691,11 @@ mod tests {
         let _pin = crate::internal::worktree_scope::WorktreeScope::pin_request_scope(
             quiet.path().to_path_buf(),
         );
-        std::env::set_current_dir(noisy.path()).expect("move the cwd");
+        let _cd = crate::utils::test::ChangeDirGuard::new(noisy.path());
 
         let detected = detect_active_operation()
             .await
             .expect("detection reads the pinned repository");
-        std::env::set_current_dir(&original).expect("restore the cwd");
         assert_eq!(
             detected, None,
             "the other repository's legacy rebase directory is not this one's sequence"
@@ -1595,6 +1707,7 @@ mod tests {
     /// what makes them scope-bearing actions at all. The enumeration is what
     /// LR-02's wrapper-coverage guard consumes.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn every_sequencer_control_declares_its_mutation_scope() {
         assert_eq!(
             SequencerControl::ALL.len(),
@@ -1672,7 +1785,7 @@ mod tests {
     }
 
     /// Every control the CLI can DISPATCH must be declared, or
-    /// `begin_control_operation`'s debug assertion aborts the command.
+    /// the v2 control-operation declaration's debug assertion aborts the command.
     ///
     /// This is not hypothetical: `revert --skip` dispatched
     /// `Skip(SequenceKind::Revert)` while `ALL` listed only the cherry-pick and
@@ -1807,7 +1920,7 @@ mod tests {
     /// the loser would silently replace the winner's todo while the winner's
     /// checkout stayed on disk. Exactly one claim may win.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn only_one_start_can_claim_this_worktrees_sequence() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -1841,10 +1954,197 @@ mod tests {
         );
     }
 
+    /// #477 HF-01 (ER-HF-02): the external-conclusion marker is an additive
+    /// payload field — `current_oid`, `todo` and the row shape stay valid for a
+    /// binary that predates it — and a sequence with nothing left is cleared.
+    // Keep both legacy and resource-keyed exclusion; the bare attribute wraps
+    // the named one and acquires the legacy lock before the sorted lane locks.
+    #[tokio::test]
+    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial]
+    async fn external_conclusion_marker_uses_existing_columns() {
+        for key in [None, Some("cwd"), Some("env"), Some("hash_kind")] {
+            assert!(
+                serial_test::is_locked_serially(key),
+                "external conclusion must retain legacy and resource exclusion: {key:?}"
+            );
+        }
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        // Callers snapshot first (Codex R6); `taken()` is that read.
+        async fn taken() -> Option<SequenceState> {
+            snapshot_stopped_sequence(SequenceKind::CherryPick)
+                .await
+                .expect("snapshot")
+        }
+        let keep = |payload: &str| Ok(payload.to_string());
+        let mark = |payload: &str| Ok(format!("{payload}|concluded"));
+        let unreadable = |_: &str| Err("unreadable options".to_string());
+
+        // Nothing in progress: there is no snapshot to conclude.
+        assert!(taken().await.is_none(), "idle");
+
+        // Multi-commit sequence: only the payload changes.
+        let mut multi = sample(SequenceKind::CherryPick);
+        multi.todo = vec!["c".repeat(40), "d".repeat(40)];
+        multi.payload = r#"{"signoff":false}"#.to_string();
+        save(&multi).await.expect("save multi");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), mark)
+                .await
+                .expect("mark"),
+            ExternalConclusion::Marked
+        );
+        let marked = load().await.expect("load").expect("row kept");
+        assert_eq!(
+            marked.current_oid, multi.current_oid,
+            "the stopped commit id stays readable by older binaries"
+        );
+        assert_eq!(marked.todo, multi.todo, "remaining todo is kept");
+        assert_eq!(marked.payload, format!("{}|concluded", multi.payload));
+        assert_eq!(marked.head_orig, multi.head_orig);
+        // Marking again is idempotent once the mark is present.
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("re-mark"),
+            ExternalConclusion::Marked
+        );
+
+        // A payload this binary cannot read is an error, not a silent "already
+        // marked": the row is left byte-identical for the caller to warn about.
+        let before = load().await.expect("load").expect("row kept");
+        assert!(
+            conclude_stopped_sequence(taken().await.expect("row"), unreadable)
+                .await
+                .is_err(),
+            "an unreadable payload must not report success"
+        );
+        let after = load().await.expect("load").expect("row kept");
+        assert_eq!(after.payload, before.payload, "payload untouched");
+        assert_eq!(after.current_oid, before.current_oid, "row untouched");
+        assert_eq!(after.todo, before.todo, "todo untouched");
+
+        // Nothing left to pick: the row goes away.
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let single = SequenceState {
+            todo: Vec::new(),
+            ..sample(SequenceKind::CherryPick)
+        };
+        save(&single).await.expect("save single");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("clear"),
+            ExternalConclusion::Cleared
+        );
+        assert!(load().await.expect("load").is_none());
+
+        // A different kind is left alone.
+        save(&sample(SequenceKind::Rebase))
+            .await
+            .expect("save rebase");
+        assert!(taken().await.is_none(), "a different kind is not ours");
+        assert!(
+            load().await.expect("load").is_some(),
+            "rebase state is untouched"
+        );
+        // Codex R5: a `--quit` racing the conclusion, followed by a fresh start,
+        // keeps its own row — the fenced write only fires on the snapshot it
+        // read, and the stale conclusion reports `Superseded`.
+        let reclaimed_payload = r#"{"signoff":true,"reclaimed":1}"#;
+        unsafe {
+            std::env::set_var("LIBRA_TEST", "1");
+            std::env::set_var(
+                "LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE",
+                reclaimed_payload,
+            );
+        }
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let mut racing = sample(SequenceKind::CherryPick);
+        racing.todo = vec!["e".repeat(40)];
+        racing.payload = r#"{"signoff":false}"#.to_string();
+        save(&racing).await.expect("save racing");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), mark)
+                .await
+                .expect("superseded"),
+            ExternalConclusion::Superseded
+        );
+        let winner = load().await.expect("load").expect("reclaimed row kept");
+        assert_eq!(
+            winner.payload, reclaimed_payload,
+            "the row the concurrent start wrote survives"
+        );
+        assert_eq!(winner.current_oid, "9".repeat(40));
+
+        // Same fence on the clearing branch: nothing left to pick, but the row
+        // was reclaimed under us.
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let single_racing = SequenceState {
+            todo: Vec::new(),
+            ..sample(SequenceKind::CherryPick)
+        };
+        save(&single_racing).await.expect("save single racing");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("superseded"),
+            ExternalConclusion::Superseded
+        );
+        assert_eq!(
+            load()
+                .await
+                .expect("load")
+                .expect("reclaimed row kept")
+                .payload,
+            reclaimed_payload,
+            "the clearing branch does not delete someone else's row"
+        );
+        unsafe {
+            std::env::remove_var("LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE");
+            std::env::remove_var("LIBRA_TEST");
+        }
+    }
+
+    /// #477 HF-31: a fenced clear removes the row only while its payload still
+    /// carries the caller's token.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn clear_if_payload_contains_only_removes_the_owners_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        let mut row = sample(SequenceKind::CherryPick);
+        row.payload = r#"{"claim_token":"theirs"}"#.to_string();
+        save(&row).await.expect("save");
+        let mine = r#""claim_token":"mine""#;
+        assert!(
+            !clear_if_payload_contains(SequenceKind::CherryPick, mine)
+                .await
+                .expect("fenced clear")
+        );
+        assert!(
+            load().await.expect("load").is_some(),
+            "another owner's row stays"
+        );
+        let theirs = r#""claim_token":"theirs""#;
+        assert!(
+            clear_if_payload_contains(SequenceKind::CherryPick, theirs)
+                .await
+                .expect("fenced clear")
+        );
+        assert!(
+            load().await.expect("load").is_none(),
+            "the owner's row is removed"
+        );
+    }
+
     /// Round-trip every SequenceKind through the unified table so the superset
     /// schema is validated for all four consumers (not just the migrated one).
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn save_load_clear_round_trip_all_kinds() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -1889,7 +2189,7 @@ mod tests {
     /// The symmetric mutex blocks a DIFFERENT sequence, allows the same kind
     /// (its own command handles same-op), and passes when idle.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn ensure_none_in_progress_cross_op_matrix() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());

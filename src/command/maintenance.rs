@@ -1940,6 +1940,11 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
     let digest: Vec<u8> = match oids[0].kind() {
         HashKind::Sha256 => sha2::Sha256::digest(&buf).to_vec(),
         HashKind::Sha1 => sha1::Sha1::digest(&buf).to_vec(),
+        HashKind::Blake3 => {
+            let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+            hasher.update(&buf);
+            hasher.finalize_object_hash().as_ref().to_vec()
+        }
     };
     buf.extend_from_slice(&digest);
     Some(buf)
@@ -2713,7 +2718,7 @@ const fn memory_projection_oid(
         column,
         status: GcSourceStatus::IndexOnly,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090701_memory_core rebuildable projection",
+        schema: "2026092501_memory_core rebuildable projection",
         read_bound: "not read by GC; projection replay removes stale rows",
         corruption: GcCorruptionPolicy::LenientSkip,
         note,
@@ -2731,7 +2736,7 @@ const fn memory_runtime_oid(
         column,
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090701_memory_core bounded runtime state",
+        schema: "2026092501_memory_core bounded runtime state",
         read_bound: "not read by GC; one bounded row per compiler root or source cursor",
         corruption: GcCorruptionPolicy::NotApplicable,
         note,
@@ -2884,7 +2889,7 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::File,
-        location: "<gitdir>/COMMIT_EDITMSG, MERGE_MSG, CHERRY_PICK_MSG, REVERT_EDITMSG, TAG_EDITMSG, NOTES_EDITMSG, BRANCH_DESCRIPTION_EDITMSG",
+        location: "<gitdir>/COMMIT_EDITMSG, MERGE_MSG, SQUASH_MSG, CHERRY_PICK_MSG, REVERT_EDITMSG, TAG_EDITMSG, NOTES_EDITMSG, BRANCH_DESCRIPTION_EDITMSG",
         column: "",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::Sidecar,
@@ -3119,17 +3124,6 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
-        location: "legacy_operation_view_ref",
-        column: "target_oid",
-        status: GcSourceStatus::TracedRoot,
-        kind: GcStorageKind::SqliteColumn,
-        schema: "migration-owned SQLite column",
-        read_bound: "full table scan, one query per collection pass",
-        corruption: GcCorruptionPolicy::FailClosed,
-        note: "undo/view snapshots must stay restorable",
-    },
-    GcObjectSource {
-        origin: GcSourceOrigin::Column,
         location: "agent_checkpoint",
         column: "parent_commit",
         status: GcSourceStatus::TracedRoot,
@@ -3215,28 +3209,6 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         read_bound: "full table scan, one query per collection pass",
         corruption: GcCorruptionPolicy::FailClosed,
         note: "workspace sync-back baseline (W4 §C.8)",
-    },
-    GcObjectSource {
-        origin: GcSourceOrigin::Column,
-        location: "legacy_operation_view",
-        column: "head_target",
-        status: GcSourceStatus::TracedRoot,
-        kind: GcStorageKind::SqliteColumn,
-        schema: "migration-owned SQLite column",
-        read_bound: "full table scan, one query per collection pass",
-        corruption: GcCorruptionPolicy::FailClosed,
-        note: "undo view HEAD pointer — rooted when it is an OID (a name is ref-anchored)",
-    },
-    GcObjectSource {
-        origin: GcSourceOrigin::Column,
-        location: "legacy_operation_view_workspace",
-        column: "pointer_value",
-        status: GcSourceStatus::TracedRoot,
-        kind: GcStorageKind::SqliteColumn,
-        schema: "migration-owned SQLite column",
-        read_bound: "full table scan, one query per collection pass",
-        corruption: GcCorruptionPolicy::FailClosed,
-        note: "undo view workspace pointer — rooted when it is an OID",
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
@@ -3443,7 +3415,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         column: "revision_oid",
         status: GcSourceStatus::IndexOnly,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090702_memory_fts_search rebuildable projection",
+        schema: "2026092502_memory_fts_search rebuildable projection",
         read_bound: "not read by GC; projection replay rebuilds the search document and FTS postings",
         corruption: GcCorruptionPolicy::LenientSkip,
         note: "Episode search lookup keyed by an authoritative Memory revision; SQLite search state never owns object reachability",
@@ -3464,7 +3436,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         column: "code_commit",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090703 local-only bounded context selection receipt",
+        schema: "2026092503 local-only bounded context selection receipt",
         read_bound: "never read by GC",
         corruption: GcCorruptionPolicy::NotApplicable,
         note: "audit-time code anchor only; the receipt records why context was selected but does not own object reachability, so a collected commit makes replay non-reproducible",
@@ -3475,7 +3447,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         column: "source_heads_json",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090703 bounded JSON map of receipt source names to observed OIDs",
+        schema: "2026092503 bounded JSON map of receipt source names to observed OIDs",
         read_bound: "never read by GC",
         corruption: GcCorruptionPolicy::NotApplicable,
         note: "audit-time source snapshot only; authoritative refs own reachability and a collected source object makes replay non-reproducible",
@@ -3486,7 +3458,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         column: "projection_watermarks_json",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090703 bounded JSON map of projection names to observed OIDs",
+        schema: "2026092503 bounded JSON map of projection names to observed OIDs",
         read_bound: "never read by GC",
         corruption: GcCorruptionPolicy::NotApplicable,
         note: "audit-time projection watermark only; projections are rebuildable and the receipt cannot keep their source objects alive",
@@ -3497,7 +3469,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         column: "selected_json",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090703 bounded JSON array containing selected Memory revision OIDs",
+        schema: "2026092503 bounded JSON array containing selected Memory revision OIDs",
         read_bound: "never read by GC",
         corruption: GcCorruptionPolicy::NotApplicable,
         note: "audit-time selection explanation only; Memory refs and events own reachability, so missing selected revisions make replay non-reproducible",
@@ -3508,7 +3480,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         column: "policy_hash",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090703 SHA-256 policy content digest",
+        schema: "2026092503 SHA-256 policy content digest",
         read_bound: "never read by GC",
         corruption: GcCorruptionPolicy::NotApplicable,
         note: "domain-separated policy digest used for receipt replay checks; it is not an object-store address and keeps no Libra object alive",
@@ -3519,7 +3491,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         column: "bundle_hash",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::SqliteColumn,
-        schema: "2026090703 SHA-256 rendered bundle digest",
+        schema: "2026092503 SHA-256 rendered bundle digest",
         read_bound: "never read by GC",
         corruption: GcCorruptionPolicy::NotApplicable,
         note: "integrity digest of the selected context bundle; the bundle is not stored as an object under this hash, so the value contributes no reachability root",
@@ -3580,9 +3552,6 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
     enum CellMode {
         /// A non-empty cell MUST be a valid OID (fail closed otherwise).
         StrictOid,
-        /// The cell may hold a ref/branch NAME or an OID — only an
-        /// OID-parsing value roots (names are anchored via repository refs).
-        OidIfParses,
         /// An operation view manifest whose workspace snapshots must be
         /// expanded before the ordinary Git object walk.
         V2View,
@@ -3599,24 +3568,6 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
             "SELECT blob FROM notes",
             &["blob"],
             CellMode::StrictOid,
-        ),
-        (
-            "legacy_operation_view_ref",
-            "SELECT target_oid FROM legacy_operation_view_ref",
-            &["target_oid"],
-            CellMode::StrictOid,
-        ),
-        (
-            "legacy_operation_view",
-            "SELECT head_target FROM legacy_operation_view",
-            &["head_target"],
-            CellMode::OidIfParses,
-        ),
-        (
-            "legacy_operation_view_workspace",
-            "SELECT pointer_value FROM legacy_operation_view_workspace",
-            &["pointer_value"],
-            CellMode::OidIfParses,
         ),
         (
             "operation",
@@ -3712,11 +3663,6 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
                                     .with_stable_code(StableErrorCode::RepoCorrupt)
                                 })?;
                                 walk_reachable(&hash, storage, boundaries, reachable)?;
-                            }
-                            CellMode::OidIfParses => {
-                                if let Some(hash) = parse_object_hash(trimmed) {
-                                    walk_reachable(&hash, storage, boundaries, reachable)?;
-                                }
                             }
                             CellMode::V2View => {
                                 let hash = parse_object_hash(trimmed).ok_or_else(|| {
@@ -4888,6 +4834,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn commit_graph_build_roundtrip() {
         use std::str::FromStr;
 
@@ -4951,6 +4898,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn commit_graph_build_writes_octopus_edge_chunk() {
         use std::str::FromStr;
 
@@ -5123,6 +5071,14 @@ mod tests {
                 "the HEAD pointer file (dual-layout compatibility); ref OIDs are inventoried in the DB half (reference)",
             ),
             (
+                "operation-v2.lock",
+                "the cross-process operation middleware lease; it contains no object ids and is never a GC root",
+            ),
+            (
+                "operation-v2-repository.lock",
+                "the repository-scoped operation middleware lease; it contains no object ids and is never a GC root",
+            ),
+            (
                 "config",
                 "repository configuration file (dual-layout compatibility); no object ids",
             ),
@@ -5135,36 +5091,14 @@ mod tests {
                 "loose-object write STAGING inside the object store: objects are hardlinked out of it on publish, and an orphaned temp file is re-writable content, never the only copy",
             ),
             ("stash-stack.lock", "the shared stash stack's advisory lock"),
-            ("contexts", "agent context files (§C.4.1.1 config surface)"),
-            ("rules", "agent rule files (§C.4.1.1 config surface)"),
-            (
-                "skills",
-                "agent skill definitions (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
-            ),
             ("hooks.json", "hook configuration (§C.4.1.1 config surface)"),
-            (
-                "dagrs-checkpoints",
-                "agent scheduler checkpoints; task graph state, no object ids",
-            ),
             (
                 "tmp/commit-preview",
                 "scratch directory for commit previews",
             ),
             (
-                "commands",
-                "custom command definitions (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
-            ),
-            (
                 "automations.toml",
                 "automation rules (§C.4.1.1 config surface)",
-            ),
-            (
-                "agents.toml",
-                "agent registry file (§C.4.1.1 config surface)",
-            ),
-            (
-                "agents",
-                "agent definition files (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
             ),
             (
                 "objects",
@@ -5174,10 +5108,6 @@ mod tests {
             (
                 "lost-found",
                 "where `fsck` WRITES dangling objects it found; never an input",
-            ),
-            (
-                "libra.db",
-                "the database; its OID columns are the inventory's other half",
             ),
             (
                 "info",
@@ -5234,6 +5164,18 @@ mod tests {
             (
                 "obliteration-audit.jsonl",
                 "audit trail; the AntiRoot itself is the `object_obliteration` table",
+            ),
+            (
+                "ADD_EDIT.patch",
+                "temporary add/reset -p hunk-edit buffer; contains no object ids and is removed after the session",
+            ),
+            (
+                "rebase-merge",
+                "temporary interactive rebase editor directory; durable OIDs live in rebase-aux.json",
+            ),
+            (
+                "git-rebase-todo",
+                "temporary sequence-editor buffer under rebase-merge/; cleaned up after edit",
             ),
         ];
 

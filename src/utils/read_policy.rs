@@ -127,7 +127,7 @@ mod tests {
     /// to Auto (which would re-enable remote reads).
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn read_policy_from_env_rejects_non_utf8_value() {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 

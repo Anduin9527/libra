@@ -66,6 +66,7 @@ pub(crate) fn stderr_json(output: &Output) -> Value {
         .rfind("\n{")
         .map(|index| index + 1)
         .or_else(|| trimmed.find('{'))
-        .expect("structured command error should contain JSON");
-    serde_json::from_str(&trimmed[start..]).expect("decode command JSON stderr")
+        .unwrap_or_else(|| panic!("structured command error should contain JSON: {trimmed}"));
+    serde_json::from_str(&trimmed[start..])
+        .unwrap_or_else(|error| panic!("decode command JSON stderr ({error}): {trimmed}"))
 }

@@ -28,6 +28,8 @@ libra restore --ignore-unmerged [--source <tree-ish>] <pathspec>...
 
 从来源 tree、索引或冲突 stage 恢复符号链接时，Libra 会在支持 symlink 的平台上创建真正的 symlink，并把链接 blob 字节作为目标路径。恢复过程不会跟随或打开目标路径，因此指向仓库外部的 symlink 也只会被恢复为链接本身。`--merge` 重建冲突标记时也会先替换工作树中的既有 symlink，再写入普通冲突标记文件。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写成普通文件内容。
 
+恢复出的文件会沿用来源条目的权限位：`100755` 创建为可执行（`0777`，再由进程 `umask` 约束），`100644` 创建为普通文件（`0666`，再由 `umask` 约束），因此在 `umask 077` 下分别得到 `700`/`600`。替换已存在文件时通过同目录临时文件加 rename 完成，并会清除遗留的可执行位（plan issues/470 FM-01）。
+
 ## 选项
 
 | 选项 | 短选项 | 长选项 | 说明 |
@@ -223,6 +225,8 @@ Git 的 `restore` 默认为仅恢复工作树，并要求 `--staged` 才能以�
 
 注意：jj 的 `restore` 作用于修订，而不是暂存区，将一个修订的内容恢复到另一个修订中。它不区分已暂存和未暂存更改。
 
+其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-p`/`--patch`，D15）。请用 `libra restore <pathspec>` 或 `libra restore --staged <pathspec>`。
+
 ## 错误处理
 
 | 代码 | 条件 |
@@ -237,3 +241,7 @@ Git 的 `restore` 默认为仅恢复工作树，并要求 `--staged` 才能以�
 | `LBR-CONFLICT-002` | 恢复会替换非空的已 materialize gitlink 目录，或会删除/覆盖 `160000` submodule 路径上并非 Libra 写入的内容——该路径上的两个方向都拒绝，除非索引把它记为普通 tracked 内容（可恢复）（退出码 128） |
 
 > `--ours` 与 `--theirs` 彼此互斥，并与 `--source`、`--staged`、`--ignore-unmerged` 互斥；任一此类组合会以 `LBR-CLI-002`、退出码 129 被拒绝。（`--source`、`--staged`、`--ignore-unmerged` 之间可以组合——例如 `--ignore-unmerged --source HEAD`。）
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`

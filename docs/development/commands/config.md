@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。vault-backed local/global config 已支持；section 操作 `--remove-section <name>` / `--rename-section <old> <new>`（事务化，采用 Git 的 section/subsection 身份而非裸前缀——`--remove-section branch` 删除 `branch.<key>` 但不动 `branch.feature.*` 子节）已支持；`-z`/`--null` NUL 分隔输出（get/get-all 输出 `value\0`，`--get-regexp`/`--list` 输出 `key\nvalue\0`，`--name-only` 输出 `key\0`，`--show-origin` 前缀 `origin\0`）已支持；读取与设置时的类型规范化 `--type=<bool|int|path>` 及 `--bool`/`--int`/`--path` 快捷方式（bool 变体→true/false、int 的 k/m/g 1024 倍率、path 的 `~`/`~/` 展开；set 时在存储前校验+规范化，非法值报错不写入）已支持；`--system` 作用域（`/etc/libra/config.db`，可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖，级联优先级最低；vault 加密密钥与 `import` 在该作用域被拒绝）已支持；editor round-trip 和 includeIf 尚未完整支持。
+- 兼容级别：`partial`。vault-backed local/global config 已支持；section 操作 `--remove-section <name>` / `--rename-section <old> <new>`（事务化，采用 Git 的 section/subsection 身份而非裸前缀——`--remove-section branch` 删除 `branch.<key>` 但不动 `branch.feature.*` 子节）已支持；`-z`/`--null` NUL 分隔输出（get/get-all 输出 `value\0`，`--get-regexp`/`--list` 输出 `key\nvalue\0`，`--name-only` 输出 `key\0`，`--show-origin` 前缀 `origin\0`）已支持；读取与设置时的类型规范化 `--type=<bool|int|path>` 及 `--bool`/`--int`/`--path` 快捷方式（bool 变体→true/false、int 的 k/m/g 1024 倍率、path 的 `~`/`~/` 展开；set 时在存储前校验+规范化，非法值报错不写入）已支持；`--system` 作用域（`/etc/libra/config.db`，可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖，级联优先级最低；vault 加密密钥与 `import` 在该作用域被拒绝）已支持；editor round-trip 和 includeIf 尚未完整支持。global 作用域路径为 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（各平台一致，含 macOS；本仓库 2026-09-19 GCX-01），legacy `<home>/.libra/config.db` 在被迁移前仍是活动回退（`migration_pending`），第一条真正读写 global 配置的命令会以「目录锁 + 只读 `VACUUM INTO` 快照 + `integrity_check`/receipt/行数校验 + 同目录 `rename`」把它一次性复制到新路径（GCX-02），legacy 文件原样保留为降级备份、失败时读回退并告警、写 fail-closed（`LBR-IO-002`）；`LIBRA_CONFIG_GLOBAL_DB` 仍是逐字覆写并禁用迁移；全域 vault unseal key 同域迁移到 `<config dir>/libra/vault-unseal-key`（0600/0700，复制不轮换，两份内容不同时 fail-closed），per-repo `~/.libra/vault-keys/<repo-id>` 与 `~/.libra/tmp` 位置不变（GCX-03）；`config path --json` / `doctor --global-schema` 的 `path_source` 取 `LIBRA_CONFIG_GLOBAL_DB`/`xdg`/`home`/`legacy`，并新增 `legacy_path`/`legacy_exists`/`migration_pending` 字段。
 
 - 裸读 `libra config <key>`（单个位置参数、无值）是**读取**，与 `git config <key>` 一致：`resolve_command_typed` 的兜底分支解析为 `ResolvedCommand::Set { value: None, explicit_set: false }`，`handle_set` 在「无值」分支把普通 key 转 `handle_get`（`reveal=false`），因此多值取末值、级联与 `config get` 同序、加密值渲染 `<REDACTED>`、未设置 key 为 exit 1 + `LBR-CLI-002`；`-z`/`--null` 也经 `ResolvedCommand::Set.null` 透传给 `handle_get`，使 `config -z <key>` 与 `config -z get <key>` 逐字节相同（此前裸读硬编码换行结尾）。**有意差异**：受保护 key（`is_sensitive_key`）保留交互式安全赋值路径而非读取，非交互环境报 protected-key 错误 + exit 2，已登记进 `COMPATIBILITY.md` 的 config 行。`has_encrypted`（该 key 已存有密文）**只在显式赋值**（`config set <key>` / `--add`，即 `explicit_set=true`）时才推断为赋值意图——否则一个普通 key 一旦存了密文就再也读不出来，只会报「missing value for protected key」。回归：`tests/command/config_test.rs` 的 13 个 `config_bare_read_*`（含 `config_bare_read_encrypted_is_redacted`、`config_bare_read_sensitive_key_never_leaks_value`、pty 驱动的 `config_bare_read_protected_key_interactive_pty`）。
 
@@ -15,6 +15,8 @@
 
 ## 设计方案
 
+- Schema 角色与恢复：global/system 配置连接使用 `DatabaseRole::GlobalConfig/SystemConfig` 及独立 configuration ledger，不运行 Repository migration；local 配置仍属于 Repository。`doctor --global-schema` 在 `src/command/config/doctor.rs` 只读诊断，默认 `repair_eligible=false`。配对的 `--repair --confirm <canonical-path>` 由独立 `repair.rs` 处理，仅在已注册 producer-format 指纹、私有 Unix 路径与锁检查通过后执行一致性备份；备份验证后，在同一物理连接的 SQLite 写事务内重验并初始化 configuration ledger，调用唯一 `db::write_configuration_barrier`。不读配置值、不打开 Vault/System/Repository DB；不运行自动升级或 Repository recovery。CLI 的 Repository scope census 保持只读以绕过仓库资源，但明确 repair 的 operation class 是 `LibraStateMutation`，不可把它当作无副作用诊断。
+- 恢复契约与验证：完整边界见 [database-migration-scope.md](../internal/database-migration-scope.md) 和[用户 config 文档](../../commands/config.md)。格式 attestation 不证明历史 writer，未知/超长/内嵌 NUL 元数据拒绝；backup、原子事务、WAL、并发拒绝与 secret-free 门归 `compat_global_config_schema_future` / `db_migration_test`；hash-pinned 旧 reader 拒写由 `old_reader_oracle_test` 的显式 opt-in gate 证明。故障门仅在 `test-upgrade` + `LIBRA_TEST=1` 下编译/启用，release 不含 hook；测试仅使用临时 fixture。
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/config.rs`。参数/子命令类型包括：`ConfigArgs`、`ConfigCommand`；输出、错误或状态类型包括：`ConfigListEntry`、`ConfigImportSummary`、`ConfigSshKeyEntry`、`ConfigGpgKeyEntry`（`--json` 序列化），错误通过 `CliError` / `CliResult` 统一传播；主要执行函数包括：`execute`、`execute_safe`、`execute_inner`、`resolve_command`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
@@ -36,6 +38,7 @@ flowchart TD
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
 ## 实现历史
+- 2026-09-20（plan issues/470 FM-03）：新增共享读取 `internal::config::core_file_mode()`（大小写不敏感读 `core.fileMode`/`core.filemode`，Unix 默认 true、非法值 fail-closed 并沿用 `commit.verbose` 的 `CliError::command_usage` 映射）；`index_ext::update_preserving_file_mode` 在 `false` 时保留旧条目 mode、新路径 100644；接入 `add`/`commit -a`/`update-index <path>`，`status` 仅做非法值校验。纯解析函数 `resolve_core_file_mode` 带单测。
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-07-15（plan-20260708 P0-12 回归修复）：`internal::config` 的两条级联读取（`read_cascaded_config_value_strict` 与 `global_config_value`）在 global scope 读取失败时，改为先经 `utils::client_storage::inspect_global_config_schema_future_at_path` 做类型化 future-schema 探测：命中则复用 P0-12 的去重警告（`emit_global_config_schema_future_warning`）并把 global scope 视为未设置继续级联；其它失败保持 fail-closed 原样传播（`LBR-IO-001` 契约不变）。此前 P1-05 家族给 `status`/`branch`/`tag`/`merge`/`commit`/`fetch`/`init`/`diff`/`log` 等命令加的配置默认读取会把 schema-newer 的全局库当普通 I/O 失败，破坏 P0-12「本地命令警告一次并继续」的既定行为（回归由 `compat_global_config_schema_future::local_command_warns_once_and_continues` 钉住）。
@@ -51,7 +54,8 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/config.md`。
 - Synopsis：`libra config [OPTIONS] [key] [value] [COMMAND]`。
-- 公开参数/子命令包括：`set`、`get`、`list`、`unset`、`import`、`path`、`edit`、`generate-ssh-key`、`generate-gpg-key`、`--local`、`--global`、`-d, --default <DEFAULT>` 等（另含隐藏 Git 兼容标志 `--get`、`--get-all`、`--unset`、`--unset-all`、`-l, --list`、`--add`、`--import`、`--get-regexp`、`--show-origin`、`--remove-section`、`--rename-section`、`-z`/`--null`、`--type`/`--bool`/`--int`/`--path`）。`--type`/`--bool`/`--int`/`--path`（互斥；`resolve_value_type`）对 get/get-all/get-regexp（读时规范化）与 set（写时校验+规范化，与 git `config --type` 一致：`yes`→`true`、`1k`→`1024`、`~/x`→展开路径；非法值报错且不写入）有效，其它模式报 129。`--remove-section <name>` / `--rename-section <old> <new>` 经 `ScopedConfig::get_connection` + sea-orm 事务执行：先 `begin()`，再在事务内 `get_by_prefix_with_conn` 取候选并用 `key_in_section` 过滤为精确 section 成员（Git section/subsection 身份，非裸前缀），rename 先 `add_with_conn` 到 `new.<name>` 再 `unset_all_with_conn` 旧 key，全部一个事务内提交；空 section 报 “No such section”（exit 128），rename 同名（exit 2）或目标 section 已存在（exit 128，避免合并与加密标志继承）均拒绝。`--system` 已支持：作用域 DB 为 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖），级联优先级最低（`CASCADE_ORDER = [Local, Global, System]`）；`get_config_path`/`ensure_config_exists`/`get_connection`（经 `SYSTEM_CONFIG_CONN` 缓存）镜像 Global 实现，写入通常需提升权限。级联读取在 `path.exists()` 处跳过不存在的系统 DB，且 `should_skip_config_scope_read_error` 对 System 一律跳过（避免不可读的 `/etc/libra/config.db` 破坏所有读取）。vault 加密密钥（`vault.*`/`--encrypt`）在 System 作用域被拒绝（root 拥有的 unseal key 的权限隔离问题）；SSH/GPG key 生成沿用 `reject_global_key_generation`（仅 local）。详见下方缺口表。
+- 公开参数/子命令包括：`set`、`get`、`list`、`unset`、`import`、`path`、`edit`、`generate-ssh-key`、`generate-gpg-key`、`--local`、`--global`、`-d, --default <DEFAULT>` 等（另含隐藏 Git 兼容标志 `--get`、`--get-all`、`--unset`、`--unset-all`、`-l, --list`、`--add`、`--import`、`--get-regexp`、`--show-origin`、`--remove-section`、`--rename-section`、`-z`/`--null`、`--type`/`--bool`/`--int`/`--path`）。`--type`/`--bool`/`--int`/`--path`（互斥；`resolve_value_type`）对 get/get-all/get-regexp（读时规范化）与 set（写时校验+规范化，与 git `config --type` 一致：`yes`→`true`、`1k`→`1024`、`~/x`→展开路径；非法值报错且不写入）有效，其它模式报 129。`--remove-section <name>` / `--rename-section <old> <new>` 经 `ScopedConfig::get_connection` + sea-orm 事务执行：先 `begin()`，再在事务内 `get_by_prefix_with_conn` 取候选并用 `key_in_section` 过滤为精确 section 成员（Git section/subsection 身份，非裸前缀），rename 先 `add_with_conn` 到 `new.<name>` 再 `unset_all_with_conn` 旧 key，全部一个事务内提交；空 section 报 “No such section”（exit 128），rename 同名（exit 2）或目标 section 已存在（exit 128，避免合并与加密标志继承）均拒绝。`--system` 已支持：作用域 DB 为 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖），级联优先级最低（`CASCADE_ORDER = [Local, Global, System]`）；`get_config_path`/`ensure_config_exists`/`get_connection`（经 `SYSTEM_CONFIG_CONN` 缓存）镜像 Global 实现，写入通常需提升权限。级联读取在 `path.exists()` 处跳过不存在的系统 DB，且 `should_skip_config_scope_read_error` 对 System 一律跳过（避免不可读的 `/etc/libra/config.db` 破坏所有读取）。vault 加密密钥（`vault.*`/`--encrypt`）在 System 作用域被拒绝（root 拥有的 unseal key 的权限隔离问题）；SSH/GPG key 生成沿用 `reject_global_key_generation`（仅 local）。
+- plan-20260921 新增三张 Libra 专属子命令（仅 local）：**`vault.signing` 语义**——首度导入且该键**未设置**时置 `true`（ADR-VG-12 §1）；**显式值一律尊重**（`false` 时保留并给可操作提示）；`generate-gpg-key` 亦会置 `true`；**同指纹重复导入幂等**（`config_import_gpg_key_...` 系列门）；**移除活动 key 必须 `--force`**，否则拒绝并点名该旗标；`export-gpg-key` **拒绝** `--json`/`--machine`/`--quiet`（`LBR-CLI-002`，门 `config_export_gpg_key_rejects_json_machine_and_quiet`）；**签名在无公钥时 fail-closed**（`vault.gpg.pubkey` 与 `generated_pubkey` 双双缺失 → 报错并给恢复提示，不出未签名提交/标签）；**注意首用路径**——`init` 已生成活动签名 key，故文档示例一律带 `--replace`（实测：省略即 `LBR-CONFLICT-002`，沙箱取证）；移除路径会把被移除 key 的公钥归档为 `vault.gpg.history.<FPR>.pubkey`（既有历史行只增不删，门 `removal_preserves_existing_history_rows`）；`import-gpg-key [--list|--key <fpr>|--file <path>|--passphrase-file <path>|--replace]`（GnuPG home 发现或 armored 文件导入；`--list` 零写入；多候选必填 `--key`）、`export-gpg-key [--fingerprint|--out <path>]`（仅公钥；`--out` 临时文件+rename 原子替换）、`remove-gpg-key [--force]`（写历史行→删 allowlist 键→恢复/清空活动公钥→`source=generated`；**四步在单个 SQLite 事务内**，任何一步失败即整体回滚、导入密钥原样保留——四步各有一条故障注入门 `config_remove_gpg_key_inject_failure_{history,delete_imported,restore_pubkey,source}`）。导入私钥以 `vault.gpg.seckey_enc`（`encrypted=true`，unseal key 派生 AES-GCM）持久化，并在 get/bare-read/list/JSON/`--show-origin` 全路径 predicate-first 脱敏为 `<REDACTED>`，`--reveal` 拒绝；`is_vault_internal_key` 已显式包含该键。签名按 `vault.gpg.source` 分派（`imported` 走进程内 `pgp` 解保护证书 + `signing_key_id` 选 (sub)key；**生成路径在 `vault.gpg.pubkey` 与 `vault.gpg.generated_pubkey` 双双缺失时 fail-closed 并给恢复提示，绝不出产事后不可验证的签名**），验证与 source 无关，按固定允许列表（活动 → `generated_pubkey` → 历史，指纹字典序）进程内验签。`generate-gpg-key` 改用版本化键名 `libra-signing-<unix-ns>`（碰撞 probe 重试 ≤8）并先把当前活动公钥归档到 `vault.gpg.history.<FPR>.pubkey`，随后依序写 `generated_pubkey`/`generated_key_name`/`pubkey`/`source=generated`，各步 config 写错误一律传播（不再吞掉）；`source=imported` 时 generate 不再 fail-closed，而是执行该迁移。详见下方缺口表。
 
 
 ## 还未实现的功能
@@ -65,10 +69,105 @@ flowchart TD
 | ✅ 已实现 | NUL 分隔输出 `-z`/`--null` | `ConfigArgs.null`（`global=true`）线程到 `ResolvedCommand::{Get,List}` 与 `handle_get`/`handle_list`：get/get-all → `value\0`；`--get-regexp`/`--list` → `key\nvalue\0`；`--name-only` → `key\0`；`--show-origin` 前缀 `origin\0`。`--json` 优先于 `-z`。`-z` 与 Libra 专有的 `--ssh-keys`/`--gpg-keys`/`--vault` 汇总视图组合时报 `command_usage`（exit 129，无 `key\nvalue\0` 映射），仅作用于标准 key/value 输出。带集成测试 `test_config_null_terminated_output`（精确字节断言）。 |
 | ✅ 已实现 | 重命名/删除 section | 采用 Git section/subsection 身份（`key_in_section`：section=首个 `.` 前、name=末个 `.` 后、subsection=两者之间）。`--remove-section <name>` 删除该 section 的 key（`--remove-section branch` 只删 `branch.<key>`，不动 `branch.feature.*`）；`--rename-section <old> <new>` 把 old section 的 key 搬到 new（保留 value 与加密标志，多值顺序由 `get_by_prefix_with_conn` 的 `(Key,Id)` 排序稳定保留，目标 section 已存在则拒绝以避免合并/标志继承）。均在单个 sea-orm 事务内（含存在性检查），空 section→exit 128，rename 同名/目标已存在→exit 2/128。带集成测试 `test_config_remove_and_rename_section`/`test_config_section_ops_exact_git_semantics`/`test_config_rename_section_preserves_multivalue_order`。 |
 | 兼容差异项 | 条件配置 | 原始对照：includeIf；相关参数/替代：[[when]] blocks；当前说明：不支持。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
-| ✅ 已实现（Libra-only，intentionally-different） | 保留命名空间 `upgrade.*`（plan-20260714 §A.3） | 自动升级配置存储在 `{LIBRA_HOME}/upgrade/settings.json`（`internal::upgrade::settings`，原子写 + Unix 0700/0600 权限；`resolve_libra_home()` 与 install.sh 的 `LIBRA_HOME`/`HOME` 规则一致），绝不落入 SQLite。`execute_inner` 在 `resolve_command` 之后经 `route_upgrade_namespace` 拦截所有可到达该命名空间的拼写：仅允许 `--global` 单值 `set`/`get`/`unset`（`set` 仅接受 `auto`/`manual`/`off` 大小写不敏感；`get` 文件缺失读 `off`、损坏报 `LBR-UPGRADE-001`；`unset` 写 `mode=off` 保留文件）；local/system、`--add`、`--get-all`、`--unset-all`、`--type`、`--encrypt`/`--plaintext`/`--stdin`、`--default`、`--remove-section`/`--rename-section`、多 action 拼写组合（`upgrade_conflicting_action_spelling`）、带空白 key/value、能匹配 `upgrade.mode` 的 `--get-regexp` 模式（`regexp_reaches_upgrade_mode`，与 `get_regexp_with_conn` 同一 `regex::is_match` 语义）一律 fail-closed（用法错误 `LBR-CLI-002`/exit 129；`LBR-UPGRADE-001` 专用于 settings 文件损坏/不可读）。`resolve_libra_home()` 顺序：`LIBRA_HOME` > `LIBRA_CONFIG_GLOBAL_DB` 父目录（测试隔离契约）> `$HOME/.libra`（HOME 缺失时不退回 /tmp，报可操作错误——与 install.sh 有意偏差，见 home.rs 模块文档）。`list`（含 `--show-origin`，origin 为 `file:{path}`）渲染文件条目并抑制 SQLite 中陈旧 `upgrade.*` 行；`--get-regexp` 同样抑制；`import` 跳过保留键并 warning（`ignored_reserved` 计数进 JSON）。升级流程自身经 `effective_mode_for_upgrade()` 宽松读取（损坏视为 `off` + 一次性 warning）。带集成测试 `test_config_upgrade_mode_*`（roundtrip、拒绝矩阵、unset 保留文件、损坏严格报错、list/get-regexp 抑制、import 跳过）与 `internal/upgrade` 单元测试。 |
+| ✅ 已实现（Libra-only，intentionally-different） | 保留命名空间 `upgrade.*`（plan-20260714 §A.3） | 自动升级配置存储在 `{LIBRA_HOME}/upgrade/settings.json`（`internal::upgrade::settings`，原子写 + Unix 0700/0600 权限；`resolve_libra_home()` 与 install.sh 的 `LIBRA_HOME`/`HOME` 规则一致），绝不落入 SQLite。`execute_inner` 在 `resolve_command` 之后经 `route_upgrade_namespace` 拦截所有可到达该命名空间的拼写：仅允许 `--global` 单值 `set`/`get`/`unset`（`set` 仅接受 `auto`/`manual`/`off` 大小写不敏感；`get` 文件缺失读 `off`、损坏报 `LBR-UPGRADE-001`；`unset` 写 `mode=off` 保留文件）；local/system、`--add`、`--get-all`、`--unset-all`、`--type`、`--encrypt`/`--plaintext`/`--stdin`、`--default`、`--remove-section`/`--rename-section`、多 action 拼写组合（`upgrade_conflicting_action_spelling`）、带空白 key/value、能匹配 `upgrade.mode` 的 `--get-regexp` 模式（`regexp_reaches_upgrade_mode`，与 `get_regexp_with_conn` 同一 `regex::is_match` 语义）一律 fail-closed（用法错误 `LBR-CLI-002`/exit 129；`LBR-UPGRADE-001` 专用于 settings 文件损坏/不可读）。`resolve_libra_home()` 顺序：`LIBRA_HOME` > `LIBRA_CONFIG_GLOBAL_DB` 父目录（仅用于显式隔离场景的测试隔离契约，不再描述默认布局）> `$HOME/.libra`（HOME 缺失时不退回 /tmp，报可操作错误——与 install.sh 有意偏差，见 home.rs 模块文档）。`list`（含 `--show-origin`，origin 为 `file:{path}`）渲染文件条目并抑制 SQLite 中陈旧 `upgrade.*` 行；`--get-regexp` 同样抑制；`import` 跳过保留键并 warning（`ignored_reserved` 计数进 JSON）。升级流程自身经 `effective_mode_for_upgrade()` 宽松读取（损坏视为 `off` + 一次性 warning）。带集成测试 `test_config_upgrade_mode_*`（roundtrip、拒绝矩阵、unset 保留文件、损坏严格报错、list/get-regexp 抑制、import 跳过）与 `internal/upgrade` 单元测试。 |
 
 ## 维护要求
 
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## SSH authentication and captured diagnostics
+
+Libra invokes SSH with `BatchMode=yes` for both terminal and non-terminal callers.
+It does not prompt for a private-key passphrase or an interactive host-key
+decision during a Libra command. Load or unlock an encrypted key in `ssh-agent`
+before retrying. For host trust, verify the fingerprint through a trusted
+provider console or another trusted channel before manually updating
+`~/.ssh/known_hosts`. Alternatively, make a separate interactive SSH connection
+and compare the displayed fingerprint before accepting it. For example,
+`ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
+port. Do not accept a fingerprint that has not been verified.
+
+`ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
+`no` values. `ask` leaves that SSH option to the user's SSH configuration;
+`BatchMode=yes` still prevents interactive decisions. Explicit values are
+forwarded to SSH. Choose a host-trust policy appropriate to your repository.
+
+SSH stderr is always captured, including in terminal sessions. It is drained
+from process startup, retaining at most 64 KiB while counting and hashing the
+remaining bytes. User-facing errors contain fixed text and a local exit status
+when available. Raw remote stderr is neither printed nor logged. Debug diagnostics
+contain only the status, total and retained byte counts, and a SHA-256 digest of
+the collected stream. Failed or cancelled collection may prevent these metadata
+from being reported; no completed digest is claimed in that case. Hashing work
+is proportional to the number of bytes drained.
+
+SSH reference advertisements and receive-pack responses each have a 16 MiB
+aggregate limit. An oversized advertisement fails with `LBR-NET-001` and guidance
+to use the repository’s HTTPS URL if available, or ask its maintainer to reduce refs. An oversized push response fails with `LBR-NET-001`
+and guidance to push fewer refs; it is not accepted as a truncated success.
+These limits can affect repositories with very large ref sets or updates. The
+streamed fetch pack is not subject to this cap. A failed push response does not
+prove that the server rolled back its refs: inspect the remote state before
+retrying. Existing IO timeouts still apply.
+
+After a complete discovery advertisement, Libra allows up to 100 milliseconds
+for SSH to exit before requesting termination, within a two-second total
+cleanup deadline. Captured-output tasks are cancelled when their owner exits or
+their deadline expires, including when a descendant keeps a pipe open.
+
+## SSH capture validation scope
+
+The twelve named PKT-11 library gates retain the original plan names. They cover
+fixed diagnostics and metadata-only tracing, both service argument lists, three
+non-zero-exit paths, malformed-advertisement cleanup and all six capture paths
+under stderr floods. The flood gate also covers retained-prefix/full-stream
+digest accounting, collector cancellation, and oversized advertisement and push
+response rejection. The host-trust gate covers native exit 255, typed primary
+error preservation through a secondary cleanup warning, the internal discovery
+carrier and an actual local fake-SSH clone command. Existing fetch/push CLI cases
+retain their names and test human, JSON and machine output plus remote-ref safety.
+The terminal gate uses a real local PTY. The passphrase gate creates an encrypted
+local key without an agent and exercises a simulated SSH failure; it does not
+claim live OpenSSH network authentication. Actual run IDs and results belong in
+plan-20260901.md after execution; the existence of these tests is not acceptance.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+### SSH transport configuration awaits the shared database
+
+Transport construction awaits host-key policy, vault key/unseal-key, legacy key and fetch timeout configuration on the caller's Tokio runtime. It must not create a nested runtime and synchronously join it: that can strand the task returning the cached SQLite pool's only connection. Environment/config precedence, best-effort optional values, required vault-entry errors and public CLI options remain unchanged. The existing current-thread host-trust and timeout-precedence tests exercise configuration immediately after database writes, without a test-only yield or extra runtime workers.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.

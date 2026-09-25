@@ -41,8 +41,12 @@ whether it still exists — an existing path is staged, a missing one is dropped
 
 Working-tree staging returns `LBR-IO-002` if the blob or its durable cloud
 index marker cannot be written; it does not panic or save an index entry that
-lacks repair ownership. A normal retry re-registers a payload that the failed
-attempt already persisted.
+lacks repair ownership. The failure message follows the canonical wording:
+the object payloads were stored safely, no paths were staged, and a direct
+retry reuses the already-stored payloads without any lock-file cleanup (lock
+timeouts additionally name the lock holder, and lock files must never be
+deleted). A normal retry re-registers a payload that the failed attempt
+already persisted.
 
 Local index persistence and the later cloud-catalog update have separate
 durability boundaries. If a terminal background `object_index` error happens
@@ -59,6 +63,7 @@ agent cleanup fail closed while repair remains pending. With
 |--------|-------------|---------|
 | `--add` | Allow positional paths to add new (untracked) files. | `libra update-index --add a.txt` |
 | `--remove` | Remove the positional paths from the index. With `--add`, presence on disk decides per path (existing → staged, missing → removed). | `libra update-index --remove old.txt` |
+| `--force-remove` | Drop the positional paths from the index regardless of whether the working-tree file exists; paths the index does not know are a no-op, and every stage of an unmerged path is removed. Wins over `--add`/`--remove`. | `libra update-index --force-remove old.txt` |
 | `--add --remove` | Both permissions at once: stage what exists, drop what is gone. | `libra update-index --add --remove a.txt gone.txt` |
 | `--cacheinfo <mode>,<object>,<path>` | Register an entry from an object id (repeatable). | `libra update-index --cacheinfo 100644,<oid>,dir/f.txt` |
 | `--json` / `--machine` | Structured output: `{ updated: <n>, removed: <n> }`. | `libra --json update-index --add a.txt` |
@@ -98,7 +103,8 @@ libra update-index --add link-to-target
 |------|-------|-----|
 | Stage a file | `libra update-index --add f` | `git update-index --add f` |
 | Remove a path | `libra update-index --remove f` | `git update-index --remove f` |
+| Remove a path even when the file is gone | `libra update-index --force-remove f` | `git update-index --force-remove f` |
 | Register by id | `libra update-index --cacheinfo m,oid,p` | `git update-index --cacheinfo m,oid,p` |
 
-Deferred (not exposed): bare-path stat refresh, `--force-remove`, `--chmod`,
+Deferred (not exposed): bare-path stat refresh, `--chmod`,
 `--assume-unchanged`, `--skip-worktree`, `--index-info`, and other Git flags.

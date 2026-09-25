@@ -19,9 +19,9 @@ fn repo_root() -> &'static Path {
 /// Capture modules must not import the internal AgentRuntime or the
 /// checkpoint-writer layers. Allowed seams: `hooks::{lifecycle,provider}`
 /// (hook contracts), `completion` (shared usage model), `session` (session
-/// context types) and — documented exception — `orchestrator::types` for
-/// the derived `ToolCallRecord` projection (`derived.rs`). Anything else
-/// from the runtime side is a boundary violation.
+/// context types), and `tool_call_record` (plan-20260920 RC-04). The
+/// former `orchestrator::types` exception for `ToolCallRecord` is closed.
+/// Anything else from the runtime side is a boundary violation.
 ///
 /// The check is AST-based (`syn`): use-trees are flattened (so grouped and
 /// nested-grouped imports cannot slip through), inline fully-qualified
@@ -87,10 +87,8 @@ fn observed_agent_modules_do_not_import_runtime_or_checkpoint_layers() {
         if candidate == "hooks::runtime" || candidate.starts_with("hooks::runtime::") {
             return Some("internal::ai::hooks::runtime".to_string());
         }
-        if (candidate == "orchestrator" || candidate.starts_with("orchestrator::"))
-            && !candidate.starts_with("orchestrator::types")
-        {
-            return Some("internal::ai::orchestrator (outside the ::types seam)".to_string());
+        if candidate == "orchestrator" || candidate.starts_with("orchestrator::") {
+            return Some("internal::ai::orchestrator".to_string());
         }
         None
     }
@@ -427,11 +425,9 @@ fn code_web_only_completion_gate() {
             "TUI was removed before Web-only completion gates passed: {}",
             incomplete.join(", ")
         );
-        let runtime_mod = fs::read_to_string(repo_root().join("src/internal/ai/runtime/mod.rs"))
-            .expect("read runtime/mod.rs");
         assert!(
-            runtime_mod.contains("pub mod worker;"),
-            "TUI removal requires the UI-neutral AgentRuntime worker seam"
+            !repo_root().join("src/internal/ai/runtime/mod.rs").exists(),
+            "RC-23 deleted the AgentRuntime SCC; runtime/mod.rs must not return"
         );
     }
 }
@@ -502,49 +498,13 @@ fn terminal_ui_dependencies_and_production_symbols_remain_retired() {
 /// workflow state machine. Docs must keep Web as the default surface.
 #[test]
 fn code_runtime_stays_web_owned_without_tui_or_private_plan_state() {
-    let code = fs::read_to_string(repo_root().join("src/command/code.rs")).expect("read code.rs");
-    for forbidden in ["TuiCodeUiAdapter", "execute_tui", "Tui::new", "Tui::"] {
-        assert!(
-            !code.contains(forbidden),
-            "src/command/code.rs must not restore TUI startup/adapter token {forbidden:?}"
-        );
-    }
-
-    let mut web_sources = Vec::new();
-    fn visit(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
-        for entry in fs::read_dir(dir).expect("read web source directory") {
-            let entry = entry.expect("read web source entry");
-            let path = entry.path();
-            if path.is_dir() {
-                visit(&path, files);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-    }
-    visit(&repo_root().join("src/internal/ai/web"), &mut web_sources);
-    let mut saw_runtime_plan_handoff = false;
-    for source in &web_sources {
-        let contents = fs::read_to_string(source).expect("read web rust source");
-        assert!(
-            !contents.contains("TuiCodeUiAdapter"),
-            "{} must not restore TuiCodeUiAdapter",
-            source.display()
-        );
-        assert!(
-            !contents.contains("pending_post_plan") && !contents.contains("struct PendingPlan"),
-            "{} must not keep a private Plan workflow state machine",
-            source.display()
-        );
-        if contents.contains("submit_confirmed_plan_execution")
-            || contents.contains("StartPlanExecution")
-        {
-            saw_runtime_plan_handoff = true;
-        }
-    }
     assert!(
-        saw_runtime_plan_handoff,
-        "Web adapter must hand confirmed plan execution to AgentRuntime"
+        !repo_root().join("src/command/code.rs").exists(),
+        "RC-23 deleted src/command/code.rs; it must not return"
+    );
+    assert!(
+        !repo_root().join("src/internal/ai/web").exists(),
+        "RC-23 deleted src/internal/ai/web; it must not return"
     );
 
     let code_doc = fs::read_to_string(repo_root().join("docs/commands/code.md"))
@@ -563,8 +523,12 @@ fn code_runtime_stays_web_owned_without_tui_or_private_plan_state() {
             "{path} must not advertise TUI as the current default"
         );
         assert!(
-            body.contains("Web Code UI") || body.contains("Web Code UI"),
-            "{path} must keep Web Code UI as the default surface"
+            body.contains("has been removed") || body.contains("已移除"),
+            "{path} must document that the public Code CLI is gone"
+        );
+        assert!(
+            !body.contains("Web Code UI"),
+            "{path} must not advertise Web Code UI as a current surface"
         );
     }
 }
@@ -660,18 +624,10 @@ fn code_session_event_boundary_is_documented() {
         );
     }
 
-    let durability = fs::read_to_string(repo_root().join("src/internal/ai/runtime/durability.rs"))
-        .expect("read runtime command durability implementation");
-    for required in [
-        "BeforeIntentFsync",
-        "AfterIntentFsyncBeforeDispatch",
-        "AfterDispatchBeforeTerminalFsync",
-        "AfterTerminalFsync",
-        "retry_recovered_read_only",
-    ] {
-        assert!(
-            durability.contains(required),
-            "W1-05 runtime durability boundary is missing {required}"
-        );
-    }
+    assert!(
+        !repo_root()
+            .join("src/internal/ai/runtime/durability.rs")
+            .exists(),
+        "RC-23 deleted runtime durability; the file must not return"
+    );
 }

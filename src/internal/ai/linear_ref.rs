@@ -167,6 +167,7 @@ impl OwnedRefSpec {
     /// Full Memory ref classification belongs to M2-05. This conversion is
     /// intentionally narrower: it only admits the two histories that already
     /// use `HistoryManager` today.
+    #[cfg(test)]
     pub(crate) fn for_history_storage_name(name: &str) -> Option<Self> {
         Self::for_storage_name(name).filter(|spec| !matches!(spec, Self::MemoryRepo))
     }

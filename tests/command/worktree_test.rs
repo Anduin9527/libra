@@ -21,6 +21,27 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn test_worktree_move_cross_device_error_is_portable() {
+    let source = include_str!("../../src/command/worktree.rs");
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains("error.kind()!=io::ErrorKind::CrossesDevices"));
+    assert!(!source.contains("libc::EXDEV"));
+    #[cfg(unix)]
+    let raw_error = libc::EXDEV;
+    #[cfg(windows)]
+    let raw_error = 17; // Windows ERROR_NOT_SAME_DEVICE.
+    #[cfg(any(unix, windows))]
+    assert_eq!(
+        std::io::Error::from_raw_os_error(raw_error).kind(),
+        std::io::ErrorKind::CrossesDevices
+    );
+    assert_ne!(
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied).kind(),
+        std::io::ErrorKind::CrossesDevices
+    );
+}
+
+#[test]
 fn test_worktree_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["worktree", "list"], temp.path());
@@ -979,6 +1000,8 @@ async fn test_worktree_add_rejects_existing_non_empty_directory() {
 
     test::ensure_file("a.txt", Some("repo-version"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".to_string()],
         all: false,
         update: false,
@@ -992,6 +1015,10 @@ async fn test_worktree_add_rejects_existing_non_empty_directory() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1073,6 +1100,8 @@ async fn test_worktree_add_rolls_back_link_on_restore_failure() {
 
     test::ensure_file("conflict/file.txt", Some("v1"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict/file.txt".to_string()],
         all: false,
         update: false,
@@ -1086,6 +1115,10 @@ async fn test_worktree_add_rolls_back_link_on_restore_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1138,6 +1171,8 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1151,6 +1186,10 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1217,7 +1256,7 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial(cwd)]
-/// Cross-filesystem moves should fail cleanly and keep registry/state unchanged when test env provides separate devices.
+/// Cross-filesystem moves should complete through the copy fallback when test env provides separate devices.
 async fn test_worktree_move_across_filesystems_rolls_back_when_supported() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -1242,24 +1281,26 @@ async fn test_worktree_move_across_filesystems_rolls_back_when_supported() {
 
     let dest_path = other_fs_dir.path().join("wt_cross_dest");
     let dest_str = dest_path.to_string_lossy().to_string();
-    let before_paths = worktree_paths();
-
     exec_worktree(&["move", "wt_cross_src", dest_str.as_str()])
         .await
-        .expect("worktree move command itself should not fail");
+        .expect("worktree move command should complete across filesystems");
 
     let after_paths = worktree_paths();
     assert_eq!(
-        before_paths, after_paths,
-        "failed cross-filesystem move should keep worktree registry unchanged"
+        vec![
+            repo_dir.path().to_string_lossy().to_string(),
+            dest_path.to_string_lossy().to_string(),
+        ],
+        after_paths,
+        "cross-filesystem move should update the worktree registry"
     );
     assert!(
-        src_path.exists(),
-        "source directory should remain after failed cross-filesystem move"
+        !src_path.exists(),
+        "source directory should be removed after a successful cross-filesystem move"
     );
     assert!(
-        !dest_path.exists(),
-        "destination directory should not be created by failed cross-filesystem move"
+        dest_path.exists(),
+        "destination directory should exist after a successful cross-filesystem move"
     );
 }
 
@@ -1337,6 +1378,8 @@ async fn test_worktree_add_does_not_reset_index() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1350,6 +1393,10 @@ async fn test_worktree_add_does_not_reset_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1359,6 +1406,8 @@ async fn test_worktree_add_does_not_reset_index() {
 
     test::ensure_file("tracked.txt", Some("v2"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1372,6 +1421,10 @@ async fn test_worktree_add_does_not_reset_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1408,6 +1461,8 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1421,6 +1476,10 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1429,6 +1488,8 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
 
     test::ensure_file("tracked.txt", Some("v2"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["tracked.txt".to_string()],
         all: false,
         update: false,
@@ -1442,6 +1503,10 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -2184,5 +2249,58 @@ fn worktree_list_porcelain_emits_attribute_lines() {
     assert!(
         text.ends_with("\n\n"),
         "entry is terminated by a blank line: {text:?}"
+    );
+}
+
+/// FM-01 (M-MAT T8): `worktree add` checks out the linked worktree with the
+/// entry's execute bit.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn test_worktree_add_preserves_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let script = repo_dir.path().join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_dir.path()),
+        "stage script",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "executable", "--no-verify"],
+            repo_dir.path(),
+        ),
+        "commit script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", "wt_mode"], repo_dir.path()),
+        "worktree add",
+    );
+
+    let output = run_libra_command(&["--json", "worktree", "list"], repo_dir.path());
+    assert_cli_success(&output, "worktree list");
+    let parsed = parse_json_stdout(&output);
+    let linked_path = parsed["data"]["worktrees"]
+        .as_array()
+        .expect("worktrees array")
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .and_then(|entry| entry["path"].as_str())
+        .expect("linked worktree path")
+        .to_string();
+    let linked_script = std::path::Path::new(&linked_path).join("run.sh");
+    assert_eq!(
+        std::fs::symlink_metadata(&linked_script)
+            .expect("linked script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "worktree add must materialize the execute bit"
     );
 }

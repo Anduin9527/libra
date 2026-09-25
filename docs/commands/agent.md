@@ -78,7 +78,6 @@ for any other non-roster agent — return an actionable unsupported error.
 | `session show <id>` | Show a captured session, including a non-sensitive retryable checkpoint-capture diagnostic when the last Codex Stop failed |
 | `session stop <id>` | Mark a captured session as stopped |
 | `session resume <id>` | Mark a stopped captured session active again |
-| `session promote <id>` | Promote a captured session into Libra intent metadata |
 | `session derive-tool-calls <id>` | Derive tool-call records from a captured session |
 | `checkpoint list` | List captured checkpoints |
 | `checkpoint show <id>` | Show checkpoint metadata |
@@ -88,7 +87,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `skill list` | Alias of `skill search` (same filters) |
 | `skill registry` | Show the curated per-agent discoverable-skill registry (`--provider <slug>` to scope; the public SkillDiscoverer surface) |
 | `clean` | Clean up temporary checkpoints from stopped sessions (prune fails closed while a checkpoint write is in flight, the traces ref reaches uncataloged commits, or durable object-index repair remains pending; also drops `object_index` rows made unreachable) |
-| `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies |
+| `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies. The read-only `legacy_code_residue` field (human: a "Frozen Code residue" line) reports whether the frozen Code-era paths `.libra/sessions/code/` and `.libra/code/` and the `libra/intent` ref still exist; it never deletes or rewrites that state — cleanup is tracked separately (plan-20260920 ADR-RC-04 / DEFER-RC-02) |
 | `push` | Push `refs/libra/traces` to a remote (`--force-rewrite` for the non-fast-forward push after a `clean` prune, using force-with-lease) |
 | `rpc list` | List discovered `libra-agent-*` binaries on `PATH` (with trusted/quarantined state); requires the external-agents opt-in |
 | `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable, or when the binary is not under a trusted directory — `LBR-AGENT-005`). The provider-exporter slug `opencode` instead pins the provider's own CLI binary — resolved only from registered trusted directories, never `$PATH` — for the sandboxed export bridge; this form needs no external-agents opt-in |
@@ -156,6 +155,14 @@ the default version 1 payload remains shape-compatible and never gains those
 fields implicitly. OpenCode reports `transcript_discoverable` unsupported
 because batch discovery is unavailable; explicit-ID `importable` and
 `export_bridge` availability depend on its trusted offline exporter/sandbox.
+On Unix, the exporter subprocess and its descendants run with both soft and
+hard `RLIMIT_CORE` set to zero. This suppresses core files for intentional
+limit enforcement and unexpected exporter crashes when the system core
+handler honors that limit; signal events may still appear in system logs.
+Libra retains the exporter exit status and bounded stderr diagnostics. This
+child-only setting leaves the parent Libra process and system configuration
+unchanged.
+
 On macOS the sandboxed export uses seatbelt (`sandbox-exec`; deprecated by
 Apple and may be removed) so store writes and network are denied outside the
 OpenCode data dir; host read is not confined (global `file-read*`), unlike

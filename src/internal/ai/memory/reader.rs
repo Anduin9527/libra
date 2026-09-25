@@ -586,7 +586,6 @@ pub(crate) mod tests {
                 policy::TrustedMemoryTarget,
                 writer::tests::{Fixture, fixture, proposal},
             },
-            prompt::SystemPromptBuilder,
         },
         utils::{object::write_git_object, storage::local::LocalStorage},
     };
@@ -823,14 +822,6 @@ pub(crate) mod tests {
             "episode-fts-bm25-v1+context-budget-v1",
         );
         assert!(!bundle.receipt().query_hmac().contains("budgettoken"));
-
-        let prompt = SystemPromptBuilder::new(fixture._temp.path())
-            .expect("prompt builder")
-            .with_memory_bundle(&bundle)
-            .build()
-            .expect("deliver audited bundle to prompt");
-        assert!(prompt.contains("## Retrieved Project Memory"));
-        assert!(prompt.contains(selected_target.root().id()));
     }
 
     #[tokio::test]

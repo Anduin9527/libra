@@ -19,6 +19,8 @@ use super::{assert_cli_success, parse_cli_error_stderr, parse_json_stdout, run_l
 async fn add_and_commit(message: &str, pathspec: Vec<String>) {
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec,
             all: false,
             update: false,
@@ -32,6 +34,10 @@ async fn add_and_commit(message: &str, pathspec: Vec<String>) {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -339,6 +345,8 @@ async fn test_grep_tree_accepts_branch_revisions() {
             delete: None,
             delete_safe: None,
             set_upstream_to: None,
+            track: None,
+            no_track: false,
             unset_upstream: None,
             edit_description: None,
             show_current: false,

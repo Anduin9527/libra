@@ -18,14 +18,11 @@
 //! process cwd at each layer (the cwd is not a reliable scope carrier — RAII
 //! `set_current_dir` guards make it a moving target).
 
-use std::{
-    path::PathBuf,
-    sync::{RwLock, RwLockReadGuard},
-};
+use std::path::PathBuf;
 
-/// The scope AND working directory resolved once at command entry — see
-/// [`WorktreeScope::pin_request_scope`]. `None` outside a CLI invocation.
-static REQUEST_SCOPE: RwLock<Option<RequestScope>> = RwLock::new(None);
+mod context;
+pub use context::ScopeOverrideGuard;
+pub(crate) use context::{with_request_scope, with_request_scope_sync};
 
 /// What an invocation resolved about itself, once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,39 +122,14 @@ pub async fn request_db() -> std::io::Result<sea_orm::DatabaseConnection> {
     // different storage than the gitdir/root this same pin already handed to
     // the file layers — the two halves disagreeing is the accident §C.4.2
     // exists to prevent.
-    let storage = pinned().as_ref().map(|pinned| pinned.storage.clone());
+    let storage =
+        context::with_current(|pinned| pinned.as_ref().map(|pinned| pinned.storage.clone()));
     match storage {
         Some(storage) => {
             crate::internal::db::get_db_conn_instance_for_path(&storage.join(util::DATABASE)).await
         }
         None => Ok(crate::internal::db::get_db_conn_instance().await),
     }
-}
-
-/// Restores the enclosing request scope when dropped — see
-/// [`WorktreeScope::override_scope`].
-#[must_use = "the override ends when this guard is dropped"]
-pub struct ScopeOverrideGuard {
-    previous: Option<RequestScope>,
-}
-
-impl Drop for ScopeOverrideGuard {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        match REQUEST_SCOPE.write() {
-            Ok(mut slot) => *slot = previous,
-            Err(poison) => *poison.into_inner() = previous,
-        }
-    }
-}
-
-/// Read the pinned scope, tolerating a poisoned lock: the guarded value is a
-/// plain `Option` swap, so a panicked writer cannot leave it half-written, and
-/// crashing every scope lookup would be far worse than reading it.
-fn pinned() -> RwLockReadGuard<'static, Option<RequestScope>> {
-    REQUEST_SCOPE
-        .read()
-        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 use crate::utils::{
@@ -207,15 +179,17 @@ impl WorktreeScope {
     /// --migrate-layout` seeds a migrated one — and answering those with the
     /// invoking worktree's scope looks for rows that were never there.
     pub fn for_request() -> Self {
-        match pinned().as_ref() {
-            Some(pinned) => pinned.scope.clone(),
+        let scope =
+            context::with_current(|pinned| pinned.as_ref().map(|pinned| pinned.scope.clone()));
+        match scope {
+            Some(scope) => scope,
             None => Self::resolve_from_cwd(),
         }
     }
 
     /// This invocation's resolved scope AND workdir, if it pinned one.
     pub fn request_scope() -> Option<RequestScope> {
-        pinned().clone()
+        context::with_current(Clone::clone)
     }
 
     /// Read the cwd and resolve, ignoring any pinned request scope.
@@ -239,6 +213,8 @@ impl WorktreeScope {
     ///
     /// Pin for the lifetime of the returned guard, which RESTORES whatever was
     /// pinned before (including nothing).
+    /// Inside an operation future this changes only that request's slot;
+    /// standalone synchronous callers retain the legacy process-wide fallback.
     ///
     /// Restoring matters for in-process hosts: a process that dispatches
     /// `--version` from main and then calls a library API from a linked
@@ -252,16 +228,12 @@ impl WorktreeScope {
     }
 
     fn replace_request_scope(next: Option<RequestScope>) -> ScopeOverrideGuard {
-        let previous = match REQUEST_SCOPE.write() {
-            Ok(mut slot) => std::mem::replace(&mut *slot, next),
-            Err(poison) => std::mem::replace(&mut *poison.into_inner(), next),
-        };
-        ScopeOverrideGuard { previous }
+        context::replace(next)
     }
 
     /// Whether this invocation pinned a scope.
     pub fn request_scope_is_pinned() -> bool {
-        pinned().is_some()
+        context::with_current(Option::is_some)
     }
 
     /// Act on a DIFFERENT scope for the duration of the returned guard.
@@ -373,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn linked_scope_carries_its_id_in_both_key_forms() {
         let scope = WorktreeScope::Linked("wt-abc123".to_string());
         assert!(scope.is_linked());
@@ -389,7 +362,7 @@ mod tests {
     /// follows would land in whatever worktree the cwd had become, deleting
     /// A's sequence while A's checkout stays on disk.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn a_pinned_scope_survives_a_cwd_change() {
         let repo = tempfile::tempdir().expect("repo");
         {
@@ -442,7 +415,7 @@ mod tests {
     /// next lands in scope B's gitdir — pairing one worktree's database state
     /// with another's file state, which is worse than either alone.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn a_pinned_workdir_keeps_sidecars_in_their_own_gitdir() {
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
@@ -494,7 +467,7 @@ mod tests {
     /// directory and overwrite B's files. Pinning a SUBDIRECTORY also proves
     /// the root is the resolved worktree root, not the invocation directory.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     fn a_pinned_request_resolves_storage_and_worktree_root_once() {
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
@@ -542,7 +515,7 @@ mod tests {
     /// later reads never find them, so a second sequence could start and strand
     /// the first one's recovery state.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn the_request_database_follows_the_pin_not_the_cwd() {
         let repo_a = tempfile::tempdir().expect("repo a");
         let repo_b = tempfile::tempdir().expect("repo b");
@@ -594,7 +567,7 @@ mod tests {
     /// the outer one, so worktree A's rows are read for an operation that has
     /// nothing to do with A.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn an_unresolvable_pin_installs_nothing_and_never_inherits() {
         let outer = tempfile::tempdir().expect("the enclosing repository");
         let ambient = tempfile::tempdir().expect("the repository the cwd is in");

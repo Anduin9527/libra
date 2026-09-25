@@ -18,6 +18,8 @@ use super::{
     init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout, run_libra_command,
 };
 
+mod squash_conflicts;
+
 fn git(args: &[&str], cwd: &Path) {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -381,6 +383,66 @@ async fn test_pull_diverged_remote_creates_three_way_merge() {
     );
     assert!(local_repo.path().join("remote.txt").exists());
     assert!(local_repo.path().join("local.txt").exists());
+}
+
+/// MG-11: pull is a consumer of the shared three-way engine and inherits
+/// `merge.renormalize` even though pull does not expose merge's `-X` surface.
+#[test]
+fn test_pull_inherits_merge_renormalize_config() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    fs::write(work_dir.join("shared.txt"), "top\nbase\nbottom\n").expect("write base");
+    fs::write(work_dir.join(".gitattributes"), "*.txt text eol=lf\n").expect("write attributes");
+    git(&["add", "shared.txt", ".gitattributes"], &work_dir);
+    git(&["commit", "-m", "add shared text"], &work_dir);
+    git(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "initial pull",
+    );
+
+    fs::write(work_dir.join("shared.txt"), "top\nfeature\nbottom\n").expect("write remote edit");
+    git(&["add", "shared.txt"], &work_dir);
+    git(&["commit", "-m", "remote text edit"], &work_dir);
+    git(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    fs::write(
+        local_repo.path().join("shared.txt"),
+        b"top\r\nbase\r\nbottom\r\n",
+    )
+    .expect("write local CRLF edit");
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], local_repo.path()),
+        "stage local CRLF edit",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "local line endings", "--no-verify"],
+            local_repo.path(),
+        ),
+        "commit local CRLF edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renormalize", "true"], local_repo.path()),
+        "configure merge.renormalize",
+    );
+
+    let output = run_libra_command(&["pull"], local_repo.path());
+    assert_cli_success(&output, "pull with merge.renormalize");
+    assert_eq!(
+        fs::read(local_repo.path().join("shared.txt")).expect("read pulled text"),
+        b"top\r\nfeature\r\nbottom\r\n"
+    );
 }
 
 /// MG-04 (Codex R1): pull inherits merge's directory/file handling; under
@@ -1366,7 +1428,7 @@ async fn test_stash_push_works_on_a_packed_head_from_pull() {
 /// repository — the five fetch packs collapse into one (old packs deleted),
 /// while history and a blob staged only in a linked worktree stay readable.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_incremental_repack_consolidates_with_linked_worktree_roots() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
     let local_repo = tempdir().expect("local repo");
@@ -1505,4 +1567,218 @@ async fn test_prefetch_releases_pack_keep_pins() {
         leftover_keeps.is_empty(),
         "prefetch released every pack .keep pin: {leftover_keeps:?}"
     );
+}
+
+fn setup_local_upstream_current_branch() -> (TempDir, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let current = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&current, "show current branch");
+    let base = String::from_utf8_lossy(&current.stdout).trim().to_string();
+    assert_cli_success(&run_libra_command(&["branch", "alpha"], p), "create alpha");
+    assert_cli_success(&run_libra_command(&["switch", "alpha"], p), "switch alpha");
+    assert_cli_success(
+        &run_libra_command(&["branch", "-u", &base], p),
+        "set local upstream",
+    );
+    (repo, "alpha".to_string())
+}
+
+fn branch_config_snapshot(repo: &Path) -> String {
+    let output = run_libra_command(&["config", "--get-regexp", r"^branch\."], repo);
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn refs_snapshot(repo: &Path) -> String {
+    let output = run_libra_command(&["show-ref"], repo);
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(ToString::to_string)
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn fetch_head_snapshot(repo: &Path) -> String {
+    fs::read_to_string(repo.join(".libra/FETCH_HEAD")).unwrap_or_default()
+}
+
+fn assert_local_upstream_network_refusal(cmd: &[&str], verb: &str, branch: &str, repo: &Path) {
+    let refs_before = refs_snapshot(repo);
+    let cfg_before = branch_config_snapshot(repo);
+    let fetch_before = fetch_head_snapshot(repo);
+
+    let output = run_libra_command(cmd, repo);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(output.status.code(), Some(129), "{stderr}");
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains(&format!("cannot {verb}")) && stderr.contains("local upstream"),
+        "human stderr should name the local-upstream refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("branch '{branch}'"))
+            && stderr.contains("issues/480")
+            && stderr.contains("HP-16"),
+        "human stderr should name the branch and HP-16: {stderr}"
+    );
+
+    let mut json_cmd = vec!["--json"];
+    json_cmd.extend_from_slice(cmd);
+    let json_out = run_libra_command(&json_cmd, repo);
+    let (_json_human, json_report) = parse_cli_error_stderr(&json_out.stderr);
+    assert_eq!(json_out.status.code(), Some(129));
+    assert_eq!(json_report.error_code, "LBR-CLI-003");
+    assert!(
+        json_report.message.contains("local upstream")
+            && json_report.message.contains("issues/480 HP-16"),
+        "json envelope should carry the refusal: {}",
+        json_report.message
+    );
+    assert_eq!(
+        json_report.details.get("remote").and_then(|v| v.as_str()),
+        Some(".")
+    );
+    assert_eq!(
+        json_report
+            .details
+            .get("upstream_kind")
+            .and_then(|v| v.as_str()),
+        Some("local")
+    );
+
+    assert_eq!(refs_snapshot(repo), refs_before, "refs must stay unchanged");
+    assert_eq!(
+        branch_config_snapshot(repo),
+        cfg_before,
+        "branch.* config must stay unchanged"
+    );
+    assert_eq!(
+        fetch_head_snapshot(repo),
+        fetch_before,
+        "FETCH_HEAD must stay unchanged"
+    );
+}
+
+/// M-UPSTREAM P8 (#477 HF-30): `pull` refuses a configured local upstream
+/// before any network or FETCH_HEAD write.
+#[test]
+fn test_pull_refuses_local_upstream() {
+    let (repo, branch) = setup_local_upstream_current_branch();
+    let p = repo.path();
+    assert_local_upstream_network_refusal(&["pull"], "pull", &branch, p);
+
+    let explicit = run_libra_command(&["pull", "."], p);
+    let (stderr, report) = parse_cli_error_stderr(&explicit.stderr);
+    assert_eq!(explicit.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("remote '.' not found") || report.message.contains("remote '.' not found"),
+        "explicit '.' must keep the existing remote-not-found path: {stderr} / {}",
+        report.message
+    );
+}
+
+/// FM-01 (M-MAT T7): pulling a fast-forward commit materializes its
+/// executable entry with the execute bit.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_fast_forward_materializes_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "initial pull",
+    );
+
+    let script = work_dir.join("run.sh");
+    fs::write(&script, "#!/bin/sh\necho run\n").expect("write remote script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod remote script");
+    git(&["add", "run.sh"], &work_dir);
+    git(&["commit", "-m", "remote executable"], &work_dir);
+    git(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "pull executable commit",
+    );
+    assert_eq!(
+        fs::symlink_metadata(local_repo.path().join("run.sh"))
+            .expect("pulled script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "pull fast-forward must materialize the execute bit"
+    );
+}
+
+/// M-BFETCH H2: pull fast-forwards from a replaced bundle remote.
+#[test]
+fn test_pull_from_bundle_remote_fast_forward() {
+    let src = create_committed_repo_via_cli();
+    let parent = tempdir().expect("bundle parent");
+    let bundle = parent.path().join("remote.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "create bundle",
+    );
+    let dest = parent.path().join("cloned");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", bundle.to_str().unwrap(), dest.to_str().unwrap()],
+            parent.path(),
+        ),
+        "clone from bundle",
+    );
+    let old_head = run_libra_command(&["rev-parse", "HEAD"], &dest);
+    assert_cli_success(&old_head, "old HEAD");
+    let old = String::from_utf8_lossy(&old_head.stdout).trim().to_string();
+
+    fs::write(src.path().join("next.txt"), "next\n").expect("next file");
+    assert_cli_success(
+        &run_libra_command(&["add", "next.txt"], src.path()),
+        "add next",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "next", "--no-verify"], src.path()),
+        "commit next",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "replace bundle",
+    );
+    let new_src = run_libra_command(&["rev-parse", "HEAD"], src.path());
+    assert_cli_success(&new_src, "src HEAD");
+    let expected = String::from_utf8_lossy(&new_src.stdout).trim().to_string();
+
+    let pull = run_libra_command(&["pull"], &dest);
+    assert_cli_success(&pull, "H2 pull from replaced bundle");
+    let new_head = run_libra_command(&["rev-parse", "HEAD"], &dest);
+    assert_cli_success(&new_head, "new HEAD");
+    let got = String::from_utf8_lossy(&new_head.stdout).trim().to_string();
+    assert_ne!(got, old, "H2 pull must move HEAD");
+    assert_eq!(got, expected, "H2 pull must fast-forward to the new tip");
+    assert!(dest.join("next.txt").exists(), "H2 pull restores new file");
 }

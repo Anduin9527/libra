@@ -283,14 +283,6 @@ pub enum StableErrorCode {
     /// Agent checkpoint store inconsistent across ref/DB/object-index
     /// (E10 `ERR_AGENT_CHECKPOINT_STORE_INCONSISTENT`, AG-20).
     AgentCheckpointStoreInconsistent,
-    /// `review --fix` / `investigate fix` requested but the internal
-    /// AgentRuntime fix bridge is unavailable (E10
-    /// `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`, AG-22/AG-23).
-    AgentFixBridgeUnavailable,
-    /// Untrusted seed content attempted to enter a mutating workflow
-    /// without explicit approval (E10 `ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION`,
-    /// AG-22/AG-23).
-    AgentUntrustedSeedForMutation,
     /// External agent RPC transport failed — invoke timeout, broken
     /// pipe / unexpected exit, or a malformed JSON-RPC frame — and the
     /// invocation was withheld fail-closed (E10
@@ -421,8 +413,6 @@ impl StableErrorCode {
             Self::AgentIoRedactionSecurityFailure => "LBR-AGENT-007",
             Self::AgentHookEnvelopeInvalid => "LBR-AGENT-008",
             Self::AgentCheckpointStoreInconsistent => "LBR-AGENT-009",
-            Self::AgentFixBridgeUnavailable => "LBR-AGENT-010",
-            Self::AgentUntrustedSeedForMutation => "LBR-AGENT-011",
             Self::AgentRpcTransportFailed => "LBR-AGENT-012",
             Self::AgentRawAccessDenied => "LBR-AGENT-013",
             Self::AgentRunQueueFull => "LBR-AGENT-014",
@@ -504,8 +494,6 @@ impl StableErrorCode {
             | Self::AgentIoRedactionSecurityFailure
             | Self::AgentHookEnvelopeInvalid
             | Self::AgentCheckpointStoreInconsistent
-            | Self::AgentFixBridgeUnavailable
-            | Self::AgentUntrustedSeedForMutation
             | Self::AgentRpcTransportFailed
             | Self::AgentRawAccessDenied
             | Self::AgentRunQueueFull
@@ -675,12 +663,6 @@ impl StableErrorCode {
             }
             Self::AgentCheckpointStoreInconsistent => {
                 "Agent checkpoint store inconsistent across ref/DB/object-index; run libra agent doctor."
-            }
-            Self::AgentFixBridgeUnavailable => {
-                "review/investigate --fix requires the internal AgentRuntime fix bridge, which is not available."
-            }
-            Self::AgentUntrustedSeedForMutation => {
-                "Untrusted seed content cannot enter a mutating workflow without explicit approval."
             }
             Self::AgentRpcTransportFailed => {
                 "External agent RPC transport failed (timeout, broken pipe, or malformed frame); invocation withheld fail-closed."
@@ -1447,11 +1429,11 @@ pub fn emit_advisory_warning(message: impl std::fmt::Display) {
     eprintln!("warning: {message}");
 }
 
-/// W5-07 migration hint for the removed `libra code` Web aliases.
+/// W5-07 migration hint for the removed `libra code` aliases.
 ///
 /// When a clap parse failure came from the `code` subcommand and argv still
 /// carries the removed `--web` / `--web-only` flags (exact or `=value`
-/// forms), return one hint pointing at the default Web Code UI launch. The
+/// forms), return one hint pointing at the external-agent capture command. The
 /// matcher lives here — outside `src/command/` and `src/cli.rs` — so the
 /// removed-flag literals never reappear on the guarded CLI surface.
 pub(crate) fn removed_code_web_alias_hints(argv: &[std::ffi::OsString]) -> Vec<String> {
@@ -1491,7 +1473,7 @@ pub(crate) fn removed_code_web_alias_hints(argv: &[std::ffi::OsString]) -> Vec<S
     });
     if has_removed_alias {
         vec![
-            "`--web` / `--web-only` were removed in the W5 breaking release; `libra code` already defaults to the Web Code UI — remove the flag"
+            "`--web` / `--web-only` were removed with `libra code`; use `libra agent` for external-agent capture"
                 .to_string(),
         ]
     } else {
@@ -1522,9 +1504,23 @@ fn infer_stable_error_code(kind: CliErrorKind, message: &str) -> StableErrorCode
     }
 }
 
+/// Opening words of the fail-closed error raised when the one-time global
+/// configuration migration cannot run (plan-20260919 GCX-02). Shared so the
+/// message and its stable-code rule can never drift apart.
+pub(crate) const GLOBAL_CONFIG_MIGRATION_FAILURE_MARKER: &str =
+    "cannot move the global configuration to";
+
 fn infer_runtime_error_code(lower: &str) -> StableErrorCode {
     if is_internal_error(lower) {
         return StableErrorCode::InternalInvariant;
+    }
+    // plan-20260919 GCX-02: a refused one-time global-configuration migration
+    // IS a write failure, whatever the underlying `io::Error` text says. The
+    // rule sits above the auth check because the common cause — an unwritable
+    // configuration directory — surfaces as "permission denied" and would
+    // otherwise be reported as a credentials problem.
+    if lower.contains(GLOBAL_CONFIG_MIGRATION_FAILURE_MARKER) {
+        return StableErrorCode::IoWriteFailed;
     }
     if is_auth_permission_error(lower) {
         return StableErrorCode::AuthPermissionDenied;
@@ -1733,8 +1729,6 @@ fn is_network_unavailable_error(lower: &str) -> bool {
             "connection closed unexpectedly",
             "connection reset by peer",
             "remote end hung up unexpectedly",
-            "failed to start mcp server",
-            "failed to start web server",
         ],
     )
 }
@@ -1906,8 +1900,8 @@ mod tests {
             let hints = removed_code_web_alias_hints(&argv(args));
             assert_eq!(hints.len(), 1, "expected one hint for {args:?}");
             assert!(
-                hints[0].contains("already defaults to the Web Code UI"),
-                "hint must point at the default Web Code UI; got: {}",
+                hints[0].contains("use `libra agent`"),
+                "hint must point at external-agent capture; got: {}",
                 hints[0]
             );
         }
@@ -2163,14 +2157,14 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn stderr_render_mode_env_defaults_to_auto_for_falsey_values() {
         let _guard = ScopedEnvVar::set(LIBRA_ERROR_JSON_ENV, "0");
         assert_eq!(StructuredStderrMode::from_env(), StructuredStderrMode::Auto);
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn stderr_render_mode_env_can_force_structured_output() {
         let _guard = ScopedEnvVar::set(LIBRA_ERROR_JSON_ENV, "1");
         assert_eq!(
@@ -2181,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn fine_exit_codes_env_returns_legacy_category_codes() {
         let _guard = ScopedEnvVar::set(LIBRA_FINE_EXIT_CODES_ENV, "1");
 
@@ -2320,11 +2314,6 @@ mod tests {
             (
                 StableErrorCode::AgentCheckpointStoreInconsistent,
                 "LBR-AGENT-009",
-            ),
-            (StableErrorCode::AgentFixBridgeUnavailable, "LBR-AGENT-010"),
-            (
-                StableErrorCode::AgentUntrustedSeedForMutation,
-                "LBR-AGENT-011",
             ),
             (StableErrorCode::AgentRpcTransportFailed, "LBR-AGENT-012"),
             (StableErrorCode::AgentRawAccessDenied, "LBR-AGENT-013"),
@@ -2517,8 +2506,6 @@ mod tests {
             StableErrorCode::AgentIoRedactionSecurityFailure,
             StableErrorCode::AgentHookEnvelopeInvalid,
             StableErrorCode::AgentCheckpointStoreInconsistent,
-            StableErrorCode::AgentFixBridgeUnavailable,
-            StableErrorCode::AgentUntrustedSeedForMutation,
             StableErrorCode::AgentRpcTransportFailed,
             StableErrorCode::AgentRawAccessDenied,
             StableErrorCode::AgentRunQueueFull,

@@ -46,6 +46,7 @@ EXAMPLES:
     libra switch -                         Return to the previous checkout target
     libra switch -c feature-x              Create and switch to a new branch
     libra switch -c fix-123 abc1234        Create branch from specific commit
+    libra switch --detach                  Detach HEAD at the current commit
     libra switch --detach v1.0             Detach HEAD at a tag
     libra switch --track origin/main       Track and switch to remote branch
     libra switch feature                   Auto-create a tracking branch from a unique remote (guess)
@@ -155,6 +156,9 @@ pub enum SwitchError {
     #[error("branch name is required when using --detach")]
     MissingDetachTarget,
 
+    #[error("You are on a branch yet to be born")]
+    UnbornHead,
+
     #[error("branch name is required")]
     MissingBranchName,
 
@@ -221,6 +225,8 @@ impl From<SwitchError> for CliError {
             SwitchError::MissingDetachTarget => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("provide a commit, tag, or branch to detach at."),
+            SwitchError::UnbornHead => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid),
             SwitchError::MissingBranchName => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("provide a branch name."),
@@ -838,18 +844,23 @@ fn target_index_for_commit(commit_id: &ObjectHash) -> Result<Index, SwitchError>
 
 /// Working-tree precondition before switching to `target_commit`. Without
 /// `--force` the worktree must be clean relative to the target; with `--force`
-/// local (tracked) changes are allowed to be discarded and only untracked files
-/// that the target would overwrite are guarded.
-async fn ensure_switch_clean_or_force(
+/// local tracked changes may be discarded, but untracked overwrites and unsafe
+/// gitlink directory transitions are still refused.
+pub(crate) async fn ensure_switch_clean_or_force(
     force: bool,
     target_commit: ObjectHash,
     output: &OutputConfig,
 ) -> Result<(), SwitchError> {
     if force {
-        ensure_no_untracked_overwrite(target_commit)
+        ensure_no_untracked_overwrite(target_commit)?;
     } else {
-        ensure_clean_status_for_commit(target_commit, output).await
+        ensure_clean_status_for_commit(target_commit, output).await?;
     }
+    // Creation/reset callers must reject unsafe restores before changing refs.
+    restore::preflight_worktree_restore_to_commit(&target_commit)
+        .await
+        .map_err(CliError::from)?;
+    Ok(())
 }
 
 pub(crate) fn ensure_no_untracked_overwrite(target_commit: ObjectHash) -> Result<(), SwitchError> {
@@ -966,31 +977,33 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
 
     if let Some(new_branch_name) = force_create {
         validate_new_branch_request(&new_branch_name, branch.as_deref(), true).await?;
-        if let Some(existing) = Branch::find_branch_result(&new_branch_name, None)
+        let existing = Branch::find_branch_result(&new_branch_name, None)
             .await
-            .map_err(map_branch_store_error)?
+            .map_err(map_branch_store_error)?;
+        if let Some(existing) = &existing
+            && Some(existing.name.as_str()) == previous_branch.as_deref()
         {
-            if Some(existing.name.as_str()) == previous_branch.as_deref() {
-                return Err(SwitchError::DelegatedCli(
-                    CliError::fatal(format!(
-                        "cannot force-create the currently checked-out branch '{}'",
-                        new_branch_name
-                    ))
-                    .with_stable_code(StableErrorCode::ConflictOperationBlocked),
-                ));
-            }
-            Branch::delete_branch_result(&new_branch_name, None)
-                .await
-                .map_err(|e| SwitchError::BranchDelete {
-                    branch: new_branch_name.clone(),
-                    detail: e.to_string(),
-                })?;
+            return Err(SwitchError::DelegatedCli(
+                CliError::fatal(format!(
+                    "cannot force-create the currently checked-out branch '{}'",
+                    new_branch_name
+                ))
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+            ));
         }
         match resolve_create_switch_target(branch.as_deref()).await? {
             Some(target_commit) => {
                 ensure_switch_clean_or_force(force, target_commit, output).await?
             }
             None => ensure_clean_status(output).await?,
+        }
+        if existing.is_some() {
+            Branch::delete_branch_result(&new_branch_name, None)
+                .await
+                .map_err(|e| SwitchError::BranchDelete {
+                    branch: new_branch_name.clone(),
+                    detail: e.to_string(),
+                })?;
         }
         branch::create_branch_safe(new_branch_name.clone(), branch).await?;
         let created_branch = resolve_created_branch(&new_branch_name).await?;
@@ -1036,6 +1049,25 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
     };
 
     if detach {
+        if branch.is_none() {
+            let Some(commit) = previous_commit.as_deref() else {
+                return Err(SwitchError::UnbornHead);
+            };
+            let commit_hash = ObjectHash::from_str(commit)
+                .map_err(|error| SwitchError::CommitResolve(error.to_string()))?;
+            detach_head_in_place(commit_hash, NavigationCommand::Switch).await?;
+            return Ok(SwitchOutput {
+                previous_branch,
+                previous_commit,
+                branch: None,
+                commit: commit_hash.to_string(),
+                created: false,
+                detached: true,
+                unborn: false,
+                already_on: false,
+                tracking: None,
+            });
+        }
         let target = branch.ok_or(SwitchError::MissingDetachTarget)?;
         let commit_base = match previous_target {
             Some(PreviousCheckoutTarget::Branch { commit, .. })
@@ -1387,6 +1419,10 @@ async fn move_to_commit(
     guard_target_tree_case(&commit_hash)
         .await
         .map_err(SwitchError::CaseCollision)?;
+    // Restore runs after publishing HEAD, so reject directory transitions now.
+    restore::preflight_worktree_restore_to_commit(&commit_hash)
+        .await
+        .map_err(CliError::from)?;
 
     let action = navigation_reflog_action(
         navigation_command,
@@ -1418,6 +1454,44 @@ async fn move_to_commit(
 
     // Only restore the working directory *after* HEAD has been successfully updated.
     restore_to_commit(commit_hash, output).await?;
+    Ok(commit_hash)
+}
+
+/// Detach HEAD at `commit_hash` without restoring the worktree. Used for
+/// bare `--detach` (same commit as the current HEAD) so uncommitted edits
+/// are kept.
+pub(crate) async fn detach_head_in_place(
+    commit_hash: ObjectHash,
+    navigation_command: NavigationCommand,
+) -> Result<ObjectHash, SwitchError> {
+    let db = get_db_conn_instance().await;
+    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
+    let action = navigation_reflog_action(
+        navigation_command,
+        from_ref_name,
+        short_object_id(commit_hash),
+    );
+    let context = ReflogContext {
+        old_oid,
+        new_oid: commit_hash.to_string(),
+        action,
+    };
+
+    if let Err(error) = with_reflog(
+        context,
+        move |txn: &sea_orm::DatabaseTransaction| {
+            Box::pin(async move {
+                Head::update_result_with_conn(txn, Head::Detached(commit_hash), None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
+            })
+        },
+        false,
+    )
+    .await
+    {
+        return Err(SwitchError::HeadUpdate(error.to_string()));
+    }
     Ok(commit_hash)
 }
 
@@ -1520,6 +1594,9 @@ async fn move_to_resolved_branch(
     guard_target_tree_case(&target_commit_id)
         .await
         .map_err(SwitchError::CaseCollision)?;
+    restore::preflight_worktree_restore_to_commit(&target_commit_id)
+        .await
+        .map_err(CliError::from)?;
     let context = ReflogContext {
         old_oid,
         new_oid: target_commit_id.to_string(),
@@ -1672,6 +1749,10 @@ mod tests {
         assert_eq!(
             SwitchError::MissingDetachTarget.to_string(),
             "branch name is required when using --detach",
+        );
+        assert_eq!(
+            SwitchError::UnbornHead.to_string(),
+            "You are on a branch yet to be born",
         );
         assert_eq!(
             SwitchError::MissingBranchName.to_string(),

@@ -994,7 +994,7 @@ mod tests {
     /// for that case — so before `db::begin_write_transaction` a second writer
     /// anywhere in the repository made these fail outright rather than wait.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn a_ref_mutation_waits_for_a_concurrent_writer() {
         use std::time::Duration;
 
@@ -1049,7 +1049,7 @@ mod tests {
     /// moved is kept (TipMoved), an unmoved one is deleted, a missing one
     /// reports NotFound; no query→delete window exists (single txn).
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn conditional_delete_only_removes_the_unmoved_tip() {
         let temp_path = tempdir().unwrap();
         test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1097,7 +1097,7 @@ mod tests {
     /// but a non-matching branch suffix, then asserts that
     /// [`Branch::search_branch_result`] returns exactly the three real matches.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_search_branch() {
         let _guard = set_hash_kind_for_test(HashKind::Sha256);
         let temp_path = tempdir().unwrap();

@@ -42,7 +42,7 @@ use self::options::parse_rename_score;
 use self::options::{DiffPrefixes, ResolvedDiffConfig, resolve_diff_config};
 use crate::{
     command::{
-        get_target_commit, load_object, read_worktree_blob_bytes,
+        load_object, read_worktree_blob_bytes,
         unmerged::{self, UnmergedEntry},
     },
     internal::{config::ConfigKv, head::Head},
@@ -588,6 +588,11 @@ pub(crate) enum DiffError {
     #[error("bad config value '{value}' for '{key}'")]
     InvalidDiffConfig { key: &'static str, value: String },
 
+    /// A shared configuration read failed (for example an invalid
+    /// `core.fileMode`); the message is already user-facing.
+    #[error("{0}")]
+    InvalidConfig(String),
+
     #[error("failed to read config '{key}': {detail}")]
     DiffConfigRead { key: &'static str, detail: String },
 
@@ -663,6 +668,8 @@ impl From<DiffError> for CliError {
             DiffError::InvalidDiffConfig { key, .. } => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint(format!("fix the offending value with 'libra config {key} <value>'")),
+            DiffError::InvalidConfig(_) => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
             DiffError::DiffConfigRead { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::IoReadFailed),
             DiffError::InvalidColorMoved(_) => CliError::fatal(message)
@@ -715,6 +722,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     if util::require_repo().is_err() {
         return Err(CliError::from(DiffError::NotInRepo));
     }
+    crate::command::status::warn_sparse_checkout_unsupported_once().await;
     let mut args = args;
     resolve_positional_revisions(&mut args)
         .await
@@ -1803,7 +1811,10 @@ async fn resolve_positional_revisions(args: &mut DiffArgs) -> Result<(), DiffErr
             remaining.push(tok);
             continue;
         }
-        let resolves = crate::command::get_target_commit(&tok).await.is_ok();
+        let resolves = crate::command::get_target_commit(&tok).await.is_ok()
+            || crate::utils::util::resolve_tree_ish_with_auto_merge_typed(&tok)
+                .await
+                .is_ok();
         let is_path = exists_as_path(&tok);
         if resolves && is_path && !dashdash {
             return Err(DiffError::AmbiguousArgument(tok));
@@ -1906,7 +1917,7 @@ pub(crate) fn record_algorithm_selector_events(args: &mut DiffArgs, argv: &[Stri
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DiffAlgorithm {
+pub(crate) enum DiffAlgorithm {
     Myers,
     MyersMinimal,
     Patience,
@@ -2358,6 +2369,11 @@ async fn run_diff(
     util::require_repo().map_err(|_| DiffError::NotInRepo)?;
     tracing::debug!("diff args: {:?}", args);
     let index = Index::load(path::index()).map_err(|e| DiffError::IndexLoad(e.to_string()))?;
+    // ADR-FM-05: whether working-tree mode differences count is controlled by
+    // core.fileMode (invalid values fail diff closed before any output).
+    let file_mode = crate::internal::config::core_file_mode()
+        .await
+        .map_err(|error| DiffError::InvalidConfig(error.to_string()))?;
 
     // `--progress=json` keeps immediate NDJSON scan events for machine
     // consumers. Gate matches the old startup print: --json output, --quiet,
@@ -2394,7 +2410,7 @@ async fn run_diff(
     // the hint mid-scan, and the SAME handle is awaited afterwards — the
     // scan runs exactly once and a huge tree is never truncated (#466,
     // cf. #372). `finish()` erases the hint when the scan completes.
-    let old_side = resolve_diff_side(&args.old, args.staged, false, &index).await?;
+    let old_side = resolve_diff_side(&args.old, args.staged, false, &index, file_mode).await?;
     let (new_side, index) = if scan_hint.enabled {
         // `Index` is not `Clone`; move it into the blocking task through an
         // `Arc` and take it back out afterwards.
@@ -2416,7 +2432,7 @@ async fn run_diff(
                     previous: get_hash_kind(),
                 };
                 set_hash_kind(hash_kind);
-                resolve_worktree_side(&index)
+                resolve_worktree_side(&index, file_mode)
             })
         };
         let side =
@@ -2439,7 +2455,7 @@ async fn run_diff(
         };
         (side, index)
     } else {
-        let side = resolve_diff_side(&args.new, args.staged, true, &index).await?;
+        let side = resolve_diff_side(&args.new, args.staged, true, &index, file_mode).await?;
         (side, index)
     };
 
@@ -3382,6 +3398,15 @@ fn get_worktree_diff_files(index: &Index) -> Result<Vec<PathBuf>, DiffError> {
     let mut files = Vec::new();
 
     for file in index.tracked_files() {
+        // ADR-SW-04 item 1: skip-worktree paths are sparse-checkout entries;
+        // their (absent or stale) worktree copy is not a diff.
+        if file
+            .to_str()
+            .and_then(|name| index.get(name, 0))
+            .is_some_and(|entry| entry.flags.skip_worktree)
+        {
+            continue;
+        }
         let absolute = util::workdir_to_absolute(&file);
         if std::fs::symlink_metadata(&absolute).is_ok() {
             files.push(file);
@@ -3398,10 +3423,16 @@ fn get_worktree_diff_files(index: &Index) -> Result<Vec<PathBuf>, DiffError> {
 fn get_index_side(
     index: &Index,
     policy: IgnorePolicy,
+    exclude_skip_worktree: bool,
 ) -> (Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>) {
     let entries = index
         .tracked_entries(0)
         .into_iter()
+        // ADR-SW-04 item 1: a skip-worktree path is intentionally absent or
+        // stale in the worktree and must not appear on the index side of a
+        // WORKING-DIRECTORY diff. A staged diff (`--cached`) still shows the
+        // index content, so the caller opts in explicitly.
+        .filter(|entry| !exclude_skip_worktree || !entry.flags.skip_worktree)
         .filter(|entry| !ignore::should_ignore(&PathBuf::from(&entry.name), policy, index));
     let mut blobs = Vec::new();
     let mut modes = HashMap::new();
@@ -3432,10 +3463,27 @@ fn get_worktree_modes(files: &[PathBuf]) -> Result<HashMap<PathBuf, u32>, DiffEr
 /// (no `.await`), so it must run on the blocking pool to keep the async
 /// runtime responsive while a large tree is scanned (#372) and to let the
 /// `WorktreeScanHint` timer actually win the race on slow scans (#466).
-fn resolve_worktree_side(index: &Index) -> Result<DiffSide, DiffError> {
+fn resolve_worktree_side(index: &Index, file_mode: bool) -> Result<DiffSide, DiffError> {
     let files = get_worktree_diff_files(index)?;
     let blobs = get_files_blobs(&files, index, IgnorePolicy::Respect)?;
-    let modes = get_worktree_modes(&files)?;
+    // ADR-FM-05: with core.fileMode=false the worktree mode comparison is
+    // disabled; the index's recorded mode is used so only content (and entry
+    // type) changes surface.
+    let modes = if file_mode {
+        get_worktree_modes(&files)?
+    } else {
+        files
+            .iter()
+            .map(|path| {
+                let mode = path
+                    .to_str()
+                    .and_then(|name| index.get(name, 0))
+                    .map(|entry| entry.mode)
+                    .unwrap_or(0o100644);
+                (path.clone(), mode)
+            })
+            .collect()
+    };
     Ok(DiffSide {
         label: "working tree".to_string(),
         worktree_entries: blobs.iter().cloned().collect(),
@@ -3450,12 +3498,10 @@ async fn resolve_diff_side(
     staged: bool,
     is_new: bool,
     index: &Index,
+    file_mode: bool,
 ) -> Result<DiffSide, DiffError> {
     if let Some(source) = source {
-        let commit_hash = get_target_commit(source)
-            .await
-            .map_err(|_| DiffError::InvalidRevision(source.clone()))?;
-        let (blobs, modes) = get_commit_entries(&commit_hash).await?;
+        let (blobs, modes) = get_treeish_entries(source).await?;
         return Ok(DiffSide {
             label: source.clone(),
             blobs,
@@ -3467,7 +3513,7 @@ async fn resolve_diff_side(
 
     if is_new {
         if staged {
-            let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
+            let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect, false);
             Ok(DiffSide {
                 label: "index".to_string(),
                 blobs,
@@ -3476,7 +3522,7 @@ async fn resolve_diff_side(
                 is_worktree: false,
             })
         } else {
-            resolve_worktree_side(index)
+            resolve_worktree_side(index, file_mode)
         }
     } else if staged {
         match Head::current_commit().await {
@@ -3499,7 +3545,7 @@ async fn resolve_diff_side(
             }),
         }
     } else {
-        let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
+        let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect, true);
         Ok(DiffSide {
             label: "index".to_string(),
             blobs,
@@ -3510,6 +3556,8 @@ async fn resolve_diff_side(
     }
 }
 
+type DiffTreeEntries = (Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>);
+
 async fn get_commit_blobs(
     commit_hash: &ObjectHash,
 ) -> Result<Vec<(PathBuf, ObjectHash)>, DiffError> {
@@ -3518,17 +3566,26 @@ async fn get_commit_blobs(
         .map(|(blobs, _)| blobs)
 }
 
-async fn get_commit_entries(
-    commit_hash: &ObjectHash,
-) -> Result<(Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>), DiffError> {
+async fn get_commit_entries(commit_hash: &ObjectHash) -> Result<DiffTreeEntries, DiffError> {
     let commit = load_object::<Commit>(commit_hash).map_err(|e| DiffError::ObjectLoad {
         kind: "commit",
         object_id: commit_hash.to_string(),
         detail: e.to_string(),
     })?;
-    let tree = load_object::<Tree>(&commit.tree_id).map_err(|e| DiffError::ObjectLoad {
+    get_tree_entries(&commit.tree_id)
+}
+
+async fn get_treeish_entries(source: &str) -> Result<DiffTreeEntries, DiffError> {
+    let tree_id = util::resolve_tree_ish_with_auto_merge_typed(source)
+        .await
+        .map_err(|_| DiffError::InvalidRevision(source.to_string()))?;
+    get_tree_entries(&tree_id)
+}
+
+fn get_tree_entries(tree_id: &ObjectHash) -> Result<DiffTreeEntries, DiffError> {
+    let tree = load_object::<Tree>(tree_id).map_err(|e| DiffError::ObjectLoad {
         kind: "tree",
-        object_id: commit.tree_id.to_string(),
+        object_id: tree_id.to_string(),
         detail: e.to_string(),
     })?;
     let mut blobs = Vec::new();
@@ -5889,7 +5946,7 @@ fn materialize_indexed_changes<'a>(
 /// copy of git_internal's `compute_unified_diff`. Myers matches git_internal's
 /// initial body; Patience/Histogram/Anchored replace it with their selected
 /// anchors.
-fn compute_unified_hunks(
+pub(crate) fn compute_unified_hunks(
     old_text: &str,
     new_text: &str,
     context: usize,
@@ -5927,7 +5984,7 @@ fn compute_unified_hunks(
 
 /// Normalizer for `-w` / `--ignore-all-space`: drop every whitespace character
 /// so two lines compare equal iff they match after all whitespace is removed.
-fn normalize_ignore_all_space(line: &str) -> String {
+pub(crate) fn normalize_ignore_all_space(line: &str) -> String {
     line.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
@@ -5936,7 +5993,7 @@ fn normalize_ignore_all_space(line: &str) -> String {
 /// and trailing whitespace is dropped. The PRESENCE of whitespace still matters,
 /// so `"a  b"` ≡ `"a b"` and `"\ta"` ≡ `"  a"` (both `" a"`), but `"a b"` ≠ `"ab"`
 /// and `"a"` ≠ `"  a"`. Matches `git diff -b` (verified empirically).
-fn normalize_ignore_space_change(line: &str) -> String {
+pub(crate) fn normalize_ignore_space_change(line: &str) -> String {
     let trimmed = line.trim_end();
     let mut out = String::with_capacity(trimmed.len());
     let mut in_ws = false;
@@ -5957,7 +6014,7 @@ fn normalize_ignore_space_change(line: &str) -> String {
 /// Normalizer for `--ignore-space-at-eol`: ignore only trailing whitespace;
 /// leading and internal whitespace compare exactly. Matches `git diff
 /// --ignore-space-at-eol` (verified empirically).
-fn normalize_ignore_space_at_eol(line: &str) -> String {
+pub(crate) fn normalize_ignore_space_at_eol(line: &str) -> String {
     line.trim_end().to_string()
 }
 
@@ -5970,7 +6027,7 @@ fn normalize_ignore_space_at_eol(line: &str) -> String {
 /// raw-splits on `\n` keeping `\r` bytes; with strip-all both paths equate
 /// exactly the same line pairs. See the flag's doc for the documented
 /// approximation vs Git's non-transitive allow-one-remaining-CR comparison.
-fn normalize_ignore_cr_at_eol(line: &str) -> String {
+pub(crate) fn normalize_ignore_cr_at_eol(line: &str) -> String {
     line.trim_end_matches('\r').to_string()
 }
 
@@ -7551,6 +7608,7 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn test_diff_algorithms_use_selected_line_anchors() {
         let old = "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n";
         let new = "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n";
@@ -7568,6 +7626,7 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(hash_kind)]
     fn anchored_patience_locks_qualifying_crossing_line() {
         let old = ["ANCHOR", "b", "c"];
         let new = ["b", "c", "ANCHOR"];
@@ -7995,7 +8054,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_maybe_colorize_diff_respects_flag() {
         let diff = "diff --git a/file.txt b/file.txt\n--- /dev/null\n+++ b/file.txt\n+line\n";
         let _guard = ColorOverrideReset;
@@ -8015,7 +8074,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_color_moved_uses_distinct_colors() {
         let _guard = ColorOverrideReset;
         colored::control::set_override(true);
@@ -8035,7 +8094,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     /// Tests that the get_files_blobs function properly respects .libraignore patterns.
     /// Verifies ignored files are correctly excluded from the blob collection process.
     async fn test_get_files_blob_gitignore() {
@@ -8061,7 +8120,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_get_files_blobs_reuses_index_hash_when_stat_matches() {
         let temp_path = tempdir().unwrap();
         test::setup_with_new_libra_in(temp_path.path()).await;

@@ -28,6 +28,7 @@ pub const LIBRA_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "LIBRA_SANDBOX_NETWORK_
 const CARGO_TARGET_DIR_ENV_VAR: &str = "CARGO_TARGET_DIR";
 const CARGO_HOME_ENV_VAR: &str = "CARGO_HOME";
 const HOME_ENV_VAR: &str = "HOME";
+const RUSTUP_HOME_ENV_VAR: &str = "RUSTUP_HOME";
 const LIBRA_LOG_FILE_ENV_VAR: &str = "LIBRA_LOG_FILE";
 const XDG_CACHE_HOME_ENV_VAR: &str = "XDG_CACHE_HOME";
 const XDG_CONFIG_HOME_ENV_VAR: &str = "XDG_CONFIG_HOME";
@@ -149,9 +150,36 @@ fn default_shell() -> String {
 }
 
 fn apply_task_worktree_env_overrides(cwd: &Path, env: &mut HashMap<String, String>) {
+    apply_task_worktree_env_overrides_from_home(
+        cwd,
+        env,
+        std::env::var_os(RUSTUP_HOME_ENV_VAR).is_some(),
+        dirs::home_dir().as_deref(),
+    );
+}
+
+fn apply_task_worktree_env_overrides_from_home(
+    cwd: &Path,
+    env: &mut HashMap<String, String>,
+    rustup_home_is_set: bool,
+    original_home: Option<&Path>,
+) {
     let Some(worktree_root) = enclosing_task_worktree_root(cwd) else {
         return;
     };
+
+    // Unix rustup otherwise follows the task-local HOME and loses the installed
+    // toolchains. Keep the original root without selecting a toolchain or
+    // changing sandbox permissions; Cargo's writable cache stays task-local.
+    // Windows rustup uses USERPROFILE, which this override does not change.
+    if cfg!(unix)
+        && !rustup_home_is_set
+        && !env.contains_key(RUSTUP_HOME_ENV_VAR)
+        && let Some(rustup_home) = original_home.and_then(rustup_home_candidate)
+        && Path::new(&rustup_home).is_dir()
+    {
+        env.insert(RUSTUP_HOME_ENV_VAR.to_string(), rustup_home);
+    }
 
     insert_path_env(env, HOME_ENV_VAR, worktree_root.join("home"));
     insert_path_env(
@@ -166,6 +194,14 @@ fn apply_task_worktree_env_overrides(cwd: &Path, env: &mut HashMap<String, Strin
         LIBRA_LOG_FILE_ENV_VAR,
         worktree_root.join("logs").join("libra.log"),
     );
+}
+
+fn rustup_home_candidate(original_home: &Path) -> Option<String> {
+    let root = original_home.join(".rustup");
+    if !root.is_absolute() {
+        return None;
+    }
+    root.into_os_string().into_string().ok()
 }
 
 fn insert_path_env(env: &mut HashMap<String, String>, key: &str, path: PathBuf) {
@@ -1545,7 +1581,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_linux_seccomp_falls_back_when_helper_is_missing() {
         let _helper = EnvVarGuard::unset("LIBRA_LINUX_SANDBOX_EXE");
         let _bwrap = EnvVarGuard::set("LIBRA_BWRAP_BINARY", "/does/not/exist/bwrap");
@@ -1587,7 +1623,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_linux_required_enforcement_rejects_missing_helper() {
         let _helper = EnvVarGuard::unset("LIBRA_LINUX_SANDBOX_EXE");
         let _bwrap = EnvVarGuard::set("LIBRA_BWRAP_BINARY", "/does/not/exist/bwrap");
@@ -2085,7 +2121,7 @@ mod tests {
     /// built-in bwrap path is gated to that platform.
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_threads_seccomp_policy_into_exec_env_on_linux_bwrap_path() {
         let tmpdir = tempfile::tempdir().expect("tempdir for seccomp threading test");
         let fake_bwrap = tmpdir.path().join("bwrap");
@@ -2162,7 +2198,7 @@ mod tests {
     /// matrix can run the built-in bwrap path without relying on
     /// host-installed bubblewrap.
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn locate_bwrap_binary_honours_override_env_var() {
         let tmpdir = tempfile::tempdir().expect("tempdir for override probe");
         let fake_bwrap = tmpdir.path().join("bwrap");
@@ -2253,7 +2289,7 @@ mod tests {
     /// gated behind `#[cfg(target_os = "linux")]`.
     #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial(sandbox_env)]
+    #[serial_test::serial(sandbox_env, env)]
     fn transform_uses_built_in_bwrap_when_helper_is_missing_but_bwrap_is_available() {
         let tmpdir = tempfile::tempdir().expect("tempdir for built-in bwrap test");
         let fake_bwrap = tmpdir.path().join("bwrap");
@@ -2508,6 +2544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_sets_cargo_target_dir_inside_fuse_worktree() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-fuse-7-019d/workspace/src");
@@ -2523,6 +2560,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_skips_when_caller_already_set_target_dir() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-fuse-7-019d/workspace");
@@ -2539,6 +2577,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_skips_when_ambient_env_has_target_dir() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-fuse-7-019d/workspace");
@@ -2551,6 +2590,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn apply_fuse_workspace_env_overrides_noops_outside_fuse_worktree() {
         let mut env = HashMap::new();
         apply_fuse_workspace_env_overrides(Path::new("/repo/src"), &mut env, false);
@@ -2558,6 +2598,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_uses_task_local_home_cargo_and_log_paths() {
         let cwd =
             Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-copy-9-019e/workspace/src");
@@ -2598,6 +2639,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_does_not_inject_task_local_env_outside_task_worktree() {
         let spec = CommandSpec::shell_inner(
             "echo ok",
@@ -2610,9 +2652,111 @@ mod tests {
         assert!(!spec.env.contains_key(HOME_ENV_VAR));
         assert!(!spec.env.contains_key(CARGO_HOME_ENV_VAR));
         assert!(!spec.env.contains_key(LIBRA_LOG_FILE_ENV_VAR));
+        assert!(!spec.env.contains_key(RUSTUP_HOME_ENV_VAR));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_shell_preserves_default_rustup_home() {
+        let home = tempfile::tempdir().unwrap();
+        let rustup_home = home.path().join(".rustup");
+        std::fs::create_dir(&rustup_home).unwrap();
+        let root = Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-copy-test");
+        for cwd in [root.join("workspace"), root.join("workspace/src")] {
+            let mut env = HashMap::new();
+            apply_task_worktree_env_overrides_from_home(&cwd, &mut env, false, Some(home.path()));
+            assert_eq!(env[RUSTUP_HOME_ENV_VAR], rustup_home.to_str().unwrap());
+            assert_eq!(env[HOME_ENV_VAR], root.join("home").to_str().unwrap());
+            assert_eq!(
+                env[CARGO_HOME_ENV_VAR],
+                root.join("cargo-home").to_str().unwrap()
+            );
+            assert_eq!(
+                env[XDG_CONFIG_HOME_ENV_VAR],
+                root.join("xdg-config").to_str().unwrap()
+            );
+            assert_eq!(
+                env[XDG_CACHE_HOME_ENV_VAR],
+                root.join("xdg-cache").to_str().unwrap()
+            );
+            assert_eq!(
+                env[LIBRA_LOG_FILE_ENV_VAR],
+                root.join("logs/libra.log").to_str().unwrap()
+            );
+            assert!(!env.contains_key("RUSTUP_TOOLCHAIN"));
+        }
+        let mut env = HashMap::new();
+        apply_task_worktree_env_overrides_from_home(
+            Path::new("/repo/src"),
+            &mut env,
+            false,
+            Some(home.path()),
+        );
+        assert!(env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_shell_preserves_explicit_rustup_environment() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".rustup")).unwrap();
+        let cwd = Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-copy-test/workspace");
+        for ambient_is_set in [false, true] {
+            for explicit in ["/configured/toolchains", "relative/root", ""] {
+                let mut env = HashMap::from([
+                    (RUSTUP_HOME_ENV_VAR.to_string(), explicit.to_string()),
+                    ("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string()),
+                ]);
+                apply_task_worktree_env_overrides_from_home(
+                    cwd,
+                    &mut env,
+                    ambient_is_set,
+                    Some(home.path()),
+                );
+                assert_eq!(env[RUSTUP_HOME_ENV_VAR], explicit);
+                assert_eq!(env["RUSTUP_TOOLCHAIN"], "nightly");
+            }
+        }
+        // An inherited explicit value need not be representable by this String
+        // map: absence from the overrides preserves its original OS bytes.
+        let mut env = HashMap::new();
+        apply_task_worktree_env_overrides_from_home(cwd, &mut env, true, Some(home.path()));
+        assert!(!env.contains_key(RUSTUP_HOME_ENV_VAR));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_shell_rustup_home_derivation_is_conservative() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let home = tempfile::tempdir().unwrap();
+        let file_home = home.path().join("file-home");
+        std::fs::create_dir(&file_home).unwrap();
+        std::fs::write(file_home.join(".rustup"), "not a directory").unwrap();
+        let non_unicode_home = home.path().join(OsString::from_vec(b"home-\xff".to_vec()));
+        // Test rejection before any filesystem access: APFS cannot create an
+        // invalid UTF-8 filename, but its in-memory path still must be rejected.
+        assert!(rustup_home_candidate(&non_unicode_home).is_none());
+        assert!(rustup_home_candidate(Path::new("relative-home")).is_none());
+        let cwd = Path::new("/repo/.libra/worktrees/tasks/libra-task-worktree-copy-test/workspace");
+        for original in [
+            None,
+            Some(Path::new("relative-home")),
+            Some(home.path()),
+            Some(file_home.as_path()),
+            Some(non_unicode_home.as_path()),
+        ] {
+            let mut env = HashMap::new();
+            apply_task_worktree_env_overrides_from_home(cwd, &mut env, false, original);
+            assert!(!env.contains_key(RUSTUP_HOME_ENV_VAR));
+            assert!(!env.contains_key("RUSTUP_TOOLCHAIN"));
+            assert!(env.contains_key(HOME_ENV_VAR));
+            assert!(env.contains_key(CARGO_HOME_ENV_VAR));
+        }
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_injects_cargo_target_dir_inside_fuse_workspace() {
         // Production wrapper test: drives the inner constructor with an
         // explicit ambient-env flag so we don't rely on whatever the test
@@ -2641,6 +2785,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_skips_injection_when_ambient_env_has_target_dir() {
         // When the operator has `CARGO_TARGET_DIR` exported the inner
         // constructor must respect that choice, even inside a FUSE worktree.
@@ -2661,6 +2806,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn shell_command_spec_does_not_inject_cargo_target_dir_outside_fuse_workspace() {
         let cwd = std::env::temp_dir();
         let spec = CommandSpec::shell_inner(
@@ -2957,6 +3103,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     #[cfg_attr(target_os = "linux", serial_test::serial(sandbox_env))]
     fn seam_trusted_bwrap_field_consumed() {
         let cwd = tempfile::tempdir().expect("tempdir");

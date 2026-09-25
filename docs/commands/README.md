@@ -29,6 +29,8 @@ Every Libra command accepts the following global flags:
 | `--quiet` | `-q` | Suppress stdout |
 | `--exit-code-on-warning` | | Return exit code 9 on warnings |
 | `--progress` | | Control progress output (`json`, `text`, `none`, `auto`) |
+| `--literal-pathspecs` | | Treat pathspecs as literal (no glob, no `:(magic)`). Also `GIT_LITERAL_PATHSPECS=1`. |
+| `--no-literal-pathspecs` | | Cancel `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` (last flag wins). |
 
 ## Command Index
 
@@ -98,6 +100,7 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra reset` | | Move HEAD and optionally reset index or working directory | [reset.md](reset.md) |
 | `libra merge` | | Fast-forward merge a branch into the current branch | [merge.md](merge.md) |
+| `libra mergetool` | | Resolve ordinary content conflicts using a configured external tool | [mergetool.md](mergetool.md) |
 | `libra merge-file` | | Three-way merge of three files (git merge-file) | [merge-file.md](merge-file.md) |
 | `libra merge-base` | | Find the best common ancestor(s) of two commits | [merge-base.md](merge-base.md) |
 | `libra rebase` | `rb` | Reapply commits on top of another base tip with conflict resolution | [rebase.md](rebase.md) |
@@ -130,19 +133,18 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra cloud` | | Cloud backup and restore operations via Cloudflare D1/R2 | [cloud.md](cloud.md) |
 | `libra cache` | | Inspect the tiered-storage / LRU cache configuration (type, threshold, budget) | [cache.md](cache.md) |
-| `libra publish` | | Manage read-only Cloudflare Worker publishing | [publish.md](publish.md) |
+| `libra publish` | | Removed. Use `libra cloud` for repository backup | [publish.md](publish.md) |
 | `libra worktree` | `wt` | Manage multiple working trees attached to the repository | [worktree.md](worktree.md) |
 
 ### AI & Development
 
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
-| `libra code` | | Interactive Web Code UI with AI agent, web server, and MCP integration | [code.md](code.md) |
-| `libra code-control` | | **Removed in the W5 breaking release** — use `libra code --control stdio` (breaking-change migration note) | [code-control.md](code-control.md) |
-| Codex data storage | | Link `libra code --provider codex` to Codex app-server and persist Codex session data | [codex-data-storage.md](codex-data-storage.md) |
+| `libra code` | | Removed. Capture external agents with `libra agent` | [code.md](code.md) |
+| `libra code-control` | | Removed with `libra code`. Use `libra agent` | [code-control.md](code-control.md) |
 | `libra automation` | | List, run, and inspect AI automation rules | [automation.md](automation.md) |
-| `libra usage` | | Report and prune AI provider/model usage aggregates | [usage.md](usage.md) |
-| `libra graph` | | Inspect a Libra Code thread version graph (`--json`/`--machine`; interactive TUI entry removed in the W5 breaking release, use Web Code UI) | [graph.md](graph.md) |
+| `libra usage` | | Removed. Usage stats only served the deleted developer agent | [usage.md](usage.md) |
+| `libra graph` | | Removed. Use `libra --json agent graph <session>` for the capture graph | [graph.md](graph.md) |
 | `libra sandbox` | | Inspect AI sandbox diagnostics, including OS backend availability and downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | Manage external-agent capture, checkpoints, hooks, and RPC adapters | [agent.md](agent.md) |
 | `libra memory` | | Search, inspect, diagnose, and rebuild repository development-history Memory | [memory.md](memory.md) |
@@ -224,5 +226,5 @@ Libra's command-line interface is designed with these principles:
 4. **Security by default** — Vault-backed signing and secret encryption are enabled by default, not opt-in.
 5. **Explicit over implicit** — Commands like `clean` require `-f` or `-n`; `status --exit-code` is an explicit opt-in rather than Git's ambiguous exit code behavior.
 6. **Actionable errors** — Every error includes a stable code (`LBR-*`), a human-readable message, and a hint for resolution.
-7. **AI-native development** — The `libra code` command integrates AI agents directly into the version control workflow with multi-provider support and MCP protocol.
+7. **AI-native development** — External-agent capture (`libra agent`) observes Claude/Codex/OpenCode sessions into versioned checkpoints; read-only `review` / `investigate` run supervised agents (the `libra code` Web UI was removed in 0.23.0).
 8. **Cloud-native storage** — Built-in tiered storage (S3/R2) and cloud backup (D1/R2) for distributed monorepo workflows.

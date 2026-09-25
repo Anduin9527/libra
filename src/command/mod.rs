@@ -31,13 +31,11 @@ pub mod cherry_pick;
 pub mod clean;
 pub mod clone;
 pub mod cloud;
-pub mod code;
-pub mod code_control;
-pub mod code_control_files;
 pub mod commit;
 pub mod commit_tree;
 pub mod completions;
 pub mod config;
+pub mod control_lock;
 pub mod credential;
 pub mod deps;
 pub mod describe;
@@ -52,7 +50,6 @@ pub mod file;
 pub mod for_each_ref;
 pub mod format_patch;
 pub mod fsck;
-pub mod graph;
 pub mod grep;
 pub mod hash_object;
 pub(crate) mod history_config;
@@ -75,23 +72,25 @@ pub mod mailinfo;
 pub mod maintenance;
 #[cfg(feature = "fastcdc")]
 pub mod media;
+pub mod mega2; // plan-20260912 MB-03: the single public `libra mega2 browser` surface
+pub mod mega2_browser; // plan-20260912 MB-02: mega2 browser TUI state + terminal lifecycle
 pub mod memory;
 pub mod merge;
 pub mod merge_base;
 pub mod merge_file;
 pub(crate) mod merge_message;
+pub mod mergetool;
 pub mod metadata;
 pub mod mv;
 pub mod notes;
 pub mod op;
 pub mod open;
 pub mod pack_objects;
-pub mod package;
-pub mod publish;
 pub mod pull;
 pub mod push;
 pub mod read_tree;
 pub mod rebase;
+pub mod rebase_todo;
 pub mod reflog;
 pub mod remote;
 pub mod remove;
@@ -123,7 +122,6 @@ pub mod tag;
 pub(crate) mod unmerged;
 pub mod update_index;
 pub mod update_ref;
-pub mod usage;
 pub mod verify_pack;
 mod verify_pack_decode;
 mod verify_pack_index;
@@ -146,7 +144,6 @@ pub(crate) mod status_untracked;
 pub(crate) mod status_untracked_paths;
 pub mod switch;
 pub mod upgrade;
-pub mod web_assets;
 pub mod write_tree;
 
 use std::{
@@ -599,7 +596,7 @@ mod tests {
         utils::test,
     };
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     /// Test objects can be correctly saved to and loaded from storage.
     async fn test_save_load_object() {
         let temp_path = tempdir().unwrap();

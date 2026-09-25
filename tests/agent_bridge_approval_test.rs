@@ -30,7 +30,6 @@ fn dangerous_actions_default_to_deny() {
         "evidence.append",
         "provenance.append",
         "context.get",
-        "memory.recall",
     ] {
         assert_eq!(classify(m), ActionClass::Normal, "{m} should be normal");
     }

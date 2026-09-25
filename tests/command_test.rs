@@ -7,4 +7,3 @@
 
 mod command;
 mod helpers;
-mod operation_wrapper_test;

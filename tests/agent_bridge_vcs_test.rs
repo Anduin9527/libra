@@ -74,6 +74,8 @@ fn write_file(root: &Path, name: &str, body: &str) {
 
 async fn stage(paths: &[&str]) {
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: paths.iter().map(|p| p.to_string()).collect(),
         all: false,
         update: false,
@@ -87,6 +89,10 @@ async fn stage(paths: &[&str]) {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 }
@@ -140,7 +146,7 @@ fn envelope_data(value: &Value) -> &Value {
 /// `diff.get` reads the real working-tree diff, carries the patch body, and
 /// scopes to validated repository-relative paths.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn diff_get_reports_real_worktree_changes_and_is_path_scoped() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
@@ -217,7 +223,7 @@ async fn diff_get_reports_real_worktree_changes_and_is_path_scoped() {
 /// both refused with `invalid_params`, so a request can never become an
 /// arbitrary revision or pathspec (GC-LB-03).
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn diff_get_rejects_untyped_selectors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
@@ -248,7 +254,7 @@ async fn diff_get_rejects_untyped_selectors() {
 /// replay of the same `operation_id` reports the ORIGINAL commit instead of
 /// creating a second one.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn commit_create_commits_the_index_and_replays_idempotently() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
@@ -306,7 +312,7 @@ async fn commit_create_commits_the_index_and_replays_idempotently() {
 /// A stated-but-stale `expected_head` refuses the commit before it is created
 /// (LB-05 AC5 fence).
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn commit_create_refuses_on_head_drift() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
@@ -341,7 +347,7 @@ async fn commit_create_refuses_on_head_drift() {
 /// checkpoint pins, and refuses first on a dirty worktree (nothing is
 /// destroyed) — HEAD is never moved either way.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn checkpoint_restore_honours_the_fence_and_restores_the_worktree() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
@@ -406,7 +412,7 @@ async fn checkpoint_restore_honours_the_fence_and_restores_the_worktree() {
 /// A bridge checkpoint that pins no commit cannot be a restore or diff target:
 /// it fails closed rather than restoring "nothing".
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn checkpoint_without_a_commit_cannot_be_restored() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
@@ -439,7 +445,7 @@ async fn checkpoint_without_a_commit_cannot_be_restored() {
 /// capability matrix before any run directory exists, and the bridge
 /// supervises nothing after a refusal (GC-LB-10).
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn review_run_refuses_unlaunchable_reviewers_without_residue() {
     use libra::internal::ai::agent_bridge::vcs::supervisor;
 
@@ -499,7 +505,7 @@ impl Drop for ChildGuard {
 /// when a shared take would block, so its existence proves the bridge waited
 /// rather than merely being slow — there is no sleep here to be wrong about.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 #[cfg(unix)]
 fn commit_create_waits_for_a_deletion_phase_before_publishing() {
     use std::io::{BufRead, BufReader, Write as _};

@@ -56,7 +56,6 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 | `session show <id>` | 显示一个已捕获会话 |
 | `session stop <id>` | 将已捕获会话标记为 stopped |
 | `session resume <id>` | 将已停止的已捕获会话重新标记为 active |
-| `session promote <id>` | 将已捕获会话提升为 Libra intent 元数据 |
 | `session derive-tool-calls <id>` | 从已捕获会话推导工具调用记录 |
 | `checkpoint list` | 列出已捕获 checkpoint |
 | `checkpoint show <id>` | 显示 checkpoint 元数据 |
@@ -66,7 +65,7 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 | `skill list` | `skill search` 的别名（同过滤项） |
 | `skill registry` | 展示各 agent 的 curated 可发现 skill 注册表（`--provider <slug>` 限定；公开 SkillDiscoverer 面） |
 | `clean` | 清理已停止会话的临时 checkpoint（prune 遇到进行中的 checkpoint 写入、traces 引用可达但无 catalog 行的提交、或仍有耐久 object-index repair 待处理时 fail-closed 拒绝；同时删除因此不可达的 `object_index` 行） |
-| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致 |
+| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致。只读的 `legacy_code_residue` 字段（人读为「Frozen Code residue」行）报告冷冻的 Code 时代路径 `.libra/sessions/code/`、`.libra/code/` 与 `libra/intent` ref 是否仍存在；它不会删除或改写该状态，清理另由 plan-20260920 ADR-RC-04 / DEFER-RC-02 承接 |
 | `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |
 | `rpc list` | 列出 `PATH` 上发现的 `libra-agent-*` 二进制（含 trusted/quarantined 状态）；需先开启 external-agents 开关 |
 | `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`）。provider-exporter slug `opencode` 则改为固定 provider 自身的 CLI 二进制——只从已注册受信目录解析、绝不扫描 `$PATH`——供沙箱化 export bridge 使用；该形式无需 external-agents opt-in |
@@ -118,7 +117,14 @@ libra --json agent rpc list
 支持及当前可用状态；默认版本 1 的 payload 保持原有字段集合，不会隐式
 增加扩展字段。OpenCode 的 `transcript_discoverable` 明确为 unsupported（不支持
 批量发现）；显式 ID 的 `importable`/`export_bridge` 可用性取决于受信任离线
-exporter 与 sandbox。macOS 经 seatbelt（`sandbox-exec`）启用内容捕获（store 可写、主机写与网络被拒）；seatbelt 存在弃用风险。读隔离不对称（macOS 不限制读，与 Linux bwrap 默认拒绝读不同）。`sandbox-exec` 不可用时 fail-closed 降级 metadata-only。启用该 exporter 的方式：先注册包含已核验 `opencode`
+exporter 与 sandbox。
+
+在 Unix 上，exporter 子程序及其后代的 `RLIMIT_CORE` soft/hard limit 均设为零。
+当系统 core handler 尊重该限制时，预期的限制执法与意外 exporter 崩溃都不会
+保存 core 文件；系统日志仍可能记录信号事件。Libra 保留退出状态及有界 stderr
+诊断。该设置只作用于子程序，不修改 Libra 父程序限制或系统配置。
+
+macOS 经 seatbelt（`sandbox-exec`）启用内容捕获（store 可写、主机写与网络被拒）；seatbelt 存在弃用风险。读隔离不对称（macOS 不限制读，与 Linux bwrap 默认拒绝读不同）。`sandbox-exec` 不可用时 fail-closed 降级 metadata-only。启用该 exporter 的方式：先注册包含已核验 `opencode`
 二进制的目录，再固定它——`libra agent rpc trust --dir <path>`，然后
 `libra agent rpc trust opencode`。两步都不会打开 external-RPC 表面
 （`agent.external_agents.enabled` 保持不变）；二进制只从已注册受信目录解析，

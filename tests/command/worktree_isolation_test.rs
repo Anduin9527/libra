@@ -13,8 +13,8 @@
 use std::fs;
 
 use super::{
-    assert_cli_success, base_libra_command, parse_json_stdout, run_libra_command,
-    run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
+    LimitedChild, assert_cli_success, base_libra_command, historical_schema, parse_json_stdout,
+    run_libra_command, run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
 
 /// A committed repo (a.txt @ c1) with a `feature` branch. Returns its dir.
@@ -35,75 +35,6 @@ fn repo_with_feature() -> tempfile::TempDir {
     );
     assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
     repo
-}
-
-/// Reconstruct the real pre-OL-02 operation shape for rollback fixtures.
-/// Production v2 is intentionally forward-only, so older migration downs
-/// must run against v1 tables rather than a same-named v2 table.
-async fn restore_v1_operation_shape(conn: &sea_orm::DatabaseConnection) {
-    use sea_orm::{ConnectionTrait, Statement};
-
-    for table in [
-        "ai_operation_link",
-        "change_predecessor",
-        "change_revision",
-        "change_identity",
-        "operation_journal",
-        "operation_head",
-        "operation_parent",
-        "operation",
-    ] {
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            format!("DROP TABLE IF EXISTS `{table}`"),
-        ))
-        .await
-        .unwrap_or_else(|error| panic!("drop v2 fixture table {table}: {error}"));
-    }
-    for trigger in [
-        "legacy_operation_scope_provenance_domain_insert",
-        "legacy_operation_scope_provenance_domain_update",
-        "legacy_operation_scope_kind_domain_insert",
-        "legacy_operation_scope_kind_domain_update",
-    ] {
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            format!("DROP TRIGGER IF EXISTS {trigger}"),
-        ))
-        .await
-        .unwrap_or_else(|error| panic!("drop v2 fixture trigger {trigger}: {error}"));
-    }
-    for index in [
-        "idx_legacy_operation_repo_order",
-        "idx_legacy_operation_dedup_scope",
-        "idx_legacy_operation_control_slot",
-        "idx_legacy_operation_parent_parent",
-        "idx_legacy_operation_view_repo_created",
-    ] {
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            format!("DROP INDEX IF EXISTS {index}"),
-        ))
-        .await
-        .unwrap_or_else(|error| panic!("drop v2 fixture index {index}: {error}"));
-    }
-    for (legacy, v1) in [
-        ("legacy_operation", "operation"),
-        ("legacy_operation_parent", "operation_parent"),
-        ("legacy_operation_view", "operation_view"),
-        ("legacy_operation_view_ref", "operation_view_ref"),
-        (
-            "legacy_operation_view_workspace",
-            "operation_view_workspace",
-        ),
-    ] {
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            format!("ALTER TABLE `{legacy}` RENAME TO `{v1}`"),
-        ))
-        .await
-        .unwrap_or_else(|error| panic!("restore {legacy} as {v1}: {error}"));
-    }
 }
 
 fn abbrev_head(dir: &std::path::Path) -> String {
@@ -4030,6 +3961,12 @@ fn sequencer_state_rows_are_gc_roots_across_scopes() {
         );
     };
     sqlite("DELETE FROM reflog;");
+    // CH04's change projection is also a documented GC root. Remove the
+    // commit's projection so the state rows below are the only anchors under
+    // test; otherwise the negative control can never become a prune candidate.
+    sqlite(&format!(
+        "DELETE FROM change_revision WHERE commit_oid = '{oid}';"
+    ));
 
     // Plant a FOREIGN-scope rebase_state row anchoring the commit.
     sqlite(&format!(
@@ -4294,8 +4231,8 @@ fn concurrent_control_slots_are_held_per_worktree() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let rows = match sqlite_query_no_wait(
             &db,
-            "SELECT worktree_id FROM legacy_operation WHERE status = 'running' \
-             AND control_slot IS NOT NULL ORDER BY worktree_id",
+            "SELECT op_id FROM operation WHERE status = 'running' \
+             AND command_name = 'rebase' ORDER BY op_id",
         ) {
             Ok(rows) => rows,
             Err(err) => {
@@ -5279,7 +5216,7 @@ fn sparse_view_is_worktree_scoped() {
 fn registry_mutators_serialize_on_worktrees_lock() {
     /// Kill-and-reap on every exit path — an assertion failure must never
     /// leave a spawned add running against a removed temp repository.
-    struct ChildGuard(std::process::Child);
+    struct ChildGuard(LimitedChild);
     impl Drop for ChildGuard {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -5973,62 +5910,24 @@ fn worktree_repair_path_refuses_main_and_unregistered() {
 /// refused at connect time no matter which command first touches the v2 file.
 #[tokio::test]
 async fn worktree_commands_apply_capability_marker_before_registry_io() {
-    use libra::internal::db::migration::{MigrationRunner, builtin_migrations};
-    use sea_orm::{ConnectionTrait, Database, Statement};
+    use sea_orm::{ConnectionTrait, Statement};
 
-    let dir = repo_with_feature();
+    // Given the complete history immediately before the capability marker.
+    let dir = historical_schema::repository_at(2026072304).await;
     let main = dir.path();
-    let db_url = format!(
-        "sqlite://{}?mode=rwc",
-        main.join(".libra/libra.db").display()
-    );
+    let conn = historical_schema::connect(main).await;
+    historical_schema::assert_history(&conn, 2026072304).await;
+    conn.close().await.expect("close historical repository db");
 
-    // Re-open the pre-v2 window: roll back ONLY the capability marker.
-    {
-        let conn = Database::connect(&db_url).await.expect("connect repo db");
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
-        ))
-        .await
-        .expect("remove forward-only v2 version marker before rollback fixture");
-        restore_v1_operation_shape(&conn).await;
-        let mut runner = MigrationRunner::new();
-        runner
-            .extend(
-                builtin_migrations()
-                    .into_iter()
-                    .filter(|migration| migration.version != 2026090101),
-            )
-            .expect("historical migration registry");
-        let rolled = runner
-            .rollback_to(&conn, 2026072304)
-            .await
-            .expect("roll back capability marker");
-        // Newest first. `2026072501` (the W4 workspace record) rolls back
-        // cleanly here because a fresh repository holds no workspace lease —
-        // its own down guard refuses once one exists, which is also what keeps
-        // a live lease from being rolled through the deeper guards.
-        // Derived from the registry rather than pinned to a literal: every
-        // unrelated migration that lands on top rolls back with the marker,
-        // so a hard-coded list turns the next schema addition into a spurious
-        // failure here.
-        let mut expected_rolled: Vec<i64> = libra::internal::db::migration::builtin_migrations()
-            .into_iter()
-            .map(|migration| migration.version)
-            .filter(|version| *version > 2026072304 && *version != 2026090101)
-            .collect();
-        expected_rolled.reverse();
-        assert_eq!(rolled, expected_rolled);
-        conn.close().await.expect("close");
-    }
-
+    // When an ordinary worktree command opens the historical repository.
     assert_cli_success(
         &run_libra_command(&["worktree", "list"], main),
         "worktree list on a pre-marker database",
     );
 
-    let conn = Database::connect(&db_url).await.expect("reconnect repo db");
+    // Then its migration preflight installs the capability and current schema.
+    let conn = historical_schema::connect(main).await;
+    historical_schema::assert_current(&conn).await;
     let backend = conn.get_database_backend();
     let row = conn
         .query_one_raw(Statement::from_string(
@@ -6043,8 +5942,20 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
     let count: i32 = row.try_get_by_index(0).expect("count");
     assert_eq!(
         count, 1,
-        "the preflight re-applied the capability marker before registry IO"
+        "the preflight applied the capability marker before registry IO"
     );
+    let markers: Vec<i64> = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT version FROM worktree_registry_capability ORDER BY version",
+        ))
+        .await
+        .expect("read capability versions")
+        .into_iter()
+        .map(|row| row.try_get_by_index(0).expect("capability version"))
+        .collect();
+    assert_eq!(markers, [2, 3]);
+    conn.close().await.expect("close upgraded repository db");
 }
 
 /// §C.7: `worktree repair <path> --resolve-identity --yes` — the ONLY
@@ -8654,55 +8565,42 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
 /// before committing to an upgrade. The already-current-schema test cannot
 /// catch this, because there is no migration to apply.
 ///
-/// The repository is put behind schema by removing the LAST applied version
-/// from the ledger AND undoing what it created, so re-applying is a real
-/// forward step rather than a non-idempotent replay.
-///
-/// It must be the LAST, not merely a recent one: the runner treats
-/// `version > MAX(applied)` as pending, so deleting a middle row leaves
-/// nothing to apply and the "an ordinary command still upgrades" half of this
-/// test would compare an untouched database against itself. The assertion
-/// below pins that, so adding a migration fails here loudly instead of
-/// quietly hollowing the test out.
+/// The fixture is initialized from bootstrap through 2026073101. Its complete
+/// historical receipts and physical schema leave the later migrations pending,
+/// including forward-only changes that cannot be undone from the current tip.
 #[tokio::test]
 async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
-    use libra::internal::db::migration::builtin_runner;
-    use sea_orm::Database;
-
-    let dir = repo_with_feature();
+    // Given a real historical repository with later migrations still pending.
+    let dir = historical_schema::repository_at(2026073101).await;
     let main = dir.path();
     let db = main.join(".libra").join("libra.db");
-    let db_url = format!("sqlite://{}?mode=rwc", db.display());
-
-    // Use the real down migration rather than deleting its ledger row. The
-    // newest Memory receipt migration creates physical tables, so undoing it
-    // represents a repository that is genuinely one migration behind.
-    let conn = Database::connect(&db_url)
-        .await
-        .expect("open repository db");
-    assert_eq!(
-        builtin_runner()
-            .expect("builtin runner")
-            .rollback_to(&conn, 2026090702)
-            .await
-            .expect("roll back newest migration"),
-        vec![2026090703]
-    );
+    let conn = historical_schema::connect(main).await;
+    historical_schema::assert_history(&conn, 2026073101).await;
+    let historical_snapshot = historical_schema::snapshot(&conn).await;
     conn.close().await.expect("close repository db");
-    assert!(
-        sqlite_max_schema_version(&db) < 2026090703,
-        "2026090703 must be the NEWEST migration for this test to leave one \
-         pending — retarget it at the new newest migration"
+    assert_eq!(
+        sqlite_max_schema_version(&db),
+        2026073101,
+        "the repository must remain at its historical tip before doctor"
     );
     let before = std::fs::read(&db).expect("db before");
 
+    // When the read-only doctor inspects the repository.
     let out = run_libra_command(&["worktree", "doctor"], main);
     assert_cli_success(&out, "doctor on a behind-schema repository");
+    // Then neither database bytes nor schema and receipts change.
     assert_eq!(
         before,
         std::fs::read(&db).expect("db after"),
         "doctor must not apply the pending migration"
     );
+    let conn = historical_schema::connect(main).await;
+    historical_schema::assert_history(&conn, 2026073101).await;
+    assert_eq!(
+        historical_schema::snapshot(&conn).await,
+        historical_snapshot
+    );
+    conn.close().await.expect("close diagnosed repository db");
 
     // An ordinary command still upgrades, so the exclusion is scoped to
     // doctor rather than disabling migrations outright.
@@ -8712,6 +8610,9 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
         std::fs::read(&db).expect("db after status"),
         "the pending migration was still pending, and status applied it"
     );
+    let conn = historical_schema::connect(main).await;
+    historical_schema::assert_current(&conn).await;
+    conn.close().await.expect("close upgraded repository db");
 }
 
 /// The highest version recorded in `schema_versions` — what the runner
@@ -9596,14 +9497,8 @@ fn a_converged_bisect_still_blocks_a_sequence_until_reset() {
 /// SAME control action with the same arguments inside the five-second window
 /// are two legitimate operations, and neither is refused as a duplicate.
 ///
-/// **What this half can and cannot prove.** Sequencer control actions do not
-/// enter `with_operation_log` today, so nothing here reaches the dedup query;
-/// this is the end-to-end INVARIANT — the criterion holds for a user now, and
-/// keeps holding the day the controls are wrapped. The teeth are at the
-/// wrapper seam, where the key actually lives:
-/// `operation_wrapper_test::the_same_action_in_another_worktree_is_not_a_duplicate`
-/// seeds another worktree's identical success and requires this scope's
-/// submission to be accepted, and it fails if the key loses `worktree_id`.
+/// The unified v2 boundary records each physical worktree's running operation,
+/// so identical control actions remain independent while both callbacks hold.
 #[test]
 fn concurrent_identical_control_actions_in_two_worktrees_not_deduped() {
     let repo = repo_with_feature();

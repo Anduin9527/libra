@@ -9,6 +9,19 @@ a deprecation (**弃用**) risk if Apple removes `sandbox-exec`. See
 [`../tracing/agent.md`](../tracing/agent.md) §5 for the read-isolation
 asymmetry and fail-closed metadata-only degrade when the backend is missing.
 
+The shared `run_bounded_exporter` Unix `pre_exec` sets both soft and hard
+`RLIMIT_CORE` to zero next to the existing per-platform `RLIMIT_FSIZE`.
+Failure to set either limit fails spawn with context. Core limits propagate
+to exporter descendants without changing the parent process; SIGXFSZ
+disposition, byte caps, deadlines and sandbox controls are unchanged.
+This also suppresses cores from unexpected exporter crashes. Piped core
+handlers decide whether to honor the limit. systemd-coredump v259 honors
+it when `core_pattern` passes the limit through `%c`; brief signal metadata
+can remain. The regression
+`opencode_export_core_limits_are_zero_in_child_and_descendants` exercises
+the real runner and confirms child/descendant limits and unchanged parent
+limits. It does not establish the cause of any historical linker SIGKILL.
+
 The active development contract, backlog, and compatibility guardrails live in
 [`../tracing/agent.md`](../tracing/agent.md). Keep this file as the command
 development index entry so `docs/development/commands/README.md` can list every
@@ -118,8 +131,8 @@ same identity count by simulating coverage removal in a rolled-back transaction.
 - **Scope:** repository/worktree/workspace/actor scope is derived from the
   trusted context at handshake (GC-LB-06/07); self-reported identity is never
   a credential. `deepseek-harness` is NOT an `AgentKind` (ADR-LB-02).
-- **Non-goals:** not `libra code --control stdio` and not an MCP server
-  (ADR-LB-01). Implemented: the CLI + protocol + transport (LB-01), the durable
+- **Non-goals:** not `libra code --control stdio`; a plain JSON-RPC 2.0
+  NDJSON bridge, not a tool-serving protocol (ADR-LB-01). Implemented: the CLI + protocol + transport (LB-01), the durable
   session/event/operation storage (LB-02), the session/event ingress (LB-03),
   the typed read methods (LB-04), mutation admission/approval/actor binding
   (LB-05) and workspace lease claim/renew/release over `WorkspaceStore`

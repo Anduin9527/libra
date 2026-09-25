@@ -34,7 +34,9 @@ multivalue, type conversion, sections) fails closed. See
 
 ## What `auto` does
 
-When `upgrade.mode=auto` on an official install, each normal command also:
+When `upgrade.mode=auto` on an official install, each normal command also
+schedules the check in a detached background worker (`libra __upgrade-background`)
+after a network-free throttle decision, so the command itself is never delayed:
 
 1. **Throttles.** A successful online check sets a ~15-minute cross-process
    cooldown (plus small jitter), so at most one network check happens per
@@ -54,9 +56,13 @@ When `upgrade.mode=auto` on an official install, each normal command also:
    a post-install self-check runs, and only then is the install committed. If
    the self-check fails, the previous version is restored automatically.
 
-The check never returns an error and never trips `--exit-code-on-warning`; in
-JSON/machine output modes it is silent. In human mode you may see a one-line
-advisory when an upgrade was installed or rolled back.
+The whole check runs in the detached background worker with no terminal
+output, so it never delays the command and never prints an advisory. Every
+failure is silent: an offline or unreachable host, or access that exceeds the
+worker's bounded budget, is skipped (and a failure backoff stops it from
+retrying on every command). When an upgrade succeeds, the new binary is
+installed silently and takes effect on the next command — confirm the current
+version with `libra --version` or `libra upgrade --check`.
 
 ## Platform support (first phase)
 

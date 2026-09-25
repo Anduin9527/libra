@@ -1,5 +1,7 @@
 # `libra code` Agent framework 与 Web-only 迁移计划
 
+> **已移除（plan-20260920）：** `libra code` 公开命令、Web 执行器、AgentRuntime、MCP/tools 与 `web/` 内部模块已于 0.23.0 拆除。本文保留为历史设计记录；现行外部 Agent 观测入口是 `libra agent`，仓库备份是 `libra cloud`。
+
 > Status: agent-executable（可交给 Agent 按卡执行；本文档已包含自举清单、执行协议、代码漂移防护、测试骨架、接口契约与常见陷阱，具备直接开发条件）
 > Scope: 先设计并落地独立 Agent framework，再迁移 TUI-owned 行为，最后移除 Code TUI 并让 Web Code UI 成为唯一交互面；新增 entireio/cli 对齐轨道只扩展外部 Agent 能力、checkpoint/export 与 review/investigate 工作流，不改变 MCP 与内部 AgentRuntime 的边界。
 > Companion docs: Web/runtime 现状见 [`docs/development/commands/_general.md`](../commands/_general.md)；控制面契约见 [`docs/commands/code.md`](../../commands/code.md)「本地自动化控制」一节（W5-01 起，原 code-control 页降为迁移说明）；`libra agent` 外部捕获公共 CLI/API、E1-E9 wire 契约、AG-16~AG-24 任务卡与验收命令见 [`docs/development/tracing/agent.md`](../tracing/agent.md)；MCP stdio 独立命令拆分见 `mcp.md`（历史拆分计划，文档已删除、未落地，不得作为事实源；当前 MCP stdio 与 code-control 的边界见 `docs/development/tracing/code.md` 的 C6）。
@@ -3068,3 +3070,11 @@ Reasoning / thinking（推理 / 思考）支持是通过 provider 的 transform 
 - `claudecode` provider 没有复活；`claude-code` 只作为 observed external-agent slug/hook provider 出现。
 - 默认 CLI/Web 展示不输出 raw transcript/prompt/context；所有 transcript detail 读取都有 explicit request、size cap、redaction 和 fixture 覆盖。
 - Review/investigate 的 fix/mutation 全部通过内部 AgentRuntime serialized queue、approval/sandbox/tool gate 执行，observed external agent 只提供 evidence/provenance。
+
+## Task shell Rustup root preservation (FIX-PKT-04)
+
+`CommandSpec::shell` resolves task-worktree environment overrides in `sandbox/runtime.rs`. On Unix, before changing HOME, it derives RUSTUP_HOME from the original home only when the variable is absent and the resulting absolute UTF-8 `.rustup` directory exists. Explicit values, including values not representable by the String override map, remain inherited as OS environment bytes; no lossy Rustup path is manufactured. Missing or unrepresentable implicit roots receive no override. Windows USERPROFILE is unchanged, so no additional default-root override is needed there.
+
+HOME, CARGO_HOME, XDG and log paths remain task-local. RUSTUP_TOOLCHAIN is neither added nor replaced, preserving project and caller toolchain selection. This identifies the existing shared installation; it grants no additional filesystem, network or approval permission. Filesystem-restricted sandboxes must separately make both the tool executables and shared installation visible; this change does not add bwrap mounts. Rustup installations/updates may write to that directory only where the existing policy permits. Resolving the default adds at most one directory metadata query per relevant shell invocation, with no tool-probing subprocess, directory scan or toolchain copy.
+
+Three Unix inline tests (`task_shell_preserves_default_rustup_home`, `task_shell_preserves_explicit_rustup_environment`, `task_shell_rustup_home_derivation_is_conservative`) inject the original-home inputs without changing global environment. The existing executor Cargo-project test runs its real init/build assertions in a subprocess without inherited RUSTUP_HOME or CARGO, using a temporary home linked to the available Rustup installation; explicit toolchain selection is retained and automatic installation is disabled with `RUSTUP_AUTO_INSTALL=0` (rustup 1.28+). The parent checks the exact one-passed summary prefix, with a bounded child lifetime; the original shell command's 120-second timeout and the suite timeout remain in place. Bare Cargo installations still execute the same case. No scenario-runner or live-sandbox execution is claimed by these tests.

@@ -10,9 +10,11 @@
 //! 1. a non-empty `LIBRA_HOME` environment variable wins;
 //! 2. otherwise, when `LIBRA_CONFIG_GLOBAL_DB` is set (the global-config
 //!    isolation hook used by tests and sandboxes), the settings live next to
-//!    that database — its parent directory *is* the Libra home in the default
-//!    layout (`~/.libra/config.db`), so isolated environments are isolated
-//!    here too instead of silently touching the real user's upgrade state;
+//!    that database. This rule exists ONLY for explicit isolation calls: the
+//!    default layout is the XDG config directory since 2026-09-19 (GCX-01), so
+//!    it is no longer a description of where per-user state normally lives;
+//!    isolated environments must stay isolated instead of silently touching
+//!    the real user's upgrade state;
 //! 3. otherwise `$HOME/.libra` (falling back to the platform home directory
 //!    on systems where `HOME` is not set, e.g. Windows).
 //!
@@ -85,7 +87,7 @@ mod tests {
     use crate::utils::test::ScopedEnvVar;
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn explicit_libra_home_wins() {
         let _env = ScopedEnvVar::set(LIBRA_HOME_ENV, "/custom/libra-home");
         let _db = ScopedEnvVar::set(LIBRA_CONFIG_GLOBAL_DB_ENV, "/isolated/config.db");
@@ -96,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn global_db_isolation_hook_beats_home() {
         let _env = ScopedEnvVar::unset(LIBRA_HOME_ENV);
         let _db = ScopedEnvVar::set(LIBRA_CONFIG_GLOBAL_DB_ENV, "/isolated/store/config.db");
@@ -108,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn bare_relative_global_db_override_stays_isolated() {
         let _env = ScopedEnvVar::unset(LIBRA_HOME_ENV);
         let _db = ScopedEnvVar::set(LIBRA_CONFIG_GLOBAL_DB_ENV, "config.db");
@@ -120,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn empty_libra_home_is_treated_as_unset() {
         let _env = ScopedEnvVar::set(LIBRA_HOME_ENV, "");
         let _db = ScopedEnvVar::unset(LIBRA_CONFIG_GLOBAL_DB_ENV);
@@ -132,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn falls_back_to_home_dot_libra() {
         let _env = ScopedEnvVar::unset(LIBRA_HOME_ENV);
         let _db = ScopedEnvVar::unset(LIBRA_CONFIG_GLOBAL_DB_ENV);

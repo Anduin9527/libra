@@ -2,6 +2,291 @@
 
 ## [Unreleased]
 
+### Git conversion and shallow-source fetch
+
+- `libra init --from-git-repository` now follows the source repository's advertised
+  `HEAD`, including when it points to a branch other than `main`.
+- Git, HTTPS, and SSH fetches request the `shallow` capability only when the
+  server advertises it. Fetches from an already shallow Git source retain its
+  advertised history boundaries. Reference advertisements allow at most 4,096
+  distinct shallow boundaries; upload-pack responses separately allow at most
+  4,096 distinct OIDs across `shallow` and `unshallow` lines. Larger sets fail
+  instead of processing boundaries without a limit.
+  Response boundary lines are also capped at 8,192 including duplicates; OIDs
+  are checked against the server's object format, with violations reported as
+  `LBR-NET-002`.
+- Inspecting advertised shallow-boundary commits is capped at 4 MiB of decoded
+  payload per commit, 64 MiB of decoded commit payload per fetch, and 262,144
+  parent IDs in total. Exceeding a limit aborts the fetch or clone;
+  aggregate-limit errors suggest fetching fewer refs or asking the remote owner
+  to reduce its shallow boundaries.
+- Network Git (`git://`), HTTP(S), and SSH fetches, including clone's internal
+  fetch, verify wanted objects and fetched commit-parent links against final
+  shallow boundaries before updating refs; unmarked missing parents are refused.
+  The temporary parent-edge file is capped at 1 GiB and the in-pack commit-ID
+  index at 64 MiB per fetch. Further depth-response shallow-marker checks cap
+  requested-object and tag-target inspections at 16,384. The response ancestry
+  walk separately caps distinct commits and parent edges at 262,144 each.
+  Remote type probes and inspected tags share a 256 MiB decoded object-payload
+  budget across each shallow response validation. Exceeding a limit fails
+  closed; fetch fewer refs or split the fetch. Smart HTTP additionally rechecks
+  the source's shallow advertisement after upload-pack POST.
+- Clone documentation now distinguishes local shallow-source rejection from
+  the network post-fetch `--reject-shallow` check when `--depth` is also set.
+- The unsupported `libra::internal::protocol::DiscoveryResult` embedding API
+  gains a `shallow_boundaries` field. External code constructing that struct
+  directly must initialize the new field.
+
+## [0.23.65] — 2026-09-24
+
+### GnuPG key import into the repository vault (plan-20260921)
+
+> This section records the plan-20260921 GPG family. The key-import family and
+> its management-plane commands (`export-gpg-key`, `remove-gpg-key`,
+> `list --gpg-keys`, and versioned generated-key names) ship together in this
+> one release. Upstream versions `0.23.37`–`0.23.64` were published without
+> CHANGELOG sections, so the log below is intentionally scoped to this family.
+
+- `libra config import-gpg-key [--list|--key <fpr>|--file <path>|--passphrase-file <path>|--replace]`
+  adopts an existing GnuPG secret key into the repository vault: the first
+  import enables `vault.signing` when it is unset, an explicit `false` is kept
+  with an actionable note, duplicate imports are idempotent, and replacing a
+  different active key archives the previous public key under
+  `vault.gpg.history.<FPR>.pubkey` so earlier signatures keep verifying.
+- `libra config export-gpg-key [--fingerprint|--out <path>]` exports only the
+  public half (`--out` replaces atomically; `--quiet`/`--json`/`--machine` are
+  refused) and `libra config remove-gpg-key [--force]` removes an imported key
+  as **one transaction** — a failure at any of its four steps rolls back and
+  leaves the imported key active exactly as it was. The removed key's own public
+  half is archived as `vault.gpg.history.<FPR>.pubkey` first, so signatures it
+  already made keep verifying while the archive only ever gains a row.
+- `libra config list --gpg-keys` reports each entry's usage, key type, source
+  (`imported`/`generated`), fingerprint, signing key id, import time and
+  archived-history count; secret material is never printed (`vault.gpg.seckey_enc`
+  reads back as `<REDACTED>` and `--reveal` on a vault internal key is refused).
+- Verification (`libra tag -v`, `libra merge --verify-signatures`) accepts any
+  certificate in the repository allowlist (active key, generated fallback,
+  archived history) and evaluates revocation and expiry at the **signature's
+  own creation time**; signatures made by keys the repository never imported
+  are rejected.
+- Signing fails closed with a recovery hint when neither `vault.gpg.pubkey` nor
+  `vault.gpg.generated_pubkey` is published, instead of emitting a signature
+  the repository cannot verify.
+- `libra config generate-gpg-key` uses versioned vault key names
+  (`libra-signing-<unix-ns>`) with collision retries and a staged, resumable
+  migration when an imported key is active.
+
+## [0.23.36] — 2026-09-21
+
+### Operation v2 cutover and baseline stabilization
+
+- Completed the plan-20260822 operation/change cutover (#452): `libra op`,
+  change tracking, and every operation-state writer now run on the v2
+  operation model. The legacy operation model (`legacy_operation`,
+  `legacy_operation_model/*`), the v1 operation wrapper, and their test
+  suites are removed; the v1→v2 migration path stays forward-only.
+- `libra hooks <provider> <event>` (and the hidden `libra agent hooks …`
+  alias) no longer run the auto-upgrade startup recovery gate or the
+  `upgrade.mode=auto` check, so hook callbacks succeed from read-only
+  installations (immutable containers, CI sandboxes) without recovery
+  warnings (#502).
+- `libra op undo` / `libra op restore` acquire SQLite's write lock before
+  their read-then-write transactions, removing the intermittent
+  `restore storage failed: … database is locked` failure when the background
+  object-index consumer writes the same repository.
+- CI/test baseline: archive pathspec unit tests initialize a throwaway
+  repository and serialize on the `cwd` lane; rustdoc intra-doc links, the
+  `AddArgs.sparse` build initialization, and the permission-sensitive repair
+  fixtures (scratch root under `/tmp` with explicit `0o700/0o600` modes) are
+  repaired.
+
+## [0.23.3] — 2026-09-20
+
+### Removed: MCP and the `web/` directory
+
+- Removed every remaining MCP trace: the unused `rmcp` / `rig-core`
+  dependencies, hardening MCP tool classifications, `ControlInfo.mcp_url`,
+  the `e2e_mcp_flow` test and nine unregistered Code-era test files, and all
+  MCP mentions in code, tests, and current-facing docs. `libra` has no MCP
+  server surface and none is planned (DEFER-RC-04 closed by user decision).
+- Deleted the `web/` Next.js tree (39k files) and the release workflow's
+  Node/pnpm steps. Release version surfaces are now three: `Cargo.toml`,
+  `install.sh`, `install.ps1` (`compat_version_surface_sync` updated).
+  The long-orphaned `show_ref_exists` / `show_ref_verify` command tests were
+  removed with the Code-era test files (their assertions predate current
+  `show-ref` behavior).
+
+### Fixed: Windows release build
+
+The v0.23.2 Windows build failed because `tokio::signal` was not enabled on
+Windows (previously inherited through a dependency that was removed). The
+`signal` tokio feature is now declared explicitly, so `libra agent review` /
+`investigate` / `service` compile on `x86_64-pc-windows-msvc`.
+
+## [0.23.2] — 2026-09-20
+
+### Completed: internal Code executor removal and dead-code cleanup
+
+Finalizes the plan-20260920 teardown started in 0.23.0. No public surface
+changed in this release — the breaking surface removal shipped in 0.23.0.
+
+- Removed the Code UI / AgentRuntime executor compile SCC and its leftovers
+  (~223k lines): `web`, `orchestrator`, `runtime`, `mcp`, `codex`, `agent`,
+  `goal*`, `context_budget`, `projection`, `tools`, `usage`, `providers`,
+  `prompt`, `intentspec`, `node_adapter`, `libra_vcs`, `workspace_snapshot`,
+  `generated_artifacts`, and the non-SCC `client` / `commands` / `skills` /
+  `capability_package` / `package` modules. The binary no longer links any
+  Code-era executor.
+- `libra agent doctor` gains a read-only `legacy_code_residue` diagnostic
+  (`.libra/sessions/code`, `.libra/code`, `refs/libra/intent`); frozen
+  `ai_*` / `agent_usage_stats` tables stay untouched (ADR-RC-04).
+- Removed the Code UI test infrastructure: the `test-provider` feature, the
+  `web-check` CI job, the SSE-soak and model-generation nightly workflows,
+  and the `code_ui_*` / harness scenario targets.
+- Swept dead code left by the removal: fault-injection seams, zero-caller
+  legacy config/vault APIs, orphaned test fixtures and stale Code-era docs.
+- Long-lived docs, tracing pages, error-code references, and the plan index
+  now reflect the removal; `tests/INDEX.md` rows restored for kept targets.
+
+## [0.23.1] — 2026-09-19
+
+### Changed: global configuration moved to the XDG config directory
+
+Global config (`config.db`, vault unseal key, global hooks) now lives under
+`<XDG_CONFIG_HOME or ~/.config>/libra` on all platforms (macOS included). An
+existing `~/.libra/config.db` is migrated automatically on first use and kept
+as a backup; `LIBRA_HOME` (`bin/`, `env`, `upgrade/`) is unchanged.
+
+## [0.23.0] — 2026-09-19
+
+### Removed: public Code, graph, usage, and Publish surfaces
+
+Breaking minor after last `0.22.x` (`0.22.49`). The public development-agent
+and read-only site-host surfaces are gone in this release:
+
+- `libra code` (including `--control stdio`)
+- `libra graph`
+- `review --fix` / `investigate --fix`
+- `agent session promote --as-intent`
+- `libra usage`
+- `libra publish`
+- `clone libra+cloud://`
+
+Keep `libra cloud`, `libra agent` capture, read-only `review` / `investigate`,
+`sandbox`, `automation`, and `service`. Repository backup stays on
+`libra cloud`; ordinary remotes replace `libra+cloud://` clone. Internal
+modules and `worker/` are still linked until later `0.23.x` cleanup and are
+not a supported user surface.
+
+## [0.22.49] — 2026-09-18
+
+### Fixed: signed artifact size cap for Windows release binaries
+
+The official Windows `keyring` release binary for 0.22.48 grew to
+136,529,408 bytes, 2.2 MiB over the shared 128 MiB upload/install bound.
+The credential broker therefore rejected the Windows object list with
+`422 invalid_object_list`, so installers, Homebrew, and the stable
+manifest were not published.
+
+The signed-artifact cap is now 256 MiB across `libra upgrade`,
+`install.sh`, `install.ps1`, and the release broker. Windows installs of
+0.22.48 cannot `libra upgrade` across this bound; re-run `install.ps1`
+(or the updated installer after this release) to move onto 0.22.49.
+
+## [0.22.48] — 2026-09-18
+
+### Added: Git-aligned history rewrite and patch mode (#477)
+
+Libra now covers the remaining #477 / #495 history-rewrite gaps that were still
+open against git 2.54:
+
+- Sequencer recovery: `reset` and finishing `commit` clear stopped
+  cherry-pick / revert / merge state; `--continue` after an external finish of
+  the stopped item does not replay it; an in-progress merge can be completed
+  with an ordinary `commit`.
+- Conflict markers use the user-spelled target (for example `>>>>>>> y`)
+  rather than a 7-hex object id.
+- `commit --allow-empty-message` and typed empty-tree diagnostics; `branch
+  -u/--set-upstream-to <upstream> [<branch>]`, `--track` / `--no-track`,
+  refname-ordered listing, and `branch -d` refusals exit 1; local-upstream
+  refusals on `pull` / `push` / `fetch`; bare `switch --detach` /
+  `checkout --detach`; `tag -a/--annotate`; `rebase --autosquash` /
+  `--no-autosquash` and `rebase --root`.
+- `add -p` / `reset -p` (shared hunk engine, `--[no-]auto-advance`, `s` /
+  `e`, navigation). `add -i` and the remaining D15 patch surfaces stay
+  declined with stable diagnostics.
+- Public `rebase -i/--interactive` and `--edit-todo`: pick / reword / edit /
+  squash / fixup / exec / break / drop, plus `--autosquash`, `--root`,
+  `--exec`, and `--autostash` combinations. `--rebase-merges` and
+  `-i --update-refs` remain declined (D16 / DEFER-02).
+
+Website pages were not updated (`../libra-backend` is a `.libra` checkout;
+ER-06a fail-closed).
+
+## [Unreleased]
+
+### Changed: isolated agent tasks publish one main-workspace sync-back operation
+
+An isolated `libra code` DAG task no longer publishes an `agent.tool.*`
+operation for every mutating tool call inside its temporary copy/FUSE
+workspace. Tool permission, hardening, audit, redaction, and sandbox checks still
+run there. When the completed task is replayed into the main workspace, a
+successful view-changing replay instead publishes one
+`agent.task.sync-back` `WorkspaceMutation`; its `causal_context_id` is the task
+UUID. A replay that leaves the view unchanged does not create an operation.
+
+Transient scope-lease contention first gets a short bounded retry of sync-back
+from the same completed task workspace, without rerunning the task or consuming
+its fresh-baseline retry budget. Persistent contention can then use the normal
+task retry policy; stale-pointer and pre-replay CAS conflicts continue to use a
+fresh baseline. If replay has already completed but the operation record cannot
+be finalized, Libra fails without automatic retry and warns that the main
+workspace may already contain the task changes; inspect `libra status` and
+`libra op log` before recovering. Persistent scope-lock files now honor the existing
+`core.sharedRepository` group/all/numeric permissions, following Git's shared
+file-mode rules.
+
+### Fixed: authoritative HEAD for new operation-v2 captures
+
+New captures use the pinned scope's SQLite HEAD, with no sidecar/default-`main`
+fallback:
+missing, duplicate or corrupt rows and query errors reject capture, valid
+detached commits remain snapshot roots, and HEAD-only changes affect content
+identity. Existing immutable manifests are not rewritten. Full integration,
+implementation review and release acceptance remain pending. This is not a
+claim of reproduced GC data loss, full restore, or concurrent mixed-hash
+snapshot support.
+
+
+### Fixed: operation-v2 request isolation and conservative snapshot capture
+
+- V2 operations retain their own pinned request context across asynchronous work;
+  independent linked worktree gitdirs use separate scope leases. The lease makes
+  one zero-wait acquisition attempt and reports a busy scope/path before the
+  business callback or journal starts. Wait for the other operation to finish
+  and retry; do not delete the persistent lock file to resolve contention.
+  Closing its owning file releases the lock.
+- Snapshot ignore checks share the original scan deadline. Unknown ignore
+  decisions, ignore-file read failures (including invalid UTF-8), or deadline
+  expiry discard the visible-file listing and mark capture `Partial`, without
+  hashing or persisting files from that rejected listing. Ignore-file I/O/parsing
+  no longer holds the shared raw-source cache lock.
+- These unreleased changes do not add CLI flags or configuration settings,
+  promise an atomic filesystem snapshot or arbitrary-filesystem hard deadline,
+  or establish Windows runtime, full integration or release acceptance.
+
+### Fixed: operation-v2 convergence for repositories already upgraded by #472
+
+The forward-only `2026090801` migration handles repositories that already
+applied `2026090601` while missing operation-v2 migration `2026090101`.
+Original migration receipts and timestamps, legacy operation data, and
+`config`/`config_kv` values are preserved. Older binaries that do not support
+the new schema refuse access instead of using incompatible operation tables.
+
+Keep a verified consistent pre-upgrade backup: replacing the binary alone
+cannot downgrade the database. Controlled old-binary upgrade fixtures have
+passed focused validation; full integration and release acceptance remain open.
+
 ### Changed: `diff` scan progress is deferred, TTY-gated, and self-erasing (#466)
 
 `libra diff` no longer prints `Scanning working tree ...` on every invocation.

@@ -19,11 +19,23 @@ libra revert --abort
 
 该命令通过计算目标提交与其父提交之间的 diff，然后将该 diff 的逆应用到当前工作树和索引来工作。如果结果状态干净，会记录一个新提交，消息格式为 `Revert "<original subject>"`。
 
+当逆向更改与后续历史都修改了同一路径时，内容合并与 `libra merge`
+共用该路径的 `merge` gitattribute 与 `merge.default` 回退。内建支持
+`text`、`binary`、`union`；未知名称回退 `text`。union 在每个重叠区域
+依次保留 current 与要恢复的 parent 内容；binary driver 冲突保留完整
+current 文件，不插入文本标记。
+
 revert 提交使用当前 author 与 committer 身份/日期，并在创建提交时遵循与 `libra commit` 相同的 `GIT_AUTHOR_*` 与 `GIT_COMMITTER_*` 环境变量规则。生成的 subject 来自目标提交剥离签名后的消息正文，因此嵌入的 `gpgsig` 块不会被当作原始 subject。
 
 回滚 root 提交（没有父提交的提交）会产生空树，实际效果是撤销初始提交的更改。
 
 该命令要求处于活动分支（不是 detached HEAD）。它接受一个或多个提交引用，按给定顺序依次回滚（每个各自生成一个 revert commit）；冲突会停止该序列，用 `libra revert --continue` 收尾、`libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。当冲突中断多提交回滚时，其后仍待处理的提交会被记住，并在 `--continue`/`--skip` 续作序列时自动回滚。`-n/--no-commit` 与 `-m/--mainline` 仅适用于单个提交。
+
+新的 revert 在索引存在未合并条目时拒绝开始：在解析任何目标、写入索引、工作树、引用或 `revert-state.json` 之前，以 exit 128 与 `LBR-CONFLICT-001` 退出，并列出最多 10 条未合并路径（Git 以 `your index file is unmerged` 拒绝）。逐条解决后 `libra add`，或用 `libra reset --hard` 放弃冲突，然后重新执行 revert；该拒绝不写 revert state，`--continue`、`--skip`、`--abort` 对它不适用。
+
+已停止的 revert 不会比它所在的工作树活得更久：之后的 reset 会结束已停止的单提交 revert（在清除索引冲突阶段后），下一次 revert 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 revert。多提交序列保留剩余提交并记录被停提交已结束：`--continue` 不会重新提交已在序列外结束的停止项，而是继续 revert 剩余提交。`libra revert --abort` 仍会将 HEAD、索引和已跟踪文件恢复到 revert 前的状态，丢弃之后的已跟踪改动（包括 reset 选择的目标）。
+
+工作树物化按条目 mode 语义执行（plan issues/470 FM-02）：文件按条目权限位创建（`100755`→`0777`、`100644`→`0666`）并受进程 `umask` 约束，经同目录临时文件原子替换；索引/树条目保留 mode（`100755`/`100644`/`120000`）。
 
 ## 选项
 
@@ -166,7 +178,7 @@ Git 的 `--mainline <parent-number>` 会选择合并提交的某个父提交，�
 
 ### 冲突处理（`--continue`、`--skip`、`--abort`）
 
-冲突的 revert 会向工作树写入三方冲突标记，把 revert 状态记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决冲突并运行 `libra revert --continue` 收尾、`libra revert --skip` 丢弃当前提交继续，或 `libra revert --abort` 恢复 revert 前状态。
+冲突的 revert 会向工作树写入三方冲突标记（`<<<<<<< HEAD` / `>>>>>>> parent of <abbrev7> (<subject>)`；`merge.conflictStyle=diff3` 时祖先标签为 `<abbrev7> (<subject>)`），把 revert 状态记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决冲突并运行 `libra revert --continue` 收尾、`libra revert --skip` 丢弃当前提交继续，或 `libra revert --abort` 恢复 revert 前状态。
 
 1. **显式、对代理友好的错误。** 报告具体路径与错误码，便于代理以编程方式解决冲突并续作。
 2. **可预测的状态。** revert 状态集中在单个 `revert-state.json` 文件，而非散落的隐式标记。
@@ -175,6 +187,7 @@ Git 的 `--mainline <parent-number>` 会选择合并提交的某个父提交，�
 ### 冲突模型（三方合并）
 
 Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时干净更新文件；与后续更改重叠时，向工作树写入标准冲突标记，把未合并状态与 revert 进度记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决标记并运行 `libra revert --continue`、用 `libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。
+文本冲突与 merge/cherry-pick 共用 `merge.conflictStyle`：默认 `merge` 风格重新 diff 双方 postimage；`diff3` 加入完整 `||||||| <abbrev7> (<subject>)` ancestor 块；`zdiff3` 保留该块并把共同前后缀移到 marker 外。未知风格只会在内容合并仍有冲突、确需渲染时于索引或工作树写入前失败；干净合并不会被无关的呈现配置阻断。所有可识别输入行尾均为 CRLF 时 marker 行也使用 CRLF，否则使用 LF。binary driver 仍保留完整当前文件且不写 marker。
 
 ## 参数对比：Libra vs Git vs jj
 
@@ -205,9 +218,20 @@ Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时
 |------|-----------|------|
 | `LBR-REPO-001` | 不在 libra 仓库内 | 使用 `libra init` 初始化或进入仓库 |
 | `LBR-REPO-003` | HEAD detached（不在分支上） | 使用 `libra switch <branch>` 切换到分支 |
+| `LBR-REPO-003` | `--continue` 时之后的 reset 已结束该停止的 revert | 用 `libra revert --skip` 消化剩余提交，或用 `libra revert --abort` 恢复 revert 前状态（丢弃之后的已跟踪改动） |
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
 | `LBR-CLI-002` | 合并提交缺 `-m`、对非合并提交传 `-m`、父编号越界、非法 `--cleanup`，或 `-e`/`--edit` 下未配置编辑器、编辑器中止或消息为空 | 合并提交传有效 `-m <父编号>`；cleanup 使用 `strip`/`whitespace`/`verbatim`/`scissors`/`default`；`--edit` 需配置编辑器并保存非空消息 |
 | `LBR-CONFLICT-001` | 文件已被后续提交修改，产生冲突 | 解决冲突后 `libra revert --continue`、用 `libra revert --skip` 跳过当前提交，或 `libra revert --abort` 取消 |
+| `LBR-CONFLICT-001` | 索引已有未合并条目时新的 revert 被拒绝（不写 revert state） | 逐条解决并 `libra add`（或用 `libra reset --hard` 放弃）后重新执行 revert；`--continue`/`--skip`/`--abort` 不适用 |
 | `LBR-REPO-002` | apply/continue/skip/abort 期间索引损坏或不可读 | 修复或恢复 `.libra/index`；revert state 会保留以便重试恢复 |
 | `LBR-IO-001` | 无法加载对象（提交、树、blob） | 检查仓库完整性 |
 | `LBR-IO-002` | 无法保存对象、索引或更新 HEAD | 检查文件系统权限和仓库可写性 |
+
+### 暂存文本冲突与 reset 收尾
+
+revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也检查该次 revert 冲突路径的暂存内容：仍有 `<<<<<<<` 标记或 blob 无法读取时，保留 revert 状态并发出恢复警告。因此即使 `ls-files --unmerged` 为空，`--soft` 也不会丢掉恢复状态。解决并重新暂存内容（或从索引移除路径），或通过 `--mixed`/`--hard` 将索引替换为干净内容后，可以正常收尾。仅工作树中残留的标记不阻止 mixed reset 收尾。本次不改变 revert 的冲突表示及 `--continue` 行为。
+
+## Issue #477 notes
+
+--continue 不会重新提交已在序列外结束的停止项
+冲突标记以「parent of」加缩写提交标注被 revert 的一侧

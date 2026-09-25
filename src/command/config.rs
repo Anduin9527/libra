@@ -7,7 +7,7 @@ use std::{io::IsTerminal, path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 use once_cell::sync::Lazy;
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use sea_orm::{DatabaseConnection, DatabaseTransaction};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -17,14 +17,24 @@ use crate::{
             ConfigKv, ConfigKvEntry, is_memory_owned_config_key, is_sensitive_key,
             is_vault_internal_key,
         },
-        db::{create_database, establish_connection, get_db_conn_instance},
+        db::{
+            DatabaseRole, begin_write_transaction, get_db_conn_instance,
+            schema::{
+                create_configuration_database, ensure_configuration_schema_is_current,
+                open_configuration_database,
+            },
+            write_configuration_barrier,
+        },
         upgrade::settings::{
             UPGRADE_MODE_KEY, UpgradeMode, UpgradeSettingsError, read_mode as read_upgrade_mode,
             settings_path as upgrade_settings_path, write_mode as write_upgrade_mode,
         },
         vault::{
-            decrypt_token, encrypt_token, generate_pgp_key, generate_ssh_key_pair,
-            lazy_init_vault_for_scope, load_unseal_key_for_scope,
+            decrypt_token, describe_public_key, discover_gpg_secret_keys, encrypt_token,
+            export_gpg_secret_key, generate_pgp_key, generate_ssh_key_pair, gpg_source,
+            gpg_version_at_least, key_fingerprint_from_armor, lazy_init_vault_for_scope,
+            load_unseal_key_for_scope, persist_imported_gpg_key, prepare_imported_key,
+            remove_imported_gpg_key, select_signing_candidate,
         },
     },
     utils::{
@@ -35,6 +45,9 @@ use crate::{
         util::{DATABASE, try_get_storage_path},
     },
 };
+
+mod doctor;
+mod repair;
 
 /// Cached database connection for Global scope, paired with the resolved DB path.
 static GLOBAL_CONFIG_CONN: Lazy<Mutex<Option<(PathBuf, DatabaseConnection)>>> =
@@ -62,6 +75,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     libra config generate-ssh-key --remote origin      Generate SSH key for remote
     libra config generate-gpg-key                      Generate GPG signing key
     libra config list --name-only                      List all key names
+    libra config doctor --global-schema                 Diagnose global schema without values or writes
     libra config path                                  Show config DB path"#;
 
 /// Configuration scope that determines where values are stored and retrieved.
@@ -69,7 +83,8 @@ const EXAMPLES: &str = r#"EXAMPLES:
 pub enum ConfigScope {
     /// Repository-specific (`.libra/libra.db`). Default for writes.
     Local,
-    /// User-level (`~/.libra/config.db`).
+    /// User-level (`<config dir>/libra/config.db`, falling back to the legacy
+    /// `~/.libra/config.db` until the migration lands).
     Global,
     /// System-wide (`/etc/libra/config.db`, overridable via
     /// `LIBRA_CONFIG_SYSTEM_DB`). Lowest precedence; writing it usually needs
@@ -78,6 +93,14 @@ pub enum ConfigScope {
 }
 
 impl ConfigScope {
+    pub fn database_role(self) -> DatabaseRole {
+        match self {
+            Self::Local => DatabaseRole::Repository,
+            Self::Global => DatabaseRole::GlobalConfig,
+            Self::System => DatabaseRole::SystemConfig,
+        }
+    }
+
     /// Cascade order for reads (highest to lowest precedence): local overrides
     /// global, which overrides system — matching Git.
     pub const CASCADE_ORDER: [ConfigScope; 3] =
@@ -87,12 +110,7 @@ impl ConfigScope {
     pub fn get_config_path(&self) -> Option<PathBuf> {
         match self {
             ConfigScope::Local => None,
-            ConfigScope::Global => {
-                if let Some(p) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB") {
-                    return Some(PathBuf::from(p));
-                }
-                dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
-            }
+            ConfigScope::Global => crate::internal::config::global_config_path(),
             ConfigScope::System => {
                 if let Some(p) = std::env::var_os("LIBRA_CONFIG_SYSTEM_DB") {
                     return Some(PathBuf::from(p));
@@ -103,40 +121,10 @@ impl ConfigScope {
     }
 
     pub async fn ensure_config_exists(&self) -> Result<(), String> {
-        match self {
-            ConfigScope::Local => Ok(()),
-            ConfigScope::Global | ConfigScope::System => {
-                let label = scope_name(*self);
-                if let Some(config_path) = self.get_config_path() {
-                    if let Some(parent_dir) = config_path.parent()
-                        && !parent_dir.exists()
-                    {
-                        std::fs::create_dir_all(parent_dir).map_err(|e| {
-                            format!(
-                                "Failed to create {label} config directory '{}': {e}{}",
-                                parent_dir.display(),
-                                if matches!(self, ConfigScope::System) {
-                                    " (writing system config usually requires elevated privileges)"
-                                } else {
-                                    ""
-                                }
-                            )
-                        })?;
-                    }
-                    if !config_path.exists() {
-                        let config_path_str = config_path.to_string_lossy();
-                        create_database(&config_path_str).await.map_err(|e| {
-                            format!("Failed to create {label} config database: {e}")
-                        })?;
-                    }
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "Could not determine {label} config path: home directory not available"
-                    ))
-                }
-            }
+        if *self != ConfigScope::Local {
+            ScopedConfig::get_connection(*self).await?;
         }
+        Ok(())
     }
 }
 
@@ -175,28 +163,97 @@ impl ScopedConfig {
         scope: ConfigScope,
         scope_name: &str,
     ) -> Result<DatabaseConnection, String> {
-        let Some(config_path) = scope.get_config_path() else {
+        // plan-20260919 GCX-02: acquiring a global connection is the trigger
+        // for the one-time legacy migration, so the path is resolved through
+        // the migrating resolver rather than the pure path query.
+        let config_path = match scope {
+            ConfigScope::Global => crate::internal::config::global_config_path_for_read().await,
+            _ => scope.get_config_path(),
+        };
+        let Some(config_path) = config_path else {
             return Err(format!(
                 "Could not determine config path for {scope_name} scope"
             ));
         };
         let mut guard = cache.lock().await;
+        let role = scope.database_role();
         if let Some((cached_path, cached_conn)) = guard.as_ref() {
             if cached_path == &config_path {
+                ensure_configuration_schema_is_current(cached_conn, role)
+                    .await
+                    .map_err(|error| {
+                        format!("Failed to validate {scope_name} config database: {error}")
+                    })?;
                 return Ok(cached_conn.clone());
             }
             *guard = None;
         }
-        scope.ensure_config_exists().await?;
-        let config_path_str = config_path.to_string_lossy();
-        let conn = establish_connection(&config_path_str)
-            .await
-            .map_err(|e| format!("Failed to connect to {scope_name} config database: {e}"))?;
+        let exists = config_path.try_exists().map_err(|error| {
+            format!(
+                "Failed to inspect {scope_name} config database '{}': {error}",
+                config_path.display()
+            )
+        })?;
+        let conn = if exists {
+            open_configuration_database(&config_path, role).await
+        } else {
+            if let Some(parent) = config_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Failed to create {scope_name} config directory '{}': {error}{}",
+                        parent.display(),
+                        if scope == ConfigScope::System {
+                            " (writing system config usually requires elevated privileges)"
+                        } else {
+                            ""
+                        }
+                    )
+                })?;
+            }
+            match create_configuration_database(&config_path, role).await {
+                // Another process may have created the file since the probe.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_configuration_database(&config_path, role).await
+                }
+                result => result,
+            }
+        }
+        .map_err(|error| format!("Failed to connect to {scope_name} config database: {error}"))?;
         *guard = Some((config_path, conn.clone()));
         Ok(conn)
     }
 
     // ── ConfigKv wrappers with scope ─────────────────────────────────
+
+    async fn begin_mutation(scope: ConfigScope) -> Result<DatabaseTransaction, String> {
+        // A write must never land while the legacy and XDG databases could
+        // both be live, so a failed migration fails the write closed
+        // (ADR-GCX-02 §6) instead of silently writing to the legacy file.
+        if scope == ConfigScope::Global {
+            crate::internal::config::global_config_path_for_write().await?;
+        }
+        let conn = Self::get_connection(scope).await?;
+        let txn = begin_write_transaction(&conn).await.map_err(|error| {
+            format!(
+                "failed to start {} config transaction: {error}",
+                scope_name(scope)
+            )
+        })?;
+        if scope != ConfigScope::Local {
+            write_configuration_barrier(&txn, scope.database_role())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to protect {} config before writing: {error}",
+                        scope_name(scope)
+                    )
+                })?;
+        }
+        Ok(txn)
+    }
 
     pub async fn get(scope: ConfigScope, key: &str) -> Result<Option<ConfigKvEntry>, String> {
         let conn = Self::get_connection(scope).await?;
@@ -218,10 +275,13 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::set_with_conn(&conn, key, value, encrypted)
+        let txn = Self::begin_mutation(scope).await?;
+        ConfigKv::set_with_conn(&txn, key, value, encrypted)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to set config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn add(
@@ -230,24 +290,35 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::add_with_conn(&conn, key, value, encrypted)
+        let txn = Self::begin_mutation(scope).await?;
+        ConfigKv::add_with_conn(&txn, key, value, encrypted)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to add config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn unset(scope: ConfigScope, key: &str) -> Result<usize, String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::unset_with_conn(&conn, key)
+        let txn = Self::begin_mutation(scope).await?;
+        let removed = ConfigKv::unset_with_conn(&txn, key)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(removed)
     }
 
     pub async fn unset_all(scope: ConfigScope, key: &str) -> Result<usize, String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::unset_all_with_conn(&conn, key)
+        let txn = Self::begin_mutation(scope).await?;
+        let removed = ConfigKv::unset_all_with_conn(&txn, key)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(removed)
     }
 
     pub async fn list_all(scope: ConfigScope) -> Result<Vec<ConfigKvEntry>, String> {
@@ -376,6 +447,18 @@ pub struct ConfigArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
+    /// Diagnose global schema metadata without reading configuration values
+    Doctor {
+        /// Inspect only the global configuration schema (required)
+        #[clap(long, required = true)]
+        global_schema: bool,
+        /// Repair an attested legacy global schema after a verified backup (Unix)
+        #[clap(long, requires = "confirm")]
+        repair: bool,
+        /// Confirm the exact absolute canonical global database path
+        #[clap(long, requires = "repair", value_name = "CANONICAL_PATH")]
+        confirm: Option<PathBuf>,
+    },
     /// Set a configuration value
     Set {
         /// Configuration key (dotted format, e.g. user.name)
@@ -462,6 +545,39 @@ pub enum ConfigCommand {
         #[clap(long, value_name = "KIND")]
         usage: Option<String>,
     },
+    /// Import a GPG signing key from the GnuPG home or an armored file
+    ImportGpgKey {
+        /// Fingerprint or key id to import (required when multiple candidates)
+        #[clap(long, value_name = "FPR")]
+        key: Option<String>,
+        /// List discoverable secret keys and exit
+        #[clap(long)]
+        list: bool,
+        /// Import a secret key from an armored file instead of the GnuPG home
+        #[clap(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Read the passphrase from a file
+        #[clap(long, value_name = "PATH")]
+        passphrase_file: Option<PathBuf>,
+        /// Replace the active key (archive it to history first)
+        #[clap(long)]
+        replace: bool,
+    },
+    /// Export the active GPG public key
+    ExportGpgKey {
+        /// Write the public key to a file instead of stdout
+        #[clap(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Print only the primary fingerprint
+        #[clap(long)]
+        fingerprint: bool,
+    },
+    /// Remove the active imported GPG key (falls back to the generated key)
+    RemoveGpgKey {
+        /// Bypass the confirmation prompt for the active key
+        #[clap(long)]
+        force: bool,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -507,6 +623,18 @@ struct ConfigGpgKeyEntry {
     key_type: String,
     pubkey_config_key: String,
     signing_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signing_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_count: Option<usize>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -525,11 +653,75 @@ pub async fn execute_safe(args: ConfigArgs, output: &OutputConfig) -> CliResult<
     execute_inner(args, output).await
 }
 
+/// The exact diagnostic variant, including flag combinations that will be
+/// refused. Refusal must not run a migration or auto-upgrade before validation.
+pub fn is_schema_doctor_request(args: &ConfigArgs) -> bool {
+    matches!(args.command, Some(ConfigCommand::Doctor { .. }))
+}
+
+pub fn is_schema_repair_request(args: &ConfigArgs) -> bool {
+    matches!(
+        args.command,
+        Some(ConfigCommand::Doctor { repair: true, .. })
+    )
+}
+
+fn validate_schema_doctor_args(args: &ConfigArgs) -> CliResult<()> {
+    let requested = matches!(
+        args.command,
+        Some(ConfigCommand::Doctor {
+            global_schema: true,
+            ..
+        })
+    );
+    if let Some(ConfigCommand::Doctor {
+        repair, confirm, ..
+    }) = &args.command
+        && *repair != confirm.is_some()
+    {
+        return Err(CliError::command_usage(
+            "schema repair requires both --repair and --confirm <canonical-global-db-path>",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    if !requested
+        || args.local
+        || args.system
+        || args.get
+        || args.get_all
+        || args.unset
+        || args.unset_all
+        || args.list
+        || args.add
+        || args.import
+        || args.get_regexp
+        || args.show_origin
+        || args.remove_section
+        || args.rename_section
+        || args.null
+        || args.value_type.is_some()
+        || args.type_bool
+        || args.type_int
+        || args.type_path
+        || args.key.is_some()
+        || args.valuepattern.is_some()
+        || args.default.is_some()
+    {
+        return Err(CliError::command_usage(
+            "use libra config doctor --global-schema without value, action, type, --local or --system options",
+        ).with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Dispatch logic
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()> {
+    if is_schema_doctor_request(&args) {
+        validate_schema_doctor_args(&args)?;
+    }
     let scope = get_scope(&args);
     let use_cascade = !has_explicit_scope(&args);
 
@@ -551,6 +743,18 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
     }
 
     match cmd {
+        ResolvedCommand::Doctor => {
+            if let Some(ConfigCommand::Doctor {
+                repair: true,
+                confirm: Some(path),
+                ..
+            }) = &args.command
+            {
+                repair::execute(path, output).await
+            } else {
+                doctor::execute(output).await
+            }
+        }
         ResolvedCommand::Set {
             key,
             value,
@@ -646,6 +850,30 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 output,
             )
             .await
+        }
+        ResolvedCommand::ImportGpgKey {
+            key,
+            list,
+            file,
+            passphrase_file,
+            replace,
+        } => {
+            handle_import_gpg_key(
+                key.as_deref(),
+                list,
+                file.as_deref(),
+                passphrase_file.as_deref(),
+                replace,
+                scope,
+                output,
+            )
+            .await
+        }
+        ResolvedCommand::ExportGpgKey { out, fingerprint } => {
+            handle_export_gpg_key(out.as_deref(), fingerprint, scope, output).await
+        }
+        ResolvedCommand::RemoveGpgKey { force } => {
+            handle_remove_gpg_key(force, scope, output).await
         }
     }
 }
@@ -1067,6 +1295,7 @@ fn upgrade_list_entry(name_only: bool, with_origin: bool) -> CliResult<Option<Co
 
 #[derive(Debug)]
 enum ResolvedCommand {
+    Doctor,
     Set {
         key: String,
         value: Option<String>,
@@ -1130,6 +1359,20 @@ enum ResolvedCommand {
         email: Option<String>,
         usage: Option<String>,
     },
+    ImportGpgKey {
+        key: Option<String>,
+        list: bool,
+        file: Option<PathBuf>,
+        passphrase_file: Option<PathBuf>,
+        replace: bool,
+    },
+    ExportGpgKey {
+        out: Option<PathBuf>,
+        fingerprint: bool,
+    },
+    RemoveGpgKey {
+        force: bool,
+    },
 }
 
 fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
@@ -1163,6 +1406,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
     // If an explicit subcommand was provided, use it directly
     if let Some(ref cmd) = args.command {
         return Ok(match cmd {
+            ConfigCommand::Doctor { .. } => ResolvedCommand::Doctor,
             ConfigCommand::Set {
                 key,
                 value,
@@ -1226,6 +1470,26 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                     email: email.clone(),
                     usage: usage.clone(),
                 }
+            }
+            ConfigCommand::ImportGpgKey {
+                key,
+                list,
+                file,
+                passphrase_file,
+                replace,
+            } => ResolvedCommand::ImportGpgKey {
+                key: key.clone(),
+                list: *list,
+                file: file.clone(),
+                passphrase_file: passphrase_file.clone(),
+                replace: *replace,
+            },
+            ConfigCommand::ExportGpgKey { out, fingerprint } => ResolvedCommand::ExportGpgKey {
+                out: out.clone(),
+                fingerprint: *fingerprint,
+            },
+            ConfigCommand::RemoveGpgKey { force } => {
+                ResolvedCommand::RemoveGpgKey { force: *force }
             }
         });
     }
@@ -1680,14 +1944,18 @@ async fn render_get_value(
     scope: ConfigScope,
     _use_cascade: bool,
 ) -> CliResult<String> {
-    if is_memory_owned_config_key(&entry.key) {
+    // predicate-first: an internal key must be redacted even when it was
+    // (incorrectly) stored as plaintext — the encrypted early-return below
+    // must never win over this check.
+    if is_vault_internal_key(&entry.key) || is_memory_owned_config_key(&entry.key) {
         return Ok("<REDACTED>".to_string());
     }
+
     if !entry.encrypted {
         return Ok(entry.value.clone());
     }
 
-    if !reveal || is_vault_internal_key(&entry.key) {
+    if !reveal {
         return Ok("<REDACTED>".to_string());
     }
 
@@ -2161,9 +2429,29 @@ async fn handle_list(
                         ""
                     };
                     println!(
-                        "  {:<10} {}{}",
-                        entry.usage, entry.pubkey_config_key, signing_suffix
+                        "  {:<10} {} ({}){}",
+                        entry.usage, entry.pubkey_config_key, entry.key_type, signing_suffix
                     );
+                    if let Some(source) = &entry.source {
+                        println!("    source:       {source}");
+                    }
+                    if let Some(fp) = &entry.fingerprint {
+                        println!("    fingerprint:  {fp}");
+                    }
+                    if let Some(skid) = &entry.signing_key_id {
+                        println!("    signing key:  {skid}");
+                    }
+                    if let Some(uid) = &entry.uid
+                        && !uid.is_empty()
+                    {
+                        println!("    uid:          {uid}");
+                    }
+                    if let Some(imported_at) = &entry.imported_at {
+                        println!("    imported_at:  {imported_at}");
+                    }
+                    if let Some(history) = entry.history_count {
+                        println!("    history:      {history} archived key(s)");
+                    }
                 }
                 println!();
                 println!("{} keys configured", entries.len());
@@ -2383,6 +2671,16 @@ async fn list_ssh_key_entries(scope: ConfigScope) -> CliResult<Vec<ConfigSshKeyE
 }
 
 async fn list_gpg_key_entries(scope: ConfigScope) -> CliResult<Vec<ConfigGpgKeyEntry>> {
+    reject_non_local_scope(scope, "list --gpg-keys")?;
+
+    async fn get_meta_value(scope: ConfigScope, key: &str) -> Option<String> {
+        ScopedConfig::get(scope, key)
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value)
+    }
+
     let mut entries = ScopedConfig::list_all(scope)
         .await
         .map_err(CliError::from_legacy_string)?
@@ -2396,11 +2694,11 @@ async fn list_gpg_key_entries(scope: ConfigScope) -> CliResult<Vec<ConfigGpgKeyE
                     .to_string(),
                 _ => return None,
             };
-            Some((usage, entry.key))
+            Some((usage, entry.key, entry.value))
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
-    entries.dedup_by(|left, right| left.0 == right.0);
+    entries.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
 
     let signing_enabled = ScopedConfig::get(scope, "vault.signing")
         .await
@@ -2408,14 +2706,42 @@ async fn list_gpg_key_entries(scope: ConfigScope) -> CliResult<Vec<ConfigGpgKeyE
         .map(|entry| entry.value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // Imported-key metadata (ADR-VG-02 keyspace). These are attacker-visible
+    // metadata only — no secret material.
+    let source = get_meta_value(scope, "vault.gpg.source").await;
+    let fingerprint = get_meta_value(scope, "vault.gpg.fingerprint").await;
+    let signing_key_id = get_meta_value(scope, "vault.gpg.signing_key_id").await;
+    let uid = get_meta_value(scope, "vault.gpg.uid").await;
+    let imported_at = get_meta_value(scope, "vault.gpg.imported_at").await;
+    let history_count = ScopedConfig::get_by_prefix(scope, "vault.gpg.history.")
+        .await
+        .map_err(CliError::from_legacy_string)?
+        .len();
+
+    let describe_key_type = |pubkey_armor: &str| {
+        describe_public_key(pubkey_armor).unwrap_or_else(|_| "PGP".to_string())
+    };
+
     Ok(entries
         .into_iter()
-        .map(|(usage, pubkey_config_key)| ConfigGpgKeyEntry {
-            signing_enabled: usage == "signing" && signing_enabled,
-            usage,
-            key_type: "PGP 2048".to_string(),
-            pubkey_config_key,
-        })
+        .map(
+            |(usage, pubkey_config_key, pubkey_armor)| ConfigGpgKeyEntry {
+                signing_enabled: usage == "signing" && signing_enabled,
+                key_type: describe_key_type(&pubkey_armor),
+                usage,
+                pubkey_config_key,
+                source: if source.as_deref().is_some() {
+                    source.clone()
+                } else {
+                    None
+                },
+                fingerprint: fingerprint.clone(),
+                signing_key_id: signing_key_id.clone(),
+                uid: uid.clone(),
+                imported_at: imported_at.clone(),
+                history_count: (history_count > 0).then_some(history_count),
+            },
+        )
         .collect())
 }
 
@@ -2545,12 +2871,8 @@ async fn handle_remove_section(
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    let conn = ScopedConfig::get_connection(scope)
-        .await
-        .map_err(config_read_cli_error)?;
-    // Begin first so the existence check and the deletes are one atomic unit.
-    let txn = conn
-        .begin()
+    // Lock before reading; the compatibility marker rolls back with deletes.
+    let txn = ScopedConfig::begin_mutation(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
 
@@ -2611,11 +2933,7 @@ async fn handle_rename_section(
         .with_exit_code(2));
     }
 
-    let conn = ScopedConfig::get_connection(scope)
-        .await
-        .map_err(config_read_cli_error)?;
-    let txn = conn
-        .begin()
+    let txn = ScopedConfig::begin_mutation(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
 
@@ -2772,20 +3090,36 @@ async fn handle_path(scope: ConfigScope, output: &OutputConfig) -> CliResult<()>
     };
 
     let exists = path.exists();
+    let resolution = if scope == ConfigScope::Global {
+        crate::internal::config::global_config_resolution()
+    } else {
+        None
+    };
 
     if output.is_json() {
-        emit_json_data(
-            "config",
-            &serde_json::json!({
-                "action": "path",
-                "scope": scope_name(scope),
-                "path": path.to_string_lossy(),
-                "exists": exists,
-            }),
-            output,
-        )?;
+        let mut data = serde_json::json!({
+            "action": "path",
+            "scope": scope_name(scope),
+            "path": path.to_string_lossy(),
+            "exists": exists,
+        });
+        if let Some(resolution) = resolution.as_ref() {
+            data["source"] = serde_json::json!(resolution.source.as_str());
+            data["legacy_path"] = match resolution.legacy_path.as_ref() {
+                Some(legacy) => serde_json::json!(legacy.to_string_lossy()),
+                None => serde_json::Value::Null,
+            };
+            data["legacy_exists"] = serde_json::json!(resolution.legacy_exists);
+            data["migration_pending"] = serde_json::json!(resolution.migration_pending);
+        }
+        emit_json_data("config", &data, output)?;
     } else if !output.quiet {
         println!("{}", path.display());
+        if let Some(resolution) = resolution.as_ref()
+            && let Some(notice) = crate::internal::config::legacy_global_config_notice(resolution)
+        {
+            eprintln!("warning: {notice}");
+        }
     }
     Ok(())
 }
@@ -2951,23 +3285,33 @@ async fn handle_generate_gpg_key(
         .map(String::from)
         .unwrap_or_else(|| "user@libra.local".to_string());
 
-    let public_key = generate_pgp_key(&storage, &unseal_key, &user_name, &user_email)
+    let (public_key, _key_name) = generate_pgp_key(&storage, &unseal_key, &user_name, &user_email)
         .await
         .map_err(|e| {
             CliError::from_legacy_string(format!("error: GPG key generation failed: {e}"))
         })?;
 
-    // Store pubkey under usage-specific dotted key
+    // generate_pgp_key already persisted vault.gpg.generated_key_name,
+    // vault.gpg.pubkey and vault.gpg.source for the signing key. The encrypt
+    // usage keeps a separate namespace slot.
     let pubkey_config_key = if is_signing {
         "vault.gpg.pubkey".to_string()
     } else {
         format!("vault.gpg.{usage}.pubkey")
     };
-    let _ = ConfigKv::set(&pubkey_config_key, &public_key, false).await;
+    if !is_signing {
+        ConfigKv::set(&pubkey_config_key, &public_key, false)
+            .await
+            .map_err(|e| {
+                config_write_cli_error(format!("failed to persist GPG public key: {e}"))
+            })?;
+    }
 
-    // Only enable vault.signing for signing usage
+    // Enable commit signing (signing usage only). No `let _ =` swallowing.
     if is_signing {
-        let _ = ConfigKv::set("vault.signing", "true", false).await;
+        ConfigKv::set("vault.signing", "true", false)
+            .await
+            .map_err(|e| config_write_cli_error(format!("failed to enable commit signing: {e}")))?;
     }
 
     if output.is_json() {
@@ -3013,6 +3357,444 @@ fn reject_global_key_generation(scope: ConfigScope, command: &str) -> CliResult<
         "{command} only supports local scope; --global key generation is not supported yet"
     ))
     .with_hint("run without --global to generate a repository-local key"))
+}
+
+fn reject_non_local_scope(scope: ConfigScope, command: &str) -> CliResult<()> {
+    if scope == ConfigScope::Local {
+        return Ok(());
+    }
+    Err(CliError::command_usage(format!(
+        "{command} only supports the local scope; --global/--system are not supported"
+    )))
+}
+
+fn not_a_repo_error() -> CliError {
+    CliError::from_legacy_string("error: not a libra repository")
+}
+
+fn usage_error(message: impl Into<String>) -> CliError {
+    CliError::command_usage(message).with_stable_code(StableErrorCode::CliInvalidArguments)
+}
+
+fn gpg_io_error(message: impl Into<String>) -> CliError {
+    CliError::fatal(message)
+        .with_stable_code(StableErrorCode::IoReadFailed)
+        .with_exit_code(128)
+}
+
+fn gpg_unsupported_error(message: impl Into<String>) -> CliError {
+    CliError::fatal(message)
+        .with_stable_code(StableErrorCode::Unsupported)
+        .with_exit_code(128)
+}
+
+fn gpg_conflict_error(message: impl Into<String>) -> CliError {
+    CliError::fatal(message)
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_exit_code(128)
+}
+
+fn unix_timestamp_secs() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+async fn resolve_gpg_program(scope: ConfigScope) -> String {
+    ScopedConfig::get(scope, "gpg.program")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "gpg".to_string())
+}
+
+fn resolve_gnupghome() -> CliResult<Option<std::path::PathBuf>> {
+    let Some(raw) = std::env::var_os("GNUPGHOME") else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(&raw);
+    if !path.is_absolute() {
+        return Err(usage_error(
+            "GNUPGHOME must be an absolute path (refusing a relative GnuPG home)",
+        ));
+    }
+    Ok(Some(path))
+}
+
+async fn load_or_init_local_unseal_key(output: &OutputConfig) -> CliResult<Vec<u8>> {
+    match load_unseal_key_for_scope("local").await {
+        Some(key) => Ok(key),
+        None => {
+            let key = lazy_init_vault_for_scope("local").await.map_err(|e| {
+                CliError::from_legacy_string(format!(
+                    "error: failed to initialize vault for local scope: {e}"
+                ))
+            })?;
+            if !output.quiet {
+                println!("Initialized vault for local scope");
+            }
+            Ok(key)
+        }
+    }
+}
+
+/// Acquire the passphrase (file > hidden TTY prompt > `None` when non-interactive
+/// and no `--passphrase-file`). Zero-ing is the caller's responsibility; the
+/// plaintext string is dropped as soon as `prepare_imported_key` returns.
+/// Read the GPG passphrase for an import.
+///
+/// The returned buffer and the intermediate file contents are wrapped in
+/// `Zeroizing` so the passphrase never survives in a freed heap block
+/// (plan-20260921 GC-VG-01).
+fn acquire_passphrase(
+    passphrase_file: Option<&std::path::Path>,
+) -> CliResult<Option<zeroize::Zeroizing<String>>> {
+    if let Some(path) = passphrase_file {
+        use std::io::Read;
+
+        // Read straight into a pre-sized, self-wiping buffer: neither a
+        // helper-allocated intermediate String nor a `to_string()` copy is
+        // created, so no un-wiped copy of the passphrase can be released when
+        // a buffer grows (plan-20260921 GC-VG-01).
+        let mut file = std::fs::File::open(path).map_err(|e| {
+            gpg_io_error(format!(
+                "failed to read passphrase file '{}': {e}",
+                path.display()
+            ))
+        })?;
+        let mut text = zeroize::Zeroizing::new(String::new());
+        file.read_to_string(&mut text).map_err(|e| {
+            gpg_io_error(format!(
+                "failed to read passphrase file '{}': {e}",
+                path.display()
+            ))
+        })?;
+        let trimmed = text.trim_end_matches(['\n', '\r']).len();
+        text.truncate(trimmed);
+        return Ok(Some(text));
+    }
+
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        let pw = rpassword::prompt_password("Enter passphrase for GPG key: ")
+            .map_err(|e| gpg_io_error(format!("failed to read passphrase: {e}")))?;
+        return Ok(Some(zeroize::Zeroizing::new(pw)));
+    }
+
+    Ok(None)
+}
+
+async fn handle_import_gpg_key_list(scope: ConfigScope, output: &OutputConfig) -> CliResult<()> {
+    reject_non_local_scope(scope, "import-gpg-key")?;
+    let gpg_program = resolve_gpg_program(scope).await;
+    let gnupghome = resolve_gnupghome()?;
+    let (version, candidates) = discover_gpg_secret_keys(&gpg_program, gnupghome.as_deref())
+        .await
+        .map_err(|e| {
+            gpg_unsupported_error(format!(
+                "gpg is unavailable or failed: {e}\nhint: use --file to import a raw armored secret key, or install gpg >= 2.2"
+            ))
+        })?;
+    if !gpg_version_at_least(version, 2, 2) {
+        return Err(gpg_unsupported_error(
+            "gpg must be >= 2.2 for HOME-based import; use --file to import a raw key",
+        ));
+    }
+
+    if output.is_json() {
+        let rows: Vec<serde_json::Value> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "fingerprint": c.fingerprint,
+                    "key_id": c.key_id,
+                    "uid": c.uid,
+                    "algorithm_bits": c.algorithm_bits,
+                    "capabilities": c.capabilities,
+                })
+            })
+            .collect();
+        emit_json_data("config", &serde_json::json!({ "gpg_keys": rows }), output)?;
+    } else {
+        for c in &candidates {
+            println!(
+                "{}  {}  {}  {}  {}",
+                c.fingerprint, c.key_id, c.uid, c.algorithm_bits, c.capabilities
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn handle_import_gpg_key(
+    key: Option<&str>,
+    list: bool,
+    file: Option<&std::path::Path>,
+    passphrase_file: Option<&std::path::Path>,
+    replace: bool,
+    scope: ConfigScope,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if list {
+        return handle_import_gpg_key_list(scope, output).await;
+    }
+    reject_non_local_scope(scope, "import-gpg-key")?;
+
+    let _ = try_get_storage_path(None).map_err(|_| not_a_repo_error())?;
+    let unseal_key = load_or_init_local_unseal_key(output).await?;
+
+    let armor_plain = match file {
+        Some(path) => std::fs::read_to_string(path).map_err(|e| {
+            gpg_io_error(format!(
+                "failed to read secret key file '{}': {e}",
+                path.display()
+            ))
+        })?,
+        None => {
+            let gpg_program = resolve_gpg_program(scope).await;
+            let gnupghome = resolve_gnupghome()?;
+            let (version, candidates) = discover_gpg_secret_keys(&gpg_program, gnupghome.as_deref())
+                .await
+                .map_err(|e| {
+                    gpg_unsupported_error(format!(
+                        "gpg is unavailable for HOME-based import: {e}\nhint: use --file to import a raw armored secret key"
+                    ))
+                })?;
+            if !gpg_version_at_least(version, 2, 2) {
+                return Err(gpg_unsupported_error(
+                    "gpg must be >= 2.2 for HOME-based import; use --file to import a raw key",
+                ));
+            }
+            let idx = select_signing_candidate(&candidates, key)
+                .map_err(|msg| usage_error(format!("cannot select a key to import: {msg}")))?;
+            let fpr = candidates[idx].fingerprint.clone();
+            export_gpg_secret_key(&gpg_program, gnupghome.as_deref(), &fpr)
+                .await
+                .map_err(|e| gpg_unsupported_error(format!("failed to export secret key: {e}")))?
+        }
+    };
+    // The armored secret key is plaintext key material (plan GC-VG-01).
+    let armor = zeroize::Zeroizing::new(armor_plain);
+
+    let passphrase = acquire_passphrase(passphrase_file)?;
+    let provided_passphrase = passphrase.is_some();
+    let material = prepare_imported_key(
+        armor.as_str(),
+        passphrase.as_ref().map(|p| p.as_str()).unwrap_or(""),
+    )
+        .map_err(|e| {
+            if provided_passphrase {
+                gpg_io_error(format!(
+                    "failed to unlock the imported key (wrong passphrase or corrupt key): {e}"
+                ))
+            } else {
+                usage_error(format!(
+                    "imported key is protected but no --passphrase-file given and stdin is not a terminal; supply --passphrase-file: {e}"
+                ))
+            }
+        })?;
+
+    // Idempotent duplicate import (ADR-VG-06 §2 / VG-03 G7): same fingerprint
+    // refreshes the timestamp and signing key id without a new history row.
+    let existing_fp = ScopedConfig::get(scope, "vault.gpg.fingerprint")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value);
+    if existing_fp.as_deref() == Some(material.fingerprint.as_str()) {
+        let now = unix_timestamp_secs();
+        ConfigKv::set("vault.gpg.imported_at", &now, false)
+            .await
+            .map_err(|e| gpg_io_error(format!("failed to refresh imported_at: {e}")))?;
+        ConfigKv::set("vault.gpg.signing_key_id", &material.signing_key_id, false)
+            .await
+            .map_err(|e| gpg_io_error(format!("failed to refresh signing_key_id: {e}")))?;
+        if output.is_json() {
+            emit_json_data(
+                "config",
+                &serde_json::json!({ "action": "import-gpg-key", "idempotent": true, "fingerprint": material.fingerprint }),
+                output,
+            )?;
+        } else if !output.quiet {
+            println!(
+                "GPG key {} already imported (refreshed)",
+                material.fingerprint
+            );
+        }
+        return Ok(());
+    }
+
+    // Overwriting an active imported/generated key requires --replace.
+    let active_source = gpg_source().await;
+    if matches!(
+        active_source.as_deref(),
+        Some("imported") | Some("generated")
+    ) && !replace
+    {
+        return Err(gpg_conflict_error(
+            "an active GPG key already exists; pass --replace to import a different key",
+        ));
+    }
+
+    persist_imported_gpg_key(&unseal_key, &material)
+        .await
+        .map_err(|e| gpg_io_error(format!("failed to persist imported GPG key: {e}")))?;
+
+    let signing = ScopedConfig::get(scope, "vault.signing")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value);
+
+    // ADR-VG-12 §1: a first import enables commit signing when the policy is
+    // unset, so an imported signing key is never silently unused. §2: an
+    // explicit value (true or false) is always respected, and the false branch
+    // keeps the actionable hint below.
+    let signing_off = match signing.as_deref() {
+        None => {
+            ConfigKv::set("vault.signing", "true", false)
+                .await
+                .map_err(|e| {
+                    config_write_cli_error(format!("failed to enable commit signing: {e}"))
+                })?;
+            false
+        }
+        Some(value) => value.eq_ignore_ascii_case("false"),
+    };
+
+    if output.is_json() {
+        emit_json_data(
+            "config",
+            &serde_json::json!({ "action": "import-gpg-key", "fingerprint": material.fingerprint, "signing_key_id": material.signing_key_id, "uid": material.uid }),
+            output,
+        )?;
+    } else if !output.quiet {
+        println!("Imported GPG key:");
+        println!("  fingerprint: {}", material.fingerprint);
+        println!("  signing key: {}", material.signing_key_id);
+        if !material.uid.is_empty() {
+            println!("  uid:         {}", material.uid);
+        }
+        if signing_off {
+            println!(
+                "note: vault.signing is false, so commit signing stays disabled (set vault.signing true to enable)"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn handle_export_gpg_key(
+    out: Option<&std::path::Path>,
+    fingerprint: bool,
+    scope: ConfigScope,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    reject_non_local_scope(scope, "export-gpg-key")?;
+    if output.is_json() || output.quiet {
+        return Err(usage_error(
+            "export-gpg-key does not support --json/--machine/--quiet",
+        ));
+    }
+    if out.is_some() && fingerprint {
+        return Err(usage_error(
+            "--out and --fingerprint are mutually exclusive",
+        ));
+    }
+
+    let pubkey = ScopedConfig::get(scope, "vault.gpg.pubkey")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+        .filter(|v| !v.is_empty());
+    let Some(pubkey) = pubkey else {
+        return Err(gpg_conflict_error(
+            "no active GPG public key to export (import or generate one first)",
+        ));
+    };
+
+    if fingerprint {
+        let fp = key_fingerprint_from_armor(&pubkey)
+            .map_err(|e| gpg_io_error(format!("failed to parse stored public key: {e}")))?;
+        println!("{fp}");
+        return Ok(());
+    }
+
+    match out {
+        None => print!("{pubkey}"),
+        Some(path) => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| gpg_io_error(format!("invalid --out path '{}'", path.display())))?;
+            if !parent.exists() {
+                return Err(gpg_io_error(format!(
+                    "parent directory '{}' does not exist",
+                    parent.display()
+                )));
+            }
+            let tmp = path.with_extension(format!(
+                "{}.tmp{}",
+                path.extension().and_then(|e| e.to_str()).unwrap_or("asc"),
+                std::process::id()
+            ));
+            std::fs::write(&tmp, pubkey.as_bytes())
+                .map_err(|e| gpg_io_error(format!("failed to write '{}': {e}", tmp.display())))?;
+            std::fs::rename(&tmp, path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                gpg_io_error(format!("failed to replace '{}': {e}", path.display()))
+            })?;
+            if !output.quiet {
+                eprintln!("wrote public key to {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_remove_gpg_key(
+    force: bool,
+    scope: ConfigScope,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    reject_non_local_scope(scope, "remove-gpg-key")?;
+
+    if gpg_source().await.as_deref() != Some("imported") {
+        if output.is_json() {
+            emit_json_data(
+                "config",
+                &serde_json::json!({ "action": "remove-gpg-key", "idempotent": true }),
+                output,
+            )?;
+        } else if !output.quiet {
+            println!("No imported GPG key to remove");
+        }
+        return Ok(());
+    }
+
+    if !force {
+        return Err(gpg_conflict_error(
+            "an imported GPG key is active; pass --force to remove it",
+        ));
+    }
+
+    remove_imported_gpg_key()
+        .await
+        .map_err(|e| gpg_io_error(format!("failed to remove imported GPG key: {e}")))?;
+
+    if output.is_json() {
+        emit_json_data(
+            "config",
+            &serde_json::json!({ "action": "remove-gpg-key", "removed": true }),
+            output,
+        )?;
+    } else if !output.quiet {
+        println!("Removed imported GPG key; signing fell back to the generated key");
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3434,5 +4216,125 @@ mod args_tests {
     fn git_compat_list_flag() {
         let args = ConfigArgs::try_parse_from(["config", "-l"]).unwrap();
         assert!(args.list);
+    }
+}
+
+#[cfg(test)]
+mod render_get_value_tests {
+    use super::*;
+
+    fn entry(key: &str, value: &str, encrypted: bool) -> ConfigKvEntry {
+        ConfigKvEntry {
+            key: key.to_string(),
+            value: value.to_string(),
+            encrypted,
+        }
+    }
+
+    /// plan-20260921 ADR-VG-02: redaction is predicate-first, so an internal
+    /// key is masked even when it was stored as plaintext (the encrypted
+    /// early-return must never win over the internal-key check).
+    #[tokio::test]
+    async fn render_get_value_redacts_internal_key_before_encrypted_check() {
+        let ciphertext = entry("vault.gpg.seckey_enc", "deadbeef", true);
+        assert_eq!(
+            render_get_value(&ciphertext, true, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+
+        let plaintext_internal =
+            entry("vault.gpg.seckey_enc", "BEGIN PGP PRIVATE KEY BLOCK", false);
+        assert_eq!(
+            render_get_value(&plaintext_internal, true, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+
+        let readable = entry("user.name", "Test User", false);
+        assert_eq!(
+            render_get_value(&readable, false, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "Test User"
+        );
+
+        let encrypted_env = entry("vault.env.FOO", "deadbeef", true);
+        assert_eq!(
+            render_get_value(&encrypted_env, false, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+    }
+}
+
+#[cfg(test)]
+mod render_internal_key_tests {
+    use super::*;
+
+    /// plan-20260921 ADR-VG-02: even a plaintext-stored value under an internal
+    /// key is redacted by the list/get rendering path.
+    #[tokio::test]
+    async fn list_rendering_redacts_internal_key_even_when_plaintext_stored() {
+        let entry = ConfigKvEntry {
+            key: "vault.gpg.seckey_enc".to_string(),
+            value: "BEGIN PGP PRIVATE KEY BLOCK".to_string(),
+            encrypted: false,
+        };
+        assert_eq!(
+            render_get_value(&entry, false, ConfigScope::Local, false)
+                .await
+                .unwrap(),
+            "<REDACTED>"
+        );
+    }
+}
+
+#[cfg(test)]
+mod acquire_passphrase_tests {
+    use super::*;
+
+    /// plan-20260921 GC-VG-01 / VG-03 G8: the passphrase buffer must be
+    /// self-wiping.
+    ///
+    /// The integration probe in `tests/zeroize_buffers_test.rs` can only replay
+    /// the *shape* of this function (it is private), so it would stay green if
+    /// the return type regressed to a plain `String`. Binding the real call's
+    /// result to `Zeroizing<String>` is a compile-time assertion that the
+    /// production reader hands the caller a buffer that wipes itself on drop.
+    #[test]
+    fn acquire_passphrase_returns_a_self_wiping_buffer() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("passphrase.txt");
+        std::fs::write(&path, "s3cret-passphrase\n").expect("write passphrase file");
+
+        let acquired: zeroize::Zeroizing<String> = acquire_passphrase(Some(&path))
+            .expect("read passphrase")
+            .expect("passphrase file yields a value");
+
+        assert_eq!(
+            &*acquired, "s3cret-passphrase",
+            "the trailing newline is trimmed from the passphrase buffer"
+        );
+    }
+
+    /// A missing passphrase file is a user-facing error, not a panic.
+    #[test]
+    fn acquire_passphrase_reports_a_missing_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing = dir.path().join("absent.txt");
+        let error = acquire_passphrase(Some(&missing)).expect_err("missing file must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to read passphrase file"),
+            "actionable message names the failed read: {message}"
+        );
+        assert!(
+            !message.contains("s3cret"),
+            "the error must never echo passphrase material: {message}"
+        );
     }
 }

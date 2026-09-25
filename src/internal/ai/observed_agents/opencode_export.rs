@@ -27,7 +27,12 @@
 //!   deadline (default 3 s — expiry kills the child's process group). stderr
 //!   is capped and redacted before it can appear in any error text
 //!   (GC-DR-13). A child that leaves descendants in its process group after
-//!   exit is killed without its output being accepted.
+//!   exit is killed without its output being accepted. On Unix both core
+//!   limits are zero in the child and its descendants, and `SIGXFSZ` is set
+//!   to `SIG_IGN` so the `RLIMIT_FSIZE` write-time bound fails over-cap
+//!   writes with `EFBIG` instead of terminating the child (no core file, no
+//!   "abnormal termination" journal noise); system handlers that honor
+//!   `RLIMIT_CORE` still suppress core files from other unexpected crashes.
 //!
 //! Sandbox: the Required offline profile lives in
 //! [`run_export_subprocess_sandboxed`] — assembled via
@@ -256,6 +261,31 @@ async fn run_bounded_exporter(
                 if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // `RLIMIT_FSIZE` over-run must not be a fatal signal: with the
+                // default disposition the kernel SIGXFSZ-kills the child, and
+                // system handlers (systemd-coredump) journal it as an
+                // "abnormal termination" crash — with whole core files when the
+                // handler predates RLIMIT_CORE=0. The byte cap is enforced by
+                // the parent's size poll + post-exit recheck, so the child
+                // dying adds nothing but noise. Ignoring SIGXFSZ turns each
+                // over-cap write into `EFBIG` while the file still cannot grow
+                // past `max_bytes + 1`: the cap stays hard, there is just no
+                // crash to report. (Ignored dispositions persist across exec,
+                // so descendants inherit it too.)
+                if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Suppress exporter core files when the system handler honors
+                // RLIMIT_CORE (including systemd-coredump). This covers
+                // unexpected child crashes (SIGSEGV/SIGABRT etc.); SIGXFSZ is
+                // ignored above and can no longer core.
+                let core = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -422,8 +452,8 @@ async fn run_bounded_exporter(
 /// (`SandboxEnforcement::Required` semantics). Assembly is delegated to
 /// [`crate::internal::ai::sandbox::SandboxManager::transform`]; execution
 /// stays in [`run_bounded_exporter`] (file-backed stdout, `RLIMIT_FSIZE`,
-/// process group, wall clock, 16 MiB). Linux uses trusted bwrap; macOS uses
-/// seatbelt (`sandbox-exec`). Fail-CLOSED when the sandbox cannot be
+/// `RLIMIT_CORE=0`, process group, wall clock, 16 MiB). Linux uses trusted
+/// bwrap; macOS uses seatbelt (`sandbox-exec`). Fail-CLOSED when the sandbox cannot be
 /// provided: the capability is unavailable — never a degraded unsandboxed
 /// run (GC-DR-14).
 pub async fn run_export_subprocess_sandboxed(
@@ -1188,6 +1218,43 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out), "export|sess_1-2");
     }
 
+    /// Core limits are set on the exporter child, inherited by its children,
+    /// and leave the caller process resource limits unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_export_core_limits_are_zero_in_child_and_descendants() {
+        let parent_core_limits = || {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit writes to our valid rlimit and does not mutate
+            // the process resource limits.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+            (limit.rlim_cur, limit.rlim_max)
+        };
+        let before = parent_core_limits();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(
+            dir.path(),
+            r#"ulimit -Sc; ulimit -Hc; /bin/sh -c 'ulimit -Sc; ulimit -Hc'"#,
+        );
+        let out = run_export_subprocess(&bin, "core_limits", ExportLimits::default())
+            .await
+            .expect("exporter can report its inherited core limits");
+        assert_eq!(
+            out,
+            b"0\n0\n0\n0\n",
+            "both exporter and descendant must inherit zero soft/hard core limits; got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(
+            parent_core_limits(),
+            before,
+            "parent core limits must remain unchanged"
+        );
+    }
+
     /// opencode_export_bytes_path_byte_cap: over-cap output kills the run —
     /// error, never a silent truncation.
     #[cfg(unix)]
@@ -1345,6 +1412,7 @@ mod tests {
     /// A symlinked entry is refused at pin time (`O_NOFOLLOW`).
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn pin_store_under_captures_inode_atomically() {
         use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -1391,6 +1459,7 @@ mod tests {
     /// the host at the pinned inode. Skips without a trusted, usable bwrap.
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn pin_store_binds_rw_through_bwrap() {
         use std::os::fd::AsRawFd;
         if !trusted_bwrap_available() {
@@ -1478,6 +1547,7 @@ mod tests {
     /// bwrap is unavailable (the production path then fails closed).
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn opencode_export_offline_sandbox_profile() {
         // Detect "trusted AND usable", not merely present (Codex M3 R3): a
         // bwrap under a user-writable path is refused by the integrity policy,
@@ -1532,9 +1602,11 @@ printf 'offline-ok'"#,
 
     /// SBX-03: execution stays `run_bounded_exporter` (file-backed stdout
     /// with the 16 MiB poll cap, per-OS RLIMIT_FSIZE — strict on Linux, 8
-    /// GiB backstop on macOS (FIX-SBX-01) — process group, 3s wall clock).
+    /// GiB backstop on macOS (FIX-SBX-01) — RLIMIT_CORE=0 in the child,
+    /// process group, 3s wall clock).
     /// Linux keep_fds store fd is non-CLOEXEC.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn runner_controls_preserved() {
         assert_eq!(EXPORT_MAX_BYTES, 16 * 1024 * 1024);
         assert_eq!(EXPORT_DEADLINE, Duration::from_secs(3));
@@ -1625,7 +1697,7 @@ printf 'offline-ok'"#,
     /// rejects a symlink (O_NOFOLLOW). Production classification
     /// (`pin_opencode_store`) treats only an absent store as `Ok(None)`.
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_pin_three_states() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1670,7 +1742,7 @@ printf 'offline-ok'"#,
 
     /// SBX-04: F_GETPATH / canonical path resolution failure is fail-closed.
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_pin_fgetpath_failure() {
         fn fail_resolve(_: &std::os::fd::OwnedFd, _: &std::path::Path) -> Result<String> {
@@ -1690,7 +1762,7 @@ printf 'offline-ok'"#,
 
     /// SBX-04: macOS pin shares `pin_store_under` with Linux.
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_pin_shares_pin_store_under() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1711,7 +1783,7 @@ printf 'offline-ok'"#,
 
     /// SBX-04: transform on macOS selects seatbelt (`sandbox-exec`).
     #[cfg(target_os = "macos")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn macos_transform_selects_seatbelt() {
         assert!(
@@ -1774,6 +1846,7 @@ printf 'offline-ok'"#,
     /// pinned fd, not accepted as-is.
     #[cfg(target_os = "macos")]
     #[test]
+    #[serial_test::serial(env)]
     fn macos_scratch_bind_tightens_wide_mode() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -1804,6 +1877,7 @@ printf 'offline-ok'"#,
     /// the writable-bind (O_NOFOLLOW pin refuses it).
     #[cfg(target_os = "macos")]
     #[test]
+    #[serial_test::serial(env)]
     fn macos_scratch_bind_refuses_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("elsewhere");
@@ -1876,8 +1950,10 @@ printf 'offline-ok'"#,
     /// before store bind, FD-pinned `/proc/self/fd/N → store`, binary-parent
     /// via sandbox_cwd, `--` then the exporter).
     #[cfg(target_os = "linux")]
-    #[serial_test::serial(export_sandbox_env)]
+    // Bridge default and env groups (env alone misses default), in that order.
+    #[serial_test::serial(inner_attrs = [serial_test::serial(env, export_sandbox_env)])]
     #[test]
+    #[serial_test::serial(export_sandbox_env, env)]
     fn bwrap_argv_equivalent() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
@@ -1954,6 +2030,7 @@ printf 'offline-ok'"#,
     /// export bytes (hence no claim) are produced.
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn trusted_bwrap_rejects_user_writable() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
@@ -1977,6 +2054,7 @@ printf 'offline-ok'"#,
     /// capability degrades (no authorized bytes to claim).
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial(env)]
     fn backend_missing_degrades_metadata_only() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_exporter(dir.path(), r#"printf 'should-not-run'"#);
@@ -1997,7 +2075,7 @@ printf 'offline-ok'"#,
     /// SBX-03: trusted_bwrap_exe is the only bwrap channel — transform must
     /// not consume `LIBRA_BWRAP_BINARY` or `linux_sandbox_exe`.
     #[cfg(target_os = "linux")]
-    #[serial_test::serial(export_sandbox_env)]
+    #[serial_test::serial(export_sandbox_env, env)]
     #[test]
     fn trusted_bwrap_exe_channel_used() {
         let dir = tempfile::tempdir().unwrap();

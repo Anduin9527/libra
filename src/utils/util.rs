@@ -157,7 +157,48 @@ pub fn cur_dir() -> PathBuf {
     }
 }
 
+/// Whether `path` is reserved for per-user state rather than repository storage.
+/// The upgrade home and global config directories can differ when overridden;
+/// neither may be adopted because of a stray `libra.db`. Resolve existing
+/// ancestors too, so a not-yet-created home behind a symlink is still reserved.
+///
+/// The reserved set covers the Libra home, the XDG-based global config
+/// directory and the legacy `<home>/.libra` config directory (ADR-GCX-01).
+/// Two strengths apply:
+/// - the **config directories** are reserved recursively, so `libra init`
+///   refuses a storage root inside the user's configuration directory;
+/// - the **Libra home** (`LIBRA_HOME`, or the parent of an explicit
+///   `LIBRA_CONFIG_GLOBAL_DB` override) is reserved only as itself, because
+///   isolated test/sandbox setups legitimately keep repositories beneath that
+///   directory (the override is an isolation hook, not a storage policy).
+pub fn is_global_libra_home(path: &Path) -> bool {
+    let path = canonicalize_deepest_existing(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = |home: PathBuf| canonicalize_deepest_existing(&home).unwrap_or(home);
+    let home = crate::internal::upgrade::home::resolve_libra_home()
+        .ok()
+        .map(canonical);
+    if home.as_deref() == Some(path.as_path()) {
+        return true;
+    }
+    [
+        crate::internal::config::global_config_dir(),
+        crate::internal::config::legacy_global_config_path()
+            .and_then(|db| db.parent().map(Path::to_path_buf)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(canonical)
+    .any(|config_dir| path == config_dir || path.starts_with(&config_dir))
+}
+
 fn is_valid_storage_dir(path: &Path) -> bool {
+    // The Libra home must be refused before the `libra.db` check: adopting it
+    // made repository discovery read global-side files as repo-local config,
+    // failing commands with `no such table: config` on home DBs that lack the
+    // legacy `config` table.
+    if is_global_libra_home(path) {
+        return false;
+    }
     if path.join(DATABASE).exists() {
         return true;
     }
@@ -397,6 +438,9 @@ pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation>
 /// database-less local gitdir where "not found" masquerades as "no
 /// configuration".
 fn is_terminal_common_storage(path: &Path) -> bool {
+    if is_global_libra_home(path) {
+        return false;
+    }
     // `symlink_metadata`, not `exists()`: a DANGLING `commondir` symlink is
     // still a commondir marker — `exists()` follows the link and reports the
     // marker absent, which would bless a non-terminal (corrupt) target. And
@@ -607,6 +651,19 @@ pub(crate) fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// Preserve why discovery skipped user storage while retaining NotFound semantics.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{workdir:?} is not a libra repository; '{}' is the global Libra home, \
+     reserved for per-user state rather than repository storage; \
+     use a dedicated project directory (e.g. 'libra init <project>')",
+    home.display()
+)]
+pub(crate) struct GlobalHomeNotRepository {
+    workdir: PathBuf,
+    home: PathBuf,
+}
+
 /// Resolve `(common_storage, workdir, worktree_gitdir)` for a path.
 /// - `worktree_gitdir`: the LOCAL `.libra` for this working tree (holds the
 ///   private `index` and `worktree_id`).
@@ -615,9 +672,15 @@ pub(crate) fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
 fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
     let mut path = path.clone().unwrap_or_else(cur_dir);
     let orig = path.clone();
+    let mut skipped_home = None;
 
     loop {
         let standard_repo = path.join(ROOT_DIR);
+        if standard_repo.join(DATABASE).exists() && is_global_libra_home(&standard_repo) {
+            skipped_home = Some(standard_repo.clone());
+        } else if path.join(DATABASE).exists() && is_global_libra_home(&path) {
+            skipped_home = Some(path.clone());
+        }
         if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
             // unwrap_or is safe here: if canonicalize fails, we use the original path
             let gitdir = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
@@ -625,15 +688,27 @@ fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBu
             return Ok((common, path.clone(), gitdir));
         }
 
-        if path.join(DATABASE).exists() && path.join("objects").exists() {
+        if path.join(DATABASE).exists()
+            && path.join("objects").exists()
+            && !is_global_libra_home(&path)
+        {
             return Ok((path.clone(), path.clone(), path.clone()));
         }
 
         if !path.pop() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{orig:?} is not a libra repository"),
-            ));
+            return Err(match skipped_home {
+                Some(home) => io::Error::new(
+                    io::ErrorKind::NotFound,
+                    GlobalHomeNotRepository {
+                        workdir: orig,
+                        home,
+                    },
+                ),
+                None => io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{orig:?} is not a libra repository"),
+                ),
+            });
         }
     }
 }
@@ -942,17 +1017,8 @@ pub fn objects_storage() -> ClientStorage {
 
 /// Get `ClientStorage` for the `objects` directory, returning a Result
 pub fn try_objects_storage() -> io::Result<ClientStorage> {
-    // Check if we are in a valid repo first to avoid panic in path::objects() if possible,
-    // though path::objects() currently panics if storage_path() fails.
-    // Ideally path::objects() should also be fallible.
-    // For now, let's wrap the panic-prone call if we can, or just rely on try_get_storage_path check.
-    if try_get_storage_path(None).is_err() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "not a libra repository",
-        ));
-    }
-    Ok(cached_objects_storage(path::objects()))
+    let storage = try_get_storage_path(None)?;
+    Ok(cached_objects_storage(storage.join("objects")))
 }
 
 fn cached_objects_storage(base_path: PathBuf) -> ClientStorage {
@@ -1273,16 +1339,6 @@ where
             base.as_ref()
         );
     }
-}
-
-#[allow(dead_code)]
-/// Convert a path to relative path to the current directory
-/// - `path` must be absolute or relative (to current dir)
-pub fn to_current_dir<P>(path: P) -> PathBuf
-where
-    P: AsRef<Path>,
-{
-    to_relative(path, cur_dir())
 }
 
 /// Convert a workdir path to relative path
@@ -2132,9 +2188,46 @@ pub async fn resolve_object_spec_typed(name: &str) -> Result<ObjectHash, CommitB
     resolve_revision_expression_typed(name).await
 }
 
+/// Resolve the sole public pseudo-ref that is deliberately opt-in. Keeping
+/// this separate from [`resolve_object_spec_typed`] preserves the rejection
+/// contract for every other consumer, including `update-ref` CAS arguments.
+pub async fn resolve_object_spec_with_auto_merge_typed(
+    name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let auto_merge = crate::internal::pseudo_ref::PseudoRef::AutoMerge.name();
+    let suffix = name.strip_prefix(auto_merge);
+    if let Some(suffix) = suffix.filter(|suffix| {
+        suffix.is_empty() || matches!(suffix.as_bytes().first(), Some(b'^' | b'~' | b':'))
+    }) {
+        let refs = crate::internal::pseudo_ref::WorktreePseudoRefs::for_request();
+        return match refs
+            .resolve(crate::internal::pseudo_ref::PseudoRef::AutoMerge)
+            .await
+        {
+            Ok(Some(value)) => {
+                let projected_spec = format!("{}{suffix}", value.oid);
+                resolve_object_spec_typed(&projected_spec).await
+            }
+            Ok(None) => Err(invalid_reference(name)),
+            Err(detail) => Err(CommitBaseError::ReadFailure(format!(
+                "failed to resolve {name}: {detail}"
+            ))),
+        };
+    }
+    resolve_object_spec_typed(name).await
+}
+
 /// Resolve a tree-ish expression and peel commits or annotated tags to a tree.
 pub async fn resolve_tree_ish_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
     let object_id = resolve_object_spec_typed(name).await?;
+    peel_object_to_type_typed(object_id, Some(ObjectType::Tree), name)
+}
+
+/// Tree-ish counterpart for consumers that explicitly support `AUTO_MERGE`.
+pub async fn resolve_tree_ish_with_auto_merge_typed(
+    name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = resolve_object_spec_with_auto_merge_typed(name).await?;
     peel_object_to_type_typed(object_id, Some(ObjectType::Tree), name)
 }
 
@@ -2496,9 +2589,26 @@ pub fn check_gitignore_as_dir_for_walk(
     is_dir: bool,
     walk_epoch: u64,
 ) -> bool {
-    IGNORE_OP_EPOCH.with(|cell| cell.set(walk_epoch));
-    let answer = check_gitignore_as_dir(work_dir, target_file, is_dir);
-    IGNORE_OP_EPOCH.with(|cell| cell.set(0));
+    check_gitignore_with_layers_as_dir_for_walk(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+        is_dir,
+        walk_epoch,
+    )
+}
+
+/// Match within an explicit epoch without recapturing the caller's layer scope.
+pub(crate) fn check_gitignore_with_layers_as_dir_for_walk(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+    is_dir: bool,
+    walk_epoch: u64,
+) -> bool {
+    let previous = IGNORE_OP_EPOCH.with(|cell| cell.replace(walk_epoch));
+    let answer = check_gitignore_with_layers_as_dir(work_dir, target_file, layers, is_dir);
+    IGNORE_OP_EPOCH.with(|cell| cell.set(previous));
     answer
 }
 
@@ -2675,10 +2785,12 @@ fn find_pattern_line(source: &Path, pattern: &str) -> Option<usize> {
 
 fn cached_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
     let Ok(metadata) = fs::metadata(ignore_path) else {
-        return load_ignore_file(ignore_path, base);
+        return load_ignore_file(ignore_path, base)
+            .unwrap_or_else(|()| Arc::new(Gitignore::empty()));
     };
     let Ok(modified) = metadata.modified() else {
-        return load_ignore_file(ignore_path, base);
+        return load_ignore_file(ignore_path, base)
+            .unwrap_or_else(|()| Arc::new(Gitignore::empty()));
     };
     let len = metadata.len();
     let key = IgnoreCacheKey {
@@ -2686,18 +2798,28 @@ fn cached_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
         base: base.to_path_buf(),
     };
 
+    {
+        let cache = match LIBRAIGNORE_CACHE.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = cache.get(&key)
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Arc::clone(&cached.matcher);
+        }
+    }
+
+    // A blocked source must not hold the process-wide cache lock.
+    let Ok(matcher) = load_ignore_file(ignore_path, base) else {
+        // Failed reads must relatch in later walks, including after epoch-zero warmup.
+        return Arc::new(Gitignore::empty());
+    };
     let mut cache = match LIBRAIGNORE_CACHE.lock() {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(cached) = cache.get(&key)
-        && cached.len == len
-        && cached.modified == modified
-    {
-        return Arc::clone(&cached.matcher);
-    }
-
-    let matcher = load_ignore_file(ignore_path, base);
     cache.insert(
         key,
         CachedGitignore {
@@ -2720,17 +2842,26 @@ fn cached_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) 
         source: ignore_path.to_path_buf(),
         base: base.to_path_buf(),
     };
+    {
+        let cache = match LIBRAIGNORE_CACHE.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = cache.get(&key)
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Arc::clone(&cached.matcher);
+        }
+    }
+    // Parsing and warning emission do not serialize unrelated cache users.
+    let Ok(matcher) = load_ignore_file_from_bytes(ignore_path, base, bytes) else {
+        return Arc::new(Gitignore::empty());
+    };
     let mut cache = match LIBRAIGNORE_CACHE.lock() {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(cached) = cache.get(&key)
-        && cached.len == len
-        && cached.modified == modified
-    {
-        return Arc::clone(&cached.matcher);
-    }
-    let matcher = load_ignore_file_from_bytes(ignore_path, base, bytes);
     cache.insert(
         key,
         CachedGitignore {
@@ -2804,6 +2935,10 @@ pub fn exclude_matcher_verdict(
 /// status/probe walk.
 pub fn ignore_read_failed() -> bool {
     let epoch = CURRENT_WALK_EPOCH.with(|cell| cell.get());
+    ignore_read_failed_for_walk(epoch)
+}
+
+pub(crate) fn ignore_read_failed_for_walk(epoch: u64) -> bool {
     if epoch == 0 {
         return false;
     }
@@ -2849,7 +2984,7 @@ pub fn ignore_file_defines_any_pattern(ignore_path: &Path, base: &Path) -> bool 
     builder.build().map(|set| !set.is_empty()).unwrap_or(false)
 }
 
-fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
+fn load_ignore_file(ignore_path: &Path, base: &Path) -> Result<Arc<Gitignore>, ()> {
     match fs::read(ignore_path) {
         Ok(bytes) => load_ignore_file_from_bytes(ignore_path, base, &bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2861,12 +2996,16 @@ fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
                 "failed to read ignore file {}: {error}",
                 ignore_path.display()
             ));
-            load_ignore_file_from_bytes(ignore_path, base, b"")
+            Err(())
         }
     }
 }
 
-fn load_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) -> Arc<Gitignore> {
+fn load_ignore_file_from_bytes(
+    ignore_path: &Path,
+    base: &Path,
+    bytes: &[u8],
+) -> Result<Arc<Gitignore>, ()> {
     let contents = match std::str::from_utf8(bytes) {
         Ok(text) => text,
         Err(error) => {
@@ -2875,7 +3014,7 @@ fn load_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) ->
                 "ignore file {} is not valid UTF-8: {error}",
                 ignore_path.display()
             ));
-            return Arc::new(Gitignore::empty());
+            return Err(());
         }
     };
     let mut builder = GitignoreBuilder::new(base);
@@ -2888,13 +3027,13 @@ fn load_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) ->
         }
     }
     match builder.build() {
-        Ok(ignore) => Arc::new(ignore),
+        Ok(ignore) => Ok(Arc::new(ignore)),
         Err(error) => {
             eprintln!(
                 "warning: failed to compile ignore file {}: {error}",
                 ignore_path.display()
             );
-            Arc::new(Gitignore::empty())
+            Ok(Arc::new(Gitignore::empty()))
         }
     }
 }
@@ -3166,8 +3305,10 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     ///Test get current directory success.
     fn cur_dir_returns_current_directory() {
+        let _cwd_lock = test::cwd_lock_guard();
         match env::current_dir() {
             Ok(expected) => {
                 let actual = cur_dir();
@@ -3185,7 +3326,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     ///Test the function of is_sub_path.
     fn test_is_sub_path() {
         let _guard = test::ChangeDirGuard::new(Path::new(env!("CARGO_MANIFEST_DIR")));
@@ -3203,7 +3344,7 @@ mod test {
     /// a string `starts_with`, `srcfoo/x` would falsely read as inside
     /// `src` — a scope-escape. Pin the rejection.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_is_sub_path_rejects_byte_prefix_sibling_and_unrelated_paths() {
         let _guard = test::ChangeDirGuard::new(Path::new(env!("CARGO_MANIFEST_DIR")));
 
@@ -3237,7 +3378,7 @@ mod test {
     /// otherwise only by the root-escape test — is pinned for the
     /// in-scope / sibling-escape cases too.
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_is_sub_path_resolves_interior_parent_dir() {
         let _guard = test::ChangeDirGuard::new(Path::new(env!("CARGO_MANIFEST_DIR")));
 
@@ -3273,7 +3414,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn list_workdir_files_prunes_libraignored_directories() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3304,7 +3445,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_rejects_unborn_branch_before_hash_fallback() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3312,6 +3453,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -3325,6 +3468,10 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
         commit::execute(CommitArgs {
@@ -3365,7 +3512,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_head_navigation_reports_unborn_head() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3378,7 +3525,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_tag_object_hash_with_caret_zero_resolves_commit() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3386,6 +3533,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -3399,6 +3548,10 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
         commit::execute(CommitArgs {
@@ -3423,7 +3576,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_peels_nested_tag_object_hash_to_commit() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3431,6 +3584,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -3444,6 +3599,10 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
         commit::execute(CommitArgs {
@@ -3471,7 +3630,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn get_commit_base_typed_reports_tag_cycle_as_corruption() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -3479,6 +3638,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -3492,6 +3653,10 @@ mod test {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
         commit::execute(CommitArgs {
@@ -3520,7 +3685,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     ///Test the function of to_workdir_path.
     async fn test_to_workdir_path() {
         let temp_path = tempdir().unwrap();
@@ -3537,7 +3702,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that files matching patterns in .libraignore are correctly identified as ignored.
     fn test_check_gitignore_ignore_files() {
         let temp_path = tempdir().unwrap();
@@ -3551,7 +3716,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that directories matching patterns in .libraignore are correctly identified as ignored.
     fn test_check_gitignore_ignore_directory() {
         let temp_path = tempdir().unwrap();
@@ -3565,7 +3730,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests ignore pattern matching in subdirectories with .libraignore files at different directory levels.
     fn test_check_gitignore_ignore_subdirectory_files() {
         let temp_path = tempdir().unwrap();
@@ -3583,7 +3748,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that files not matching patterns in .libraignore are correctly identified as not ignored.
     fn test_check_gitignore_not_ignore() {
         let temp_path = tempdir().unwrap();
@@ -3598,7 +3763,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     /// Tests that files not matching subdirectory-specific patterns in .libraignore are correctly identified as not ignored.
     fn test_check_gitignore_not_ignore_subdirectory_files() {
         let temp_path = tempdir().unwrap();
@@ -3667,7 +3832,7 @@ mod test {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_ignores_global_libra_dir_without_repo_markers() {
         let temp = tempdir().unwrap();
         let home_like = temp.path();
@@ -3687,7 +3852,7 @@ mod test {
         );
     }
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_accepts_valid_repo_under_ancestor_with_global_libra_dir() {
         let temp = tempdir().unwrap();
         let home_like = temp.path();
@@ -3715,7 +3880,7 @@ mod test {
         );
     }
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_rejects_libra_dir_with_only_hooks() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("project");
@@ -3733,7 +3898,7 @@ mod test {
         );
     }
     #[test]
-    #[serial]
+    #[serial(cwd)]
     fn test_try_get_storage_path_rejects_libra_dir_with_only_objects() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("project");
@@ -3966,6 +4131,7 @@ mod test {
     /// trust its local configuration as the repository's. Discovery must
     /// also STOP there rather than climbing into an ancestor repository.
     #[test]
+    #[serial_test::serial(env)]
     fn test_pointerless_linked_gitdir_fails_closed() {
         let temp = tempdir().unwrap();
         // An ancestor repository the walk must NOT climb into.
@@ -3992,6 +4158,67 @@ mod test {
         assert!(
             !err.to_string().contains("not a libra repository"),
             "it must be a CORRUPTION refusal, not a 'no repository' answer: {err}"
+        );
+    }
+
+    /// The global Libra home is NEVER repository storage: a stray `libra.db`
+    /// in `$LIBRA_HOME` (the artifact of a command once run from `$HOME`) must
+    /// not let discovery adopt the home as a repository. Adopting it routed
+    /// the config cascade's LOCAL scope at `~/.libra/libra.db`, so `libra init`
+    /// failed with `no such table: config` on home DBs lacking the legacy
+    /// `config` table — and the printed `libra config --global` hint could
+    /// never fix it (global config lives in `~/.libra/config.db`).
+    #[test]
+    #[serial(cwd, env)]
+    fn test_global_libra_home_is_never_repository_storage() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join(ROOT_DIR);
+        fs::create_dir_all(&home).unwrap();
+        // Artifact: the home carries a database, exactly like a storage dir.
+        fs::write(home.join(DATABASE), b"").unwrap();
+
+        let _env = test::ScopedEnvVar::set("LIBRA_HOME", &home);
+        assert!(
+            is_global_libra_home(&home),
+            "the resolved LIBRA_HOME itself must be recognized"
+        );
+        assert!(
+            !is_valid_storage_dir(&home),
+            "the Libra home is never a valid storage dir, even with a libra.db in it"
+        );
+        let err = try_get_storage_path(Some(temp.path().to_path_buf()))
+            .expect_err("discovery must not adopt the Libra home as a repository");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the walk must climb PAST the home and answer 'no repository', not resolve it: {err}"
+        );
+
+        // Control: a real repository next to the home still resolves normally.
+        let repo_root = temp.path().join("repo");
+        let repo_gitdir = repo_root.join(ROOT_DIR);
+        fs::create_dir_all(&repo_gitdir).unwrap();
+        fs::write(repo_gitdir.join(DATABASE), b"").unwrap();
+        assert!(is_valid_storage_dir(&repo_gitdir));
+        // Discovery canonicalizes the accepted gitdir (tmpdir paths may sit
+        // behind a symlink), so compare against the canonical form too.
+        let expected_gitdir = fs::canonicalize(&repo_gitdir).unwrap_or(repo_gitdir.clone());
+        let (storage, workdir) = try_get_paths(Some(repo_root.clone())).unwrap();
+        assert_eq!(storage, expected_gitdir);
+        assert_eq!(workdir, repo_root);
+    }
+
+    #[test]
+    fn global_home_not_repository_display_is_actionable() {
+        let error = GlobalHomeNotRepository {
+            workdir: PathBuf::from("outside"),
+            home: PathBuf::from(".libra"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "\"outside\" is not a libra repository; '.libra' is the global Libra home, \
+             reserved for per-user state rather than repository storage; \
+             use a dedicated project directory (e.g. 'libra init <project>')"
         );
     }
 
@@ -4165,6 +4392,7 @@ mod test {
     /// Concurrent status walks must not clear each other's failure latch
     /// (Codex WIO-02 r32 P1).
     #[test]
+    #[serial_test::serial(cwd)]
     fn concurrent_ignore_walks_keep_independent_failure_latches() {
         use std::sync::Barrier;
 
@@ -4209,6 +4437,7 @@ mod test {
 
     /// A timed-out worker from a finished walk must not poison a later walk.
     #[test]
+    #[serial_test::serial(cwd)]
     fn finished_ignore_walk_rejects_late_worker_latch() {
         let epoch = {
             let _walk = begin_secure_ignore_walk();

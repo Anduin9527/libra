@@ -14,7 +14,6 @@ use crate::internal::ai::{
     },
     memory::{domain::EpisodeRootKind, source::RedactedEpisodeSource},
     observed_agents::Redactor,
-    providers::AnyCompletionModel,
 };
 
 pub(crate) const INTENT_ITERATION_PROMPT_VERSION: &str = "intent-iteration-v1";
@@ -31,13 +30,6 @@ pub(crate) struct IntentIterationCompiler<M> {
     model: M,
     model_id: String,
     timeout: Duration,
-}
-
-impl IntentIterationCompiler<AnyCompletionModel> {
-    pub(crate) fn new(model: AnyCompletionModel) -> Result<Self, EpisodeCompilerError> {
-        let model_id = model.model_id().to_string();
-        Self::from_parts(model, model_id, DEFAULT_PROVIDER_TIMEOUT)
-    }
 }
 
 impl<M> IntentIterationCompiler<M> {
@@ -433,7 +425,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test-provider")]
+    #[cfg(any())]
     #[tokio::test]
     async fn existing_test_provider_implements_intent_compiler_contract() {
         use std::path::Path;

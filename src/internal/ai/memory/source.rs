@@ -1626,10 +1626,18 @@ mod tests {
         let intent = Intent::new(actor.clone(), "Implement bounded memory source")
             .expect("construct intent");
         let intent_id = intent.header().object_id();
-        storage
-            .put_tracked(&intent, &history)
+        let intent_blob = storage
+            .put_json(&intent)
             .await
-            .expect("persist intent");
+            .expect("persist intent blob");
+        history
+            .append(
+                &ObjectType::Intent.to_string(),
+                &intent_id.to_string(),
+                intent_blob,
+            )
+            .await
+            .expect("append intent to AI history");
         let before_task_head = history
             .resolve_history_head()
             .await

@@ -43,9 +43,7 @@ use crate::{
         error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, ProgressMode, emit_json_data},
         path,
-        storage::{
-            Storage, local::LocalStorage, publish_storage::PublishStorage, remote::RemoteStorage,
-        },
+        storage::{Storage, local::LocalStorage, remote::RemoteStorage},
         util,
     },
 };
@@ -2022,18 +2020,6 @@ async fn create_r2_storage_for_db_path(
 ) -> CloudResult<RemoteStorage> {
     let store = create_r2_object_store_for_db_path(local_db_path).await?;
     Ok(RemoteStorage::new_with_prefix(store, repo_id.to_string()))
-}
-
-/// Create publish arbitrary-object storage from the same R2
-/// environment/config surface used by `libra cloud sync`.
-pub(crate) async fn create_publish_storage(
-    repo_id: &str,
-    site_id: &str,
-) -> CloudResult<PublishStorage> {
-    let local_db_path = cloud_local_db_path()?;
-    let store = create_r2_object_store_for_db_path(&local_db_path).await?;
-    PublishStorage::new(store, repo_id, site_id)
-        .map_err(|e| CloudError::Generic(format!("failed to build publish storage prefix: {e}")))
 }
 
 async fn create_r2_object_store_for_db_path(
@@ -5731,23 +5717,6 @@ async fn restore_metadata(
     Ok(deferred_capture_refs)
 }
 
-/// Restore refs metadata and fail hard when the metadata object is missing.
-///
-/// `libra cloud restore` keeps its historical warning-only behavior through
-/// [`restore_metadata`]. Cloud clone restore needs a stricter contract: without
-/// refs metadata it cannot set HEAD/branches safely, so the caller must fail and
-/// clean up the just-created destination.
-pub(crate) async fn restore_metadata_strict(
-    db_conn: &sea_orm::DatabaseConnection,
-    r2_storage: &RemoteStorage,
-) -> CloudResult<()> {
-    let data = r2_storage
-        .get_metadata()
-        .await
-        .map_err(|e| CloudError::Generic(format!("failed to download metadata: {}", e)))?;
-    restore_metadata_from_bytes_strict(db_conn, &data).await
-}
-
 async fn restore_metadata_from_bytes(
     db_conn: &sea_orm::DatabaseConnection,
     data: &[u8],
@@ -5755,30 +5724,6 @@ async fn restore_metadata_from_bytes(
     let references: Vec<reference::Model> = serde_json::from_slice(data)
         .map_err(|e| CloudError::Generic(format!("Failed to deserialize metadata: {}", e)))?;
     restore_metadata_models(db_conn, references, false).await
-}
-
-async fn restore_metadata_from_bytes_strict(
-    db_conn: &sea_orm::DatabaseConnection,
-    data: &[u8],
-) -> CloudResult<()> {
-    let references: Vec<reference::Model> = serde_json::from_slice(data)
-        .map_err(|e| CloudError::Generic(format!("Failed to deserialize metadata: {}", e)))?;
-    validate_strict_refs_metadata(&references)?;
-    restore_metadata_models_with_capture_policy(db_conn, references, true, false)
-        .await
-        .map(|_| ())
-}
-
-fn validate_strict_refs_metadata(references: &[reference::Model]) -> CloudResult<()> {
-    if !references
-        .iter()
-        .any(|model| model.kind == reference::ConfigKind::Head && model.remote.is_none())
-    {
-        return Err(CloudError::Generic(
-            "metadata does not contain local HEAD reference".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 async fn restore_metadata_models(
@@ -5884,6 +5829,7 @@ async fn restore_legacy_capture_refs_if_unowned(
 #[cfg(test)]
 mod tests {
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn merge_import_tombstones_keeps_newest_and_fingerprints() {
         use crate::utils::d1_client::AgentImportTombstoneRow;
 
@@ -6242,7 +6188,7 @@ mod tests {
     /// `IS NULL` and update the existing HEAD/branch rows instead of inserting
     /// duplicates that leave HEAD pointing at the init-time repository state.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_updates_existing_null_remote_references() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -6303,7 +6249,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_never_moves_generation_fenced_traces_ref() {
         let rt = tokio::runtime::Runtime::new().expect("create test runtime");
         let repo = tempdir().expect("create repo tempdir");
@@ -6369,7 +6315,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_metadata_reinstates_legacy_traces_ref_without_a_generation() {
         let rt = tokio::runtime::Runtime::new().expect("create test runtime");
         let repo = tempdir().expect("create repo tempdir");
@@ -6428,72 +6374,8 @@ mod tests {
         assert!(message.contains("already pruned locally"));
     }
 
-    #[test]
-    #[serial]
-    fn restore_metadata_strict_fails_when_metadata_object_is_missing() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let repo = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let _home = ScopedEnvVar::set("HOME", home.path());
-        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
-        rt.block_on(setup_with_new_libra_in(repo.path()));
-        let _cwd = ChangeDirGuard::new(repo.path());
-
-        rt.block_on(async {
-            let db_conn = db::get_db_conn_instance().await;
-            let remote = RemoteStorage::new(Arc::new(InMemory::new()));
-
-            let error = restore_metadata_strict(&db_conn, &remote)
-                .await
-                .expect_err("strict metadata restore must fail on missing metadata.json");
-
-            let message = error.to_string();
-            assert!(
-                message.contains("failed to download metadata"),
-                "error should explain metadata download failure: {message}",
-            );
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn restore_metadata_strict_fails_when_metadata_has_no_local_head() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let repo = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let _home = ScopedEnvVar::set("HOME", home.path());
-        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
-        rt.block_on(setup_with_new_libra_in(repo.path()));
-        let _cwd = ChangeDirGuard::new(repo.path());
-
-        rt.block_on(async {
-            let db_conn = db::get_db_conn_instance().await;
-            let remote = RemoteStorage::new(Arc::new(InMemory::new()));
-            let refs = vec![reference::Model {
-                id: 0,
-                name: Some("main".to_string()),
-                kind: reference::ConfigKind::Branch,
-                commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-                remote: None,
-                worktree_id: None,
-            }];
-            let metadata = serde_json::to_vec(&refs).expect("metadata should serialize");
-            remote.put_metadata(&metadata).await.unwrap();
-
-            let error = restore_metadata_strict(&db_conn, &remote)
-                .await
-                .expect_err("strict metadata restore must reject metadata without HEAD");
-
-            let message = error.to_string();
-            assert!(
-                message.contains("metadata does not contain local HEAD reference"),
-                "error should explain missing HEAD: {message}",
-            );
-        });
-    }
-
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_restore_indexed_objects_downloads_skips_and_verifies_hash() {
         let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
@@ -6530,7 +6412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn cloud_restore_indexed_objects_reports_hash_mismatch() {
         let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
@@ -6591,7 +6473,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn create_r2_storage_reads_values_from_local_config() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7006,7 +6888,7 @@ mod tests {
     /// erased. Both the session and its checkpoints must be dropped, and
     /// everything else must still restore.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_skips_locally_tombstoned_sessions_and_their_checkpoints() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7106,7 +6988,7 @@ mod tests {
     /// checkpoints into the local catalog. Smoke-tests the happy path
     /// without spinning up a D1 client.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_inserts_fresh_rows() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7164,7 +7046,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_rejects_locally_pruned_remote_checkpoint() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7268,7 +7150,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_round_trips_subagent_companion_relations() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7360,7 +7242,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_subagent_revision_conflict_rolls_back_claim_advance_atomically() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7892,7 +7774,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn agent_capture_snapshot_never_publishes_catalog_beyond_object_generation() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -7987,7 +7869,7 @@ mod tests {
     /// existing row in place rather than inserting a duplicate or erroring
     /// on the unique index (`idx_agent_session_provider`).
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_upserts_existing_session_on_conflict() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8054,7 +7936,7 @@ mod tests {
     /// Immutable checkpoint fields never change merely because a remote row
     /// carries a generation number.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_rejects_immutable_checkpoint_conflict() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8104,7 +7986,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_applies_newer_checkpoint_prune_rewrite() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8165,7 +8047,7 @@ mod tests {
     /// otherwise claims/checkpoints from a partially applied remote snapshot
     /// can become visible together with stale local companions.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_partial_failure_returns_err() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8207,7 +8089,7 @@ mod tests {
     /// rows into a half-built catalogue. This test simulates that
     /// scenario by dropping the checkpoint table after init.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn restore_agent_capture_warns_when_checkpoint_table_missing() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -8270,7 +8152,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn validate_cloud_backup_env_surfaces_config_resolution_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();

@@ -18,6 +18,8 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) {
     writeln!(f, "hello").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -31,6 +33,10 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -42,7 +48,7 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_lists_heads() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -248,6 +254,8 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
     // c1 then c2 on main.
     std::fs::write("a.txt", "1\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -261,6 +269,10 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -275,6 +287,8 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
 
     std::fs::write("a.txt", "2\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -288,6 +302,10 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -330,7 +348,7 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_format_and_json() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -353,7 +371,7 @@ async fn test_for_each_ref_format_and_json() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_sort_and_count() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -370,7 +388,7 @@ async fn test_for_each_ref_sort_and_count() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_points_at_matches_direct_and_peeled_tag_targets() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -421,7 +439,7 @@ async fn test_for_each_ref_points_at_matches_direct_and_peeled_tag_targets() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_unknown_sort_rejects() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -439,7 +457,7 @@ async fn test_for_each_ref_unknown_sort_rejects() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_sort_version_refname() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -484,7 +502,7 @@ async fn test_for_each_ref_sort_version_refname() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_format_short_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -533,7 +551,7 @@ async fn test_for_each_ref_format_short_atoms() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_head_marker_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await; // checked out on main
@@ -562,7 +580,7 @@ async fn test_for_each_ref_head_marker_atom() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_upstream_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -601,7 +619,7 @@ async fn test_for_each_ref_upstream_atom() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_push_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -697,7 +715,7 @@ async fn test_for_each_ref_push_atom() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_subject_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await; // commits with subject "initial"
@@ -721,7 +739,7 @@ async fn test_for_each_ref_subject_atom() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_subject_with_percent_paren_is_literal() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -750,7 +768,7 @@ async fn test_for_each_ref_subject_with_percent_paren_is_literal() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_author_committer_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -785,7 +803,7 @@ async fn test_for_each_ref_author_committer_atoms() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_tagger_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -834,7 +852,7 @@ async fn test_for_each_ref_tagger_atoms() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_date_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -865,7 +883,7 @@ async fn test_for_each_ref_date_atoms() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_refname_lstrip_rstrip() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await; // refs/heads/main
@@ -901,7 +919,7 @@ async fn test_for_each_ref_refname_lstrip_rstrip() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_contents_and_body_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -956,7 +974,7 @@ async fn test_for_each_ref_contents_and_body_atoms() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_objectname_short_n() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -1038,6 +1056,8 @@ async fn test_for_each_ref_sort_by_committerdate() {
     // c1 on main, then branch `older` at c1.
     std::fs::write("a.txt", "1\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1051,6 +1071,10 @@ async fn test_for_each_ref_sort_by_committerdate() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1068,6 +1092,8 @@ async fn test_for_each_ref_sort_by_committerdate() {
 
     std::fs::write("a.txt", "2\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1081,6 +1107,10 @@ async fn test_for_each_ref_sort_by_committerdate() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1147,6 +1177,8 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
     // c1, remember its hash, and branch `bbb` at it.
     std::fs::write("a.txt", "1\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1160,6 +1192,10 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1177,6 +1213,8 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     std::fs::write("a.txt", "2\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1190,6 +1228,10 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1261,6 +1303,8 @@ async fn test_for_each_ref_sort_peels_nested_annotated_tags() {
     // A single real commit c1; `main` and `bbb` both point at it.
     std::fs::write("a.txt", "1\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1274,6 +1318,10 @@ async fn test_for_each_ref_sort_peels_nested_annotated_tags() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1739,6 +1787,8 @@ async fn test_for_each_ref_deref_size_errors_on_broken_tag_chain() {
 
     std::fs::write("a.txt", "1\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1752,6 +1802,10 @@ async fn test_for_each_ref_deref_size_errors_on_broken_tag_chain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2103,7 +2157,7 @@ fn test_for_each_ref_if_then_else_conditional() {
 /// full-vs-short prefix matching, and an annotated tag (a non-commit ref →
 /// all commit-graph atoms empty).
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_for_each_ref_commit_graph_atoms() {
     let temp = tempdir().unwrap();
     init_repo_via_cli(temp.path());
@@ -2207,7 +2261,7 @@ fn test_for_each_ref_commit_graph_atoms() {
 /// commits, tagger date for annotated tags); an inapplicable date is empty; and
 /// `:relative` produces git-style "… ago" output.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_for_each_ref_date_format_modifiers() {
     let temp = tempdir().unwrap();
     init_repo_via_cli(temp.path());
@@ -2299,7 +2353,7 @@ fn test_for_each_ref_date_format_modifiers() {
 /// `%(color:<spec>)` emits ANSI escapes when color is enabled (`--color=always`),
 /// nothing when disabled (`--color=never`), and rejects an unrecognized color.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_for_each_ref_color_atom() {
     let temp = tempdir().unwrap();
     init_repo_via_cli(temp.path());
@@ -2731,6 +2785,8 @@ async fn test_for_each_ref_symref_atom() {
 
     std::fs::write("a.txt", "1\n").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2744,6 +2800,10 @@ async fn test_for_each_ref_symref_atom() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2792,7 +2852,7 @@ async fn test_for_each_ref_symref_atom() {
 }
 
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_worktreepath_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -2824,7 +2884,7 @@ async fn test_for_each_ref_worktreepath_atom() {
 /// Part C §C.3.3: `%(worktreepath)` resolves a branch to the LINKED worktree
 /// that has it checked out, even when `for-each-ref` runs in the main worktree.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_for_each_ref_worktreepath_across_worktrees() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;

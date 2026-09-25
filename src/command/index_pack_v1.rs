@@ -11,16 +11,37 @@ use git_internal::{
     hash::{HashKind, ObjectHash, get_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
+        object::types::ObjectType,
         pack::{Pack, entry::Entry},
     },
 };
 use sha1::{Digest, Sha1};
 
-use crate::command::index_pack_support::{
-    index_write_error, lock_state, record_first_pack_error, take_arc_mutex,
+use crate::{
+    command::index_pack_support::{
+        PackCommitEdges, index_write_error, lock_state, record_first_pack_error, take_arc_mutex,
+    },
+    utils::client_storage::parse_commit_header_refs,
 };
 
 pub fn build_index_v1(pack_file: &str, index_file: &str) -> Result<(), GitError> {
+    build_index_v1_inner(pack_file, index_file, false).map(|_| ())
+}
+
+/// Build the index and spool commit parent edges from the same pack decode.
+pub(crate) fn build_index_v1_with_commit_edges(
+    pack_file: &str,
+    index_file: &str,
+) -> Result<PackCommitEdges, GitError> {
+    build_index_v1_inner(pack_file, index_file, true)?
+        .ok_or_else(|| GitError::PackEncodeError("commit edge spool was not created".to_string()))
+}
+
+fn build_index_v1_inner(
+    pack_file: &str,
+    index_file: &str,
+    collect_edges: bool,
+) -> Result<Option<PackCommitEdges>, GitError> {
     if get_hash_kind() != HashKind::Sha1 {
         return Err(GitError::InvalidPackFile(
             "Index version 1 only supports SHA-1 hash".to_string(),
@@ -30,12 +51,22 @@ pub fn build_index_v1(pack_file: &str, index_file: &str) -> Result<(), GitError>
     let tmp_path = pack_path.parent().ok_or_else(|| {
         GitError::InvalidArgument(format!("invalid pack file path: '{pack_file}'"))
     })?;
+    let spool_dir = if tmp_path.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        tmp_path
+    };
     let pack_file = std::fs::File::open(pack_file)?;
     let mut pack_reader = std::io::BufReader::new(pack_file);
     let obj_map = Arc::new(Mutex::new(BTreeMap::new()));
     let obj_map_c = obj_map.clone();
     let err = Arc::new(Mutex::new(None));
     let err_c = err.clone();
+    let commit_edges = collect_edges
+        .then(|| PackCommitEdges::new(spool_dir, HashKind::Sha1))
+        .transpose()?
+        .map(|spool| Arc::new(Mutex::new(spool)));
+    let commit_edges_c = commit_edges.clone();
     let mut pack = Pack::new(
         Some(8),
         Some(1024 * 1024 * 1024),
@@ -47,6 +78,29 @@ pub fn build_index_v1(pack_file: &str, index_file: &str) -> Result<(), GitError>
         move |meta_entry: MetaAttached<Entry, EntryMeta>| {
             let entry = &meta_entry.inner;
             let hash_key = entry.hash;
+            if let Some(spool) = commit_edges_c.as_ref()
+                && entry.obj_type == ObjectType::Commit
+            {
+                let (_, parents) = match parse_commit_header_refs(&entry.data, hash_key) {
+                    Ok(refs) => refs,
+                    Err(error) => {
+                        record_first_pack_error(&err_c, error);
+                        return;
+                    }
+                };
+                match spool.lock() {
+                    Ok(mut guard) => {
+                        if let Err(error) = guard.record_parents(hash_key, &parents) {
+                            record_first_pack_error(&err_c, error);
+                            return;
+                        }
+                    }
+                    Err(_) => record_first_pack_error(
+                        &err_c,
+                        GitError::PackEncodeError("commit edge spool mutex poisoned".to_string()),
+                    ),
+                }
+            }
             let Some(offset) = meta_entry.meta.pack_offset else {
                 record_first_pack_error(
                     &err_c,
@@ -121,5 +175,11 @@ pub fn build_index_v1(pack_file: &str, index_file: &str) -> Result<(), GitError>
         .map_err(|e| index_write_error("writing index checksum", e))?;
 
     tracing::debug!("Index file is written to {:?}", index_file);
-    Ok(())
+    commit_edges
+        .map(|spool| {
+            let mut spool = take_arc_mutex(spool, "commit edge spool")?;
+            spool.finish()?;
+            Ok(spool)
+        })
+        .transpose()
 }

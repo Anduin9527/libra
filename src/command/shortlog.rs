@@ -439,9 +439,9 @@ async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<Sho
     // `--merges` is the inverse, keeping only merge commits. The two override
     // each other (last one wins), so at most one filter applies.
     if args.no_merges {
-        commits.retain(|commit| commit.parent_commit_ids.len() <= 1);
+        commits.retain(|commit| commit.parent_commit_ids.len() <= 1); // SHALLOW-DISPLAY: recorded merge-ness
     } else if args.merges {
-        commits.retain(|commit| commit.parent_commit_ids.len() >= 2);
+        commits.retain(|commit| commit.parent_commit_ids.len() >= 2); // SHALLOW-DISPLAY: recorded merge-ness
     }
 
     // `--author=<pattern>` keeps only commits whose author identity contains the
@@ -950,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn execute_safe_requires_repository() {
         let temp = tempdir().unwrap();
         test::setup_clean_testing_env_in(temp.path());

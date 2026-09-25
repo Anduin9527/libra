@@ -2,8 +2,10 @@
 //! `auth.token.*` namespace in the GLOBAL config store.
 //!
 //! Tokens are AES-256-GCM-encrypted with the global vault unseal key
-//! (`~/.libra/vault-unseal-key`, created 0600) and stored as hex ciphertext
-//! in `~/.libra/config.db` — the row's sanctioned "文件 fallback 加密"; a
+//! (`<config dir>/libra/vault-unseal-key`, created 0600; a pre-XDG
+//! `~/.libra/vault-unseal-key` is copied there once and kept as a backup) and
+//! stored as hex ciphertext in the global configuration database
+//! (`<config dir>/libra/config.db`) — the row's sanctioned "文件 fallback 加密"; a
 //! real OS keyring is the 2.7 follow-up and swaps in behind this module
 //! boundary. The plaintext token NEVER appears in logs, errors, JSON, or
 //! status output; errors name only host/port.
@@ -196,7 +198,9 @@ fn repair_global_modes() {
         use std::os::unix::fs::PermissionsExt;
         for path in [
             ConfigScope::Global.get_config_path(),
-            dirs::home_dir().map(|home| home.join(".libra").join("vault-unseal-key")),
+            // Only the key Libra actually uses: a migrated legacy file is a
+            // user-owned backup and is left untouched (ADR-GCX-04).
+            crate::internal::vault::active_global_unseal_key_path(),
         ]
         .into_iter()
         .flatten()

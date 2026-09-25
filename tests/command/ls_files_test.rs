@@ -1095,3 +1095,31 @@ fn test_ls_files_eol_classifies_line_endings() {
         "-s --eol inserts the eol column after the stage record: {s_out}"
     );
 }
+
+#[test]
+fn test_literal_pathspecs_disables_magic() {
+    let repo = tempdir().expect("tempdir");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("x.txt"), "x\n").unwrap();
+    fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "x.txt", "*.txt"], p),
+        "add both",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "files", "--no-verify"], p),
+        "commit",
+    );
+    let out = run_libra_command(
+        &["--literal-pathspecs", "ls-files", "--", ":(glob)*.txt"],
+        p,
+    );
+    assert_cli_success(&out, "ls-files literal magic");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        ":(glob)*.txt is a literal name: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

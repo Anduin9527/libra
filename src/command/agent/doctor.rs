@@ -97,7 +97,10 @@ use git_internal::{
         tree::{Tree, TreeItemMode},
     },
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
+    TransactionTrait,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -105,7 +108,7 @@ use super::DoctorArgs;
 use crate::{
     internal::{
         ai::{
-            history::{self, HistoryManager},
+            history::HistoryManager,
             hooks::{
                 providers::{claude_provider, gemini_provider},
                 runtime::{
@@ -115,10 +118,11 @@ use crate::{
                 },
             },
             observed_agents::{AgentStability, PREVIEW_SPECS, STABLE_PROMOTED_SPECS},
+            traces,
         },
-        branch::TRACES_BRANCH,
         config::ConfigKv,
         db::get_db_conn_instance,
+        model::reference::{self, ConfigKind},
     },
     utils::{
         client_storage::ClientStorage,
@@ -193,7 +197,26 @@ struct DoctorReport {
     checkpoint_store: CheckpointStoreReport,
     /// A0-06 review/investigate findings-object scan (detection + repair).
     findings_store: FindingsStoreReport,
+    /// RC-31: frozen Code-era residue (read-only existence check).
+    legacy_code_residue: LegacyCodeResidue,
 }
+
+/// plan-20260920 RC-31: frozen Code-era residue. Read-only — this diagnostic
+/// never unlinks files, rewrites objects or touches `ai_*` /
+/// `agent_usage_stats`; RC-11 stopped writing this state and DEFER-RC-02 owns
+/// any future cleanup.
+#[derive(Debug, Serialize)]
+struct LegacyCodeResidue {
+    /// Repository-relative paths that still exist (never absolute).
+    paths: Vec<String>,
+    /// The frozen intent ref still exists in the ref store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent_ref: Option<String>,
+    note: &'static str,
+}
+
+const LEGACY_CODE_RESIDUE_NOTE: &str =
+    "frozen Code-era residue, kept read-only; see plan-20260920 ADR-RC-04";
 
 #[derive(Debug, Serialize)]
 struct FindingsStoreReport {
@@ -310,6 +333,50 @@ enum RepairPlan {
     Manual,
 }
 
+/// Repository-relative paths of the frozen Code-era residue that still exist
+/// under the storage root. Only existence is reported (never absolute paths,
+/// never file contents).
+fn legacy_code_residue_paths(storage: &Path) -> Vec<String> {
+    [
+        (
+            ".libra/sessions/code",
+            storage.join("sessions").join("code"),
+        ),
+        (".libra/code", storage.join("code")),
+    ]
+    .into_iter()
+    .filter(|(_, path)| path.exists())
+    .map(|(relative, _)| relative.to_string())
+    .collect()
+}
+
+/// RC-31: read-only existence check for the frozen Code-era residue:
+/// `.libra/sessions/code/`, `.libra/code/` and the `libra/intent` ref. Only
+/// paths and a ref name are reported — never transcript content, and never an
+/// absolute path outside the repository.
+async fn scan_legacy_code_residue(conn: &DatabaseConnection) -> CliResult<LegacyCodeResidue> {
+    let paths = util::try_get_storage_path(None)
+        .map(|storage| legacy_code_residue_paths(&storage))
+        .unwrap_or_default();
+    let intent_ref = reference::Entity::find()
+        .filter(reference::Column::Name.eq(crate::internal::ai::history::AI_REF))
+        .filter(reference::Column::Kind.eq(ConfigKind::Branch))
+        .one(conn)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "agent doctor could not read the intent ref '{}': {error}",
+                crate::internal::ai::history::AI_REF
+            ))
+        })?
+        .map(|_| crate::internal::ai::history::AI_REF.to_string());
+    Ok(LegacyCodeResidue {
+        paths,
+        intent_ref,
+        note: LEGACY_CODE_RESIDUE_NOTE,
+    })
+}
+
 pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<()> {
     let conn = get_db_conn_instance().await;
     let schema_present = table_exists(&conn, "agent_session").await?
@@ -388,6 +455,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
 
     let checkpoint_store = scan_checkpoint_store(&conn, schema_present, args.repair).await?;
     let findings_store = scan_agent_findings(&conn, schema_present, args.repair).await?;
+    let legacy_code_residue = scan_legacy_code_residue(&conn).await?;
 
     emit_report(
         &DoctorReport {
@@ -399,6 +467,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
             gemini_hooks_remnant,
             checkpoint_store,
             findings_store,
+            legacy_code_residue,
         },
         output,
     )
@@ -860,11 +929,10 @@ async fn scan_checkpoint_store(
     let reader = ObjectReader {
         storage: Arc::new(ClientStorage::init(repo_path.join("objects"))),
     };
-    let history = HistoryManager::new_with_ref(
+    let history = HistoryManager::for_traces(
         reader.storage.clone(),
         repo_path.clone(),
         Arc::new(conn.clone()),
-        TRACES_BRANCH,
     );
     let mut findings: Vec<CheckpointFinding> = Vec::new();
     let mut plans: Vec<RepairPlan> = Vec::new();
@@ -1118,7 +1186,7 @@ async fn scan_checkpoint_store(
     };
     let mut markers = Vec::new();
     for entry in marker_entries {
-        match history::decode_and_validate_traces_inflight_marker(
+        match traces::decode_and_validate_traces_inflight_marker(
             &entry.value,
             &entry.target,
             &entry.key,
@@ -1371,7 +1439,7 @@ async fn scan_checkpoint_store(
         // A row may exist under a different checkpoint_id for the same
         // commit (e.g. an earlier repair raced a crash retry) — the same
         // probe the writer uses keeps this idempotent.
-        match history::agent_checkpoint_id_for_traces_commit(conn, &rc.commit).await {
+        match traces::agent_checkpoint_id_for_traces_commit(conn, &rc.commit).await {
             Ok(Some(_)) => continue,
             Ok(None) => {}
             Err(err) => {
@@ -1785,7 +1853,7 @@ async fn build_class2_plan(
     // claim recovery both rebuild catalog rows through
     // `rebuild_catalog_row_from_traces_ref`, so an unknown scope fails
     // closed identically everywhere.
-    let rebuilt = history::rebuild_catalog_row_from_traces_ref(history::RebuildCatalogRowInputs {
+    let rebuilt = traces::rebuild_catalog_row_from_traces_ref(traces::RebuildCatalogRowInputs {
         scope: scope.clone(),
         checkpoint_id: checkpoint_id.to_string(),
         session_id: metadata.session_id.clone(),
@@ -1818,7 +1886,7 @@ async fn build_class2_plan(
         ));
     }
     match rebuilt {
-        history::RebuiltCatalogRow::Subagent {
+        traces::RebuiltCatalogRow::Subagent {
             checkpoint_id,
             session_id,
             parent_commit,
@@ -1846,7 +1914,7 @@ async fn build_class2_plan(
                 created_at,
             },
         )),
-        history::RebuiltCatalogRow::Committed {
+        traces::RebuiltCatalogRow::Committed {
             checkpoint_id,
             session_id,
             parent_commit,
@@ -2652,6 +2720,18 @@ fn emit_report(report: &DoctorReport, output: &OutputConfig) -> CliResult<()> {
     println!("Active sessions      : {}", report.active_sessions);
     println!("Stopped sessions     : {}", report.stopped_sessions);
     println!("Orphan checkpoints   : {}", report.orphan_checkpoints);
+    if report.legacy_code_residue.paths.is_empty()
+        && report.legacy_code_residue.intent_ref.is_none()
+    {
+        println!("Frozen Code residue  : none");
+    } else {
+        let mut items = report.legacy_code_residue.paths.clone();
+        if let Some(intent_ref) = &report.legacy_code_residue.intent_ref {
+            items.push(intent_ref.clone());
+        }
+        println!("Frozen Code residue  : {}", items.join(", "));
+        println!("  note: {}", report.legacy_code_residue.note);
+    }
 
     println!("Provider hooks:");
     for ph in &report.provider_hooks {
@@ -2991,6 +3071,25 @@ mod tests {
         assert_eq!(
             manifest_declared_blobs(&no_len),
             vec![("metadata.json".to_string(), "aa7".to_string(), None)]
+        );
+    }
+
+    /// RC-31: only existing residue paths are reported, as repository-relative
+    /// names; an empty storage root reports nothing.
+    #[test]
+    fn legacy_code_residue_paths_reports_existing_relative_paths_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join(".libra");
+        assert!(legacy_code_residue_paths(&storage).is_empty());
+
+        std::fs::create_dir_all(storage.join("sessions").join("code")).expect("sessions/code");
+        std::fs::create_dir_all(storage.join("code")).expect("code");
+        assert_eq!(
+            legacy_code_residue_paths(&storage),
+            vec![
+                ".libra/sessions/code".to_string(),
+                ".libra/code".to_string()
+            ]
         );
     }
 }

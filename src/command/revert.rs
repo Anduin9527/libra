@@ -96,11 +96,25 @@ enum RevertError {
     #[error("unresolved conflict markers remain in '{0}'")]
     UnresolvedConflicts(String),
 
+    /// ADR-HF-04: a new revert refuses to start while the index still has
+    /// unmerged entries, before any index, worktree, ref or state write.
+    #[error("revert is not possible because the index has unmerged entries")]
+    UnmergedIndex(Vec<String>),
+
     #[error("failed to access revert state: {0}")]
     StateIo(String),
 
     #[error("failed to load object: {0}")]
     LoadObject(String),
+
+    #[error("failed to read merge.default config: {0}")]
+    MergeDriverConfigRead(String),
+
+    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge', 'diff3', or 'zdiff3')")]
+    InvalidConflictStyle(String),
+
+    #[error("failed to read merge.conflictStyle config: {0}")]
+    ConflictStyleRead(String),
 
     #[error("failed to save object: {0}")]
     SaveObject(String),
@@ -213,6 +227,10 @@ impl RevertError {
             | Self::MainlineForNonMerge(_)
             | Self::InvalidMainline { .. } => StableErrorCode::CliInvalidArguments,
             Self::LoadObject(_) => StableErrorCode::IoReadFailed,
+            Self::MergeDriverConfigRead(_) | Self::ConflictStyleRead(_) => {
+                StableErrorCode::IoReadFailed
+            }
+            Self::InvalidConflictStyle(_) => StableErrorCode::RepoStateInvalid,
             Self::SaveObject(_) => StableErrorCode::IoWriteFailed,
             Self::WriteWorktree(_) => StableErrorCode::IoWriteFailed,
             Self::IndexSave(_) => StableErrorCode::IoWriteFailed,
@@ -221,7 +239,7 @@ impl RevertError {
             Self::Signoff(_) => StableErrorCode::CliInvalidArguments,
             Self::Identity(_) => StableErrorCode::AuthMissingCredentials,
             Self::MultiCommitUnsupported(_) => StableErrorCode::CliInvalidArguments,
-            Self::Conflicts { .. } | Self::UnresolvedConflicts(_) => {
+            Self::Conflicts { .. } | Self::UnresolvedConflicts(_) | Self::UnmergedIndex(_) => {
                 StableErrorCode::ConflictUnresolved
             }
             Self::RevertInProgress | Self::NoRevertInProgress => StableErrorCode::RepoStateInvalid,
@@ -267,6 +285,15 @@ impl From<RevertError> for CliError {
             RevertError::InvalidCleanup(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("valid modes: strip, whitespace, verbatim, scissors, default"),
+            RevertError::InvalidConflictStyle(_) => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
+            RevertError::ConflictStyleRead(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("check repository integrity and retry"),
+            RevertError::UnmergedIndex(paths) => {
+                crate::command::cherry_pick::unmerged_index_cli_error(message, &paths)
+            }
             _ => CliError::fatal(message).with_stable_code(stable_code),
         }
     }
@@ -423,6 +450,14 @@ async fn run_revert(args: RevertArgs) -> Result<RevertOutput, RevertError> {
         return Err(RevertError::DetachedHead);
     }
 
+    // ADR-HF-04: refuse before resolving targets or writing anything while the
+    // index still has unmerged entries (Git: "your index file is unmerged.").
+    let unmerged =
+        crate::command::cherry_pick::unmerged_index_paths().map_err(RevertError::IndexLoad)?;
+    if !unmerged.is_empty() {
+        return Err(RevertError::UnmergedIndex(unmerged));
+    }
+
     // `--no-commit` and `-m` operate on a single revert; combining them with
     // multiple commits would need a full multi-commit sequencer, so reject the
     // combination rather than silently misbehave.
@@ -541,6 +576,7 @@ async fn revert_sequence(
                         cleanup: params.cleanup.clone(),
                         strategy_option: params.strategy_option,
                         remaining: ids[(i + 1)..].iter().map(|h| h.to_string()).collect(),
+                        stop_concluded: false,
                         conflicted_paths: conflicted_paths.clone(),
                     }
                     .save()?;
@@ -559,6 +595,45 @@ async fn revert_sequence(
 async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
     refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
+    if state.stop_concluded {
+        // #477 HF-02: a later reset/commit already concluded this stop. Do not
+        // record the current index as that revert; drain the remaining commits.
+        RevertState::cleanup()?;
+        if state.remaining.is_empty() {
+            let commit_str = state.reverted_commit.clone();
+            return Ok(RevertOutput {
+                reverted_commit: commit_str.clone(),
+                short_reverted: short_display_hash(&commit_str).to_string(),
+                new_commit: None,
+                short_new: None,
+                no_commit: false,
+                files_changed: 0,
+            });
+        }
+        let remaining = parse_remaining_ids(&state.remaining)?;
+        let params = RevertParams::for_sequence(
+            state.signoff,
+            state.edit,
+            state.cleanup.clone(),
+            state.strategy_option,
+        );
+        let outcome = revert_sequence(&remaining, &params, None, 0).await?;
+        let (commit_str, last_revert_commit, total_files_changed) = outcome.ok_or_else(|| {
+            RevertError::LoadObject(
+                "revert continuation lost the remaining sequence result".to_string(),
+            )
+        })?;
+        return Ok(RevertOutput {
+            reverted_commit: commit_str.clone(),
+            short_reverted: short_display_hash(&commit_str).to_string(),
+            new_commit: last_revert_commit.as_ref().map(|id| id.to_string()),
+            short_new: last_revert_commit
+                .as_ref()
+                .map(|id| short_display_hash(&id.to_string()).to_string()),
+            no_commit: false,
+            files_changed: total_files_changed,
+        });
+    }
 
     // Refuse to finish while conflict markers remain in any *staged* file (the
     // index is what gets committed, so the user must resolve and re-`add`).
@@ -588,7 +663,17 @@ async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
         })
         .collect();
     let files_changed = tree_items.len();
-    let tree_id = build_tree_from_map(tree_items).await?;
+    let tree_modes: std::collections::HashMap<PathBuf, TreeItemMode> = index
+        .tracked_files()
+        .into_iter()
+        .filter_map(|path| {
+            let key = path.to_str()?;
+            index
+                .get(key, 0)
+                .map(|entry| (path.clone(), index_mode_to_tree_item(entry.mode)))
+        })
+        .collect();
+    let tree_id = build_tree_from_map(tree_items, &tree_modes).await?;
     let message = resolve_revert_message(
         &reverted_commit_id,
         state.signoff,
@@ -639,9 +724,21 @@ async fn run_revert_skip() -> Result<RevertOutput, RevertError> {
     refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
 
-    // HEAD is already at `orig_head` (the conflict stopped before committing), so
-    // restoring the index/worktree to its tree drops the conflict markers.
-    restore_to_orig_head(&state.orig_head).await?;
+    // Ordinarily HEAD is still at `orig_head` (the conflict stopped before
+    // committing), so restoring its tree drops the conflict markers. #477 HF-01:
+    // once a later `reset` concluded the stop, HEAD is wherever that reset left
+    // it — restoring `orig_head` would silently undo the user's chosen target —
+    // so the skip cleans against the CURRENT HEAD and the remainder applies on
+    // top of it.
+    let restore_target = if state.stop_concluded {
+        Head::current_commit()
+            .await
+            .ok_or_else(|| RevertError::LoadObject("failed to resolve HEAD".to_string()))?
+            .to_string()
+    } else {
+        state.orig_head.clone()
+    };
+    restore_to_orig_head(&restore_target).await?;
 
     // Clear the skipped commit's state before draining the rest, so a non-conflict
     // error among the remaining commits cannot leave stale state (see
@@ -703,6 +800,7 @@ async fn restore_to_orig_head(orig_head_str: &str) -> Result<(), RevertError> {
     rebuild_index_from_tree(&tree, &mut new_index, "")?;
     let current_index =
         Index::load(path::index()).map_err(|e| RevertError::IndexLoad(e.to_string()))?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut new_index);
     reset_workdir_safely(&current_index, &new_index)?;
     new_index
         .save(path::index())
@@ -860,6 +958,12 @@ struct RevertState {
     /// sequence. `#[serde(default)]` keeps older state files loadable.
     #[serde(default)]
     remaining: Vec<String>,
+    /// #477 HF-01: whether the stopped commit was concluded from outside the
+    /// revert (a later `reset`, and from HF-29 a later `commit`). The remaining
+    /// sequence is kept; `--continue` consuming this marker is HF-02.
+    /// `#[serde(default)]` keeps older state files loadable.
+    #[serde(default)]
+    stop_concluded: bool,
     /// Paths left with conflict markers for the user to resolve.
     conflicted_paths: Vec<String>,
 }
@@ -887,6 +991,12 @@ impl RevertState {
     }
 
     fn save(&self) -> Result<(), RevertError> {
+        let _lock = RevertStateLock::acquire().map_err(RevertError::StateIo)?;
+        self.save_locked()
+    }
+
+    /// [`Self::save`] for a caller that already holds [`RevertStateLock`].
+    fn save_locked(&self) -> Result<(), RevertError> {
         let path = Self::path();
         // Record the writer's scope (W2, ADR-0714-08) — see MergeState::save.
         let mut value =
@@ -910,12 +1020,211 @@ impl RevertState {
     }
 
     fn cleanup() -> Result<(), RevertError> {
+        let _lock = RevertStateLock::acquire().map_err(RevertError::StateIo)?;
+        Self::cleanup_locked()
+    }
+
+    /// [`Self::cleanup`] for a caller that already holds [`RevertStateLock`].
+    fn cleanup_locked() -> Result<(), RevertError> {
         let path = Self::path();
         // Durable (§C.10): a resurrected revert-state replays a revert the
         // user already concluded.
         crate::utils::atomic_write::remove_durably(&path)
             .map_err(|e| RevertError::StateIo(format!("{}: {e}", path.display())))
     }
+}
+
+/// End the revert item a stopped sequence is sitting on, because a later
+/// `reset` concluded it (ADR-HF-03 items 1 and 4, #477 HF-01).
+///
+/// Removes the sidecar when nothing remains to revert, otherwise keeps the
+/// remaining commits and records `stop_concluded` (an additive
+/// `#[serde(default)]` field, so older binaries still read the file).
+/// Write raw sidecar bytes. Test-seam only: `reset`'s
+/// `LIBRA_TEST_RESET_START_SEQUENCE_AFTER_RESET` uses it to simulate a revert
+/// that starts after the reset finished.
+pub(crate) fn write_state_for_test(bytes: &[u8]) -> Result<(), String> {
+    let path = RevertState::path();
+    let _lock = RevertStateLock::acquire()?;
+    fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub(crate) fn snapshot_stopped_revert() -> Result<Option<Vec<u8>>, String> {
+    // Reset must honor the same common-storage ownership rule as control verbs.
+    refuse_ambiguous_common_state().map_err(|error| error.to_string())?;
+    let path = RevertState::path();
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Conclude exactly the sidecar `snapshot` holds.
+///
+/// Two things make this a compare-and-swap rather than a check-then-act
+/// (Codex R5/R6): the exclusive [`RevertStateLock`] is held across the whole
+/// read/validate/write — and every other mutator ([`RevertState::save`],
+/// [`RevertState::cleanup`]) takes the same lock, so no protocol participant
+/// can interleave — and the file's bytes must still equal `snapshot`, so a
+/// revert that started before we got the lock keeps its own state. The caller
+/// snapshots BEFORE its reset, so a revert started after the reset is never
+/// concluded by it.
+pub(crate) async fn conclude_stopped_revert(
+    snapshot: Vec<u8>,
+) -> Result<crate::internal::sequencer::ExternalConclusion, String> {
+    use crate::internal::sequencer::ExternalConclusion;
+
+    let path = RevertState::path();
+    let state: RevertState = serde_json::from_slice(&snapshot)
+        .map_err(|e| format!("failed to read the stopped revert state: {e}"))?;
+    if state.stop_concluded && !state.remaining.is_empty() {
+        return Ok(ExternalConclusion::Marked);
+    }
+    conclude_ready_seam()?;
+    let _lock = RevertStateLock::acquire()?;
+    revert_reclaim_race_seam(&path)?;
+    // Only a changed or vanished sidecar means someone else owns the revert
+    // now. Any other read error is a real failure: it must reach `reset`'s
+    // warning (naming `libra revert --abort`) rather than masquerade as
+    // `Superseded` and leave the stop behind silently (Codex R8).
+    match fs::read(&path) {
+        Ok(current) if current == snapshot => {}
+        Ok(_) => return Ok(ExternalConclusion::Superseded),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExternalConclusion::Superseded);
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    // Linked-worktree history can change while reset moves the tree. Recheck
+    // ownership under the mutation lock after matching the original bytes.
+    refuse_ambiguous_common_state().map_err(|error| error.to_string())?;
+    // Revert currently stores textual conflicts as stage-0 marker blobs.
+    // A soft reset can leave these intact without any unmerged index stages.
+    // Check the observed stop's paths while its sidecar is locked, before
+    // removing the user's abort recovery or marking the item concluded.
+    let index = Index::load(path::index()).map_err(|error| {
+        format!("could not read the index to check the stopped revert: {error}")
+    })?;
+    for conflict_path in &state.conflicted_paths {
+        let Some(hash) = index.get_hash(conflict_path, 0) else {
+            // Removing the path from the index is a valid conflict resolution.
+            continue;
+        };
+        let blob = load_object::<Blob>(&hash).map_err(|error| {
+            format!(
+                "could not read staged blob {hash} for '{conflict_path}': {error}; repair the missing or corrupt object before concluding the stopped revert"
+            )
+        })?;
+        if String::from_utf8_lossy(&blob.data).contains(CONFLICT_MARKER) {
+            return Err(format!(
+                "staged conflict markers remain in '{conflict_path}'; stopped revert was preserved. Resolve the conflict and stage it with 'libra add' before continuing"
+            ));
+        }
+    }
+    if state.remaining.is_empty() {
+        RevertState::cleanup_locked().map_err(|e| e.to_string())?;
+        return Ok(ExternalConclusion::Cleared);
+    }
+    RevertState {
+        stop_concluded: true,
+        ..state
+    }
+    .save_locked()
+    .map_err(|e| e.to_string())?;
+    Ok(ExternalConclusion::Marked)
+}
+
+/// Exclusive advisory lock for `revert-state.json`, held across every mutation
+/// of the sidecar so the conclusion's validate-then-write cannot interleave
+/// with a fresh revert's write (#477 HF-01, Codex R6/R9). It uses std file
+/// locking — `flock` on Unix, `LockFileEx` on Windows — like
+/// `internal::layer::layer_mutation_lock`, so the exclusion holds on every
+/// release platform. A second acquisition, in this process or another, waits
+/// for the guard to drop.
+pub(crate) struct RevertStateLock {
+    file: std::fs::File,
+}
+
+impl RevertStateLock {
+    pub(crate) fn lock_path() -> PathBuf {
+        RevertState::path().with_extension("lock")
+    }
+
+    fn open_lock_file() -> Result<std::fs::File, String> {
+        let path = Self::lock_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub(crate) fn acquire() -> Result<Self, String> {
+        let file = Self::open_lock_file()?;
+        file.lock()
+            .map_err(|e| format!("failed to lock the revert state: {e}"))?;
+        Ok(Self { file })
+    }
+
+    /// Non-blocking acquisition, used by the test that proves exclusion.
+    #[cfg(test)]
+    fn try_acquire() -> Result<Option<Self>, String> {
+        let file = Self::open_lock_file()?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(format!("failed to lock the revert state: {e}"))
+            }
+        }
+    }
+}
+
+impl Drop for RevertStateLock {
+    fn drop(&mut self) {
+        // Closing the handle releases the lock too; unlocking first makes the
+        // release explicit and immediate on every platform.
+        let _ = self.file.unlock();
+    }
+}
+
+/// `LIBRA_TEST`-gated seam: create the file named by
+/// `LIBRA_TEST_REVERT_CONCLUDE_READY_FILE` once the snapshot is taken and just
+/// before the lock is requested, so a cross-process test can hold the lock and
+/// replace the sidecar knowing this conclusion already read the old one.
+fn conclude_ready_seam() -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    let Some(marker) = std::env::var_os("LIBRA_TEST_REVERT_CONCLUDE_READY_FILE") else {
+        return Ok(());
+    };
+    fs::write(&marker, b"ready").map_err(|e| format!("{}: {e}", Path::new(&marker).display()))
+}
+
+/// `LIBRA_TEST`-gated seam that rewrites the sidecar between the conclusion's
+/// read and its fenced write, making the quit/reclaim race deterministic.
+fn revert_reclaim_race_seam(path: &Path) -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    // Make the fenced re-read fail with a REAL I/O error (reading a directory
+    // fails on every platform and even as root), so the error mapping above is
+    // exercised through `fs::read` itself rather than a faked `Err`.
+    if std::env::var_os("LIBRA_TEST_REVERT_UNREADABLE_BEFORE_CONCLUDE").is_some() {
+        fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        return fs::create_dir(path).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    let Some(contents) = std::env::var_os("LIBRA_TEST_REVERT_RECLAIM_BEFORE_CONCLUDE") else {
+        return Ok(());
+    };
+    fs::write(path, contents.as_encoded_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Result of reverting one commit against the current worktree.
@@ -930,17 +1239,28 @@ enum SingleRevertOutcome {
 }
 
 /// Content-level 3-way merge for a path that diverged since the reverted commit:
-/// base = the reverted commit's blob, ours = the current blob, theirs = the
-/// parent's blob (the revert target). Returns the resulting blob hash and whether
-/// it carries conflict markers.
+/// base = the reverted commit's blob (or empty when that commit deleted the
+/// path), ours = the current blob, and theirs = the parent's blob (the revert
+/// target). Returns the resulting blob hash and whether it remains conflicted.
+#[allow(clippy::too_many_arguments)]
 fn three_way_revert_blob(
-    reverted_hash: ObjectHash,
+    path: &Path,
+    reverted_hash: Option<ObjectHash>,
     current_hash: ObjectHash,
     parent_hash: Option<ObjectHash>,
     favor: Option<MergeFavor>,
+    default_driver: Option<&str>,
+    conflict_style: merge::ConflictStyle,
+    labels: &merge::GitConflictLabels,
 ) -> Result<(ObjectHash, bool), RevertError> {
-    let reverted: Blob =
-        load_object(&reverted_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+    let reverted_data = match reverted_hash {
+        Some(reverted_hash) => {
+            let reverted: Blob =
+                load_object(&reverted_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+            reverted.data
+        }
+        None => Vec::new(),
+    };
     let current: Blob =
         load_object(&current_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
     let parent_data = match parent_hash {
@@ -951,16 +1271,21 @@ fn three_way_revert_blob(
         }
         None => Vec::new(),
     };
-    let (bytes, conflicted) = match favor {
-        Some(favor) => (
-            merge::merge_bytes_with_favor(&reverted.data, &current.data, &parent_data, favor)
-                .map_err(RevertError::SaveObject)?,
-            false,
-        ),
-        None => match diffy::merge_bytes(&reverted.data, &current.data, &parent_data) {
-            Ok(merged) => (merged, false),
-            Err(conflicted) => (conflicted, true),
-        },
+    let driver = merge::builtin_merge_driver_for_path(path, default_driver);
+    let (bytes, conflicted) = match merge::merge_bytes_with_refined_driver_labeled(
+        driver,
+        &reverted_data,
+        &current.data,
+        &parent_data,
+        favor,
+        conflict_style,
+        0,
+        labels.as_marker_labels(),
+    )
+    .map_err(RevertError::SaveObject)?
+    {
+        merge::BuiltinMergeOutcome::Clean(bytes) => (bytes, false),
+        merge::BuiltinMergeOutcome::Conflict(bytes) => (bytes, true),
     };
     let blob = Blob::from_content_bytes(bytes);
     save_object(&blob, &blob.id).map_err(|e| RevertError::SaveObject(e.to_string()))?;
@@ -1009,6 +1334,7 @@ async fn revert_single_commit(
 ) -> Result<SingleRevertOutcome, RevertError> {
     let reverted_commit: Commit =
         load_object(commit_id).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+    let labels = merge::GitConflictLabels::for_revert(commit_id, &reverted_commit.message);
 
     // Select the baseline parent to diff against. A merge commit (>1 parent)
     // requires `-m <n>` to pick the mainline; a non-merge commit rejects `-m`.
@@ -1055,6 +1381,53 @@ async fn revert_single_commit(
         reverted_tree.get_plain_items().into_iter().collect();
     let parent_files: std::collections::HashMap<_, _> =
         parent_tree.get_plain_items().into_iter().collect();
+    // Modes travel with the hashes: the revert result tree and the materialized
+    // worktree must keep each entry's executable/symlink mode (plan issues/470
+    // FM-02) instead of collapsing everything to a plain blob.
+    let mut current_modes: std::collections::HashMap<PathBuf, TreeItemMode> = current_tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, _, mode)| (path, mode))
+        .collect();
+    let reverted_modes: std::collections::HashMap<PathBuf, TreeItemMode> = reverted_tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, _, mode)| (path, mode))
+        .collect();
+    let parent_modes: std::collections::HashMap<PathBuf, TreeItemMode> = parent_tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, _, mode)| (path, mode))
+        .collect();
+
+    let modifies_existing_path = reverted_files.iter().any(|(path, reverted_hash)| {
+        let parent_hash = parent_files.get(path);
+        Some(*reverted_hash) != parent_hash.copied()
+            && current_files.get(path) != Some(reverted_hash)
+            && current_files.contains_key(path)
+    });
+    let restores_divergent_deleted_path = parent_files.iter().any(|(path, parent_hash)| {
+        !reverted_files.contains_key(path)
+            && current_files
+                .get(path)
+                .is_some_and(|current_hash| current_hash != parent_hash)
+    });
+    let needs_content_driver = modifies_existing_path || restores_divergent_deleted_path;
+    let default_driver = if needs_content_driver {
+        merge::read_merge_default_driver()
+            .await
+            .map_err(RevertError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
+    let (conflict_style, deferred_conflict_style_error) = if needs_content_driver {
+        match merge::conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (merge::ConflictStyle::Merge, Some(error)),
+        }
+    } else {
+        (merge::ConflictStyle::Merge, None)
+    };
 
     let mut files_changed: usize = 0;
     let mut conflicted_paths: Vec<String> = Vec::new();
@@ -1078,10 +1451,22 @@ async fn revert_single_commit(
                 MergeFavor::Ours => current_files.get(path).copied(),
                 MergeFavor::Theirs => parent_hash.copied(),
             };
+            let selected_mode = match favor {
+                MergeFavor::Ours => current_modes.get(path).copied(),
+                MergeFavor::Theirs => parent_modes.get(path).copied(),
+            };
             let previous = match selected {
                 Some(hash) => current_files.insert(path.clone(), hash),
                 None => current_files.remove(path),
             };
+            match selected_mode {
+                Some(mode) if selected.is_some() => {
+                    current_modes.insert(path.clone(), mode);
+                }
+                _ => {
+                    current_modes.remove(path);
+                }
+            }
             if previous != selected {
                 files_changed += 1;
             }
@@ -1091,12 +1476,22 @@ async fn revert_single_commit(
         if current_files.get(path) != Some(&reverted_hash) && current_files.contains_key(path) {
             let current_hash = current_files[path];
             let (merged_hash, conflicted) = three_way_revert_blob(
-                reverted_hash,
+                path,
+                Some(reverted_hash),
                 current_hash,
                 parent_hash.copied(),
                 params.strategy_option,
+                default_driver.as_deref(),
+                conflict_style,
+                &labels,
             )?;
+            let merged_mode = merged_tree_mode(
+                current_modes.get(path).copied(),
+                reverted_modes.get(path).copied(),
+                parent_modes.get(path).copied(),
+            );
             current_files.insert(path.clone(), merged_hash);
+            current_modes.insert(path.clone(), merged_mode);
             files_changed += 1;
             if conflicted {
                 conflicted_paths.push(path.display().to_string());
@@ -1108,7 +1503,15 @@ async fn revert_single_commit(
             if current_files.insert(path.clone(), *parent_hash) != Some(*parent_hash) {
                 files_changed += 1;
             }
+            current_modes.insert(
+                path.clone(),
+                parent_modes
+                    .get(path)
+                    .copied()
+                    .unwrap_or(TreeItemMode::Blob),
+            );
         } else if current_files.remove(path).is_some() {
+            current_modes.remove(path);
             files_changed += 1;
         }
     }
@@ -1116,24 +1519,76 @@ async fn revert_single_commit(
     for (path, &parent_hash) in &parent_files {
         if !reverted_files.contains_key(path) {
             let current_hash = current_files.get(path).copied();
-            if current_hash.is_some()
-                && current_hash != Some(parent_hash)
-                && let Some(favor) = params.strategy_option
+            if let Some(current_hash) = current_hash
+                && current_hash != parent_hash
             {
-                if favor == MergeFavor::Theirs
-                    && current_files.insert(path.clone(), parent_hash) != Some(parent_hash)
-                {
+                let driver = merge::builtin_merge_driver_for_path(path, default_driver.as_deref());
+                if driver != merge::BuiltinMergeDriver::Text {
+                    let (merged_hash, conflicted) = three_way_revert_blob(
+                        path,
+                        None,
+                        current_hash,
+                        Some(parent_hash),
+                        params.strategy_option,
+                        default_driver.as_deref(),
+                        conflict_style,
+                        &labels,
+                    )?;
+                    let merged_mode = merged_tree_mode(
+                        current_modes.get(path).copied(),
+                        reverted_modes.get(path).copied(),
+                        parent_modes.get(path).copied(),
+                    );
+                    current_files.insert(path.clone(), merged_hash);
+                    current_modes.insert(path.clone(), merged_mode);
                     files_changed += 1;
+                    if conflicted {
+                        conflicted_paths.push(path.display().to_string());
+                    }
+                    continue;
                 }
-                continue;
+                // The implicit text fallback keeps the pre-MG-08 add/add
+                // inverse behavior: -X ours retains current, otherwise the
+                // deleted path is restored from the selected parent.
+                if let Some(favor) = params.strategy_option {
+                    if favor == MergeFavor::Theirs {
+                        if current_files.insert(path.clone(), parent_hash) != Some(parent_hash) {
+                            files_changed += 1;
+                        }
+                        current_modes.insert(
+                            path.clone(),
+                            parent_modes
+                                .get(path)
+                                .copied()
+                                .unwrap_or(TreeItemMode::Blob),
+                        );
+                    }
+                    continue;
+                }
             }
             if current_files.insert(path.clone(), parent_hash) != Some(parent_hash) {
                 files_changed += 1;
             }
+            current_modes.insert(
+                path.clone(),
+                parent_modes
+                    .get(path)
+                    .copied()
+                    .unwrap_or(TreeItemMode::Blob),
+            );
         }
     }
 
-    let final_tree_id = build_tree_from_map(current_files).await?;
+    if !conflicted_paths.is_empty()
+        && let Some(error) = deferred_conflict_style_error
+    {
+        return Err(match error {
+            merge::ConflictStyleError::Invalid(value) => RevertError::InvalidConflictStyle(value),
+            merge::ConflictStyleError::Read(detail) => RevertError::ConflictStyleRead(detail),
+        });
+    }
+
+    let final_tree_id = build_tree_from_map(current_files, &current_modes).await?;
     let final_tree: Tree =
         load_object(&final_tree_id).map_err(|e| RevertError::LoadObject(e.to_string()))?;
 
@@ -1159,6 +1614,7 @@ async fn revert_single_commit(
     rebuild_index_from_tree(&final_tree, &mut new_index, "")?;
     let current_index =
         Index::load(path::index()).map_err(|e| RevertError::IndexLoad(e.to_string()))?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut new_index);
     reset_workdir_safely(&current_index, &new_index)?;
     new_index
         .save(path::index())
@@ -1184,9 +1640,11 @@ async fn revert_single_commit(
 
 async fn build_tree_from_map(
     files: std::collections::HashMap<PathBuf, ObjectHash>,
+    modes: &std::collections::HashMap<PathBuf, TreeItemMode>,
 ) -> Result<ObjectHash, RevertError> {
     fn build_subtree(
         paths: &std::collections::HashMap<PathBuf, ObjectHash>,
+        modes: &std::collections::HashMap<PathBuf, TreeItemMode>,
         current_dir: &PathBuf,
     ) -> Result<Tree, RevertError> {
         let mut tree_items = Vec::new();
@@ -1195,7 +1653,7 @@ async fn build_tree_from_map(
             if let Ok(relative_path) = path.strip_prefix(current_dir) {
                 if relative_path.components().count() == 1 {
                     tree_items.push(git_internal::internal::object::tree::TreeItem {
-                        mode: git_internal::internal::object::tree::TreeItemMode::Blob,
+                        mode: modes.get(path).copied().unwrap_or(TreeItemMode::Blob),
                         name: path_to_utf8(relative_path)?.to_string(),
                         id: *hash,
                     });
@@ -1215,7 +1673,7 @@ async fn build_tree_from_map(
             }
         }
         for (subdir, subdir_files) in subdirs {
-            let subdir_tree = build_subtree(&subdir_files.into_iter().collect(), &subdir)?;
+            let subdir_tree = build_subtree(&subdir_files.into_iter().collect(), modes, &subdir)?;
             tree_items.push(git_internal::internal::object::tree::TreeItem {
                 mode: git_internal::internal::object::tree::TreeItemMode::Tree,
                 name: file_name_to_utf8(&subdir)?,
@@ -1227,7 +1685,7 @@ async fn build_tree_from_map(
     }
 
     let root_dir = PathBuf::new();
-    let root_tree = build_subtree(&files, &root_dir)?;
+    let root_tree = build_subtree(&files, modes, &root_dir)?;
     save_object(&root_tree, &root_tree.id).map_err(|e| RevertError::SaveObject(e.to_string()))?;
     Ok(root_tree.id)
 }
@@ -1292,7 +1750,7 @@ fn rebuild_index_from_tree(
             rebuild_index_from_tree(&subtree, index, full_path_str)?;
         } else {
             let blob = git_internal::internal::object::blob::Blob::load(&item.id);
-            let entry = IndexEntry::new_from_blob(
+            let mut entry = IndexEntry::new_from_blob(
                 full_path
                     .to_str()
                     .ok_or_else(|| {
@@ -1304,10 +1762,48 @@ fn rebuild_index_from_tree(
                 item.id,
                 blob.data.len() as u32,
             );
+            entry.mode = tree_mode_to_index_mode(item.mode);
             index.add(entry);
         }
     }
     Ok(())
+}
+
+/// Reverse of [`tree_mode_to_index_mode`] for index entries.
+fn index_mode_to_tree_item(mode: u32) -> TreeItemMode {
+    match mode & 0o170000 {
+        0o120000 => TreeItemMode::Link,
+        0o160000 => TreeItemMode::Commit,
+        0o040000 => TreeItemMode::Tree,
+        _ if mode & 0o111 != 0 => TreeItemMode::BlobExecutable,
+        _ => TreeItemMode::Blob,
+    }
+}
+
+/// Git's `merge_mode` behaviour for the revert 3-way merge (base = reverted
+/// commit, ours = current, theirs = parent): a side matching the base yields to
+/// the other side's mode; otherwise ours wins.
+fn merged_tree_mode(
+    ours: Option<TreeItemMode>,
+    base: Option<TreeItemMode>,
+    theirs: Option<TreeItemMode>,
+) -> TreeItemMode {
+    let ours = ours.unwrap_or(TreeItemMode::Blob);
+    match (base, theirs) {
+        (Some(base), Some(theirs)) if ours == base => theirs,
+        (Some(base), Some(theirs)) if theirs == base => ours,
+        _ => ours,
+    }
+}
+
+fn tree_mode_to_index_mode(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
 }
 
 fn reset_workdir_safely(current_index: &Index, new_index: &Index) -> Result<(), RevertError> {
@@ -1333,20 +1829,27 @@ fn reset_workdir_safely(current_index: &Index, new_index: &Index) -> Result<(), 
         if let Some(entry) = new_index.get(path_str, 0) {
             let blob = git_internal::internal::object::blob::Blob::load(&entry.hash);
             let target_path = workdir.join(path_str);
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
+            if entry.mode & 0o170000 == 0o120000 {
+                crate::utils::worktree_blob::write_worktree_symlink(&target_path, &blob.data)
+                    .map_err(|e| {
+                        RevertError::WriteWorktree(format!(
+                            "failed to write symlink '{}': {e}",
+                            target_path.display()
+                        ))
+                    })?;
+            } else {
+                crate::utils::worktree_blob::write_worktree_blob(
+                    &target_path,
+                    &blob.data,
+                    entry.mode & 0o111 != 0,
+                )
+                .map_err(|e| {
                     RevertError::WriteWorktree(format!(
-                        "failed to create directory '{}': {e}",
-                        parent.display()
+                        "failed to write '{}': {e}",
+                        target_path.display()
                     ))
                 })?;
             }
-            fs::write(&target_path, &blob.data).map_err(|e| {
-                RevertError::WriteWorktree(format!(
-                    "failed to write '{}': {e}",
-                    target_path.display()
-                ))
-            })?;
         }
     }
 
@@ -1492,6 +1995,59 @@ async fn update_head(commit_id: &str) -> Result<(), RevertError> {
 }
 
 #[cfg(test)]
+mod hf01_state_compat_tests {
+    use super::RevertState;
+
+    /// #477 HF-01 (ER-HF-02): a `revert-state.json` written before the marker
+    /// existed still parses, with `stop_concluded` defaulting to false.
+    #[test]
+    fn revert_state_without_stop_concluded_still_parses() {
+        let legacy = r#"{
+            "orig_head": "1111111111111111111111111111111111111111",
+            "reverted_commit": "2222222222222222222222222222222222222222",
+            "signoff": false,
+            "conflicted_paths": ["a.txt"]
+        }"#;
+        let state: RevertState = serde_json::from_str(legacy).expect("legacy sidecar parses");
+        assert!(!state.stop_concluded, "the marker defaults to false");
+        assert!(state.remaining.is_empty());
+        assert_eq!(state.conflicted_paths, vec!["a.txt".to_string()]);
+    }
+
+    /// #477 HF-01 (Codex R6): the sidecar lock is a real mutual exclusion, so
+    /// the conclusion's validate-then-write cannot interleave with the write of
+    /// a freshly started revert — every mutator goes through this same lock.
+    #[test]
+    #[serial_test::serial(cwd, env)]
+    fn revert_state_lock_excludes_a_second_holder() {
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(setup_with_new_libra_in(tmp.path()));
+
+        let held = super::RevertStateLock::acquire().expect("first holder");
+        assert!(
+            super::RevertStateLock::try_acquire()
+                .expect("try")
+                .is_none(),
+            "a second acquisition must wait while the first holder lives"
+        );
+        drop(held);
+        assert!(
+            super::RevertStateLock::try_acquire()
+                .expect("try")
+                .is_some(),
+            "the lock is released when the guard drops"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1505,6 +2061,10 @@ mod tests {
     #[test]
     fn revert_error_display_pins_each_variant() {
         assert_eq!(RevertError::NotInRepo.to_string(), "not a libra repository",);
+        assert_eq!(
+            RevertError::UnmergedIndex(vec!["a.txt".to_string()]).to_string(),
+            "revert is not possible because the index has unmerged entries",
+        );
         assert_eq!(
             RevertError::DetachedHead.to_string(),
             "you are in a 'detached HEAD' state; reverting is not allowed",
@@ -1540,6 +2100,14 @@ mod tests {
         assert_eq!(
             RevertError::LoadObject("ignored".to_string()).to_string(),
             "failed to load object: ignored",
+        );
+        assert_eq!(
+            RevertError::InvalidConflictStyle("bogus".to_string()).to_string(),
+            "unsupported merge.conflictStyle 'bogus' (expected 'merge', 'diff3', or 'zdiff3')",
+        );
+        assert_eq!(
+            RevertError::ConflictStyleRead("db locked".to_string()).to_string(),
+            "failed to read merge.conflictStyle config: db locked",
         );
         assert_eq!(
             RevertError::SaveObject("ignored".to_string()).to_string(),
@@ -1610,7 +2178,19 @@ mod tests {
             StableErrorCode::ConflictUnresolved,
         );
         assert_eq!(
+            RevertError::UnmergedIndex(vec!["a.txt".to_string()]).stable_code(),
+            StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
             RevertError::LoadObject("ignored".to_string()).stable_code(),
+            StableErrorCode::IoReadFailed,
+        );
+        assert_eq!(
+            RevertError::InvalidConflictStyle("bogus".to_string()).stable_code(),
+            StableErrorCode::RepoStateInvalid,
+        );
+        assert_eq!(
+            RevertError::ConflictStyleRead("db locked".to_string()).stable_code(),
             StableErrorCode::IoReadFailed,
         );
         assert_eq!(

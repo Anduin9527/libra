@@ -13,6 +13,7 @@ use git_internal::{
     internal::{
         index::{Index, IndexEntry},
         object::{
+            blob::Blob,
             commit::Commit,
             tree::{Tree, TreeItemMode},
         },
@@ -21,19 +22,27 @@ use git_internal::{
 use serde::Serialize;
 
 use crate::{
-    command::{load_object, symlink_target_blob_bytes},
+    command::{
+        diff::{DiffAlgorithm, compute_unified_hunks},
+        load_object, symlink_target_blob_bytes,
+    },
     common_utils::parse_commit_msg,
     internal::{
         branch::{self, Branch},
         db::get_db_conn_instance,
         head::Head,
+        patch_mode::{
+            FileDiff, HunkUse, PatchApplyMode, PatchSessionKind, SessionOptions,
+            apply_selected_hunks_to_blob, parse_unified_diff, run_session_with,
+        },
         reflog::{ReflogAction, ReflogContext, with_reflog},
     },
     utils::{
-        error::{CliError, CliResult, StableErrorCode, emit_warning},
+        error::{CliError, CliResult, StableErrorCode, emit_post_envelope_warning},
         object_ext::{BlobExt, TreeExt},
         output::{OutputConfig, emit_json_data},
         path,
+        pathspec::PathspecSet,
         text::short_display_hash,
         util, worktree,
     },
@@ -49,7 +58,8 @@ EXAMPLES:
     libra reset src/lib.rs                 Unstage a path back to HEAD
     libra reset HEAD -- src/lib.rs        Unstage a path back to HEAD
     libra reset --pathspec-from-file=paths.txt   Unstage paths read from a file ('-' for stdin)
-    libra reset --json --hard HEAD~1      Structured JSON output for agents";
+    libra reset --json --hard HEAD~1      Structured JSON output for agents
+    libra reset -p                        Interactively unstage hunks";
 
 pub(crate) const RESET_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-reset-pathspec-separator";
 pub(crate) const DEFAULT_RESET_TARGET: &str = "HEAD";
@@ -107,6 +117,20 @@ pub struct ResetArgs {
     /// so this flag is a no-op.
     #[clap(long)]
     pub no_refresh: bool,
+
+    /// Interactively choose hunks to unstage or apply to the index (`reset -p`).
+    #[clap(short = 'p', long = "patch")]
+    pub patch: bool,
+
+    /// Auto-advance after each hunk decision (the `reset -p` default). Last
+    /// one wins against `--no-auto-advance`.
+    #[clap(long = "auto-advance", overrides_with = "no_auto_advance")]
+    pub auto_advance: bool,
+
+    /// Stay on the current hunk after `y`/`n` and enable `>`/`<` file
+    /// navigation. Requires `-p`.
+    #[clap(long = "no-auto-advance", overrides_with = "auto_advance")]
+    pub no_auto_advance: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,12 +203,430 @@ pub async fn execute(args: ResetArgs) {
 /// pathspecs cannot be resolved, object reads fail, or HEAD/index/worktree
 /// updates fail.
 pub async fn execute_safe(args: ResetArgs, output: &OutputConfig) -> CliResult<()> {
-    let result = run_reset(args).await.map_err(CliError::from)?;
+    execute_safe_inner(args, output, true).await
+}
+
+/// `reset` as an INTERNAL step of another sequencer command (cherry-pick's
+/// `--ff`/`--skip`/`--abort`, `am`'s rollback).
+///
+/// #477 HF-01: those commands drive their own sequence row, so the
+/// external-conclusion rule (ADR-HF-03 item 1) must not fire underneath them —
+/// it is the user's own `libra reset` that concludes a stopped item.
+pub(crate) async fn execute_safe_internal(args: ResetArgs, output: &OutputConfig) -> CliResult<()> {
+    execute_safe_inner(args, output, false).await
+}
+
+async fn execute_safe_inner(
+    args: ResetArgs,
+    output: &OutputConfig,
+    conclude_sequences: bool,
+) -> CliResult<()> {
+    if (args.no_auto_advance || args.auto_advance) && !args.patch {
+        let option = if args.no_auto_advance {
+            "--no-auto-advance"
+        } else {
+            "--auto-advance"
+        };
+        return Err(
+            CliError::fatal(format!("the option '{option}' requires '--patch'"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    if args.patch {
+        if args.soft || args.mixed || args.hard || args.merge || args.keep {
+            return Err(CliError::command_usage(
+                "options '--patch' and '--soft/--mixed/--hard/--merge/--keep' cannot be used together",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        if output.is_json() {
+            return Err(CliError::command_usage(
+                "options '--json' and '--patch' cannot be used together",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        return run_reset_patch(&args).await;
+    }
+    let result = run_reset(args, conclude_sequences)
+        .await
+        .map_err(CliError::from)?;
     render_reset_output(&result.output, output)?;
     for warning in result.warnings {
-        emit_warning(warning);
+        emit_post_envelope_warning(warning);
     }
     Ok(())
+}
+
+struct ResetPatchCandidate {
+    file: FileDiff,
+    old_bytes: Vec<u8>,
+}
+
+async fn run_reset_patch(args: &ResetArgs) -> CliResult<()> {
+    util::require_repo().map_err(|_| ResetError::NotInRepo)?;
+    let request = normalize_reset_request(args).await?;
+    let target_tree = util::resolve_tree_ish_typed(&request.target)
+        .await
+        .map_err(map_commit_base_error)?;
+    let head_oid = Head::current_commit_result()
+        .await
+        .map_err(map_reset_head_commit_error)?
+        .ok_or(ResetError::HeadUnborn)?;
+    let head_commit: Commit = load_object(&head_oid)
+        .map_err(|error| object_load_error("commit", head_oid.to_string(), error.to_string()))?;
+    let unstage = target_tree == head_commit.tree_id;
+    let apply_mode = if unstage {
+        PatchApplyMode::ResetHead
+    } else {
+        PatchApplyMode::ResetNotHead
+    };
+    let session_kind = if unstage {
+        PatchSessionKind::Unstage
+    } else {
+        PatchSessionKind::ApplyToIndex
+    };
+
+    let workdir = util::working_dir();
+    let current_dir =
+        std::env::current_dir().map_err(|source| ResetError::WorktreeRead(source.to_string()))?;
+    let pathspecs =
+        PathspecSet::from_workdir(&request.pathspecs, &current_dir, &workdir).map_err(|error| {
+            CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+        })?;
+
+    let index_path = path::index();
+    let mut index =
+        Index::load(&index_path).map_err(|error| ResetError::IndexLoad(error.to_string()))?;
+    let target_index = index_for_tree(&target_tree)?;
+    let mut candidates =
+        collect_reset_patch_candidates(&index, &target_index, &pathspecs, unstage)?;
+    candidates.sort_by(|a, b| a.file.path.as_bytes().cmp(b.file.path.as_bytes()));
+
+    let mut session_files: Vec<FileDiff> = candidates.iter().map(|c| c.file.clone()).collect();
+    let editor = crate::command::editor::resolve_editor().await;
+    let storage_path = util::try_get_storage_path(None).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            ResetError::NotInRepo
+        } else {
+            ResetError::WorktreeRead(source.to_string())
+        }
+    })?;
+    let edit_path = storage_path.join("ADD_EDIT.patch");
+    let index_blobs = candidates.iter().map(|c| c.old_bytes.clone()).collect();
+    {
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let mut stdout = std::io::stdout();
+        run_session_with(
+            &mut session_files,
+            &mut input,
+            &mut stdout,
+            SessionOptions {
+                auto_advance: !args.no_auto_advance,
+                editor,
+                edit_path: Some(edit_path.clone()),
+                index_blobs,
+                kind: session_kind,
+            },
+        )
+        .map_err(|source| {
+            CliError::fatal(format!("failed to read patch-mode input: {source}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        let _ = std::fs::remove_file(&edit_path);
+    }
+
+    let mut pending = Vec::new();
+    for (i, file) in session_files.iter().enumerate() {
+        let decided = file
+            .hunks
+            .iter()
+            .any(|hunk| hunk.use_decision == HunkUse::Use);
+        if !decided {
+            continue;
+        }
+        let applied = apply_selected_hunks_to_blob(&candidates[i].old_bytes, file, apply_mode)
+            .map_err(|source| {
+                CliError::fatal(source.to_string())
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            })?;
+        pending.push((file.path.clone(), applied));
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for (path, applied) in pending {
+        match applied.bytes {
+            None => {
+                index.remove(&path, 0);
+            }
+            Some(bytes) => {
+                let blob = Blob::from_content_bytes(bytes);
+                blob.try_save().map_err(|source| ResetError::ObjectLoad {
+                    kind: "blob",
+                    object_id: path.clone(),
+                    detail: source.to_string(),
+                })?;
+                let mut entry =
+                    IndexEntry::new_from_blob(path.clone(), blob.id, blob.data.len() as u32);
+                if let Some(mode) = applied.mode {
+                    entry.mode = mode;
+                }
+                index.update(entry);
+            }
+        }
+    }
+    index
+        .save(&index_path)
+        .map_err(|source| ResetError::IndexSave(source.to_string()))?;
+    Ok(())
+}
+
+fn index_for_tree(tree_id: &ObjectHash) -> Result<Index, ResetError> {
+    let tree: Tree = load_object(tree_id)
+        .map_err(|error| object_load_error("tree", tree_id.to_string(), error.to_string()))?;
+    let mut index = Index::new();
+    rebuild_index_from_tree_typed(&tree, &mut index, "")?;
+    Ok(index)
+}
+
+fn collect_reset_patch_candidates(
+    index: &Index,
+    target_index: &Index,
+    pathspecs: &PathspecSet,
+    unstage: bool,
+) -> Result<Vec<ResetPatchCandidate>, ResetError> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for path in index.tracked_files() {
+        if let Some(name) = path.to_str()
+            && pathspecs.matches_path(&path)
+        {
+            names.insert(name.to_string());
+        }
+    }
+    for path in target_index.tracked_files() {
+        if let Some(name) = path.to_str()
+            && pathspecs.matches_path(&path)
+        {
+            names.insert(name.to_string());
+        }
+    }
+
+    let mut out = Vec::new();
+    for path in names {
+        let index_entry = index.get(&path, 0);
+        let target_entry = target_index.get(&path, 0);
+        match (index_entry, target_entry) {
+            (Some(index_ent), Some(target_ent))
+                if index_ent.hash == target_ent.hash && index_ent.mode == target_ent.mode =>
+            {
+                continue;
+            }
+            (None, None) => continue,
+            _ => {}
+        }
+        if let Some(candidate) =
+            build_reset_patch_candidate(&path, index_entry, target_entry, unstage)?
+        {
+            out.push(candidate);
+        }
+    }
+    Ok(out)
+}
+
+fn build_reset_patch_candidate(
+    path: &str,
+    index_entry: Option<&IndexEntry>,
+    target_entry: Option<&IndexEntry>,
+    unstage: bool,
+) -> Result<Option<ResetPatchCandidate>, ResetError> {
+    let index_bytes = match index_entry {
+        Some(entry) => load_blob_bytes(&entry.hash, path)?,
+        None => Vec::new(),
+    };
+    let target_bytes = match target_entry {
+        Some(entry) => load_blob_bytes(&entry.hash, path)?,
+        None => Vec::new(),
+    };
+    let index_mode = index_entry.map(|entry| entry.mode);
+    let target_mode = target_entry.map(|entry| entry.mode);
+    let binary = patch_bytes_are_binary(&index_bytes) || patch_bytes_are_binary(&target_bytes);
+
+    let (old_bytes, new_bytes, old_mode, new_mode, old_hash, new_hash, added, deleted) = if unstage
+    {
+        (
+            target_bytes,
+            index_bytes.clone(),
+            target_mode,
+            index_mode,
+            target_entry.map(|entry| entry.hash),
+            index_entry.map(|entry| entry.hash),
+            target_entry.is_none() && index_entry.is_some(),
+            index_entry.is_none() && target_entry.is_some(),
+        )
+    } else {
+        (
+            index_bytes.clone(),
+            target_bytes,
+            index_mode,
+            target_mode,
+            index_entry.map(|entry| entry.hash),
+            target_entry.map(|entry| entry.hash),
+            index_entry.is_none() && target_entry.is_some(),
+            target_entry.is_none() && index_entry.is_some(),
+        )
+    };
+
+    let header = build_reset_patch_header(
+        path,
+        old_hash.as_ref(),
+        new_hash.as_ref(),
+        old_mode,
+        new_mode,
+        added,
+        deleted,
+        binary,
+        !unstage,
+    );
+    if binary {
+        return Ok(Some(ResetPatchCandidate {
+            file: FileDiff {
+                path: path.to_string(),
+                header,
+                old_mode,
+                new_mode,
+                added,
+                deleted,
+                mode_change: old_mode.zip(new_mode).is_some_and(|(a, b)| a != b)
+                    && !added
+                    && !deleted,
+                binary: true,
+                hunks: Vec::new(),
+            },
+            old_bytes: index_bytes,
+        }));
+    }
+
+    let old_text = String::from_utf8(old_bytes.clone()).ok();
+    let new_text = String::from_utf8(new_bytes).ok();
+    let (Some(old_text), Some(new_text)) = (old_text, new_text) else {
+        return Ok(Some(ResetPatchCandidate {
+            file: FileDiff {
+                path: path.to_string(),
+                header,
+                old_mode,
+                new_mode,
+                added,
+                deleted,
+                mode_change: old_mode.zip(new_mode).is_some_and(|(a, b)| a != b)
+                    && !added
+                    && !deleted,
+                binary: true,
+                hunks: Vec::new(),
+            },
+            old_bytes: index_bytes,
+        }));
+    };
+    let hunk_body = if old_text == new_text {
+        String::new()
+    } else {
+        compute_unified_hunks(&old_text, &new_text, 3, &DiffAlgorithm::Myers)
+    };
+    if hunk_body.is_empty() && old_mode == new_mode {
+        return Ok(None);
+    }
+    let mut patch = header;
+    patch.push_str(&hunk_body);
+    let mut files = parse_unified_diff(&patch).map_err(|source| ResetError::ObjectLoad {
+        kind: "patch",
+        object_id: path.to_string(),
+        detail: source.to_string(),
+    })?;
+    let Some(mut file) = files.pop() else {
+        return Ok(None);
+    };
+    file.path = path.to_string();
+    file.added = added;
+    file.deleted = deleted;
+    file.old_mode = old_mode;
+    file.new_mode = new_mode;
+    file.mode_change = old_mode.zip(new_mode).is_some_and(|(a, b)| a != b) && !added && !deleted;
+    Ok(Some(ResetPatchCandidate {
+        file,
+        old_bytes: index_bytes,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_reset_patch_header(
+    path: &str,
+    old_hash: Option<&ObjectHash>,
+    new_hash: Option<&ObjectHash>,
+    old_mode: Option<u32>,
+    new_mode: Option<u32>,
+    added: bool,
+    deleted: bool,
+    binary: bool,
+    reverse_names: bool,
+) -> String {
+    let (left, right) = if reverse_names {
+        ("b", "a")
+    } else {
+        ("a", "b")
+    };
+    let mut header = format!("diff --git {left}/{path} {right}/{path}\n");
+    let old_mode = old_mode.unwrap_or(0o100644);
+    if deleted {
+        header.push_str(&format!("deleted file mode {old_mode:06o}\n"));
+        if let Some(hash) = old_hash {
+            header.push_str(&format!("index {}..0000000\n", abbrev7(hash)));
+        }
+        header.push_str(&format!("--- {left}/{path}\n+++ /dev/null\n"));
+        return header;
+    }
+    if added {
+        let new_mode = new_mode.unwrap_or(0o100644);
+        header.push_str(&format!("new file mode {new_mode:06o}\n"));
+        if let Some(hash) = new_hash {
+            header.push_str(&format!("index 0000000..{}\n", abbrev7(hash)));
+        }
+        header.push_str(&format!("--- /dev/null\n+++ {right}/{path}\n"));
+        return header;
+    }
+    let new_mode = new_mode.unwrap_or(old_mode);
+    if old_mode != new_mode {
+        header.push_str(&format!("old mode {old_mode:06o}\n"));
+        header.push_str(&format!("new mode {new_mode:06o}\n"));
+    }
+    header.push_str(&format!(
+        "index {}..{} {old_mode:06o}\n",
+        old_hash.map(abbrev7).unwrap_or_else(|| "0000000".into()),
+        new_hash.map(abbrev7).unwrap_or_else(|| "0000000".into())
+    ));
+    if binary {
+        header.push_str(&format!(
+            "Binary files {left}/{path} and {right}/{path} differ\n"
+        ));
+    } else {
+        header.push_str(&format!("--- {left}/{path}\n+++ {right}/{path}\n"));
+    }
+    header
+}
+
+fn load_blob_bytes(hash: &ObjectHash, path: &str) -> Result<Vec<u8>, ResetError> {
+    let blob: Blob = load_object(hash)
+        .map_err(|error| object_load_error("blob", format!("{path} {hash}"), error.to_string()))?;
+    Ok(blob.data)
+}
+
+fn patch_bytes_are_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
+}
+
+fn abbrev7(hash: &ObjectHash) -> String {
+    hash.to_string().chars().take(7).collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -449,7 +891,10 @@ struct ResetRequest {
     pathspecs: Vec<String>,
 }
 
-async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
+async fn run_reset(
+    args: ResetArgs,
+    conclude_sequences: bool,
+) -> Result<ResetExecution, ResetError> {
     util::require_repo().map_err(|_| ResetError::NotInRepo)?;
     let request = normalize_reset_request(&args).await?;
 
@@ -512,7 +957,79 @@ async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
     reject_reset_on_ai_managed_current_branch().await?;
 
     let target_commit_id = resolve_commit(&request.target).await?;
-    let reset_stats = perform_reset(target_commit_id, mode, &request.target).await?;
+
+    // ADR-HF-03 items 1, 4 and 5 (#477 HF-01): a user-invoked reset without
+    // pathspecs concludes a stopped cherry-pick/revert. The state is snapshotted
+    // BEFORE the reset moves the tree (Codex R6) so the conclusion can only ever
+    // end the stop this reset actually observed — a sequence started after the
+    // reset finished belongs to someone else and is left alone.
+    let stopped = if conclude_sequences {
+        snapshot_stopped_sequences().await
+    } else {
+        StoppedSequences::default()
+    };
+    let stopped_merge = if conclude_sequences {
+        crate::command::merge::snapshot_stopped_merge()
+    } else {
+        Ok(None)
+    };
+    let mut reset_stats = perform_reset(target_commit_id, mode, &request.target).await?;
+
+    // The reset itself is already durable, so a bookkeeping failure only adds a
+    // warning (exit 0) naming the command that finishes the leftover state.
+    // Resets run as an internal step of cherry-pick/am keep their caller's
+    // sequence intact.
+    //
+    // ADR-HF-03 item 5 (#477 HF-26): promote/clear an in-progress merge first.
+    // A merge-autostash promotion failure leaves both merge sidecars and must
+    // not touch cherry-pick/revert state.
+    let mut skip_sequence_conclusion = false;
+    if conclude_sequences {
+        match stopped_merge {
+            Ok(None) => {}
+            Ok(Some(snapshot)) => {
+                match crate::command::merge::conclude_stopped_merge(snapshot).await {
+                    Ok(notes) => reset_stats.warnings.extend(notes),
+                    Err(warning) => {
+                        reset_stats.warnings.push(warning);
+                        skip_sequence_conclusion = true;
+                    }
+                }
+            }
+            Err(error) => {
+                reset_stats.warnings.push(format!(
+                    "reset completed, but the in-progress merge state could not be read: {error}; \
+                     finish or abort it with `libra merge --abort`"
+                ));
+                skip_sequence_conclusion = true;
+            }
+        }
+    }
+    if conclude_sequences
+        && !skip_sequence_conclusion
+        && (!matches!(&stopped.cherry_pick, Ok(None)) || !matches!(&stopped.revert, Ok(None)))
+    {
+        // No snapshot means no recovery state to conclude or warn about. A
+        // snapshot read error still needs a warning, so only Ok(None) is absent.
+        // Soft reset leaves the index untouched, and merge reset carries its
+        // unmerged stages. Keep recovery metadata until the conflict is gone.
+        // This check follows a durable reset: a read failure must warn without
+        // turning the already-completed ref/worktree change into a failure.
+        match Index::load(path::index()) {
+            Ok(index) if unmerged_paths(&index).is_empty() => {
+                started_after_reset_seam().await?;
+                reset_stats
+                    .warnings
+                    .extend(conclude_stopped_sequences(stopped).await);
+            }
+            Ok(_) => reset_stats.warnings.push(
+                "reset completed, but the index still has unresolved conflicts; stopped sequences were preserved. Inspect 'libra status', then resolve and continue the existing operation or abort it to restore its saved state".to_string(),
+            ),
+            Err(error) => reset_stats.warnings.push(format!(
+                "reset completed, but the index could not be read: {error}; stopped sequences were preserved. Restore or repair this worktree's index before continuing or aborting the existing operation"
+            )),
+        }
+    }
 
     let subject = load_commit_summary_or_warn(&target_commit_id);
     let commit = target_commit_id.to_string();
@@ -620,43 +1137,112 @@ async fn reset_pathspecs(
     pathspecs: &[String],
     target_commit_id: &ObjectHash,
 ) -> Result<Vec<String>, ResetError> {
-    let commit: Commit = load_object(target_commit_id)
-        .map_err(|e| object_load_error("commit", target_commit_id.to_string(), e.to_string()))?;
-
-    let tree: Tree = load_object(&commit.tree_id)
-        .map_err(|e| object_load_error("tree", commit.tree_id.to_string(), e.to_string()))?;
+    // Rebuild the target index before applying pathspecs. Besides providing
+    // the exact target entries, this validates every traversed subtree. A
+    // corrupt nested tree must be reported as repository corruption rather
+    // than being mistaken for a path that should simply be removed from the
+    // current index.
+    let target_index = index_for_commit(target_commit_id)?;
 
     let index_file = path::index();
     let mut index = Index::load(&index_file).map_err(|e| ResetError::IndexLoad(e.to_string()))?;
     let mut changed = false;
     let mut changed_paths = Vec::new();
 
+    // Containment: a pathspec is workdir-relative, so resolve it against the
+    // working directory and reject anything that escapes the repository (a
+    // `../` traversal). This applies uniformly to command-line and
+    // `--pathspec-from-file` sources. `is_sub_path` normalises `..` components
+    // without touching the filesystem.
     for pathspec in pathspecs {
-        // Containment: a pathspec is workdir-relative, so resolve it against the
-        // working directory and reject anything that escapes the repository (a
-        // `../` traversal). This applies uniformly to command-line and
-        // `--pathspec-from-file` sources. `is_sub_path` normalises `..`
-        // components without touching the filesystem.
         let absolute = util::workdir_to_absolute(PathBuf::from(pathspec));
         if !util::is_sub_path(&absolute, util::working_dir()) {
             return Err(ResetError::PathspecOutsideWorkdir(pathspec.clone()));
         }
+    }
 
+    // `FIX-AD-01`: compile the WHOLE spec list at once whenever any wildcard /
+    // `:(magic)` spec is present — building a one-spec set per iteration would
+    // turn an `:(exclude)` spec into an exclude-only set, whose positive half
+    // is the whole tree, silently unstaging every path the user did not name
+    // (FIX-AD-01 review P0-1).
+    if pathspecs.iter().any(|spec| pathspec_needs_engine(spec)) {
+        let set = reset_pathspec_set(pathspecs)?;
+        let mut changed = false;
+        let mut changed_paths = Vec::new();
+        let original_tracked = index.tracked_files();
+
+        for entry_path in target_index.tracked_files() {
+            if !set.matches_path(&entry_path) {
+                continue;
+            }
+            let Some(path_str) = entry_path.to_str() else {
+                continue;
+            };
+            let Some(target_entry) = target_index.get(path_str, 0) else {
+                continue;
+            };
+            let blob: git_internal::internal::object::blob::Blob = load_object(&target_entry.hash)
+                .map_err(|e| {
+                    object_load_error("blob", target_entry.hash.to_string(), e.to_string())
+                })?;
+            let mut entry = IndexEntry::new_from_blob(
+                path_str.to_string(),
+                target_entry.hash,
+                blob.data.len() as u32,
+            );
+            entry.mode = target_entry.mode;
+            index.add(entry);
+            changed = true;
+            changed_paths.push(path_str.to_string());
+        }
+
+        let to_remove: Vec<String> = index
+            .tracked_files()
+            .iter()
+            .filter(|entry_path| set.matches_path(entry_path))
+            .filter_map(|entry_path| entry_path.to_str().map(ToString::to_string))
+            .filter(|path_str| target_index.get(path_str, 0).is_none())
+            .collect();
+        for path_str in to_remove {
+            index.remove(&path_str, 0);
+            changed = true;
+            changed_paths.push(path_str);
+        }
+
+        // A positive spec that selected nothing is still an error (the same
+        // contract the exact-path branch below keeps per spec).
+        let mut candidates: Vec<PathBuf> = target_index.tracked_files();
+        candidates.extend(original_tracked);
+        if let Some(spec) = set.unmatched_positive_specs(&candidates).first() {
+            return Err(ResetError::PathspecNotMatched((*spec).to_string()));
+        }
+
+        if changed {
+            index
+                .save(&index_file)
+                .map_err(|e| ResetError::IndexSave(e.to_string()))?;
+        }
+        return Ok(changed_paths);
+    }
+
+    for pathspec in pathspecs {
         let relative_path = util::workdir_to_current(PathBuf::from(pathspec));
         let path_str = relative_path.to_str().ok_or_else(|| {
             ResetError::InvalidPathspecEncoding(relative_path.display().to_string())
         })?;
-
-        match find_tree_item(&tree, path_str)? {
-            Some(item) => {
-                let blob: git_internal::internal::object::blob::Blob = load_object(&item.id)
-                    .map_err(|e| object_load_error("blob", item.id.to_string(), e.to_string()))?;
+        match target_index.get(path_str, 0) {
+            Some(target_entry) => {
+                let blob: git_internal::internal::object::blob::Blob =
+                    load_object(&target_entry.hash).map_err(|e| {
+                        object_load_error("blob", target_entry.hash.to_string(), e.to_string())
+                    })?;
                 let mut entry = IndexEntry::new_from_blob(
                     path_str.to_string(),
-                    item.id,
+                    target_entry.hash,
                     blob.data.len() as u32,
                 );
-                entry.mode = tree_item_mode_to_index_mode(item.mode)?;
+                entry.mode = target_entry.mode;
                 index.add(entry);
                 changed = true;
                 changed_paths.push(pathspec.clone());
@@ -685,6 +1271,22 @@ async fn reset_pathspecs(
 /// OOM / DoS from a pathological input. Matches `libra add`'s limit so both
 /// commands share one ceiling.
 const MAX_PATHSPEC_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// `FIX-AD-01`: whether a raw spec uses the shared engine's wildcard / magic
+/// forms (and therefore needs expansion rather than an exact-path lookup).
+fn pathspec_needs_engine(raw: &str) -> bool {
+    raw.starts_with(':') || raw.contains(['*', '?', '['])
+}
+
+/// `FIX-AD-01`: build a shared-engine pathspec set for `reset`.
+fn reset_pathspec_set(raw: &[String]) -> Result<PathspecSet, ResetError> {
+    let workdir = util::working_dir();
+    let current_dir = std::env::current_dir().map_err(|error| {
+        ResetError::PathspecOutsideWorkdir(format!("failed to resolve current directory: {error}"))
+    })?;
+    PathspecSet::from_workdir(raw, &current_dir, &workdir)
+        .map_err(|error| ResetError::PathspecNotMatched(error.to_string()))
+}
 
 /// Resolve the pathspecs the reset should operate on.
 ///
@@ -1192,8 +1794,7 @@ fn write_guarded_worktree_value(
         })?;
     }
     let mode = index_mode_to_tree_mode(value.mode)?;
-    write_worktree_entry(&full_path, mode, &blob.data)?;
-    apply_worktree_blob_mode(&full_path, mode)
+    write_worktree_entry(&full_path, mode, &blob.data)
 }
 
 fn apply_guarded_worktree_updates(
@@ -1356,7 +1957,6 @@ fn restore_worktree_snapshots(snapshots: &[WorktreePathSnapshot]) -> Result<(), 
                     })?;
                 let mode = index_mode_to_tree_mode(value.mode)?;
                 write_worktree_entry(&full_path, mode, &blob.data)?;
-                apply_worktree_blob_mode(&full_path, mode)?;
             }
         }
     }
@@ -1418,6 +2018,147 @@ async fn perform_guarded_reset(
 
 /// Perform the actual reset operation based on the specified mode.
 /// Updates HEAD pointer and optionally resets index and working directory.
+/// Conclude a stopped cherry-pick/revert item after a successful whole-tree
+/// reset (ADR-HF-03 items 1 and 4). Single-item sequences are cleared; a
+/// multi-commit sequence keeps its remaining work and records that the stopped
+/// item was concluded from outside (#477 HF-01).
+///
+/// Never fails the reset: a failure becomes a warning naming the command that
+/// finishes the leftover state, and STOPS the remaining cleanup steps, so the
+/// state a later step would have touched is left exactly as it was
+/// (ADR-HF-03 item 5, ordered contract).
+async fn conclude_stopped_sequences(stopped: StoppedSequences) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let cherry_pick = match stopped.cherry_pick {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warnings.push(format!(
+                "reset completed, but the stopped cherry-pick state could not be read: {error}; finish it with 'libra cherry-pick --quit'"
+            ));
+            // Ordered contract: stop here, leaving any revert state untouched.
+            return warnings;
+        }
+    };
+    if let Err(error) = conclude_cherry_pick_with_seam(cherry_pick).await {
+        warnings.push(format!(
+            "reset completed, but the stopped cherry-pick state could not be updated: {error}; finish it with 'libra cherry-pick --quit'"
+        ));
+        // Ordered contract: stop here, leaving any revert state untouched.
+        return warnings;
+    }
+    let revert_snapshot = match stopped.revert {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return warnings,
+        Err(error) => {
+            warnings.push(format!(
+                "reset completed, but the stopped revert state could not be read: {error}; inspect the leftover state with 'libra worktree doctor'; after confirming ownership and repairing the state, 'libra revert --abort' restores the pre-revert state and discards later tracked changes"
+            ));
+            return warnings;
+        }
+    };
+    if let Err(error) = crate::command::revert::conclude_stopped_revert(revert_snapshot).await {
+        warnings.push(format!(
+            "reset completed, but the stopped revert state could not be updated: {error}; inspect the leftover state with 'libra worktree doctor'; after confirming ownership and repairing the state, 'libra revert --abort' restores the pre-revert state and discards later tracked changes"
+        ));
+    }
+    warnings
+}
+
+/// The cherry-pick half of the conclusion, behind a `LIBRA_TEST`-gated seam so
+/// the ordered-contract failure path is testable (#477 HF-01, ADR-HF-03 item 5).
+async fn conclude_cherry_pick_with_seam(
+    snapshot: Option<crate::internal::sequencer::SequenceState>,
+) -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_RESET_FAIL_CONCLUDE_CHERRY_PICK").is_some()
+    {
+        return Err("test-injected failure concluding the stopped cherry-pick".to_string());
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    crate::command::cherry_pick::conclude_stopped_cherry_pick(snapshot)
+        .await
+        .map(|_| ())
+}
+
+/// `LIBRA_TEST`-gated seam that starts a brand-new sequence in the window
+/// between a successful reset and its conclusion, so "a sequence started after
+/// the reset is never concluded by it" is a deterministic regression rather
+/// than a timing hope (#477 HF-01, Codex R6).
+async fn started_after_reset_seam() -> Result<(), ResetError> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    let Some(tag) = std::env::var_os("LIBRA_TEST_RESET_START_SEQUENCE_AFTER_RESET") else {
+        return Ok(());
+    };
+    // A seam that cannot set its state up would silently weaken its own test,
+    // so both writes surface through the reset's existing state-save error.
+    let tag = tag.to_string_lossy().into_owned();
+    crate::internal::sequencer::save(&crate::internal::sequencer::SequenceState {
+        kind: crate::internal::sequencer::SequenceKind::CherryPick,
+        head_name: "master".to_string(),
+        head_orig: "1".repeat(40),
+        current_oid: "2".repeat(40),
+        todo: vec!["3".repeat(40)],
+        payload: tag.clone(),
+    })
+    .await
+    .map_err(ResetError::IndexSave)?;
+    crate::command::revert::write_state_for_test(tag.as_bytes()).map_err(ResetError::IndexSave)?;
+    Ok(())
+}
+
+/// What a whole-tree reset saw stopped BEFORE it moved the tree.
+///
+/// Each half keeps its `Result`: a state that could not even be READ is
+/// leftover state the user must finish by hand, so it owes them the ADR-HF-03
+/// item 5 warning naming the recovery command — never a silent "nothing to
+/// conclude" (Codex R7).
+struct StoppedSequences {
+    cherry_pick: Result<Option<crate::internal::sequencer::SequenceState>, String>,
+    revert: Result<Option<Vec<u8>>, String>,
+}
+
+impl Default for StoppedSequences {
+    fn default() -> Self {
+        Self {
+            cherry_pick: Ok(None),
+            revert: Ok(None),
+        }
+    }
+}
+
+/// Read both stopped states before the reset runs.
+async fn snapshot_stopped_sequences() -> StoppedSequences {
+    StoppedSequences {
+        cherry_pick: snapshot_cherry_pick_with_seam().await,
+        revert: snapshot_revert_with_seam(),
+    }
+}
+
+/// `LIBRA_TEST`-gated seams making each snapshot read fail, so the warning path
+/// for an unreadable stopped state is a regression rather than a claim.
+async fn snapshot_cherry_pick_with_seam()
+-> Result<Option<crate::internal::sequencer::SequenceState>, String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_RESET_FAIL_SNAPSHOT_CHERRY_PICK").is_some()
+    {
+        return Err("test-injected failure reading the stopped cherry-pick".to_string());
+    }
+    crate::command::cherry_pick::snapshot_stopped_cherry_pick().await
+}
+
+fn snapshot_revert_with_seam() -> Result<Option<Vec<u8>>, String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_RESET_FAIL_SNAPSHOT_REVERT").is_some()
+    {
+        return Err("test-injected failure reading the stopped revert".to_string());
+    }
+    crate::command::revert::snapshot_stopped_revert()
+}
+
 async fn perform_reset(
     target_commit_id: ObjectHash,
     mode: ResetMode,
@@ -1680,9 +2421,13 @@ fn reset_index_to_commit_typed(commit_id: &ObjectHash) -> Result<(), ResetError>
         .map_err(|e| object_load_error("tree", commit.tree_id.to_string(), e.to_string()))?;
 
     let index_file = path::index();
+    let previous = Index::load(&index_file).unwrap_or_else(|_| Index::new());
     let mut index = Index::new();
 
     rebuild_index_from_tree_typed(&tree, &mut index, "")?;
+    // Git's `unpack_trees(reset)` preserves skip-worktree across the rebuild
+    // (intent-to-add is not preserved: the path now has tree content).
+    crate::utils::index_ext::preserve_skip_worktree_from(&previous, &mut index);
 
     index
         .save(&index_file)
@@ -1819,7 +2564,6 @@ fn restore_working_directory_from_tree_counted_typed(
                     write_worktree_entry(&file_path, item.mode, &blob.data)?;
                     files_restored += 1;
                 }
-                apply_worktree_blob_mode(&file_path, item.mode)?;
             }
         }
     }
@@ -1887,35 +2631,20 @@ fn write_worktree_entry(path: &Path, mode: TreeItemMode, content: &[u8]) -> Resu
         return write_worktree_symlink(path, content);
     }
 
-    remove_existing_symlink(path)?;
-    fs::write(path, content).map_err(|error| {
+    // Replace atomically with the entry-mode permissions (ADR-FM-02/03); the
+    // rename also replaces a symlink sitting at the path.
+    crate::utils::worktree_blob::write_worktree_blob(
+        path,
+        content,
+        mode == TreeItemMode::BlobExecutable,
+    )
+    .map_err(|error| {
         ResetError::WorktreeRestore(format!(
             "failed to write file {}: {}",
             path.display(),
             error
         ))
     })
-}
-
-fn remove_existing_symlink(path: &Path) -> Result<(), ResetError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            fs::remove_file(path).map_err(|error| {
-                ResetError::WorktreeRestore(format!(
-                    "failed to replace symlink {}: {}",
-                    path.display(),
-                    error
-                ))
-            })
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ResetError::WorktreeRead(format!(
-            "failed to inspect file {}: {}",
-            path.display(),
-            error
-        ))),
-    }
 }
 
 #[cfg(unix)]
@@ -1967,32 +2696,6 @@ fn write_worktree_symlink(path: &Path, _target: &[u8]) -> Result<(), ResetError>
     )))
 }
 
-#[cfg(unix)]
-fn apply_worktree_blob_mode(path: &Path, mode: TreeItemMode) -> Result<(), ResetError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = match mode {
-        TreeItemMode::Blob => Some(0o644),
-        TreeItemMode::BlobExecutable => Some(0o755),
-        _ => None,
-    };
-    if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
-            ResetError::WorktreeRestore(format!(
-                "failed to set mode on {}: {}",
-                path.display(),
-                error
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn apply_worktree_blob_mode(_path: &Path, _mode: TreeItemMode) -> Result<(), ResetError> {
-    Ok(())
-}
-
 /// Remove empty directories from the working directory.
 /// Recursively traverses the directory tree and removes any empty directories,
 /// except for the .libra directory and the working directory root.
@@ -2001,7 +2704,7 @@ fn apply_worktree_blob_mode(_path: &Path, _mode: TreeItemMode) -> Result<(), Res
 /// not have a warning pipeline.  Non-fatal directory-removal warnings are
 /// intentionally dropped here; the typed reset path collects them via
 /// [`remove_empty_directories_with_warnings`] and routes them through
-/// `emit_warning()`.
+/// `emit_post_envelope_warning()`.
 pub(crate) fn remove_empty_directories(workdir: &Path) -> Result<(), String> {
     remove_empty_directories_with_warnings(workdir)
         .map(|_| ())
@@ -2224,7 +2927,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn guarded_worktree_snapshots_restore_file_directory_transitions() {
         let temp = tempfile::tempdir().expect("create reset snapshot test directory");
         let _guard = crate::utils::test::ChangeDirGuard::new(temp.path());

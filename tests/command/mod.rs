@@ -2,10 +2,13 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     fs,
-    io::Write,
+    io::{self, Write},
+    ops::{Deref, DerefMut},
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{Condvar, LazyLock, Mutex},
 };
 
 use git_internal::{
@@ -40,7 +43,7 @@ use libra::{
     internal::{branch::Branch, head::Head},
     utils::{
         pager::LIBRA_TEST_ENV,
-        test::{self, ChangeDirGuard},
+        test::{self, ChangeDirGuard, ConfigDbFixture},
     },
 };
 use serde::Deserialize;
@@ -63,11 +66,169 @@ pub(crate) struct CliErrorReport {
     pub(crate) details: BTreeMap<String, Value>,
 }
 
+/// Default process-local cap on live CLI children (plan-20260917 SP-00/SP-01).
+/// Must stay ≥ 3 so `registry_mutators_serialize_on_worktrees_lock` cannot
+/// deadlock under nextest (one process, three concurrent `worktree add`s).
+/// 8 still SIGKILL'd `create_committed_repo_via_cli` once in two
+/// `--test-threads=32` runs (plan-20260917 SP-01); 4 stays under the
+/// SP-00 crush band while leaving the three-add barrier runnable.
+const DEFAULT_CLI_SPAWN_LIMIT: usize = 4;
+
+fn parse_cli_spawn_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .filter(|&limit| limit >= 1)
+        .unwrap_or(DEFAULT_CLI_SPAWN_LIMIT)
+}
+
+struct CliSpawnLimiter {
+    max: usize,
+    live: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl CliSpawnLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            live: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> CliSpawnPermit<'_> {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *live >= self.max {
+            live = self
+                .cv
+                .wait(live)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *live += 1;
+        CliSpawnPermit { limiter: self }
+    }
+
+    fn release(&self) {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *live = live.saturating_sub(1);
+        self.cv.notify_one();
+    }
+}
+
+struct CliSpawnPermit<'a> {
+    limiter: &'a CliSpawnLimiter,
+}
+
+impl Drop for CliSpawnPermit<'_> {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+static CLI_SPAWN_LIMITER: LazyLock<CliSpawnLimiter> = LazyLock::new(|| {
+    CliSpawnLimiter::new(parse_cli_spawn_limit(
+        std::env::var("LIBRA_TEST_CLI_SPAWN_LIMIT").ok().as_deref(),
+    ))
+});
+
+/// `Command` wrapper that holds a limiter permit for the life of the child.
+pub(crate) struct LimitedCommand {
+    inner: Command,
+}
+
+impl LimitedCommand {
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.inner.env(key, value);
+        self
+    }
+
+    fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
+        self.inner.env_remove(key);
+        self
+    }
+
+    fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stdin(cfg);
+        self
+    }
+
+    fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stdout(cfg);
+        self
+    }
+
+    fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stderr(cfg);
+        self
+    }
+
+    fn output(&mut self) -> io::Result<Output> {
+        // One SIGKILL retry: even at DEFAULT_CLI_SPAWN_LIMIT, cargo-test
+        // --test-threads=32 still occasionally reaps a debug `libra` child
+        // with signal 9 (SP-01 cap 8 and cap 4 each lost one fixture add/commit).
+        {
+            let _permit = CLI_SPAWN_LIMITER.acquire();
+            let output = self.inner.output()?;
+            if unix_exit_signal(output.status) != Some(9) {
+                return Ok(output);
+            }
+        }
+        let _permit = CLI_SPAWN_LIMITER.acquire();
+        self.inner.output()
+    }
+
+    fn spawn(&mut self) -> io::Result<LimitedChild> {
+        let permit = CLI_SPAWN_LIMITER.acquire();
+        Ok(LimitedChild {
+            child: self.inner.spawn()?,
+            permit: Some(permit),
+        })
+    }
+}
+
+pub(crate) struct LimitedChild {
+    child: Child,
+    permit: Option<CliSpawnPermit<'static>>,
+}
+
+impl LimitedChild {
+    fn wait_with_output(mut self) -> io::Result<Output> {
+        let permit = self.permit.take();
+        let output = self.child.wait_with_output();
+        drop(permit);
+        output
+    }
+}
+
+impl Deref for LimitedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl DerefMut for LimitedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
 /// Run the Libra binary with an isolated HOME so host config never leaks into tests.
-fn base_libra_command(args: &[&str], cwd: &Path) -> Command {
+fn base_libra_command(args: &[&str], cwd: &Path) -> LimitedCommand {
     let home = cwd.join(".libra-test-home");
     let config_home = home.join(".config");
     let global_db = home.join(".libra").join("config.db");
+    let system_db = home.join(".libra").join("system-config.db");
     let llvm_profile_file = std::env::var_os("LLVM_PROFILE_FILE");
     fs::create_dir_all(&config_home).expect("failed to create isolated config directory");
 
@@ -81,6 +242,7 @@ fn base_libra_command(args: &[&str], cwd: &Path) -> Command {
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("LIBRA_CONFIG_GLOBAL_DB", &global_db)
+        .env("LIBRA_CONFIG_SYSTEM_DB", &system_db)
         .env("LANG", "C")
         .env("LC_ALL", "C")
         .env(LIBRA_TEST_ENV, "1");
@@ -89,7 +251,7 @@ fn base_libra_command(args: &[&str], cwd: &Path) -> Command {
         // do not fall back to writing `default.profraw` inside the temp repo.
         command.env("LLVM_PROFILE_FILE", llvm_profile_file);
     }
-    command
+    LimitedCommand { inner: command }
 }
 
 /// Run the Libra binary with an isolated HOME so host config never leaks into tests.
@@ -100,11 +262,18 @@ fn run_libra_command(args: &[&str], cwd: &Path) -> Output {
 }
 
 #[allow(dead_code)]
+fn run_libra_command_with_env(args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> Output {
+    spawn_libra_command_with_env(args, cwd, extra_env)
+        .wait_with_output()
+        .expect("failed to execute libra binary")
+}
+
+#[allow(dead_code)]
 fn spawn_libra_command_with_env(
     args: &[&str],
     cwd: &Path,
     extra_env: &[(&str, &str)],
-) -> std::process::Child {
+) -> LimitedChild {
     let mut command = base_libra_command(args, cwd);
     for (key, value) in extra_env {
         command.env(key, value);
@@ -169,12 +338,41 @@ fn run_libra_command_with_stdin_and_env(
         .expect("failed to collect libra command output")
 }
 
-/// Assert that a CLI command succeeded and include stderr in the failure output.
+fn cli_output_prefix(bytes: &[u8]) -> String {
+    const PREFIX: usize = 200;
+    String::from_utf8_lossy(&bytes[..bytes.len().min(PREFIX)]).into_owned()
+}
+
+fn unix_exit_signal(status: ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn format_cli_failure(output: &Output, context: &str) -> String {
+    format!(
+        "{context}: success={} code={:?} signal={:?} stderr={:?} stdout={:?}",
+        output.status.success(),
+        output.status.code(),
+        unix_exit_signal(output.status),
+        cli_output_prefix(&output.stderr),
+        cli_output_prefix(&output.stdout)
+    )
+}
+
+/// Assert that a CLI command succeeded and include status / stdout / stderr.
 fn assert_cli_success(output: &Output, context: &str) {
     assert!(
         output.status.success(),
-        "{context}: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "{}",
+        format_cli_failure(output, context)
     );
 }
 
@@ -236,6 +434,69 @@ fn loose_object_path(repo: &Path, hash: &str) -> std::path::PathBuf {
 }
 
 /// Initialize a repository through the CLI to exercise the real process entrypoint.
+/// Set `skip_worktree` on a tracked path through the git-internal index API
+/// (the CLI entry point arrives with plan issues/490 SW-07).
+#[allow(dead_code)]
+pub(crate) fn mark_skip_worktree(repo: &Path, path: &str) {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+    let index_path = repo.join(".libra/index");
+    let mut index =
+        Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load index for marking");
+    let (hash, mode, size) = {
+        let entry = index.get(path, 0).expect("tracked path");
+        (entry.hash, entry.mode, entry.size)
+    };
+    let mut entry = IndexEntry::new_from_blob(path.to_string(), hash, size);
+    entry.mode = mode;
+    entry.flags.skip_worktree = true;
+    index.update(entry);
+    index
+        .save_with_hash_kind(HashKind::Sha1, &index_path)
+        .expect("save index");
+}
+
+/// Whether a tracked path currently carries the `skip_worktree` bit.
+#[allow(dead_code)]
+pub(crate) fn skip_worktree_set(repo: &Path, path: &str) -> bool {
+    use git_internal::{hash::HashKind, internal::index::Index};
+    Index::load_with_hash_kind(HashKind::Sha1, repo.join(".libra/index"))
+        .expect("load index")
+        .get(path, 0)
+        .is_some_and(|entry| entry.flags.skip_worktree)
+}
+
+/// The stage-0 index entry for `path` as `(mode, hash hex, size,
+/// intent_to_add, skip_worktree)`, or `None` when the path has no stage 0.
+#[allow(dead_code)]
+pub(crate) fn index_entry_snapshot(
+    repo: &Path,
+    path: &str,
+) -> Option<(u32, String, u32, bool, bool)> {
+    use git_internal::{hash::HashKind, internal::index::Index};
+    Index::load_with_hash_kind(HashKind::Sha1, repo.join(".libra/index"))
+        .ok()?
+        .get(path, 0)
+        .map(|entry| {
+            (
+                entry.mode,
+                entry.hash.to_string(),
+                entry.size,
+                entry.flags.intent_to_add,
+                entry.flags.skip_worktree,
+            )
+        })
+}
+
+/// The on-disk index header version (2 or 3).
+#[allow(dead_code)]
+pub(crate) fn index_version(repo: &Path) -> u32 {
+    let bytes = std::fs::read(repo.join(".libra/index")).expect("read index");
+    u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+}
+
 fn init_repo_via_cli(repo: &Path) {
     fs::create_dir_all(repo).expect("failed to create repository directory");
     let output = run_libra_command(&["init"], repo);
@@ -268,6 +529,117 @@ fn create_committed_repo_via_cli() -> tempfile::TempDir {
     repo
 }
 
+/// M-BOUND gdeep Git source: `c1←c2←c3`(main), `c2←dev1`(dev), tag `v1`→c1, `refs/mr/1`→c2.
+struct GdeepGitRepo {
+    dir: tempfile::TempDir,
+    c1: String,
+    c2: String,
+    c3: String,
+    dev1: String,
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("spawn git {}: {error}", args.join(" ")))
+}
+
+fn git_success(repo: &Path, args: &[&str]) {
+    let output = git_output(repo, args);
+    assert!(
+        output.status.success(),
+        "git {} failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_rev_parse(repo: &Path, spec: &str) -> String {
+    let output = git_output(repo, &["rev-parse", spec]);
+    assert!(
+        output.status.success(),
+        "git rev-parse {spec} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Linear `main`-only Git history `c1←…←cN` for CL-04 cases that must not
+/// depend on `--single-branch` (CL-05).
+fn create_linear_git_repo(commits: usize) -> (tempfile::TempDir, Vec<String>) {
+    assert!(commits >= 1, "need at least one commit");
+    let dir = tempdir().expect("linear git tempdir");
+    let repo = dir.path();
+    git_success(repo, &["init", "-b", "main"]);
+    git_success(repo, &["config", "user.name", "Linear Tester"]);
+    git_success(repo, &["config", "user.email", "linear@test"]);
+    git_success(repo, &["config", "commit.gpgsign", "false"]);
+    let mut oids = Vec::with_capacity(commits);
+    for n in 1..=commits {
+        fs::write(repo.join("f.txt"), format!("c{n}\n")).expect("write linear file");
+        git_success(repo, &["add", "f.txt"]);
+        git_success(repo, &["commit", "-m", &format!("c{n}")]);
+        oids.push(git_rev_parse(repo, "HEAD"));
+    }
+    (dir, oids)
+}
+
+fn create_gdeep_git_repo() -> GdeepGitRepo {
+    let dir = tempdir().expect("gdeep tempdir");
+    let repo = dir.path();
+    git_success(repo, &["init", "-b", "main"]);
+    git_success(repo, &["config", "user.name", "Gdeep Tester"]);
+    git_success(repo, &["config", "user.email", "gdeep@test"]);
+    git_success(repo, &["config", "commit.gpgsign", "false"]);
+    git_success(repo, &["config", "tag.gpgsign", "false"]);
+    fs::write(repo.join("f.txt"), "c1\n").expect("write c1");
+    git_success(repo, &["add", "f.txt"]);
+    git_success(repo, &["commit", "-m", "c1"]);
+    let c1 = git_rev_parse(repo, "HEAD");
+    fs::write(repo.join("f.txt"), "c2\n").expect("write c2");
+    git_success(repo, &["add", "f.txt"]);
+    git_success(repo, &["commit", "-m", "c2"]);
+    let c2 = git_rev_parse(repo, "HEAD");
+    fs::write(repo.join("f.txt"), "c3\n").expect("write c3");
+    git_success(repo, &["add", "f.txt"]);
+    git_success(repo, &["commit", "-m", "c3"]);
+    let c3 = git_rev_parse(repo, "HEAD");
+    git_success(repo, &["checkout", "-b", "dev", &c2]);
+    fs::write(repo.join("dev.txt"), "dev1\n").expect("write dev1");
+    git_success(repo, &["add", "dev.txt"]);
+    git_success(repo, &["commit", "-m", "dev1"]);
+    let dev1 = git_rev_parse(repo, "HEAD");
+    git_success(repo, &["checkout", "main"]);
+    git_success(repo, &["tag", "-a", "v1", "-m", "v1", &c1]);
+    git_success(repo, &["update-ref", "refs/mr/1", &c2]);
+    GdeepGitRepo {
+        dir,
+        c1,
+        c2,
+        c3,
+        dev1,
+    }
+}
+
+fn read_shallow_oids(repo: &Path) -> Vec<String> {
+    let path = repo.join(".libra").join("shallow");
+    if !path.exists() {
+        return Vec::new();
+    }
+    let mut oids: Vec<String> = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    oids.sort();
+    oids
+}
+
 #[cfg(unix)]
 fn skip_permission_denied_test_if_root(test_name: &str) -> bool {
     unsafe extern "C" {
@@ -286,8 +658,60 @@ fn skip_permission_denied_test_if_root(test_name: &str) -> bool {
     is_root
 }
 
+#[test]
+fn assert_cli_success_reports_signal() {
+    let repo = tempdir().expect("temp repo");
+    let failed = run_libra_command(&["definitely-not-a-libra-command"], repo.path());
+    assert!(!failed.status.success(), "garbage argv must fail");
+    let message = format_cli_failure(&failed, "probe");
+    assert!(
+        message.contains("success=false"),
+        "status flag missing: {message}"
+    );
+    assert!(message.contains("code="), "exit code missing: {message}");
+    assert!(
+        message.contains("signal="),
+        "signal field missing: {message}"
+    );
+    assert!(
+        message.contains("stderr="),
+        "stderr prefix missing: {message}"
+    );
+    assert!(
+        message.contains("stdout="),
+        "stdout prefix missing: {message}"
+    );
+
+    #[cfg(unix)]
+    {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        child.kill().expect("kill sleep");
+        let killed = child.wait_with_output().expect("reap sleep");
+        let signaled = format_cli_failure(&killed, "killed");
+        assert!(
+            signaled.contains("signal=Some("),
+            "unix signal must be Some: {signaled}"
+        );
+    }
+}
+
+#[test]
+fn cli_spawn_limit_rejects_zero_and_garbage() {
+    assert_eq!(parse_cli_spawn_limit(None), DEFAULT_CLI_SPAWN_LIMIT);
+    assert_eq!(parse_cli_spawn_limit(Some("0")), DEFAULT_CLI_SPAWN_LIMIT);
+    assert_eq!(parse_cli_spawn_limit(Some("nope")), DEFAULT_CLI_SPAWN_LIMIT);
+    assert_eq!(parse_cli_spawn_limit(Some("8")), 8);
+    assert_eq!(parse_cli_spawn_limit(Some("3")), 3);
+}
+
 mod add_cli_test;
 mod add_json_test;
+mod add_patch_test;
 mod add_test;
 mod agent_bridge_test;
 mod agent_checkpoint_export_test;
@@ -316,6 +740,7 @@ mod bundle_test;
 mod cache_test;
 mod case_handling_test;
 mod cat_file_test;
+mod change_revision_provenance_test;
 mod check_attr_test;
 mod check_ignore_test;
 mod check_mailmap_test;
@@ -326,12 +751,6 @@ mod cli_error_test;
 mod clone_cli_test;
 mod clone_test;
 mod cloud_test;
-mod code_agent_config_resolver_test;
-mod code_agent_linked_guard_test;
-mod code_control_files_test;
-mod code_control_stdio_test;
-mod code_test;
-mod code_thread_id_test;
 mod commit_autosquash_test;
 mod commit_editor_test;
 mod commit_error_test;
@@ -356,11 +775,14 @@ mod file_obliterate_test;
 mod for_each_ref_test;
 mod format_patch_test;
 mod fsck_test;
-mod graph_test;
 mod grep_test;
 mod hash_object_test;
+#[path = "../helpers/historical_schema.rs"]
+mod historical_schema;
 mod hooks_help_test;
 mod hydrate_test;
+mod index_flag_preservation_test;
+mod index_format_test;
 mod index_pack_keep_test;
 mod index_pack_progress_test;
 mod index_pack_stdin_test;
@@ -379,23 +801,33 @@ mod ls_remote_options_test;
 mod ls_remote_test;
 mod ls_tree_test;
 mod maintenance_test;
+mod mega2_browser_cli_test;
+mod mega2_browser_mkdir_test;
+mod mega2_browser_mutate_test;
+mod mega2_browser_tag_test;
+mod mega2_browser_tui_test;
+mod mega2_entry_transport_test;
+mod mega2_mutate_transport_test;
+mod mega2_tag_transport_test;
+mod mega2_tree_transport_test;
 mod memory_test;
 mod merge_base_test;
 mod merge_file_test;
 mod merge_test;
+mod mergetool_test;
 mod metadata_test;
 mod mv_test;
 mod notes_test;
 mod op_test;
 mod open_test;
 mod output_flags_test;
-mod publish_test;
 mod pull_json_test;
 mod pull_test;
 mod push_error_test;
 mod push_json_test;
 mod push_test;
 mod read_tree_test;
+mod rebase_interactive_test;
 mod rebase_test;
 mod reflog_test;
 mod remote_test;
@@ -403,6 +835,7 @@ mod remove_test;
 mod repack_test;
 mod replace_test;
 mod rerere_test;
+mod reset_patch_test;
 mod reset_test;
 mod restore_test;
 mod rev_list_test;
@@ -412,6 +845,7 @@ mod revision_test;
 mod sandbox_status_test;
 mod schema_upgrade_test;
 mod service_test;
+mod shallow_walk_test;
 mod shortlog_test;
 mod show_ref_abbrev_test;
 mod show_ref_alias_test;
@@ -435,7 +869,6 @@ mod tag_test;
 mod update_index_test;
 mod update_ref_test;
 mod upgrade_cmd_test;
-mod usage_help_test;
 mod verify_pack_stat_test;
 mod verify_pack_test;
 mod worktree_doctor_test;

@@ -17,8 +17,9 @@
 //!   version row before executing the DDL, guaranteeing single
 //!   application even under concurrent upgraders.
 //! - [`MigrationRunner`] — owns the registered migration set and applies
-//!   pending migrations in monotonic version order. Tracks applied
-//!   migrations in a dedicated `schema_versions` table.
+//!   pending migrations in monotonic version order. Tracks applied migrations
+//!   in a dedicated `schema_versions` table and can close a receipt gap left
+//!   by an independently shipped branch.
 //!
 //! # Concurrency model
 //!
@@ -44,6 +45,18 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement, TransactionTrait};
 use thiserror::Error;
+
+use self::copy_validation::validate_copy;
+
+mod copy_validation;
+#[cfg(test)]
+mod copy_validation_test;
+mod operation_v2_branch_convergence;
+#[cfg(test)]
+mod operation_v2_branch_convergence_test;
+mod operation_v2_schema;
+#[cfg(test)]
+mod operation_v2_schema_test;
 
 /// One named, versioned schema change.
 ///
@@ -260,8 +273,10 @@ impl MigrationRunner {
         max_schema_version(conn).await
     }
 
-    /// Apply every registered migration whose version is greater than the
-    /// current applied version. Each migration runs inside its own
+    /// Apply every registered migration without a receipt, in version order.
+    /// Receipt-based selection is required when independently shipped
+    /// branches leave a lower migration absent while recording a later one.
+    /// Each migration runs inside its own
     /// transaction, with both the `up` DDL and the `schema_versions` row
     /// insert atomic together.
     ///
@@ -298,11 +313,16 @@ impl MigrationRunner {
         ensure_schema_versions_table(conn).await?;
         let current = self.current_version(conn).await?;
         gate().await;
+        let mut applied_versions = applied_schema_versions(conn).await?;
         let mut applied = Vec::new();
 
         for migration in &self.migrations {
-            if let Some(current) = current
-                && migration.version <= current
+            // A later receipt is a forward barrier for independently shipped
+            // migration branches. Once the database has recorded a higher
+            // version, an absent lower receipt is historical divergence, not
+            // a pending migration to replay.
+            if applied_versions.contains(&migration.version)
+                || current.is_some_and(|version| migration.version < version)
             {
                 continue;
             }
@@ -333,6 +353,7 @@ impl MigrationRunner {
             };
             if inserted {
                 applied.push(migration.version);
+                applied_versions.insert(migration.version);
             }
         }
 
@@ -353,18 +374,20 @@ impl MigrationRunner {
     ) -> Result<Vec<i64>, MigrationError> {
         ensure_schema_versions_table(conn).await?;
         let current = self.current_version(conn).await?;
+        let mut applied_versions = applied_schema_versions(conn).await?;
         let mut applied = Vec::new();
         for migration in &self.migrations {
             if migration.version > target {
                 break;
             }
-            if let Some(current) = current
-                && migration.version <= current
+            if applied_versions.contains(&migration.version)
+                || current.is_some_and(|version| migration.version < version)
             {
                 continue;
             }
             if apply_one_migration(conn, migration).await? {
                 applied.push(migration.version);
+                applied_versions.insert(migration.version);
             }
         }
         Ok(applied)
@@ -511,6 +534,26 @@ async fn max_schema_version(conn: &DatabaseConnection) -> Result<Option<i64>, Mi
     Ok(version)
 }
 
+async fn applied_schema_versions(
+    conn: &DatabaseConnection,
+) -> Result<BTreeSet<i64>, MigrationError> {
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT version FROM schema_versions ORDER BY version".to_string(),
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_get_by_index::<i64>(0).map_err(|error| {
+                MigrationError::Database(DbErr::Custom(format!(
+                    "schema_versions.version decode failed: {error}"
+                )))
+            })
+        })
+        .collect()
+}
+
 /// Apply one migration atomically. Returns `true` when this call inserted
 /// the version row, `false` when another concurrent process beat us to it
 /// (Codex r1 P1#2 fix: replaces the TOCTOU `migration_already_applied`
@@ -644,6 +687,8 @@ async fn apply_one_migration_guarded(
                 apply_migration_compatibility(txn, version, name).await?;
                 if version == OPERATION_V2_MIGRATION_VERSION {
                     apply_operation_v2_migration(txn, up).await?;
+                } else if version == operation_v2_branch_convergence::VERSION {
+                    operation_v2_branch_convergence::apply(txn, up).await?;
                 } else {
                     txn.execute_raw(Statement::from_string(backend, up)).await?;
                 }
@@ -773,6 +818,14 @@ async fn apply_operation_v2_migration(
                 "description",
                 "actor",
             ],
+            &[
+                "op_id",
+                "repo_id",
+                "view_id",
+                "command_name",
+                "description",
+                "actor",
+            ],
         )
         .await?;
         txn.execute_raw(Statement::from_string(
@@ -793,6 +846,7 @@ async fn apply_operation_v2_migration(
                 "CREATE TABLE legacy_operation_parent__staging (op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL, PRIMARY KEY (op_id, parent_op_id));",
                 "INSERT INTO legacy_operation_parent__staging (op_id, parent_op_id) SELECT op_id, parent_op_id FROM operation_parent;",
                 &["op_id", "parent_op_id"],
+                &["op_id", "parent_op_id"],
             )
             .await?;
         }
@@ -804,6 +858,7 @@ async fn apply_operation_v2_migration(
         "CREATE TABLE legacy_operation_view__staging (view_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, head_kind TEXT NOT NULL, head_target TEXT NOT NULL, created_at INTEGER NOT NULL);",
         "INSERT INTO legacy_operation_view__staging (view_id, repo_id, head_kind, head_target, created_at) SELECT view_id, repo_id, head_kind, head_target, created_at FROM operation_view;",
         &["view_id", "repo_id", "head_kind", "head_target"],
+        &["view_id", "repo_id", "head_kind", "head_target"],
     )
     .await?;
     copy_legacy_table_if_present(
@@ -813,6 +868,7 @@ async fn apply_operation_v2_migration(
         "CREATE TABLE legacy_operation_view_ref__staging (view_id TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_name TEXT NOT NULL, ref_remote TEXT NOT NULL, target_oid TEXT NOT NULL, PRIMARY KEY (view_id, ref_kind, ref_name, ref_remote));",
         "INSERT INTO legacy_operation_view_ref__staging (view_id, ref_kind, ref_name, ref_remote, target_oid) SELECT view_id, ref_kind, ref_name, ref_remote, target_oid FROM operation_view_ref;",
         &["view_id", "ref_kind", "ref_name", "target_oid"],
+        &["view_id", "ref_kind", "ref_name", "ref_remote", "target_oid"],
     )
     .await?;
     copy_legacy_table_if_present(
@@ -821,6 +877,7 @@ async fn apply_operation_v2_migration(
         "legacy_operation_view_workspace",
         "CREATE TABLE legacy_operation_view_workspace__staging (view_id TEXT NOT NULL, pointer_kind TEXT NOT NULL, pointer_value TEXT NOT NULL, PRIMARY KEY (view_id, pointer_kind));",
         "INSERT INTO legacy_operation_view_workspace__staging (view_id, pointer_kind, pointer_value) SELECT view_id, pointer_kind, pointer_value FROM operation_view_workspace;",
+        &["view_id", "pointer_kind", "pointer_value"],
         &["view_id", "pointer_kind", "pointer_value"],
     )
     .await?;
@@ -916,10 +973,20 @@ async fn copy_legacy_table_if_present(
     target: &str,
     staging_ddl: &str,
     insert_sql: &str,
-    keys: &[&str],
+    nonempty_fields: &[&str],
+    comparison_fields: &[&str],
 ) -> Result<(), DbErr> {
     if sqlite_table_exists(txn, source).await? {
-        copy_legacy_table(txn, source, target, staging_ddl, insert_sql, keys).await?;
+        copy_legacy_table(
+            txn,
+            source,
+            target,
+            staging_ddl,
+            insert_sql,
+            nonempty_fields,
+            comparison_fields,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -930,7 +997,8 @@ async fn copy_legacy_table(
     target: &str,
     staging_ddl: &str,
     insert_sql: &str,
-    keys: &[&str],
+    nonempty_fields: &[&str],
+    comparison_fields: &[&str],
 ) -> Result<(), DbErr> {
     if sqlite_table_exists(txn, target).await? {
         return Err(DbErr::Custom(format!(
@@ -948,64 +1016,12 @@ async fn copy_legacy_table(
         insert_sql.to_string(),
     ))
     .await?;
-    validate_copy(txn, source, &staging, keys).await?;
+    validate_copy(txn, source, &staging, nonempty_fields, comparison_fields).await?;
     txn.execute_raw(Statement::from_string(
         txn.get_database_backend(),
         format!("DROP TABLE {source}; ALTER TABLE {staging} RENAME TO {target};"),
     ))
     .await?;
-    Ok(())
-}
-
-async fn validate_copy(
-    txn: &sea_orm::DatabaseTransaction,
-    source: &str,
-    staging: &str,
-    keys: &[&str],
-) -> Result<(), DbErr> {
-    let source_count = count_rows(txn, source, None).await?;
-    let staging_count = count_rows(txn, staging, None).await?;
-    if source_count != staging_count {
-        return Err(DbErr::Custom(format!(
-            "copy-first migration row-count mismatch for {source}: source={source_count}, staging={staging_count}"
-        )));
-    }
-    let invalid_predicate = keys
-        .iter()
-        .map(|key| format!("COALESCE(TRIM({key}), '') = ''"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    if count_rows(txn, staging, Some(&invalid_predicate)).await? != 0 {
-        return Err(DbErr::Custom(format!(
-            "copy-first migration found an empty key in {source}"
-        )));
-    }
-    let key_predicate = keys
-        .iter()
-        .map(|key| format!("s.{key} = t.{key}"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let source_missing = count_rows(
-        txn,
-        &format!(
-            "{source} AS s WHERE NOT EXISTS (SELECT 1 FROM {staging} AS t WHERE {key_predicate})"
-        ),
-        None,
-    )
-    .await?;
-    let staging_missing = count_rows(
-        txn,
-        &format!(
-            "{staging} AS t WHERE NOT EXISTS (SELECT 1 FROM {source} AS s WHERE {key_predicate})"
-        ),
-        None,
-    )
-    .await?;
-    if source_missing != 0 || staging_missing != 0 {
-        return Err(DbErr::Custom(format!(
-            "copy-first migration key-set mismatch for {source}: source_missing={source_missing}, staging_missing={staging_missing}"
-        )));
-    }
     Ok(())
 }
 
@@ -1199,6 +1215,11 @@ async fn apply_down_migration(
 /// `establish_connection`) makes it trivial to test the wiring against an
 /// isolated runner.
 pub fn builtin_migrations() -> Vec<Migration> {
+    super::schema::migrations_for_role(super::DatabaseRole::Repository)
+}
+
+/// Historical repository namespace, consumed only by the role manifest.
+pub(crate) fn repository_migrations() -> Vec<Migration> {
     vec![
         sql_migration(
             2026050301,
@@ -1785,30 +1806,87 @@ pub fn builtin_migrations() -> Vec<Migration> {
             up: include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
             down: None,
         },
-        // M2-02: rebuildable Agent Memory projections plus bounded compiler
-        // job/observer state. FTS and receipts intentionally land separately.
+        // Self-heal stores missing the legacy `config` table (#472): the
+        // bootstrap schema always defined it, but stores created by builds
+        // whose bootstrap omitted it failed every legacy-config reader with
+        // `no such table: config`. Idempotent DDL matching the bootstrap
+        // shape exactly; down preserves this bootstrap-owned table and its data.
         sql_migration(
-            2026090701,
+            2026090601,
+            "legacy_config_table",
+            include_str!("../../../sql/migrations/2026090601_legacy_config_table.sql"),
+            include_str!("../../../sql/migrations/2026090601_legacy_config_table_down.sql"),
+        ),
+        Migration {
+            version: operation_v2_branch_convergence::VERSION,
+            name: "operation_v2_branch_convergence",
+            up: include_str!(
+                "../../../sql/migrations/2026090801_operation_v2_branch_convergence.sql"
+            ),
+            down: None,
+        },
+        // CH-04: associate AI operations with a stable Change ID after the
+        // operation-v2 namespace has converged across independently shipped
+        // branches.
+        Migration {
+            version: 2026090802,
+            name: "change_ai_link",
+            up: include_str!("../../../sql/migrations/2026090802_change_ai_link.sql"),
+            down: None,
+        },
+        // CH-02 compatibility repair: 0802 was already applied by some
+        // databases before the repository-scoped Change ID prefix index was
+        // added to its SQL. Keep the repair in a new monotonic migration;
+        // changing an applied migration body cannot replay it for those DBs.
+        Migration {
+            version: 2026090803,
+            name: "change_identity_prefix_index_repair",
+            up: include_str!(
+                "../../../sql/migrations/2026090803_change_identity_prefix_index_repair.sql"
+            ),
+            down: None,
+        },
+        Migration {
+            version: 2026091801,
+            name: "operation_v1_retirement",
+            up: include_str!("../../../sql/migrations/2026091801_operation_v1_retirement.sql"),
+            down: None,
+        },
+        Migration {
+            version: 2026091802,
+            name: "operation_v2_dedup_index",
+            up: include_str!("../../../sql/migrations/2026091802_operation_v2_dedup_index.sql"),
+            down: None,
+        },
+        Migration {
+            version: 2026091901,
+            name: "operation_boundary_claim_columns",
+            up: include_str!(
+                "../../../sql/migrations/2026091901_operation_boundary_claim_columns.sql"
+            ),
+            down: None,
+        },
+        // M2-02/M2-03: repository Memory storage, FTS projection, and
+        // context-selection receipts. These migrations were renumbered when
+        // rebasing the unpublished Memory branch so installations already at
+        // the upstream 2026091901 schema cannot skip them.
+        sql_migration(
+            2026092501,
             "memory_core",
-            include_str!("../../../sql/migrations/2026090701_memory_core.sql"),
-            include_str!("../../../sql/migrations/2026090701_memory_core_down.sql"),
+            include_str!("../../../sql/migrations/2026092501_memory_core.sql"),
+            include_str!("../../../sql/migrations/2026092501_memory_core_down.sql"),
         ),
-        // M2-02F: a single-copy Episode search document and its
-        // external-content FTS5 postings. Runtime synchronization is owned by
-        // internal::ai::memory::fts_sql; no triggers or fallback scan exist.
         sql_migration(
-            2026090702,
+            2026092502,
             "memory_fts_search",
-            include_str!("../../../sql/migrations/2026090702_memory_fts_search.sql"),
-            include_str!("../../../sql/migrations/2026090702_memory_fts_search_down.sql"),
+            include_str!("../../../sql/migrations/2026092502_memory_fts_search.sql"),
+            include_str!("../../../sql/migrations/2026092502_memory_fts_search_down.sql"),
         ),
-        // M2-02R: the single local-only context selection receipt ledger shared
-        // by Memory and mainline, plus its bounded retention watermark.
         sql_migration(
-            2026090703,
+            2026092503,
             "context_selection_receipt",
-            include_str!("../../../sql/migrations/2026090703_context_selection_receipt.sql"),
-            include_str!("../../../sql/migrations/2026090703_context_selection_receipt_down.sql"),
+            include_str!("../../../sql/migrations/2026092503_context_selection_receipt.sql"),
+            include_str!("../../../sql/migrations/2026092503_context_selection_receipt_down.sql"),
         ),
     ]
 }
@@ -2027,14 +2105,17 @@ pub fn builtin_runner() -> Result<MigrationRunner, MigrationError> {
 
 /// Highest schema version this Libra build knows how to create.
 pub fn latest_builtin_schema_version() -> Result<Option<i64>, MigrationError> {
-    Ok(builtin_runner()?.max_registered_version())
+    super::schema::latest_schema_version_for_role(super::DatabaseRole::Repository)
+        .map_err(|error| MigrationError::Other(error.into()))
 }
 
 /// Read the current built-in schema version without mutating the database.
 pub async fn current_builtin_schema_version_readonly(
     conn: &DatabaseConnection,
 ) -> Result<Option<i64>, MigrationError> {
-    builtin_runner()?.current_version_readonly(conn).await
+    super::schema::current_schema_version_for_role(conn, super::DatabaseRole::Repository)
+        .await
+        .map_err(|error| MigrationError::Other(error.into()))
 }
 
 /// The later of the two sequencer re-key migrations. A database at or past it
@@ -2176,8 +2257,18 @@ pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64
         .await
         .with_context(|| "failed to read the current schema version")?;
     if applied.unwrap_or(0) < BISECT_STATE_SCOPE_MIGRATION {
-        normalize_rebase_state_shape(conn).await?;
-        normalize_bisect_state_shape(conn).await?;
+        for top_up in super::schema::top_ups_for_role(super::DatabaseRole::Repository) {
+            match top_up {
+                super::schema::SchemaTopUp::RebaseShape => {
+                    normalize_rebase_state_shape(conn).await?
+                }
+                super::schema::SchemaTopUp::BisectShape => {
+                    normalize_bisect_state_shape(conn).await?
+                }
+                // The DB bootstrap layer owns the other top-ups.
+                _ => {}
+            }
+        }
     }
     runner
         .run_pending(conn)
@@ -2257,9 +2348,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 61);
+        assert_eq!(runner.len(), 68);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026090703));
+        assert_eq!(runner.max_registered_version(), Some(2026092503));
     }
 
     #[test]

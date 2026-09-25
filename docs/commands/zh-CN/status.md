@@ -14,11 +14,13 @@ libra status [OPTIONS] [pathspec]...
 
 `libra status` 显示工作树和暂存区状态：哪些文件已暂存到下一次提交，哪些有尚未暂存的修改，哪些未跟踪。它还报告当前分支、detached HEAD 状态和 upstream tracking 信息。
 
-该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式、供代理消费的结构化 JSON，以及 `-z` NUL 终止的机器输出。它还能检测 renames（`--find-renames`）、将输出按列对齐（`--column`），并控制是否显示 upstream ahead/behind 计数（`--ahead-behind` / `--no-ahead-behind`）。可选 pathspec 会限制报告的 staged、unstaged、unmerged、ignored 和 untracked 路径；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。
+该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式、供代理消费的结构化 JSON，以及 `-z` NUL 终止的机器输出。它还能检测 renames（`--find-renames`）、将输出按列对齐（`--column`），并控制是否显示 upstream ahead/behind 计数（`--ahead-behind` / `--no-ahead-behind`）。浅克隆中 ahead/behind 将 `.libra/shallow` 中的提交视为根；损坏的 shallow 列表会隐藏计数并告警，而不是猜测。可选 pathspec 会限制报告的 staged、unstaged、unmerged、ignored 和 untracked 路径；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。
 
 在 merge、rebase、cherry-pick 冲突期间，未合并的 index stage 条目会按冲突输出，而不会被误报为未跟踪文件。porcelain v1/短格式使用 Git 风格 XY 码（例如 `UU conflict.txt`）；porcelain v2 输出带 stage mode 与 object id 的 `u <XY> ...` 记录。默认长格式在 `Unmerged paths:` 标题下列出冲突路径，并带人类可读标签（`both modified:`、`deleted by them:`、`both added:` 等）与继续/中止提示。
 
 已跟踪符号链接与普通文件参与相同的 HEAD/索引/工作树比较。`status` 将符号链接本身视为工作树对象，比较存储的链接目标字节，并将目标变化报告为修改，而不是跟随链接或将 dangling symlink 视为已删除。
+
+当 `core.filemode=true`（Unix 默认）时，已跟踪普通文件的 owner-execute 位与索引不同而内容未变，属于仅 mode 变化，会在所有输出格式（short、long、porcelain v2、JSON）中被报告为修改；当 `core.filemode=false` 时忽略仅 mode 的差异，但条目类型变化（如普通文件被替换为符号链接）始终会被报告。非法的 `core.filemode` 值会在任何输出前使 `status` fail-closed。
 
 ### 显示相关的 config 默认值（`status.*`）
 
@@ -81,6 +83,8 @@ libra status --no-branch          # 抑制配置的 status.branch=true
 
 控制分支 tracking 行中是否显示 ahead/behind 计数。`--no-ahead-behind` 抑制计数，但仍显示 upstream 分支名。默认是在配置了 upstream 时显示计数。
 
+计数是只能从一侧到达的提交数，与 `libra rev-list --left-right --count <upstream>...HEAD` 输出的两个数字相同（先 behind 后 ahead）。计数由与 `merge-base` 共用的标记遍历算出，因此 merge、criss-cross 与日期偏斜的历史都与 Git 的计数一致；shallow 仓库中的边界提交视为根。计数无法计算时（任一侧历史中有提交读不到），status 仍然成功：短格式不带括号，porcelain v2 省略 `# branch.ab`，长格式不输出 tracking 句子，JSON 的 `ahead`/`behind` 为 `null`，并发出 `cannot count commits ahead/behind '<upstream>'` warning（code `upstream_counts_unavailable`，source `metadata`；shallow 边界列表格式错误或读不到时同样如此，而 Git 会直接退出）。unborn 分支同样省略计数，但不发 warning。
+
 ```bash
 libra status --short --branch --no-ahead-behind
 libra status --porcelain --branch --no-ahead-behind
@@ -111,9 +115,9 @@ libra status --column
 libra status --no-column
 ```
 
-### `--find-renames [PERCENT]`
+### `-M [PERCENT]` / `--find-renames [PERCENT]`
 
-设置 rename 检测的相似度阈值。rename 检测**默认开启**（50%，与 Git 一致），因此仅在需要改变阈值或在 `status.renames=false` 后重新启用时才需要 `--find-renames`。当被删除文件与新文件足够相似时，它们会作为一个 rename 对（`renamed: old -> new`）报告，而不是分开的 delete/add 条目。CLI 接受 Git 完整 raw 语法——裸整数按 `0.<digits>` 读取（`505` 即 50.5%）、`N%` 为字面百分比（`100%` 仅 exact）、支持小数（`0.8`）;`0`/裸形式回到 50% 默认。三种拼写 `--no-renames` / `--renames` / `--find-renames[=N]` 按 argv 顺序真正 last-one-wins（`--no-renames --find-renames=80` 会以 80% 重新启用）。`-z` 另有 Git 对齐的 `--null` 长别名；裸 `-z`/`--null` 无显式格式时强制 porcelain v1,与 `--long`/缓存模式组合 fail-closed。嵌入 API 的 `find_renames: Option<u8>` 保持较窄的 0–100 百分比（已记录收窄——CLI 语法为完整表面）。
+`-M[<n>]` 是 `--find-renames[=<n>]` 的短写法（Git 拼写）。设置 rename 检测的相似度阈值。rename 检测**默认开启**（50%，与 Git 一致），因此仅在需要改变阈值或在 `status.renames=false` 后重新启用时才需要 `-M` / `--find-renames`。当被删除文件与新文件足够相似时，它们会作为一个 rename 对（`renamed: old -> new`）报告，而不是分开的 delete/add 条目。CLI 接受 Git 完整 raw 语法——裸整数按 `0.<digits>` 读取（`505` 即 50.5%）、`N%` 为字面百分比（`100%` 仅 exact）、支持小数（`0.8`）;`0`/裸形式回到 50% 默认。四种拼写 `--no-renames` / `--renames` / `--find-renames[=N]` / `-M[<n>]` 按 argv 顺序真正 last-one-wins（`--no-renames -M80` 会以 80% 重新启用），`-M` 可与其他短选项组成集群（`-sM90`）；非数值（如 `-Mabc`）以 `LBR-CLI-002` fail-closed。`-z` 另有 Git 对齐的 `--null` 长别名；裸 `-z`/`--null` 无显式格式时强制 porcelain v1,与 `--long`/缓存模式组合 fail-closed。嵌入 API 的 `find_renames: Option<u8>` 保持较窄的 0–100 百分比（已记录收窄——CLI 语法为完整表面）。
 
 renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限与相似度比较预算的有界 inexact spanhash 扫描。上限由 `status.renameLimit`（回退到 `diff.renameLimit`）经严格 local → global → system 级联决定：非负整数，`0` 关闭上限，默认 1000（对齐 Git）；非法值在任何输出前 fail-closed，超限只跳过 exhaustive 阶段并给出结构化 `rename_limit_product_skipped` 警告。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树——但仅在 `status.renameUntracked` 配置（Libra 扩展，严格布尔，默认 `false`）启用时才会检测，因为 unstaged 的"新"路径都是未跟踪文件。默认关闭时，已跟踪→未跟踪的移动按 Git 语义呈现为 `D` + `??`，不产生 unstaged rename 记录。启用扩展后，destination 候选来自独立的有界 worktree probe（R0-3）：`-uno` 与折叠的 untracked 目录只隐藏**显示**标记、绝不隐藏 probe；候选按与显示扫描同一 tracked/ignore 分层做资格（tracked 路径、case-fold 别名、unmerged stage 与 ignored 路径一律不入围）；调用级双预算（枚举 50k / 合格目的地 10k）为遍历定界——触顶保留部分配对并给出结构化 `probe_truncated` 警告。目录下候选全部被 rename 消费时其 `? dir/` 标记被折叠移除；truncated 或阻塞的 probe 保守保留标记。不可读路径绝不静默降级为「无 rename」：文本格式以 `LBR-IO-001` fail-closed，`--json` 则通过 `data.io_blocked[]` 报告部分结果（见下文 *io_blocked 部分结果契约*）。名字不是合法 UTF-8 的 destination 保留其基础 `??` 行，但在本版本中完全不参与 rename 评分，并给出一条 `rename_path_encoding_unsupported` 警告（非 UTF-8 候选评分为延后扩展）。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
 
@@ -145,6 +149,7 @@ libra status --find-renames=75
 | `dirty_cache_concurrent_invalidate` | `cache` | 并发写者在读取途中使缓存失效 |
 | `dirty_cache_path_unencodable` | `cache` | 非 UTF-8 路径无法存入 dirty 缓存，其行被省略（完整 status 仍会报告该路径） |
 | `repository_preflight` | `config` | 命令运行前发出的仓库级提示（例如 durable object-index 修复待完成） |
+| `upstream_counts_unavailable` | `metadata` | 无法计算 upstream ahead/behind 计数（任一侧历史中的提交或 shallow 边界列表读不到）；计数被省略而非猜测 |
 
 `source` 列是冻结枚举：`config`、`probe`、`rename_detect`、`worktree`、`metadata`、`cache`。`probe` 与 `rename_detect` 刻意区分——`probe` 警告表示候选可能根本没被**看到**，而 `rename_detect` 表示看到了但无法评分。`config` 用于与扫描无关的仓库级提示——目前即上表的 `repository_preflight`。配置**解析**本身从不告警：非法值一律 fail-closed 而非降级。
 
@@ -376,7 +381,7 @@ Detached HEAD：
 - 在分支上时，`head.name` 是分支名；detached 时，`head.oid` 是提交哈希
 - 未配置 tracking 分支或 HEAD detached 时，`upstream` 为 `null`
 - 远程 tracking 分支不再存在时，`upstream.gone` 为 `true`
-- `gone` 为 `true` 时，`upstream.ahead` / `upstream.behind` 为 `null`
+- `gone` 为 `true`、处于 unborn 分支，或计数无法计算（任一侧历史中有提交读不到，此时 `data.warnings[]` 含 `upstream_counts_unavailable` warning）时，`upstream.ahead` / `upstream.behind` 为 `null`；其余情况下两者等于 `libra rev-list --left-right --count <upstream>...HEAD` 的输出（先右后左）
 - 只有 staged、unstaged、untracked、unmerged 列表都为空、没有全局 merge
   状态、**且** `io_blocked` 为空时，`is_clean` 才为 `true`（「无法检查」永远不是干净）
 - 新初始化且无提交的仓库中，`has_commits` 为 `false`
@@ -450,7 +455,7 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 | Quiet 模式 | `git status -q` | N/A | `libra status --quiet`（全局标志） |
 | 列显示 | `git status --column` | N/A | `libra status --column`（`--no-column` 撤销） |
 | Ahead/behind 显示 | `git status -sb`（仅文本） | N/A | 人类 + JSON 中结构化 `upstream` 对象 |
-| 查找 renames | `git status -M` | 自动 | `--find-renames` / `--renames` |
+| 查找 renames | `git status -M` | 自动 | `-M[<n>]` / `--find-renames` / `--renames` |
 | 忽略 submodules | `git status --ignore-submodules` | N/A | N/A（无 submodules） |
 | 结构化 JSON 输出 | N/A | N/A | `--json` / `--machine` |
 | 错误提示 | 最少 | 最少 | 每种错误类型都有可操作提示 |
@@ -484,5 +489,5 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 - `--porcelain v2` 输出真实的 v2 行语法（带 mode/hash 列的 `1`/`2`/`u`/`?`/`!` 记录）；`--json` 仍是更丰富的结构化表面
 - `-z` 下 Unix porcelain v1/v2 写出 RAW OS 路径字节（不 quote，非 UTF-8 名字无损）；非 `-z` 格式按 `core.quotePath` 处理 `0x7F` 以上字节——默认 `true` 时八进制转义，`false` 时原样写出。非 UTF-8 名字绝不使 status 失败——它保留基础 `??` 行，仅不参与 rename 评分（附 `rename_path_encoding_unsupported` 警告）
 - jj 的 `jj status` 始终使用短格式，并且不区分已暂存与未暂存更改（jj 没有暂存区）
-- 通过 `--find-renames[=<n>]` 及 `--renames`/`--no-renames` 开关支持重命名检测；不暴露 Git 的短别名 `-M`
+- 通过 Git 的 `-M[<n>]` / `--find-renames[=<n>]` 及 `--renames`/`--no-renames` 开关支持重命名检测；四种拼写共享同一 argv last-one-wins 顺序
 - 支持 `--column` 列对齐显示；`--no-column`（等价于 `--column=never`）经 clap `overrides_with` 撤销先前的 `--column`（最后出现者生效），status 默认非列式故单独使用为 no-op

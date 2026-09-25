@@ -35,6 +35,7 @@ payload。
 |------|------|------|
 | `--add` | 允许位置路径添加新的（未跟踪）文件。 | `libra update-index --add a.txt` |
 | `--remove` | 从 index 删除位置路径。与 `--add` 同时给出时按磁盘存在性逐路径分流（存在→暂存，消失→移除）。 | `libra update-index --remove old.txt` |
+| `--force-remove` | 无论工作树文件是否存在都删除给定路径的索引条目；索引中不存在的路径为无操作，未合并路径的 stage 1–3 全部删除。优先于 `--add`/`--remove`。 | `libra update-index --force-remove old.txt` |
 | `--add --remove` | 同时给出两项许可：存在的暂存、消失的移除。 | `libra update-index --add --remove a.txt gone.txt` |
 | `--cacheinfo <mode>,<object>,<path>` | 按对象 id 注册条目（可重复）。 | `libra update-index --cacheinfo 100644,<oid>,dir/f.txt` |
 | `--json` / `--machine` | 结构化输出：`{ updated: <n>, removed: <n> }`。 | `libra --json update-index --add a.txt` |
@@ -46,7 +47,7 @@ payload。
 | `0` | index 已更新并保存。 |
 | `9` / `LBR-WARN-001` | 本地 index 已保存，但云索引修复仍待处理，且使用了 `--exit-code-on-warning`。 |
 | `128` | 不在仓库内、用法错误（`--cacheinfo` 非法、未跟踪路径且无 `--add`），或工作树文件缺失。 |
-| `128` / `LBR-IO-002` | 工作树 blob 或耐久云索引 marker 持久化失败；修复存储权限后重试。 |
+| `128` / `LBR-IO-002` | 工作树 blob 或耐久云索引 marker 持久化失败；修复存储权限后重试。失败文案为规范口径：对象负载已安全写入、未暂存任何路径，直接重试复用已存储负载、无需锁文件清理（锁超时另附持有者说明，锁文件永不删除）。 |
 
 ## 示例
 
@@ -74,4 +75,4 @@ libra update-index --remove src/old.rs
 | 删除路径 | `libra update-index --remove f` | `git update-index --remove f` |
 | 按 id 注册 | `libra update-index --cacheinfo m,oid,p` | `git update-index --cacheinfo m,oid,p` |
 
-延后（未公开）：裸路径 stat 刷新、`--force-remove`、`--chmod`、`--assume-unchanged`、`--skip-worktree`、`--index-info` 等 Git 标志。
+延后（未公开）：裸路径 stat 刷新、`--chmod`、`--assume-unchanged`、`--skip-worktree`、`--index-info` 等 Git 标志。

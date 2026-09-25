@@ -128,7 +128,7 @@ fn visible_remote_url_redacts_scp_password() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn resolve_direct_url_skips_broken_current_repo_config() {
     let repo = tempdir().unwrap();
     let storage = repo.path().join(util::ROOT_DIR);

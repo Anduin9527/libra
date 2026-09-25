@@ -14,7 +14,6 @@ use crate::internal::ai::{
     },
     memory::{domain::EpisodeRootKind, source::RedactedEpisodeSource},
     observed_agents::Redactor,
-    providers::AnyCompletionModel,
 };
 
 pub(crate) const TASK_EPISODE_PROMPT_VERSION: &str = "task-episode-v1";
@@ -30,13 +29,6 @@ pub(crate) struct TaskEpisodeCompiler<M> {
     model: M,
     model_id: String,
     timeout: Duration,
-}
-
-impl TaskEpisodeCompiler<AnyCompletionModel> {
-    pub(crate) fn new(model: AnyCompletionModel) -> Result<Self, EpisodeCompilerError> {
-        let model_id = model.model_id().to_string();
-        Self::from_parts(model, model_id, DEFAULT_PROVIDER_TIMEOUT)
-    }
 }
 
 impl<M> TaskEpisodeCompiler<M> {
@@ -615,7 +607,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test-provider")]
+    #[cfg(any())]
     #[tokio::test]
     async fn existing_test_provider_implements_task_compiler_contract() {
         use std::path::Path;

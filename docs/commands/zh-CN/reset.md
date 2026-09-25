@@ -6,6 +6,7 @@
 
 ```
 libra reset [<target>] [--soft | --mixed | --hard | --merge | --keep]
+libra reset -p/--patch [<tree-ish>] [--] [<pathspec>...]
 libra reset <pathspec>...
 libra reset [<target>] [--] <pathspec>...
 libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
@@ -23,11 +24,17 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 
 两个保留模式都会先完整预检，并快照原始 index 字节及受影响工作树条目；工作树写入或最终 ref 更新失败时精确恢复，避免部分 reset。工作树遍历绝不跟随 symlink ancestor（包括被 ignore 的 symlink）；不安全写入会失败并 rollback，不会触碰链接目标。逃出工作树或指向 `.libra` 元数据的损坏 index/tree 路径也会被拒绝。`--merge` 还会保留既有 unmerged index stages。
 
-提供 pathspec 时，命令执行有针对性的 mixed reset：只将命名文件在索引中重置为匹配目标提交，不移动 HEAD。这是取消暂存特定文件的主要方式。与 Git 一样，如果第一个裸位置参数是已知路径且不是 revision，`libra reset src/lib.rs` 会按 `HEAD` 目标的 pathspec reset 处理，等价于 `libra reset HEAD -- src/lib.rs`。如果同一个 token 既是 revision 又是文件名，reset 会拒绝猜测并报歧义；要把它作为目标 revision，请使用 `libra reset <revision> -- <file>`，要把它作为路径，请使用 `libra reset -- <file>`。Pathspec 与 `--soft`、`--hard`、`--merge`、`--keep` 不兼容。当 pathspec reset 从目标提交恢复符号链接时，索引条目会保留 mode `120000`，blob 仍是链接目标字节。
+提供 pathspec 时，命令执行有针对性的 mixed reset：只将命名文件在索引中重置为匹配目标提交，不移动 HEAD。这是取消暂存特定文件的主要方式。与 Git 一样，如果第一个裸位置参数是已知路径且不是 revision，`libra reset src/lib.rs` 会按 `HEAD` 目标的 pathspec reset 处理，等价于 `libra reset HEAD -- src/lib.rs`。如果同一个 token 既是 revision 又是文件名，reset 会拒绝猜测并报歧义；要把它作为目标 revision，请使用 `libra reset <revision> -- <file>`，要把它作为路径，请使用 `libra reset -- <file>`。Pathspec 与 `--soft`、`--hard`、`--merge`、`--keep` 不兼容。当 pathspec reset 从目标提交恢复符号链接时，索引条目会保留 mode `120000`，blob 仍是链接目标字节。普通名称按索引精确路径命中；通配符或 `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` 规格经共享 pathspec 引擎展开，匹配合目标与当前索引中被其覆盖的每个条目（`--literal-pathspecs` 会将其转为字面）。
+
+无 pathspec 的整树 reset 仅在结果索引已无未合并冲突阶段时结束已停止的序列项：清除已停止的单提交 cherry-pick 或 revert 状态，使下一次 pick 或 revert 可以正常开始。多提交序列保留剩余提交，并记录被停提交已在此结束；用 `libra cherry-pick --skip`（或 `--quit`）或 `libra revert --skip` 在 reset 目标上应用其余提交；`libra revert --abort` 则恢复 revert 前的 HEAD、索引和已跟踪文件，丢弃之后的已跟踪改动。带 pathspec 的 reset 不改动任何序列状态，进行中的 rebase 与 merge 元数据也不受影响。若存在停止的 pick/revert 且 `--soft` 保持冲突阶段或 `--merge` 携带这些阶段，reset 会警告并完整保留停止状态，原操作仍可继续或中止。Libra 保留既有的未合并索引下 soft reset 行为；Git 会拒绝该 soft reset。若 reset 后读不出索引，也警告并保留状态，不回滚已完成的 reset。其他收尾写入失败时，reset 仍然成功，并在 warning 中指明残留状态。 有过关联工作树的仓库（包括已删除的工作树）中，若公共存储里的 revert 侧车无法证明属于主工作树，reset 会原样保留其字节并成功返回，warning 指向 `libra worktree doctor`；不会删除该证据或替它重新标注属主。
+
+`libra reset -p` 可交互式逐个选择 hunk 撤销暂存：对 `HEAD` 提示 Unstage，对其它提交/tree 提示 Apply，只改索引。`reset -p` 的无效目标以 129 + `LBR-CLI-003` 结束（Git 为 128）。
 
 默认目标是 `HEAD`，因此不带参数的 `libra reset` 等价于取消暂存所有内容。
 
 `reset --hard` 恢复工作树时会保留 tree 中的文件类型：符号链接会恢复为真正的 symlink，链接 blob 字节作为目标路径写入；若工作树当前位置已有普通文件或已有 symlink，必要时会被替换为目标 symlink。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写入普通文件。
+
+工作树物化按条目 mode 语义执行（plan issues/470 FM-02）：文件按条目权限位创建（`100755`→`0777`、`100644`→`0666`）并受进程 `umask` 约束，经同目录临时文件原子替换；索引/树条目保留 mode（`100755`/`100644`/`120000`）。
 
 ## 选项
 
@@ -43,6 +50,7 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 | | `--pathspec-from-file` | `<file>` | 从文件（`-` 为 stdin）读取 pathspec；与 CLI pathspec 互斥 |
 | | `--pathspec-file-nul` | | 使用 NUL 分隔 pathspec |
 | | `--no-refresh` | | Git 兼容 no-op；Libra 不执行 index refresh |
+| `-p` | `--patch` | 可选 `[<tree-ish>]` | 交互式逐个选择 hunk 撤销暂存或写回索引；`--[no-]auto-advance` 后者优先 |
 
 ### 标志示例
 
@@ -85,6 +93,9 @@ libra reset --pathspec-from-file=paths.txt
 
 # 面向代理的 JSON 输出
 libra reset --json --hard HEAD~1
+
+# 交互式逐个选择 hunk 撤销暂存
+libra reset -p
 ```
 
 ## 常用命令
@@ -100,6 +111,7 @@ libra reset src/lib.rs                 # 将路径取消暂存回 HEAD
 libra reset HEAD -- src/lib.rs        # 将路径取消暂存回 HEAD
 libra reset --pathspec-from-file=paths.txt   # 从文件读取待取消暂存路径
 libra reset --json --hard HEAD~1      # 面向代理的结构化 JSON 输出
+libra reset -p                        # 交互式逐个选择 hunk 撤销暂存
 ```
 
 ## 人类可读输出
@@ -200,12 +212,15 @@ Mixed 模式是最安全的通用 reset：它取消暂存更改但不丢弃工�
 | Pathspec + merge/keep | 拒绝 | 拒绝（`LBR-CLI-002`） | N/A |
 | 失败回滚 | 无 | classic mode 尝试 tree rollback；merge/keep 精确恢复 index/worktree snapshot | N/A（operation log undo） |
 
+`reset -p` 已实现。其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（D15）。
+
 ## 错误处理
 
 | 场景 | 错误码 | 提示 |
 |----------|-----------|------|
 | 不是 libra 仓库 | `LBR-REPO-001` | "run 'libra init' to create a repository in the current directory." |
 | 无效修订 | `LBR-CLI-003` | "check the revision name and try again." |
+| `reset -p` 的无效目标以 129 + `LBR-CLI-003` 结束 | `LBR-CLI-003` | Git 为 128 |
 | revision/path token 歧义 | `LBR-CLI-002` | "use '--' to separate paths from revisions, like 'libra reset <revision> -- <file>' or 'libra reset -- <file>'." |
 | HEAD unborn | `LBR-REPO-003` | "create a commit first before resetting HEAD." |
 | 无法解析 HEAD | `LBR-IO-001` | "check whether the repository database is readable." |
@@ -223,3 +238,16 @@ Mixed 模式是最安全的通用 reset：它取消暂存更改但不丢弃工�
 | `--merge`/`--keep` 会覆盖本地变更 | `LBR-CONFLICT-002` | "commit or stash the local changes, then retry the reset." |
 | Pathspec 不匹配 | `LBR-CLI-003` | "check the path and try again." |
 | 回滚失败 | （主错误码） | （主提示） |
+
+Reset 在输出结果后将恢复及清理 warning 写入 stderr，`--json` 和 `--machine` 也如此。成功 JSON schema 不变；指定 `--exit-code-on-warning` 时，有此类 warning 会返回 9，即使 reset 本身已经完成。仅有未合并索引、没有停止的 pick/revert 时，不产生序列恢复 warning。
+
+同一警告输出也适用于 cherry-pick 与 am 内部调用的 reset：既有文件系统清理 warning 在结构化模式下也会显示在 stderr。内部序列状态处理与 warning-exit 计数保持原有行为。
+
+### 暂存文本冲突与 reset 收尾
+
+revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也检查该次 revert 冲突路径的暂存内容：仍有 `<<<<<<<` 标记或 blob 无法读取时，保留 revert 状态并发出恢复警告。因此即使 `ls-files --unmerged` 为空，`--soft` 也不会丢掉恢复状态。解决并重新暂存内容（或从索引移除路径），或通过 `--mixed`/`--hard` 将索引替换为干净内容后，可以正常收尾。仅工作树中残留的标记不阻止 mixed reset 收尾。本次不改变 revert 的冲突表示及 `--continue` 行为。
+
+## Issue #477 notes
+
+清除进行中的 merge，并把其 autostash 移入 stash 列表
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`

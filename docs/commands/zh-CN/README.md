@@ -25,6 +25,8 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `--quiet` | `-q` | 抑制 stdout |
 | `--exit-code-on-warning` | | 出现警告时返回退出码 9 |
 | `--progress` | | 控制进度输出（`json`、`text`、`none`、`auto`） |
+| `--literal-pathspecs` | | 把 pathspec 当字面路径（不通配、不解析 `:(magic)`）。也可用 `GIT_LITERAL_PATHSPECS=1`。 |
+| `--no-literal-pathspecs` | | 取消 `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS`（后出现的标志生效）。 |
 
 ## 命令索引
 
@@ -94,6 +96,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 |------|------|------|------|
 | `libra reset` | | 移动 HEAD，并可选择重置索引或工作目录 | [reset.md](reset.md) |
 | `libra merge` | | 将分支快进合并到当前分支 | [merge.md](merge.md) |
+| `libra mergetool` | | 使用已配置的外部工具解决普通内容冲突 | [mergetool.md](mergetool.md) |
 | `libra merge-file` | | 对三个文件做三路合并（git merge-file） | [merge-file.md](merge-file.md) |
 | `libra merge-base` | | 查找两个提交的最佳共同祖先 | [merge-base.md](merge-base.md) |
 | `libra rebase` | `rb` | 在另一个基底 tip 上重新应用提交，并支持冲突解决 | [rebase.md](rebase.md) |
@@ -123,19 +126,19 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 |------|------|------|------|
 | `libra cloud` | | 通过 Cloudflare D1/R2 执行云备份和恢复操作 | [cloud.md](cloud.md) |
 | `libra cache` | | 检查 tiered-storage / LRU cache 配置（type、threshold、budget） | [cache.md](cache.md) |
-| `libra publish` | | 管理只读 Cloudflare Worker 发布 | [publish.md](publish.md) |
+| `libra publish` | | 已移除。仓库备份请用 `libra cloud` | [publish.md](publish.md) |
 | `libra worktree` | `wt` | 管理附加到仓库的多个工作树 | [worktree.md](worktree.md) |
 
 ### AI 与开发
 
 | 命令 | 别名 | 说明 | 文档 |
 |------|------|------|------|
-| `libra code` | | 带 AI agent、Web 服务器和 MCP 集成的交互式 Web Code UI | [code.md](code.md) |
-| `libra code-control` | | **已在 W5 breaking 发布中删除** — 请用 `libra code --control stdio`（breaking-change 迁移说明） | [code-control.md](code-control.md) |
+| `libra code` | | 已移除。外部 agent 捕获请用 `libra agent` | [code.md](code.md) |
+| `libra code-control` | | 已随 `libra code` 移除。请用 `libra agent` | [code-control.md](code-control.md) |
 | Codex data storage | | 将 `libra code --provider codex` 连接到 Codex app-server，并持久化 Codex 会话数据 | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | 列出、运行和检查 AI automation rules | [automation.md](automation.md) |
-| `libra usage` | | 报告并修剪 AI provider/model 使用聚合 | [usage.md](usage.md) |
-| `libra graph` | | 检查 Libra Code thread version graph（`--json`/`--machine`；交互式 TUI 入口已在 W5 breaking 发布中删除，请用 Web Code UI） | [graph.md](graph.md) |
+| `libra usage` | | 已移除。用量统计只服务已拆除的开发 agent | [usage.md](usage.md) |
+| `libra graph` | | 已移除。捕获图请用 `libra --json agent graph <session>` | [graph.md](graph.md) |
 | `libra sandbox` | | 检查 AI sandbox diagnostics，包括 OS backend 可用性和 downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | 管理外部 agent 捕获、checkpoints、hooks 和 RPC adapters | [agent.md](agent.md) |
 | `libra memory` | | 搜索、查看、诊断和重建当前仓库的研发历程记忆 | [memory.md](memory.md) |
@@ -217,5 +220,5 @@ Libra 的命令行接口基于以下原则设计：
 4. **默认安全** — 默认启用 vault-backed signing 和 secret encryption，而不是要求用户显式选择。
 5. **显式优先于隐式** — `clean` 等命令要求 `-f` 或 `-n`；`status --exit-code` 是显式 opt-in，而不是 Git 中含糊的退出码行为。
 6. **可操作的错误** — 每个错误都包含稳定代码（`LBR-*`）、人类可读消息和解决提示。
-7. **AI 原生开发** — `libra code` 命令将 AI agents 直接集成到版本控制工作流，并支持多 provider 和 MCP 协议。
+7. **AI 原生开发** — 外部 Agent 捕获（`libra agent`）把 Claude/Codex/OpenCode 会话观测为版本化 checkpoint；只读 `review` / `investigate` 运行受监督的 agent（`libra code` Web UI 已于 0.23.0 移除）。
 8. **云原生存储** — 内置分层存储（S3/R2）和云备份（D1/R2），服务分布式 monorepo 工作流。

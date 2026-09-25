@@ -109,7 +109,9 @@ fn repair_global_modes() {
         use std::os::unix::fs::PermissionsExt;
         for path in [
             ConfigScope::Global.get_config_path(),
-            dirs::home_dir().map(|home| home.join(".libra").join("vault-unseal-key")),
+            // Only the key Libra actually uses: a migrated legacy file is a
+            // user-owned backup and is left untouched (ADR-GCX-04).
+            crate::internal::vault::active_global_unseal_key_path(),
         ]
         .into_iter()
         .flatten()
@@ -130,7 +132,7 @@ mod tests {
     use crate::{internal::config::ConfigKv, utils::test};
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn remove_session_deletes_global_session_not_local_key() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -162,7 +164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn remove_all_sessions_deletes_global_sessions_not_local_keys() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;

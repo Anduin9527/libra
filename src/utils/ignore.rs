@@ -11,6 +11,9 @@ use walkdir::WalkDir;
 
 use super::util;
 
+mod bounded;
+pub(crate) use bounded::BoundedIgnoreWalk;
+
 const LIBRAIGNORE_FILE: &str = ".libraignore";
 const GITIGNORE_FILE: &str = ".gitignore";
 const DEFAULT_LIBRAIGNORE_CONTENT: &[u8] = b"# Libra ignore file
@@ -251,6 +254,22 @@ fn should_ignore_with_workdir(
     workdir: &Path,
     layers: &crate::internal::layer::ExclusionSnapshot,
 ) -> bool {
+    match should_ignore_with_matcher(path, policy, index, layers, || {
+        Ok::<_, std::convert::Infallible>(is_path_ignored_with_layers(path, workdir, layers))
+    }) {
+        Ok(ignored) => ignored,
+        Err(infallible) => match infallible {},
+    }
+}
+
+/// Apply index/layer policy once; callers choose the raw lookup's I/O boundary.
+fn should_ignore_with_matcher<E>(
+    path: &Path,
+    policy: IgnorePolicy,
+    index: &Index,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+    matcher: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
     let is_tracked = path_is_tracked_or_unknown_encoding(path, index);
 
     // lore.md 2.4: a materialized layer-overlay path is UN-NEGATABLY excluded
@@ -268,22 +287,22 @@ fn should_ignore_with_workdir(
         // OnlyIgnored (the `clean -x` candidate scan): NOT a candidate — protect
         // the active local overlay from being deleted by `clean -x` (only a
         // re-apply could restore it).
-        return matches!(policy, IgnorePolicy::Respect);
+        return Ok(matches!(policy, IgnorePolicy::Respect));
     }
 
     match policy {
         IgnorePolicy::Respect => {
             if is_tracked {
-                return false;
+                return Ok(false);
             }
-            is_path_ignored_with_layers(path, workdir, layers)
+            matcher()
         }
-        IgnorePolicy::IncludeIgnored => false,
+        IgnorePolicy::IncludeIgnored => Ok(false),
         IgnorePolicy::OnlyIgnored => {
             if is_tracked {
-                return true;
+                return Ok(true);
             }
-            !is_path_ignored_with_layers(path, workdir, layers)
+            matcher().map(|ignored| !ignored)
         }
     }
 }
@@ -428,6 +447,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn non_utf8_paths_use_conservative_tracked_fallback() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -460,7 +480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn respect_policy_ignores_untracked_files() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -471,6 +491,8 @@ mod tests {
         fs::write("tracked.txt", "tracked").unwrap();
 
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -484,6 +506,10 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 
@@ -501,7 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn include_ignored_policy_keeps_untracked_files() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -538,7 +564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn only_ignored_policy_returns_only_ignored_paths() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -549,6 +575,8 @@ mod tests {
         fs::write("tracked.txt", "tracked").unwrap();
 
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -562,6 +590,10 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 
@@ -579,7 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn only_ignored_policy_excludes_tracked_entries() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -589,6 +621,8 @@ mod tests {
         fs::write("ignored.txt", "initial").unwrap();
 
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["ignored.txt".into()],
             all: false,
             update: false,
@@ -602,6 +636,10 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 
@@ -638,7 +676,7 @@ mod tests {
     /// must not be staged by `add .` or `add --force`, even when a
     /// `.libraignore` whitelist rule tries to un-ignore it.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn git_directory_is_force_ignored_like_git() {
         let repo = tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -676,6 +714,8 @@ mod tests {
 
         // `add --force .` must not stage anything under `.git`.
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec![".".into()],
             all: false,
             update: false,
@@ -689,6 +729,10 @@ mod tests {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 

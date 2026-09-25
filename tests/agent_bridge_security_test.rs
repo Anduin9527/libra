@@ -45,7 +45,6 @@ fn read_method_registry_rejects_unknown_methods() {
     // The read methods that ARE allowed.
     for method in [
         "context.get",
-        "memory.recall",
         "status.get",
         "history.search",
         "checkpoint.list",

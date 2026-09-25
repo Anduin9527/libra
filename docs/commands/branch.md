@@ -8,12 +8,13 @@ Create, delete, rename, inspect, or list branches.
 
 ```
 libra branch [<new_branch>] [<commit_hash>]
+libra branch [-t | --track[=direct|inherit] | --no-track] <new_branch> [<start-point>]
 libra branch -l [-r | -a] [--contains <commit>] [--no-contains <commit>] [--points-at <object>] [--merged [<commit>]] [--no-merged [<commit>]] [--sort <key>] [--ignore-case] [--column[=<mode>]] [-v | --verbose]
 libra branch -d <name>
 libra branch -D <name>
 libra branch -m [<old>] <new>
 libra branch (-c | -C) [<old>] <new>
-libra branch -u <upstream>
+libra branch -u <upstream> [<branch>]
 libra branch --unset-upstream [<branch>]
 libra branch --edit-description [<branch>]
 libra branch --show-current
@@ -21,7 +22,7 @@ libra branch --show-current
 
 ## Description
 
-`libra branch` manages local and remote-tracking branch references stored in the SQLite database. Without arguments it lists local branches, highlighting the current branch with an asterisk. When given a positional `<new_branch>` argument it creates a new branch pointing at HEAD (or at `<commit_hash>` when provided).
+`libra branch` manages local and remote-tracking branch references stored in the SQLite database. Without arguments it lists local branches in refname order (the current branch is marked with `*` but is not moved to the top). `-v` / `-vv` pad the name column to the longest displayed name, including a detached first line `* (HEAD detached at <abbrev7>)`. `-a` prefixes remote-tracking names as `remotes/<remote>/<branch>`; `-r` omits that `remotes/` prefix. A cached remote HEAD prints as `remotes/<remote>/HEAD -> <remote>/<branch>` on `-a` and `<remote>/HEAD -> <remote>/<branch>` on `-r` (JSON keeps the full `refs/remotes/<remote>/HEAD` name). When given a positional `<new_branch>` argument it creates a new branch pointing at HEAD (or at `<commit_hash>` when provided).
 
 Deletion comes in two flavours: `-d` performs a safe delete that checks whether the branch has been fully merged into the current branch before removing it, while `-D` force-deletes regardless of merge status. Both refuse to delete the branch you are currently on.
 
@@ -36,7 +37,9 @@ The `--contains` and `--no-contains` filters (aliased as `--with` and `--without
 | `-l` | `--list` | | List branches (default when no action is specified) |
 | `-D` | `--delete-force` | `<name>` | Force-delete a branch, even if not fully merged |
 | `-d` | `--delete` | `<name>` | Safe-delete a branch (must be fully merged) |
-| `-u` | `--set-upstream-to` | `<upstream>` | Set upstream tracking for the current branch |
+| `-u` | `--set-upstream-to` | `<upstream> [<branch>]` | Set upstream tracking for the current branch, or for `<branch>` when given. A local branch name writes `branch.<name>.remote=.` and `branch.<name>.merge=refs/heads/<upstream>`. Setting a branch as its own upstream prints a warning and writes nothing. |
+| `-t` | `--track[=direct\|inherit]` | | When creating a branch, set up tracking from the start-point (`direct`, default) or copy the start-point branch's upstream (`inherit`). A commit hash start-point is refused (`LBR-CLI-003`, exit 129; Git uses 128 — intentional, ADR-HF-02) and creates nothing. Combined with `-d` / `-m` / `--list`, or used alone, `--track` is ignored. |
+| | `--no-track` | | When creating a branch, do not write tracking configuration. |
 | | `--unset-upstream` | `[branch]` | Remove upstream tracking for the current branch or the named branch |
 | | `--edit-description` | `[branch]` | Edit the branch's description (`branch.<name>.description`) in the configured editor; an empty/comment-only buffer unsets it. Defaults to the current branch. |
 | | `--show-current` | | Print the current branch name or detached HEAD state |
@@ -55,7 +58,7 @@ The `--contains` and `--no-contains` filters (aliased as `--with` and `--without
 | | `--format` | `<format>` | Render each branch with a for-each-ref format string (e.g. `%(refname:short)`, `%(objectname)`, `%(HEAD)`, `%(upstream)`, `%(if)`…`%(end)`). Replaces the default `* name` listing (and `-v`/`--column`); shares the for-each-ref atom engine |
 | | `--column[=<mode>]` | `always` / `auto` / `never` | Lay the branch list out in columns instead of one per line (bare `--column` means `always`; `auto` only when stdout is a terminal). Column mode shows plain, uncolored names. |
 | | `--no-column` | | Do not lay the branch list out in columns (equivalent to `--column=never`), countermanding an earlier `--column` (last one wins). Branches list one-per-line by default, so on its own this is a no-op. |
-| `-v` | `--verbose` | | List each branch with its tip's short sha and commit subject. Repeat (`-vv`) to also show the upstream-tracking segment `[<upstream>: ahead N, behind M]` (counts omitted when the remote-tracking ref has not been fetched; nothing shown for a branch with no configured upstream). Takes precedence over `--column`. |
+| `-v` | `--verbose` | | List each branch with its tip's short sha and commit subject. Repeat (`-vv`) to also show the upstream-tracking segment `[<upstream>: ahead N, behind M]` (the same counts `status` reports; they are omitted when the remote-tracking ref has not been fetched, or when the counts cannot be computed — the latter with a warning; nothing shown for a branch with no configured upstream). Takes precedence over `--column`. |
 
 Libra-owned local-only Memory state is hidden from local, remote, and `--all`
 branch listings. Ordinary user branches with similar names remain visible.
@@ -70,11 +73,21 @@ libra branch feature-x
 libra branch feature-x main
 libra branch hotfix abc1234
 
+# Create a branch that tracks its start-point (or copies that branch's upstream)
+libra branch --track t1 main
+libra branch --track=inherit t3 t1
+libra branch --no-track t4 main
+
 # List local branches
 libra branch -l
 
 # List all branches (local + remote)
 libra branch -l -a
+
+# Remote-tracking list includes the cached remote HEAD symlink
+# (e.g. remotes/origin/HEAD -> origin/main on -a; origin/HEAD -> origin/main on -r)
+libra branch -a
+libra branch -r
 
 # List branches with their tip sha and commit subject
 libra branch -v
@@ -116,6 +129,7 @@ libra branch -c old-name new-name
 
 # Set upstream tracking
 libra branch -u origin/main
+libra branch -u main alpha              # Point alpha at the local branch main
 
 # Clear upstream tracking for the current branch
 libra branch --unset-upstream
@@ -173,11 +187,13 @@ libra branch --json --show-current      # Structured JSON output for agents
 
 ## Human Output
 
-- List: prints the branch list with `*` marking the current branch
+- List: prints the branch list in refname order with `*` marking the current branch; `-v`/`-vv` align the name column to the longest name
 - Safe delete: `Deleted branch feature (was abc123...)`
 - Rename: `Renamed branch 'old' to 'new'`
 - Copy: `Copied branch 'old' to 'new'`
 - Unset upstream: `Branch 'main' no longer tracks an upstream branch`
+- Local upstream: `branch 'alpha' set up to track 'main'.`
+- Self-upstream: `warning: not setting branch 'main' as its own upstream` (exit 0, no write)
 - `--show-current`: prints the current branch name, or `HEAD detached at <hash>` when detached
 
 ## Structured Output (JSON examples)
@@ -239,10 +255,6 @@ Supported actions:
 
 ## Design Rationale
 
-### Why no --track/--no-track?
-
-Git's `--track` and `--no-track` flags control whether a new branch automatically sets up an upstream relationship. Libra omits these from `branch` because tracking configuration is handled explicitly through `--set-upstream-to` or at switch time via `libra switch --track`. This separation keeps `branch` focused on ref creation and avoids the confusing implicit behavior where `git branch feature origin/feature` silently configures tracking. When an agent creates a branch, it should know whether tracking was configured -- explicit is better than implicit.
-
 ### Why --contains/--no-contains with aliases --with/--without?
 
 The `--contains` and `--no-contains` flags mirror Git for compatibility, but Libra adds shorter `--with` and `--without` aliases. These read more naturally in scripts (`libra branch --with v2.0`) and reduce typing. The flags accept an optional commit argument that defaults to HEAD, which covers the most common case of "which branches include my current work?"
@@ -269,7 +281,7 @@ The trade-off is that refs are not directly inspectable as plain files. Libra co
 | Delete (force) | `git branch -D <name>` | `libra branch -D <name>` | `jj branch delete <name>` (always force) |
 | Rename | `git branch -m <old> <new>` | `libra branch -m <old> <new>` | Not supported |
 | Copy | `git branch -c <old> <new>` | `libra branch -c <old> <new>` (`-C` to force) | Not supported |
-| Set upstream | `git branch -u <upstream>` | `libra branch -u <upstream>` | N/A (no upstream concept) |
+| Set upstream | `git branch -u <upstream> [<branch>]` | `libra branch -u <upstream> [<branch>]` (local branches write `remote=.`) | N/A (no upstream concept) |
 | Unset upstream | `git branch --unset-upstream [branch]` | `libra branch --unset-upstream [branch]` | N/A |
 | Show current | `git branch --show-current` | `libra branch --show-current` | `jj log -r @` |
 | Remote branches | `git branch -r` | `libra branch -r` | `jj branch list --all` |
@@ -281,7 +293,7 @@ The trade-off is that refs are not directly inspectable as plain files. Libra co
 | Custom format | `git branch --format <format>` | `libra branch --format <format>` (for-each-ref atoms; replaces `* name`/`-v`/`--column`) | N/A |
 | Column layout | `git branch --column[=<mode>]` | `libra branch --column[=<mode>]` (`--no-column` countermands) | N/A |
 | Verbose listing | `git branch -v` / `-vv` | `libra branch -v` (sha + subject) / `-vv` (+ upstream tracking) | N/A |
-| Auto-track | `git branch --track` | N/A (use `switch --track`) | N/A |
+| Auto-track | `git branch --track[=direct\|inherit]` / `--no-track` | `libra branch --track[=direct\|inherit]` / `--no-track` (hash start-point is 129 / `LBR-CLI-003`; Git 128) | N/A |
 | Structured output | No | `--json` / `--machine` | `--template` |
 | Fuzzy suggestions | No | Levenshtein-based "did you mean" | No |
 
@@ -290,12 +302,24 @@ The trade-off is that refs are not directly inspectable as plain files. Libra co
 | Scenario | Error Code | Hint |
 |----------|-----------|------|
 | Invalid start point or missing branch | `LBR-CLI-003` | "use 'libra branch -l' to list branches" + fuzzy suggestions |
+| Missing `-u` upstream or target branch | `LBR-CLI-003` | Git wording (`the requested upstream branch '…' does not exist` / `branch '…' does not exist`); exit **129** (Git uses 128 — intentional, ADR-HF-02) |
+| Too many arguments to `-u` | `LBR-CLI-002` | `too many arguments to set new upstream` (exit 129; Git 128) |
+| `--track` start-point is not a branch | `LBR-CLI-003` | `cannot set up tracking information; starting point '…' is not a branch` (exit 129; Git 128 — intentional, ADR-HF-02) |
 | Invalid branch name | `LBR-CLI-002` | "branch names cannot contain spaces, '..', '@{', or control characters." |
 | Branch already exists | `LBR-CONFLICT-002` | "delete it first or choose a different name." |
-| Current branch cannot be deleted | `LBR-REPO-003` | "switch to a different branch first." |
-| Branch not fully merged (safe delete) | `LBR-REPO-003` | "use '-D' to force-delete." |
+| Current branch cannot be deleted | `LBR-REPO-003` | "switch to a different branch first." Safe `-d` refusals (not fully merged, missing branch, currently checked out) exit **1**; `LIBRA_FINE_EXIT_CODES=1` does not change that. |
+| Branch not fully merged (safe delete) | `LBR-REPO-003` | `the branch '…' is not fully merged` plus `libra branch -D …` (exit **1**) |
 | Locked/internal branch | `LBR-CLI-003` | -- |
 | HEAD is detached (rename/upstream) | `LBR-REPO-003` | -- |
 | Failed to write refs | `LBR-IO-002` | -- |
 | Storage query failed | `LBR-IO-001` | -- |
 | Stored reference corrupt | `LBR-REPO-002` | -- |
+
+## Issue #477 notes
+
+a local branch as upstream (`branch.<name>.remote=.`)
+invalid `-u` targets exit 129 (Git: 128)
+`--track=inherit` copies the upstream of the start branch
+`--track <commit>` is refused with exit 129 (Git: 128)
+listed in refname order; the current branch is marked but not moved
+`branch -d` refusals exit with status 1

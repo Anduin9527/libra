@@ -18,21 +18,21 @@
 //! Search supports Git's revision navigation suffixes (`HEAD`, `~`, `^`).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use futures::FutureExt; // Import for catch_unwind
+use futures::{FutureExt, StreamExt, TryStreamExt, stream}; // Import for catch_unwind
 use git_internal::{
     errors::GitError,
     hash::ObjectHash,
@@ -41,8 +41,8 @@ use git_internal::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Statement,
-    Value,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbConn, DbErr, EntityTrait, QueryFilter,
+    Statement, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -52,12 +52,12 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    command::load_object,
+    command::{config::ConfigScope, load_object},
     internal::{
         branch::Branch,
         config::{ConfigKv, decrypt_value},
         db,
-        db::establish_connection_with_busy_timeout,
+        db::{DatabaseRole, establish_connection_with_busy_timeout, schema},
         head::Head,
         model::object_index,
     },
@@ -110,14 +110,16 @@ const INDEX_REPAIR_GENERATION_LOCK: &str = "object-index-repair-generation.lock"
 const INDEX_REPAIR_LOCK_SHARD_HEX_LEN: usize = 4;
 const INDEX_REPAIR_MARKER_SCHEMA_VERSION: u8 = 1;
 const INDEX_REPAIR_MARKER_READ_CAP: u64 = 16 * 1024;
+/// Upper bound for the one-line holder metadata read on lock timeout.
+/// Anything larger is treated as undetermined (ADR-OI-02 item 2).
+const INDEX_REPAIR_LOCK_METADATA_READ_CAP: u64 = 1024;
 const INDEX_REPAIR_STAGING_SCAN_CAP: usize = 1_024;
 const INDEX_REPAIR_STAGING_REMOVE_CAP: usize = 256;
 const INDEX_REPAIR_STAGING_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(not(test))]
-const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-const INDEX_REPAIR_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 100_000;
 #[cfg(test)]
@@ -126,13 +128,36 @@ const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 3;
 const INDEX_REPAIR_BATCH_SIZE: usize = 100;
 #[cfg(test)]
 const INDEX_REPAIR_BATCH_SIZE: usize = 2;
+/// Markers published per generation-lock acquisition in batch mode
+/// (ADR-OI-04 item 1). Not configurable.
+const INDEX_REPAIR_MARKER_BATCH: usize = 256;
+
+/// Debug-build counter of repository-wide generation lock acquisitions. The
+/// regression guard for issue #469 asserts that the queued consumer never
+/// takes this lock, and OI-04 (M-BATCH B1) asserts batch publication bounds
+/// via `LIBRA_TEST_OBJECT_INDEX_GENERATION_LOCK_COUNT_PATH`. Only
+/// `acquire_index_repair_generation_lock` increments it, and only in debug
+/// builds (release binaries carry zero cost).
+#[cfg(any(test, debug_assertions))]
+static GENERATION_LOCK_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Holder metadata written into a repair lock file right after acquisition.
+/// Diagnostic only: lock semantics come from the advisory flock, never from
+/// this payload (ADR-OI-02 item 4).
+#[derive(Debug, Deserialize, Serialize)]
+struct IndexRepairLockMetadata {
+    pid: u32,
+    purpose: String,
+    started_at_ms: u64,
+    invocation: String,
+}
 
 struct PendingObjectIndexPage {
     updates: Vec<IndexUpdateMsg>,
     has_more: bool,
     // Held from the directory snapshot through the batch upsert and durable
-    // marker retirement. Publishers, queued writers, replay, and destructive
-    // deletion therefore observe one total order for marker generations.
+    // marker retirement. Publishers, replay, and destructive deletion therefore
+    // observe one total order for marker generations.
     _generation_lock: Option<ObjectIndexRepairLock>,
 }
 
@@ -244,14 +269,19 @@ fn open_index_repair_lock_file(_path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(unix)]
-fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
     use std::os::fd::AsRawFd;
 
     let file = open_index_repair_lock_file(path)?;
     // SAFETY: flock operates on an owned descriptor and does not outlive it.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
-        return Ok(Some(ObjectIndexRepairLock { file }));
+        let mut lock = ObjectIndexRepairLock { file };
+        write_index_repair_lock_metadata(&mut lock, purpose);
+        return Ok(Some(lock));
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
@@ -261,9 +291,16 @@ fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIn
 }
 
 #[cfg(windows)]
-fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
     match open_index_repair_lock_file(path) {
-        Ok(file) => Ok(Some(ObjectIndexRepairLock { file })),
+        Ok(file) => {
+            let mut lock = ObjectIndexRepairLock { file };
+            write_index_repair_lock_metadata(&mut lock, purpose);
+            Ok(Some(lock))
+        }
         // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION mean another
         // process owns this zero-share handle.
         Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(None),
@@ -272,51 +309,182 @@ fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIn
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
-    open_index_repair_lock_file(path).map(|file| Some(ObjectIndexRepairLock { file }))
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
+    let mut lock = ObjectIndexRepairLock {
+        file: open_index_repair_lock_file(path)?,
+    };
+    write_index_repair_lock_metadata(&mut lock, purpose);
+    Ok(Some(lock))
+}
+
+/// Write the one-line holder metadata after a successful acquisition.
+/// A write failure never fails the acquisition (ADR-OI-02 item 1 / M-DIAG D6):
+/// the advisory flock is the lock, the payload is only a diagnostic hint.
+fn write_index_repair_lock_metadata(lock: &mut ObjectIndexRepairLock, purpose: &'static str) {
+    let metadata = IndexRepairLockMetadata {
+        pid: std::process::id(),
+        purpose: purpose.to_string(),
+        started_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        invocation: Uuid::new_v4().to_string(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&metadata) else {
+        tracing::debug!("failed to encode object-index repair lock metadata");
+        return;
+    };
+    let result: io::Result<()> = (|| {
+        lock.file.set_len(0)?;
+        lock.file.seek(std::io::SeekFrom::Start(0))?;
+        lock.file.write_all(&bytes)?;
+        lock.file.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::debug!("failed to write object-index repair lock metadata: {error}");
+    }
+}
+
+/// Read holder metadata for lock diagnostics, capped at 1 KiB (ADR-OI-02
+/// item 2). Returns `None` when the file is unreadable, empty, oversized, or
+/// not valid metadata — callers then fall back to the undetermined message.
+fn read_index_repair_lock_metadata(path: &Path) -> Option<IndexRepairLockMetadata> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(INDEX_REPAIR_LOCK_METADATA_READ_CAP + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > INDEX_REPAIR_LOCK_METADATA_READ_CAP {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Best-effort liveness probe for a lock holder pid. Signal 0 performs an
+/// existence check only; EPERM still means the process exists.
+fn repair_lock_holder_is_live(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill with signal 0 sends no signal and only probes the pid.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Build the lock-timeout diagnostic per ADR-OI-02 item 2 and M-DIAG D1–D4.
+fn describe_index_repair_lock_timeout(lock_path: &Path, identity: &str) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let holder_clause = match read_index_repair_lock_metadata(lock_path) {
+        Some(metadata) if metadata.pid == std::process::id() => format!(
+            "; the lock is held by this Libra process itself (purpose: {}, started {}s ago) — internal lock contention is a Libra defect, please report it at https://github.com/libra-tools/libra/issues",
+            metadata.purpose,
+            now_ms.saturating_sub(metadata.started_at_ms) / 1000
+        ),
+        Some(metadata) if repair_lock_holder_is_live(metadata.pid) => format!(
+            "; another live Libra process (pid {}, purpose: {}, started {}s ago) holds it — wait for that process to finish and retry",
+            metadata.pid,
+            metadata.purpose,
+            now_ms.saturating_sub(metadata.started_at_ms) / 1000
+        ),
+        _ => "; the lock holder could not be determined".to_string(),
+    };
+    format!(
+        "timed out waiting for object-index repair lock '{}' for {identity}{holder_clause}; the lock file itself does not block anything and must not be deleted — it is released automatically when its owner exits",
+        lock_path.display()
+    )
 }
 
 fn try_acquire_index_repair_lock(
     db_path: &Path,
     oid: &str,
+    purpose: &'static str,
 ) -> io::Result<Option<ObjectIndexRepairLock>> {
-    try_acquire_index_repair_lock_file(&index_repair_lock_path(db_path, oid)?)
+    try_acquire_index_repair_lock_file(&index_repair_lock_path(db_path, oid)?, purpose)
+}
+
+/// Git-style quadratic lock-wait backoff (ADR-OI-03 item 1; git `lockfile.c:206-251`):
+/// 1ms × (attempt+1)² starting at 1ms for attempt 0, ±25% jitter, single sleep
+/// capped at 1 second.
+/// `jitter_factor` ∈ [0, 1] is the uniform random draw (0 → −25%, 1 → +25%).
+fn index_repair_lock_backoff_sleep(attempt: u32, jitter_factor: f64) -> Duration {
+    let step =
+        u64::from(attempt.saturating_add(1)).saturating_mul(u64::from(attempt.saturating_add(1)));
+    let base_ms = step.min(1_000);
+    let jittered = base_ms as f64 * (0.75 + jitter_factor.clamp(0.0, 1.0) * 0.5);
+    Duration::from_micros((jittered * 1_000.0).round() as u64)
 }
 
 fn acquire_index_repair_lock_file(
     lock_path: &Path,
     identity: &str,
+    purpose: &'static str,
 ) -> io::Result<ObjectIndexRepairLock> {
     let started = Instant::now();
+    let mut attempt: u32 = 0;
     loop {
-        if let Some(lock) = try_acquire_index_repair_lock_file(lock_path)? {
+        if let Some(lock) = try_acquire_index_repair_lock_file(lock_path, purpose)? {
             return Ok(lock);
         }
         if started.elapsed() >= INDEX_REPAIR_LOCK_WAIT_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!(
-                    "timed out waiting for object-index repair lock '{}' for {identity}; another Libra process may be stalled",
-                    lock_path.display()
-                ),
+                describe_index_repair_lock_timeout(lock_path, identity),
             ));
         }
-        std::thread::sleep(INDEX_REPAIR_LOCK_RETRY_INTERVAL);
+        std::thread::sleep(index_repair_lock_backoff_sleep(attempt, fastrand::f64()));
+        attempt = attempt.saturating_add(1);
     }
 }
 
-fn acquire_index_repair_lock(db_path: &Path, oid: &str) -> io::Result<ObjectIndexRepairLock> {
+fn acquire_index_repair_lock(
+    db_path: &Path,
+    oid: &str,
+    purpose: &'static str,
+) -> io::Result<ObjectIndexRepairLock> {
     acquire_index_repair_lock_file(
         &index_repair_lock_path(db_path, oid)?,
         &format!("object {oid}"),
+        purpose,
     )
 }
 
-fn acquire_index_repair_generation_lock(db_path: &Path) -> io::Result<ObjectIndexRepairLock> {
-    acquire_index_repair_lock_file(
+fn acquire_index_repair_generation_lock(
+    db_path: &Path,
+    purpose: &'static str,
+) -> io::Result<ObjectIndexRepairLock> {
+    let lock = acquire_index_repair_lock_file(
         &index_repair_generation_lock_path(db_path)?,
         "repair-marker generation",
-    )
+        purpose,
+    )?;
+    #[cfg(any(test, debug_assertions))]
+    GENERATION_LOCK_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    Ok(lock)
+}
+
+/// Debug-build accessor for the generation lock acquisition counter (M-BATCH
+/// B1 integration hook and the issue #469 regression guard).
+#[cfg(debug_assertions)]
+pub(crate) fn generation_lock_acquisition_count() -> usize {
+    GENERATION_LOCK_ACQUISITIONS.load(Ordering::Relaxed)
+}
+
+/// Test-build accessor for the batched-publication counter (M-BATCH B1).
+#[cfg(test)]
+pub(crate) fn batched_marker_publication_count() -> usize {
+    BATCHED_MARKER_PUBLICATIONS.load(Ordering::Relaxed)
 }
 
 #[cfg(unix)]
@@ -362,7 +530,7 @@ pub(crate) async fn acquire_object_index_deletion_fence(
             ));
         }
 
-        let generation_lock = acquire_index_repair_generation_lock(&db_path)?;
+        let generation_lock = acquire_index_repair_generation_lock(&db_path, "deletion_fence")?;
         let marker_dir = db_path
             .parent()
             .ok_or_else(|| {
@@ -447,13 +615,24 @@ fn index_repair_marker_path(db_path: &Path, oid: &str, object_type: &str) -> io:
 }
 
 fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
-    let marker_path = index_repair_marker_path(&msg.db_path, &msg.hash, &msg.obj_type)?;
     // Marker creation participates in a repository-wide generation fence.
     // Destructive cleanup holds this lock from its final marker revalidation
     // through the catalog transaction, so a new durable repair job cannot be
-    // published in the deletion window.
-    let _generation_lock = acquire_index_repair_generation_lock(&msg.db_path)?;
-    let _lock = acquire_index_repair_lock(&msg.db_path, &msg.hash)?;
+    // published in the deletion window. Replay holds the same fence while it
+    // owns and retires a page of markers. Do not also take the coarse OID-shard
+    // lock here: a queued consumer may hold that shard for an unrelated object
+    // with the same four-hex prefix, and repeated publication of the same
+    // content-addressed marker is idempotent. Queued and replay consumers still
+    // use the shard lock to arbitrate marker retirement.
+    let _generation_lock =
+        acquire_index_repair_generation_lock(&msg.db_path, "marker_publication")?;
+    persist_index_repair_marker_under_lock(msg)
+}
+
+/// Write one durable repair marker; the caller must hold the generation lock
+/// (see [`persist_index_repair_marker`] and [`persist_index_repair_marker_batch`]).
+fn persist_index_repair_marker_under_lock(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
+    let marker_path = index_repair_marker_path(&msg.db_path, &msg.hash, &msg.obj_type)?;
     let marker = PendingObjectIndexUpdate {
         schema_version: INDEX_REPAIR_MARKER_SCHEMA_VERSION,
         o_id: msg.hash.clone(),
@@ -482,6 +661,32 @@ fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
     writer.write_all(&bytes)?;
     writer.persist(&marker_path)?;
     Ok(marker_path)
+}
+
+/// Persist a batch of durable repair markers under ONE generation lock
+/// (ADR-OI-04 item 1). On failure the markers written so far stay on disk and
+/// the error is returned (M-BATCH B2); callers must not enqueue anything for
+/// the failed batch — already-stored payloads can be re-registered later via
+/// [`ClientStorage::ensure_existing_object_index`].
+/// Debug-build counter of batch publications (ADR-OI-04 item 1). The B1 unit
+/// assertion uses this instead of the total generation-lock counter so
+/// parallel tests' single-marker publications cannot skew it.
+#[cfg(any(test, debug_assertions))]
+static BATCHED_MARKER_PUBLICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn persist_index_repair_marker_batch(msgs: &[IndexUpdateMsg]) -> io::Result<Vec<PathBuf>> {
+    if msgs.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(any(test, debug_assertions))]
+    BATCHED_MARKER_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+    let _generation_lock =
+        acquire_index_repair_generation_lock(&msgs[0].db_path, "marker_publication")?;
+    let mut paths = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        paths.push(persist_index_repair_marker_under_lock(msg)?);
+    }
+    Ok(paths)
 }
 
 fn retire_index_repair_marker(path: &Path) -> io::Result<()> {
@@ -577,6 +782,7 @@ impl Drop for TaskGuard {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // consumed by the cfg(test) spawn-scope unit test
 fn register_pending_index_work(scope: &IndexWorkScope) -> TaskGuard {
     PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
     scope.pending.fetch_add(1, Ordering::Relaxed);
@@ -602,6 +808,70 @@ static INDEX_UPDATE_CHANNELS: Lazy<IndexUpdateChannels> = Lazy::new(|| {
     RUNTIME.spawn(run_index_update_consumer(unscoped_rx));
     IndexUpdateChannels { scoped, unscoped }
 });
+
+// ADR-OI-04 batch accumulation, keyed by repository database path so that
+// concurrent operations on different repositories (and parallel tests) never
+// share a batch. While a batch is active for a key (depth > 0),
+// `enqueue_stored_object_index` defers marker publication into that key's
+// pending list. `end_object_index_batch` (or a full batch of
+// `INDEX_REPAIR_MARKER_BATCH` entries) publishes every marker under a single
+// generation lock and then enqueues the messages. Global (not thread-local)
+// because async commands may hop Tokio worker threads between accumulation
+// and flush; the CLI runs one invocation per repository at a time.
+struct ObjectIndexBatchState {
+    depth: u32,
+    pending: Vec<IndexUpdateMsg>,
+}
+
+static OBJECT_INDEX_BATCH_STATE: std::sync::Mutex<BTreeMap<PathBuf, ObjectIndexBatchState>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn with_object_index_batch_state<R>(
+    key: &Path,
+    f: impl FnOnce(&mut ObjectIndexBatchState) -> R,
+) -> R {
+    let mut states = OBJECT_INDEX_BATCH_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(states
+        .entry(key.to_path_buf())
+        .or_insert_with(|| ObjectIndexBatchState {
+            depth: 0,
+            pending: Vec::new(),
+        }))
+}
+
+/// Canonical marker-registration failure message (ADR-OI-05 item 2): one
+/// prefix explaining that the payloads are safely stored, that no paths were
+/// staged, and that a direct retry reuses the payloads and needs no lock-file
+/// cleanup. Lock-timeout causes already carry the holder diagnostics from
+/// `describe_index_repair_lock_timeout` (ADR-OI-02).
+fn object_index_marker_registration_error(cause: io::Error) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "object payloads were stored safely, but their cloud object-index repair markers could not be registered: {cause}; no paths were staged — retry the command directly (the retry reuses the already-stored payloads and needs no lock-file cleanup)"
+        ),
+    )
+}
+
+/// Publish every accumulated marker for `key` under ONE generation lock, then
+/// enqueue the messages. On a publish failure the already-written markers stay
+/// on disk, the pending list is cleared, and the error propagates (M-BATCH
+/// B2); a later retry re-registers the payloads via `ensure_existing_object_index`.
+fn flush_pending_object_index_batch(key: &Path) -> io::Result<()> {
+    let msgs = with_object_index_batch_state(key, |state| std::mem::take(&mut state.pending));
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    let marker_paths =
+        persist_index_repair_marker_batch(&msgs).map_err(object_index_marker_registration_error)?;
+    for (mut msg, marker_path) in msgs.into_iter().zip(marker_paths) {
+        msg.marker_path = Some(marker_path);
+        enqueue_index_update(msg, "object index update");
+    }
+    Ok(())
+}
 
 async fn run_index_update_consumer(mut rx: Receiver<IndexUpdateMsg>) {
     while let Some(msg) = rx.recv().await {
@@ -641,77 +911,67 @@ async fn run_index_update_consumer(mut rx: Receiver<IndexUpdateMsg>) {
 }
 
 async fn apply_queued_index_update(msg: &IndexUpdateMsg) -> Result<(), String> {
-    let db_path = msg.db_path.clone();
-    let generation_lock =
-        tokio::task::spawn_blocking(move || acquire_index_repair_generation_lock(&db_path))
-            .await
-            .map_err(|error| {
-                format!(
-                    "object-index repair generation task failed for {}: {error}",
-                    msg.hash
-                )
-            })?
-            .map_err(|error| {
-                format!(
-                    "failed to acquire object-index repair generation for {}: {error}",
-                    msg.hash
-                )
-            })?;
-    let _ownership = if let Some(marker_path) = msg.marker_path.as_deref() {
-        let db_path = msg.db_path.clone();
-        let oid = msg.hash.clone();
-        let lock = tokio::task::spawn_blocking(move || acquire_index_repair_lock(&db_path, &oid))
-            .await
-            .map_err(|error| {
-                format!(
-                    "object-index repair ownership task failed for {}: {error}",
-                    msg.hash
-                )
-            })?
-            .map_err(|error| {
-                format!(
-                    "failed to acquire object-index repair ownership for {}: {error}",
-                    msg.hash
-                )
-            })?;
+    let marker_path = msg.marker_path.as_deref().ok_or_else(|| {
+        format!(
+            "queued object-index update for {} has no durable repair marker",
+            msg.hash
+        )
+    })?;
 
-        match fs::symlink_metadata(marker_path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => {
-                return Err(format!(
-                    "object-index repair marker is not a regular file: {}",
-                    marker_path.display()
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // A replay owner already reconciled and retired this exact
-                // marker while the queued writer was delayed. Skipping under
-                // the same OID-shard lock is what prevents post-clean resurrection.
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "failed to inspect object-index repair marker '{}': {error}",
-                    marker_path.display()
-                ));
-            }
+    // The marker was published under the generation lock before this message
+    // entered the queue. Keeping that repository-wide lock across SQLite retries
+    // would let the consumer starve the next foreground marker publisher. The
+    // OID-shard lock is sufficient here: same-OID deletion sees the marker and
+    // fails closed, while retirement happens only after the row update commits.
+    let db_path = msg.db_path.clone();
+    let oid = msg.hash.clone();
+    let _ownership = tokio::task::spawn_blocking(move || {
+        acquire_index_repair_lock(&db_path, &oid, "queued_update")
+    })
+    .await
+    .map_err(|error| {
+        format!(
+            "object-index repair ownership task failed for {}: {error}",
+            msg.hash
+        )
+    })?
+    .map_err(|error| {
+        format!(
+            "failed to acquire object-index repair ownership for {}: {error}",
+            msg.hash
+        )
+    })?;
+
+    match fs::symlink_metadata(marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "object-index repair marker is not a regular file: {}",
+                marker_path.display()
+            ));
         }
-        Some(lock)
-    } else {
-        None
-    };
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A replay owner already reconciled and retired this exact marker
+            // while the queued writer was delayed. Skipping under the same
+            // OID-shard lock prevents post-clean resurrection.
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect object-index repair marker '{}': {error}",
+                marker_path.display()
+            ));
+        }
+    }
 
     update_object_index(&msg.db_path, &msg.hash, &msg.obj_type, msg.size).await?;
-    if let Some(marker_path) = msg.marker_path.as_deref() {
-        retire_index_repair_marker(marker_path).map_err(|error| {
-            format!(
-                "object index updated for {}, but its repair marker '{}' could not be retired: {error}",
-                msg.hash,
-                marker_path.display()
-            )
-        })?;
-    }
-    drop(generation_lock);
+    retire_index_repair_marker(marker_path).map_err(|error| {
+        format!(
+            "object index updated for {}, but its repair marker '{}' could not be retired: {error}",
+            msg.hash,
+            marker_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -785,6 +1045,82 @@ pub struct ClientStorage {
     base_path: PathBuf, // Keep base_path for legacy access if needed
 }
 
+/// Parse only the reference-bearing commit headers. Commit messages are byte
+/// strings in Git, so decoding the full object as UTF-8 would reject valid
+/// commits and must not use unchecked string conversion on remote data.
+pub(crate) fn parse_commit_header_refs(
+    data: &[u8],
+    commit_hash: ObjectHash,
+) -> Result<(ObjectHash, Vec<ObjectHash>), GitError> {
+    fn next_line<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], GitError> {
+        let remaining = data.get(*cursor..).ok_or_else(|| {
+            GitError::InvalidObjectInfo("commit header position is out of bounds".to_string())
+        })?;
+        let end = remaining
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| {
+                GitError::InvalidObjectInfo("commit header is not newline-terminated".to_string())
+            })?;
+        *cursor += end + 1;
+        Ok(&remaining[..end])
+    }
+
+    fn parse_ref(
+        line: &[u8],
+        prefix: &[u8],
+        commit_hash: ObjectHash,
+        label: &str,
+    ) -> Result<ObjectHash, GitError> {
+        let raw = line.strip_prefix(prefix).ok_or_else(|| {
+            GitError::InvalidObjectInfo(format!("commit {commit_hash} is missing its {label} ID"))
+        })?;
+        let hex = std::str::from_utf8(raw).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has a non-ASCII {label} ID: {error}"
+            ))
+        })?;
+        ObjectHash::from_hex_for_kind(commit_hash.kind(), hex).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has an invalid {label} ID: {error}"
+            ))
+        })
+    }
+
+    let mut cursor = 0;
+    let tree_line = next_line(data, &mut cursor)?;
+    let tree = parse_ref(tree_line, b"tree ", commit_hash, "tree")?;
+    if cursor == data.len() {
+        return Err(GitError::InvalidObjectInfo(format!(
+            "commit {commit_hash} ends immediately after its tree header"
+        )));
+    }
+    let mut parents = Vec::new();
+    while data[cursor..].starts_with(b"parent ") {
+        let line = next_line(data, &mut cursor)?;
+        if line.contains(&0) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has a NUL byte in its reference headers"
+            )));
+        }
+        if parents.len() >= 262_144 {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has more than 262144 parents"
+            )));
+        }
+        parents.push(parse_ref(line, b"parent ", commit_hash, "parent")?);
+        if cursor == data.len() {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} ends immediately after a parent header"
+            )));
+        }
+    }
+    // Git's graph parser stops at the first non-parent line after `tree`.
+    // Author, committer, extensions, and message bytes do not affect edges;
+    // legacy or historical commits can omit or reorder those later fields.
+    Ok((tree, parents))
+}
+
 /// Default tiered-storage small/large object threshold (1 MiB): objects at or
 /// above this size are LRU-cached rather than stored permanently locally.
 pub const DEFAULT_STORAGE_THRESHOLD_BYTES: usize = 1024 * 1024;
@@ -806,12 +1142,14 @@ const REMOTE_STORAGE_ENV_KEYS_AFTER_TYPE: &[&str] = &[
     "LIBRA_STORAGE_CACHE_SIZE",
 ];
 
-/// Typed description of a global config DB that this binary cannot safely read.
+/// Typed configuration-schema diagnostic. The historical type name and
+/// version fields remain stable; role/ledger/reason distinguish policy cases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalConfigSchemaFuture {
     pub db_path: PathBuf,
     pub current_version: i64,
     pub latest_version: Option<i64>,
+    pub issue: schema::ConfigurationSchemaIssue,
 }
 
 impl GlobalConfigSchemaFuture {
@@ -829,7 +1167,10 @@ impl GlobalConfigSchemaFuture {
 
     pub fn diagnostic_message(&self, action: &str) -> String {
         format!(
-            "global config database schema is newer than this Libra binary supports; binary: {}; version: {}; config database: {}; config schema version: {}; latest supported schema version: {}; {action}; update with: {INSTALL_NEWER_LIBRA_COMMAND}",
+            "{} config database {}; ledger: {}; binary: {}; version: {}; config database: {}; config schema version: {}; latest supported schema version: {}; {action}; update with: {INSTALL_NEWER_LIBRA_COMMAND}",
+            self.scope_name(),
+            self.issue.reason(),
+            self.issue.ledger.table_name(),
             Self::binary_path_display(),
             env!("CARGO_PKG_VERSION"),
             self.db_path.display(),
@@ -837,14 +1178,26 @@ impl GlobalConfigSchemaFuture {
             self.latest_supported_display(),
         )
     }
+
+    pub fn scope_name(&self) -> &'static str {
+        match self.issue.role {
+            DatabaseRole::GlobalConfig => "global",
+            DatabaseRole::SystemConfig => "system",
+            DatabaseRole::Repository => "repository",
+            DatabaseRole::Derived => "derived",
+        }
+    }
 }
 
 impl std::fmt::Display for GlobalConfigSchemaFuture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "global config database '{}' schema version {} is newer than this Libra binary supports (latest supported: {})",
+            "{} config database '{}' {} (ledger: {}, version: {}, latest supported: {})",
+            self.scope_name(),
             self.db_path.display(),
+            self.issue.reason(),
+            self.issue.ledger.table_name(),
             self.current_version,
             self.latest_supported_display()
         )
@@ -866,8 +1219,8 @@ impl std::fmt::Display for StorageConfigResolutionError {
     }
 }
 
-/// Warn once when the global config DB is too new but the current command may
-/// continue in an explicit local/offline or config-irrelevant mode.
+/// Warn once per invocation about unsupported Global/System metadata when
+/// the command may continue in a local/offline or config-irrelevant mode.
 pub fn emit_global_config_schema_future_warning(future: &GlobalConfigSchemaFuture, action: &str) {
     if GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -1431,6 +1784,69 @@ impl ClientStorage {
         }
     }
 
+    /// Open an object-index publication batch (ADR-OI-04 item 1): while a
+    /// batch is active, `put`/`ensure_existing_object_index` accumulate their
+    /// markers instead of publishing per object; `end_object_index_batch`
+    /// publishes up to 256 markers per generation lock and then enqueues the
+    /// messages. Nested calls are depth-counted.
+    pub(crate) fn begin_object_index_batch(&self) {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_add(1)
+            });
+        }
+    }
+
+    /// Close the innermost publication batch; at depth 0 everything
+    /// accumulated is published and enqueued (ADR-OI-04 item 1).
+    pub(crate) fn end_object_index_batch(&self) -> io::Result<()> {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            let done = with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_sub(1);
+                state.depth == 0
+            });
+            if done {
+                return flush_pending_object_index_batch(&key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard the innermost publication batch without publishing. Used on
+    /// error paths: nothing was enqueued, so nothing durable is lost; the
+    /// stored payloads stay in place and a retry re-registers them via
+    /// [`Self::ensure_existing_object_index`].
+    pub(crate) fn abort_object_index_batch(&self) {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_sub(1);
+                if state.depth == 0 {
+                    state.pending.clear();
+                }
+            });
+        }
+    }
+
+    /// Publish accumulated markers without closing the batch. Called right
+    /// before an index write so durable markers never lag behind index
+    /// content (ADR-OI-04 item 3).
+    pub(crate) fn flush_object_index_batch(&self) -> io::Result<()> {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            return flush_pending_object_index_batch(&key);
+        }
+        Ok(())
+    }
+
+    /// Number of markers currently accumulated for this storage's repository
+    /// (ADR-OI-05 item 3: reported as `stored_objects` in the error envelope
+    /// when a batch flush fails).
+    pub(crate) fn pending_object_index_batch_count(&self) -> usize {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            return with_object_index_batch_state(&key, |state| state.pending.len());
+        }
+        0
+    }
+
     /// Run one top-level embedded CLI invocation with isolated background
     /// index failure and pending-work attribution. Tokio task locals do not
     /// leak into concurrent direct storage callers or independently spawned
@@ -1450,6 +1866,7 @@ impl ClientStorage {
     /// the producer before spawning prevents the foreground drain from seeing
     /// a transient zero, and re-entering the captured scope keeps both pending
     /// work and terminal failures attributed to the command that created it.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the cfg(test) spawn-scope unit test
     pub(crate) fn spawn_background_index_work<F>(future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
@@ -1479,6 +1896,26 @@ impl ClientStorage {
     pub(crate) async fn repair_pending_object_index_updates(
         db_path: &Path,
     ) -> Result<ObjectIndexRepairOutcome, String> {
+        Self::repair_pending_object_index_updates_with_lock_policy(db_path, false)
+            .await
+            .map(|page| page.expect("the blocking variant always replays instead of skipping"))
+    }
+
+    /// Like [`Self::repair_pending_object_index_updates`], but skip the replay
+    /// entirely (without waiting and without an error) when the generation
+    /// lock is busy: read-only preflight commands must not serialize behind a
+    /// batch writer (ADR-OI-03 item 2 / M-WAIT W5). Returns `Ok(None)` for a
+    /// skipped replay, `Ok(Some(outcome))` for a completed one.
+    pub(crate) async fn repair_pending_object_index_updates_if_uncontended(
+        db_path: &Path,
+    ) -> Result<Option<ObjectIndexRepairOutcome>, String> {
+        Self::repair_pending_object_index_updates_with_lock_policy(db_path, true).await
+    }
+
+    async fn repair_pending_object_index_updates_with_lock_policy(
+        db_path: &Path,
+        skip_when_busy: bool,
+    ) -> Result<Option<ObjectIndexRepairOutcome>, String> {
         let db_path = db_path.to_path_buf();
         let db_path_str = db_path.to_str().ok_or_else(|| {
             format!(
@@ -1498,44 +1935,31 @@ impl ClientStorage {
         let expected_oid_len = expected_index_repair_oid_len(&db_conn).await?;
         let load_path = db_path.clone();
         let page = tokio::task::spawn_blocking(move || {
-            load_pending_object_index_updates(&load_path, expected_oid_len)
+            let generation_lock = if skip_when_busy {
+                let Some(lock) = try_acquire_index_repair_lock_file(
+                    &index_repair_generation_lock_path(&load_path)?,
+                    "replay",
+                )?
+                else {
+                    return Ok(None);
+                };
+                lock
+            } else {
+                acquire_index_repair_generation_lock(&load_path, "replay")?
+            };
+            load_pending_object_index_updates(&load_path, expected_oid_len, generation_lock)
+                .map(Some)
         })
         .await
         .map_err(|error| format!("object-index repair marker reader failed: {error}"))?
         .map_err(|error| format!("failed to read object-index repair markers: {error}"))?;
-
-        if page.updates.is_empty() {
-            return Ok(ObjectIndexRepairOutcome {
-                repaired: 0,
-                remaining: page.has_more,
-            });
-        }
-        if cfg!(debug_assertions)
-            && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some()
-        {
-            return Err("injected object index update failure".to_string());
-        }
-        let repo_id = resolve_repo_id_for_index(&db_conn).await?;
-        let mut repaired = 0;
-        for batch in page.updates.chunks(INDEX_REPAIR_BATCH_SIZE) {
-            update_object_index_batch(&db_conn, &db_path, &repo_id, batch).await?;
-            for msg in batch {
-                if let Some(marker_path) = msg.marker_path.as_deref() {
-                    retire_index_repair_marker(marker_path).map_err(|error| {
-                        format!(
-                            "updated object index for {}, but failed to retire repair marker '{}': {error}",
-                            msg.hash,
-                            marker_path.display()
-                        )
-                    })?;
-                }
-                repaired += 1;
-            }
-        }
-        Ok(ObjectIndexRepairOutcome {
-            repaired,
-            remaining: page.has_more,
-        })
+        let Some(page) = page else {
+            // Generation lock busy: this replay was deliberately skipped.
+            return Ok(None);
+        };
+        apply_pending_object_index_page(&db_conn, &db_path, page)
+            .await
+            .map(Some)
     }
 
     /// Read a Git object's *raw payload* by its hash.
@@ -1553,6 +1977,128 @@ impl ClientStorage {
         let storage = self.storage.clone();
         let hash = *object_id;
         self.block_on_storage(async move { storage.get(&hash).await.map(|(data, _)| data) })
+    }
+
+    /// Read a typed object with a strict load bound, including the durable
+    /// tier when read policy allows it. This is for fetch protocol inspection;
+    /// preview's `get_with_limit` remains local-only.
+    pub fn get_typed_with_limit(
+        &self,
+        object_id: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let storage = self.storage.clone();
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.get_typed_bounded(&hash, limit).await })
+    }
+
+    /// Read raw commit objects concurrently and retain only their parent IDs.
+    /// The operation does not resolve replacement refs. Distinct IDs are read
+    /// once, and remote reads honor the configured connection limit.
+    pub fn commit_parents_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<ObjectHash>>, GitError> {
+        const MAX_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
+        const MAX_TOTAL_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
+        const MAX_TOTAL_PARENTS: usize = 262_144;
+        self.commit_parents_many_with_limits(
+            hashes,
+            MAX_COMMIT_BYTES,
+            MAX_TOTAL_COMMIT_BYTES,
+            MAX_TOTAL_PARENTS,
+        )
+    }
+
+    fn commit_parents_many_with_limits(
+        &self,
+        hashes: &[ObjectHash],
+        max_commit_bytes: u64,
+        max_total_commit_bytes: u64,
+        max_total_parents: usize,
+    ) -> Result<HashMap<ObjectHash, Vec<ObjectHash>>, GitError> {
+        let unique: HashSet<ObjectHash> = hashes.iter().copied().collect();
+        let storage = self.storage.clone();
+        let max_in_flight = crate::utils::resource_limits::max_connections().min(16);
+        self.block_on_storage(async move {
+            let mut remaining: VecDeque<_> = unique.into_iter().collect();
+            let mut commits = HashMap::new();
+            let mut total_parents = 0usize;
+            let mut total_bytes = 0u64;
+            while !remaining.is_empty() {
+                let available = max_total_commit_bytes - total_bytes;
+                if available == 0 {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "advertised shallow commits exceed {max_total_commit_bytes} bytes; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                    )));
+                }
+                let (slots, per_commit_limit) = crate::utils::storage::bounded_read_batch_shape(
+                    available,
+                    max_commit_bytes,
+                    max_in_flight,
+                );
+                let batch: Vec<_> = (0..slots).filter_map(|_| remaining.pop_front()).collect();
+                let reads: Vec<(ObjectHash, Vec<ObjectHash>, u64)> = stream::iter(batch)
+                    .map(|hash| {
+                        let storage = storage.clone();
+                        async move {
+                            let (data, object_type) = storage
+                                .get_commit_bounded(&hash, per_commit_limit)
+                                .await
+                                .map_err(|error| {
+                                    crate::utils::storage::checked_read_error(&hash, error)
+                                })?;
+                            if object_type != ObjectType::Commit {
+                                return Err(GitError::InvalidObjectInfo(format!(
+                                    "advertised shallow boundary {hash} is {object_type}, expected a commit"
+                                )));
+                            }
+                            let len = u64::try_from(data.len()).map_err(|error| {
+                                GitError::InvalidObjectInfo(format!(
+                                    "commit object {hash} is too large to inspect: {error}"
+                                ))
+                            })?;
+                            if len > per_commit_limit {
+                                return Err(GitError::InvalidObjectInfo(format!(
+                                    "commit object {hash} exceeds the remaining {per_commit_limit}-byte shallow boundary budget; fetch fewer refs"
+                                )));
+                            }
+                            let (_, parents) =
+                                parse_commit_header_refs(&data, hash).map_err(|error| {
+                                    crate::utils::storage::checked_read_error(&hash, error)
+                                })?;
+                            Ok((hash, parents, len))
+                        }
+                    })
+                    .buffer_unordered(slots)
+                    .try_collect()
+                    .await?;
+                for (hash, parents, bytes) in reads {
+                    total_parents = total_parents.checked_add(parents.len()).ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "shallow boundary parent count exceeds this platform".to_string(),
+                        )
+                    })?;
+                    if total_parents > max_total_parents {
+                        return Err(GitError::InvalidObjectInfo(format!(
+                            "advertised shallow commits have more than {max_total_parents} parents; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                        )));
+                    }
+                    total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "shallow boundary commit byte count exceeds u64".to_string(),
+                        )
+                    })?;
+                    if total_bytes > max_total_commit_bytes {
+                        return Err(GitError::InvalidObjectInfo(format!(
+                            "advertised shallow commits exceed {max_total_commit_bytes} bytes; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                        )));
+                    }
+                    commits.insert(hash, parents);
+                }
+            }
+            Ok(commits)
+        })
     }
 
     /// Read an object only when the backend can enforce `limit` before
@@ -1731,25 +2277,37 @@ impl ClientStorage {
         if let Some(db_path) = Self::index_db_path_from_base(&self.base_path)
             && db_path.exists()
         {
-            let mut msg = IndexUpdateMsg {
+            let msg = IndexUpdateMsg {
                 hash: hash_str.to_string(),
                 obj_type: type_str.to_string(),
                 size: data_len as i64,
-                db_path,
+                db_path: db_path.clone(),
                 marker_path: None,
                 _marker_lock: None,
                 failure_counter: current_index_failure_counter(),
                 pending_counter: current_index_pending_counter(),
             };
-            msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "stored object {hash_str}, but failed to register its cloud object-index repair marker: {error}"
-                    ),
-                )
-            })?);
-            enqueue_index_update(msg, "object index update");
+            let (batching, single_msg) = with_object_index_batch_state(&db_path, |state| {
+                if state.depth > 0 {
+                    // ADR-OI-04: accumulate, then publish up to 256 markers
+                    // under one generation lock. The batch is flushed by
+                    // `end_object_index_batch` (or automatically once it fills).
+                    state.pending.push(msg);
+                    (state.pending.len() >= INDEX_REPAIR_MARKER_BATCH, None)
+                } else {
+                    (false, Some(msg))
+                }
+            });
+            if batching {
+                flush_pending_object_index_batch(&db_path)?;
+            } else if let Some(mut msg) = single_msg {
+                // Single-object path keeps its existing semantics (batch = 1).
+                msg.marker_path = Some(
+                    persist_index_repair_marker(&msg)
+                        .map_err(object_index_marker_registration_error)?,
+                );
+                enqueue_index_update(msg, "object index update");
+            }
         }
 
         Ok(())
@@ -1772,6 +2330,24 @@ impl ClientStorage {
         self.block_on_storage(async move { storage.exist(&hash).await })
     }
 
+    /// Probe presence without turning a storage or pack error into absence.
+    pub fn exist_checked(&self, obj_id: &ObjectHash) -> Result<bool, GitError> {
+        let storage = self.storage.clone();
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.exist_checked(&hash).await })
+    }
+
+    /// Probe many distinct objects with bounded concurrency while preserving
+    /// storage failures as errors. Duplicate IDs are checked only once.
+    pub fn exist_checked_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, bool>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move { storage.exist_checked_batch(&hashes).await })
+    }
+
     /// Read just the `ObjectType` for `obj_id`.
     ///
     /// Boundary conditions:
@@ -1782,6 +2358,43 @@ impl ClientStorage {
         let storage = self.storage.clone();
         let hash = *obj_id;
         self.block_on_storage(async move { storage.get(&hash).await.map(|(_, t)| t) })
+    }
+
+    /// Inspect an object's type without an unbounded body read. Local loose
+    /// and pack objects use header-only probes; a remote-only object is read
+    /// through the verified 4 MiB typed bound or rejected if larger.
+    pub fn get_object_type_bounded(&self, obj_id: &ObjectHash) -> Result<ObjectType, GitError> {
+        let storage = self.storage.clone();
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.object_type_bounded_probe(&hash).await })
+    }
+
+    /// Batch variant of [`Self::get_object_type_bounded`]. Missing IDs are
+    /// omitted; callers inspecting advertised refs must reject absent keys.
+    pub fn get_object_types_bounded_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move { storage.object_types_bounded_probe(&hashes).await })
+    }
+
+    /// Like [`Self::get_object_types_bounded_many`], reporting decoded bytes
+    /// fetched from the durable tier so a caller can enforce one response-wide
+    /// budget across annotated-tag peel rounds.
+    pub fn get_object_types_bounded_many_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move {
+            storage
+                .object_types_bounded_probe_with_budget(&hashes, remaining_remote_bytes)
+                .await
+        })
     }
 
     /// Convenience wrapper: returns whether `obj_id` resolves to an object of the
@@ -2068,14 +2681,8 @@ pub(crate) fn enqueue_agent_blob_object_index_update(
         failure_counter: current_index_failure_counter(),
         pending_counter: current_index_pending_counter(),
     };
-    msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "agent object {o_id} was stored, but its durable cloud object-index repair marker could not be registered: {error}"
-            ),
-        )
-    })?);
+    msg.marker_path =
+        Some(persist_index_repair_marker(&msg).map_err(object_index_marker_registration_error)?);
     enqueue_index_update(msg, "agent blob object index update");
     Ok(())
 }
@@ -2243,6 +2850,47 @@ impl Storage for ClientStorage {
         self.storage.get_with_limit(hash, limit).await
     }
 
+    async fn get_typed_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        self.storage
+            .get_typed_bounded(hash, max_payload_bytes)
+            .await
+    }
+
+    async fn get_commit_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        self.storage
+            .get_commit_bounded(hash, max_payload_bytes)
+            .await
+    }
+
+    async fn object_type_bounded_probe(&self, hash: &ObjectHash) -> Result<ObjectType, GitError> {
+        self.storage.object_type_bounded_probe(hash).await
+    }
+
+    async fn object_types_bounded_probe(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        self.storage.object_types_bounded_probe(hashes).await
+    }
+
+    async fn object_types_bounded_probe_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        self.storage
+            .object_types_bounded_probe_with_budget(hashes, remaining_remote_bytes)
+            .await
+    }
+
     async fn put(
         &self,
         hash: &ObjectHash,
@@ -2355,9 +3003,14 @@ async fn resolve_env_for_storage_init_typed(
         if let Some(future) = inspect_global_config_schema_future_at_path(&global_db_path).await {
             return Err(StorageConfigResolutionError::GlobalSchemaFuture(future));
         }
-        match read_config_env_value(name, &vault_key, &global_db_path, "global")
-            .await
-            .map_err(StorageConfigResolutionError::Other)
+        match read_config_env_value(
+            name,
+            &vault_key,
+            &global_db_path,
+            DatabaseRole::GlobalConfig,
+        )
+        .await
+        .map_err(StorageConfigResolutionError::Other)
         {
             Ok(Some(value)) => return Ok(Some(value)),
             Ok(None) => {}
@@ -2380,9 +3033,10 @@ async fn resolve_env_for_storage_init_without_global(
     if let Ok(storage_path) = try_get_storage_path(None) {
         let local_db_path = storage_path.join(DATABASE);
         if local_db_path.exists()
-            && let Some(value) = read_config_env_value(name, &vault_key, &local_db_path, "local")
-                .await
-                .map_err(StorageConfigResolutionError::Other)?
+            && let Some(value) =
+                read_config_env_value(name, &vault_key, &local_db_path, DatabaseRole::Repository)
+                    .await
+                    .map_err(StorageConfigResolutionError::Other)?
         {
             return Ok(Some(value));
         }
@@ -2391,8 +3045,8 @@ async fn resolve_env_for_storage_init_without_global(
     Ok(None)
 }
 
-/// Inspect the configured global config DB and return only the too-new-schema
-/// case. Other config errors are left to the normal resolver path so commands
+/// Inspect the configured global DB for future or unregistered receipts.
+/// Other config errors are left to the normal resolver path so commands
 /// that never touch global storage config keep their historical behavior.
 pub async fn inspect_global_config_schema_future() -> Option<GlobalConfigSchemaFuture> {
     let global_db_path = storage_global_config_path()?;
@@ -2405,17 +3059,42 @@ pub async fn inspect_global_config_schema_future() -> Option<GlobalConfigSchemaF
 pub(crate) async fn inspect_global_config_schema_future_at_path(
     global_db_path: &Path,
 ) -> Option<GlobalConfigSchemaFuture> {
-    match db::inspect_database_schema(global_db_path).await {
-        Ok(db::SchemaCompatibility::UnsupportedFuture {
-            current_version,
-            latest_version,
-        }) => Some(GlobalConfigSchemaFuture {
-            db_path: global_db_path.to_path_buf(),
-            current_version,
-            latest_version,
-        }),
-        Ok(_) | Err(_) => None,
+    inspect_configuration_schema_issue_at_path(global_db_path, DatabaseRole::GlobalConfig).await
+}
+
+async fn inspect_configuration_schema_issue_at_path(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Option<GlobalConfigSchemaFuture> {
+    // Physically read-only, literal path, no creation or migration. Malformed
+    // and unreadable databases retain the normal resolver's error policy.
+    let conn = schema::open_readonly_connection_for_role(db_path, Duration::from_millis(200), role)
+        .await
+        .ok()?;
+    let inspection = schema::inspect_configuration_schema(&conn, role).await;
+    let _ = conn.close().await;
+    let issue = inspection.ok()?.issue?;
+    Some(GlobalConfigSchemaFuture {
+        db_path: db_path.to_path_buf(),
+        current_version: issue.current_version,
+        latest_version: issue.latest_version,
+        issue,
+    })
+}
+
+/// Inspect both scopes before dispatch makes any global-credential bypass
+/// decision. Environment credentials cannot prove System defaults irrelevant.
+pub async fn inspect_configuration_schema_issues() -> Vec<GlobalConfigSchemaFuture> {
+    let mut issues = Vec::new();
+    for scope in [ConfigScope::Global, ConfigScope::System] {
+        if let Some(path) = scope.get_config_path()
+            && let Some(issue) =
+                inspect_configuration_schema_issue_at_path(&path, scope.database_role()).await
+        {
+            issues.push(issue);
+        }
     }
+    issues
 }
 
 /// Read a single `vault.env.*` entry from a config database, decrypting if needed.
@@ -2427,36 +3106,68 @@ pub(crate) async fn inspect_global_config_schema_future_at_path(
 ///   or global key).
 ///
 /// Boundary conditions:
-/// - Returns `Err` when the database path is not valid UTF-8 (sea-orm needs a
-///   string-typed URL).
+/// - Global configuration opens a literal filename read-only with no creation
+///   or migration. Local repository reads retain their existing upgrade path.
 /// - Returns `Err` when decryption fails — the user sees the raw vault error, not a
 ///   silent fall-back to plaintext.
 async fn read_config_env_value(
     env_name: &str,
     vault_key: &str,
     db_path: &Path,
-    scope: &str,
+    role: DatabaseRole,
 ) -> Result<Option<String>, String> {
-    let db_path_str = db_path.to_str().ok_or_else(|| {
-        format!(
-            "database path is not valid UTF-8 for {scope} config: {}",
-            db_path.display()
-        )
-    })?;
-    let conn = establish_connection_with_busy_timeout(db_path_str, Duration::from_millis(200))
-        .await
-        .map_err(|err| match scope {
-            "global" => format!(
-                "failed to connect to global config '{}': {}",
-                db_path.display(),
-                err
-            ),
-            _ => format!(
-                "failed to connect to local config '{}': {}",
-                db_path.display(),
-                err
-            ),
-        })?;
+    let (conn, scope) = match role {
+        DatabaseRole::GlobalConfig => {
+            let conn = schema::open_readonly_connection_for_role(
+                db_path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to connect to global config '{}': {error}",
+                    db_path.display()
+                )
+            })?;
+            schema::check_configuration_schema(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !schema::configuration_has_kv(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(None);
+            }
+            (conn, "global")
+        }
+        DatabaseRole::Repository => {
+            let path = db_path.to_str().ok_or_else(|| {
+                format!(
+                    "database path is not valid UTF-8 for local config: {}",
+                    db_path.display()
+                )
+            })?;
+            let conn = schema::establish_connection_with_busy_timeout_for_role(
+                path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to connect to local config '{}': {error}",
+                    db_path.display()
+                )
+            })?;
+            (conn, "local")
+        }
+        DatabaseRole::SystemConfig | DatabaseRole::Derived => {
+            return Err(format!(
+                "{role} cannot supply storage credentials; use local or global configuration"
+            ));
+        }
+    };
 
     let entry = ConfigKv::get_with_conn(&conn, vault_key)
         .await
@@ -2481,14 +3192,12 @@ async fn read_config_env_value(
 /// Locate the global config database.
 ///
 /// Boundary conditions:
-/// - Honours `LIBRA_CONFIG_GLOBAL_DB` first so tests can redirect to a temp path.
-/// - Returns `None` when no home directory is discoverable; on those platforms global
-///   config is unavailable.
+/// - Delegates to the single resolver in [`crate::internal::config`] so storage
+///   and the config command cannot drift (ADR-GCX-01 / GC-GCX-01).
+/// - Returns `None` when no config directory is discoverable; on those platforms
+///   global config is unavailable.
 fn storage_global_config_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB") {
-        return Some(PathBuf::from(path));
-    }
-    dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
+    crate::internal::config::global_config_path()
 }
 
 /// Resolve (and lazily create) the per-repo `libra.repoid` used as a key prefix in
@@ -2550,11 +3259,51 @@ async fn expected_index_repair_oid_len(db_conn: &DatabaseConnection) -> Result<u
     }
 }
 
+/// Apply one loaded replay page to the object index, retiring each durable
+/// marker after its row update commits. Shared by the blocking and the
+/// uncontended preflight variants.
+async fn apply_pending_object_index_page(
+    db_conn: &DbConn,
+    db_path: &Path,
+    page: PendingObjectIndexPage,
+) -> Result<ObjectIndexRepairOutcome, String> {
+    if page.updates.is_empty() {
+        return Ok(ObjectIndexRepairOutcome {
+            repaired: 0,
+            remaining: page.has_more,
+        });
+    }
+    if cfg!(debug_assertions) && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some() {
+        return Err("injected object index update failure".to_string());
+    }
+    let repo_id = resolve_repo_id_for_index(db_conn).await?;
+    let mut repaired = 0;
+    for batch in page.updates.chunks(INDEX_REPAIR_BATCH_SIZE) {
+        update_object_index_batch(db_conn, db_path, &repo_id, batch).await?;
+        for msg in batch {
+            if let Some(marker_path) = msg.marker_path.as_deref() {
+                retire_index_repair_marker(marker_path).map_err(|error| {
+                    format!(
+                        "updated object index for {}, but failed to retire repair marker '{}': {error}",
+                        msg.hash,
+                        marker_path.display()
+                    )
+                })?;
+            }
+            repaired += 1;
+        }
+    }
+    Ok(ObjectIndexRepairOutcome {
+        repaired,
+        remaining: page.has_more,
+    })
+}
+
 fn load_pending_object_index_updates(
     db_path: &Path,
     expected_oid_len: usize,
+    generation_lock: ObjectIndexRepairLock,
 ) -> io::Result<PendingObjectIndexPage> {
-    let generation_lock = acquire_index_repair_generation_lock(db_path)?;
     scavenge_index_repair_staging(db_path)?;
     let marker_dir = db_path
         .parent()
@@ -2654,7 +3403,7 @@ fn load_pending_object_index_updates(
         let marker_lock = if let Some(lock) = held_locks.get(&lock_shard) {
             Arc::clone(lock)
         } else {
-            let Some(lock) = try_acquire_index_repair_lock(db_path, oid)? else {
+            let Some(lock) = try_acquire_index_repair_lock(db_path, oid, "replay")? else {
                 // A queued writer or another replay owns this marker. Leave it
                 // for a later bounded page rather than blocking an async CLI
                 // preflight.
@@ -3098,15 +3847,19 @@ mod tests {
         ffi::OsString,
         fs,
         path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use git_internal::{
         errors::GitError,
-        hash::{HashKind, get_hash_kind, set_hash_kind, set_hash_kind_for_test},
+        hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind, set_hash_kind_for_test},
         internal::{
             metadata::{EntryMeta, MetaAttached},
-            object::{ObjectTrait, blob::Blob},
+            object::{ObjectTrait, blob::Blob, types::ObjectType},
             pack::{encode::PackEncoder, entry::Entry},
         },
     };
@@ -3116,9 +3869,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        ClientStorage, ObjectReadFailure, acquire_index_repair_lock,
-        remove_object_index_rows_with_conn, resolve_env_sync, update_object_index,
-        update_object_index_once,
+        ClientStorage, Commit, ObjectIndexRepairLock, ObjectReadFailure, acquire_index_repair_lock,
+        parse_commit_header_refs, remove_object_index_rows_with_conn, resolve_env_sync,
+        update_object_index, update_object_index_once,
     };
     use crate::{
         internal::{
@@ -3128,9 +3881,408 @@ mod tests {
         },
         utils::{
             object_ext::BlobExt,
+            storage::Storage,
             test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
         },
     };
+
+    struct CheckedProbeStorage {
+        present: ObjectHash,
+        failed: Option<ObjectHash>,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl CheckedProbeStorage {
+        fn new(present: ObjectHash, failed: Option<ObjectHash>) -> Self {
+            Self {
+                present,
+                failed,
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CheckedProbeStorage {
+        async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
+            Err(GitError::ObjectNotFound(hash.to_string()))
+        }
+
+        async fn put(
+            &self,
+            _hash: &ObjectHash,
+            _data: &[u8],
+            _obj_type: ObjectType,
+        ) -> Result<String, GitError> {
+            unreachable!("checked-probe test never stores objects")
+        }
+
+        async fn exist(&self, _hash: &ObjectHash) -> bool {
+            unreachable!("checked-probe test must use error-aware existence")
+        }
+
+        async fn search(&self, _prefix: &str) -> Vec<ObjectHash> {
+            Vec::new()
+        }
+
+        async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.failed.as_ref() == Some(hash) {
+                return Err(GitError::IOError(std::io::Error::other(
+                    "simulated probe outage",
+                )));
+            }
+            Ok(*hash == self.present)
+        }
+    }
+
+    #[test]
+    fn checked_batch_deduplicates_and_bounds_concurrency() {
+        let hashes: Vec<ObjectHash> = (0..40).map(|byte| ObjectHash::new(&[byte; 20])).collect();
+        let backend = Arc::new(CheckedProbeStorage::new(hashes[3], None));
+        let client = ClientStorage::from_test_storage(backend.clone(), PathBuf::new());
+
+        let mut input = hashes.clone();
+        input.extend_from_slice(&[hashes[3], hashes[12]]);
+        let results = client.exist_checked_many(&input).expect("batch probe");
+
+        assert_eq!(results.len(), hashes.len());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), hashes.len());
+        assert!(results[&hashes[3]]);
+        assert!(!results[&hashes[12]]);
+        let peak = backend.peak.load(Ordering::SeqCst);
+        assert!(
+            (1..=16).contains(&peak),
+            "probe concurrency must be bounded: {peak}"
+        );
+    }
+
+    #[test]
+    fn checked_batch_reports_failing_oid() {
+        let failed = ObjectHash::new(&[9; 20]);
+        let backend = Arc::new(CheckedProbeStorage::new(
+            ObjectHash::new(&[1; 20]),
+            Some(failed),
+        ));
+        let client = ClientStorage::from_test_storage(backend, PathBuf::new());
+
+        let error = client
+            .exist_checked_many(&[failed])
+            .expect_err("storage failure must not become absence");
+        assert!(error.to_string().contains(&failed.to_string()));
+        assert!(error.to_string().contains("simulated probe outage"));
+    }
+
+    #[test]
+    fn commit_parent_batch_reads_raw_commits_and_reports_missing_oid() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[3; 20]);
+        let root = Commit::from_tree_id(tree, vec![], "root");
+        let tip = Commit::from_tree_id(tree, vec![root.id], "tip");
+        for commit in [&root, &tip] {
+            client
+                .put(
+                    &commit.id,
+                    &commit.to_data().expect("serialize fixture commit"),
+                    ObjectType::Commit,
+                )
+                .expect("store fixture commit");
+        }
+
+        let parents = client
+            .commit_parents_many(&[root.id, tip.id, tip.id])
+            .expect("batch read commits");
+        assert_eq!(parents.len(), 2);
+        assert!(parents[&root.id].is_empty());
+        assert_eq!(parents[&tip.id], vec![root.id]);
+
+        let absent = ObjectHash::new(&[4; 20]);
+        let error = client
+            .commit_parents_many(&[absent])
+            .expect_err("missing commit must be an error");
+        assert!(error.to_string().contains(&absent.to_string()));
+    }
+
+    #[test]
+    fn commit_parent_batch_rejects_wrong_type_and_oversized_payload() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[5; 20]);
+        let wrong_type = Commit::from_tree_id(tree, vec![], "content shaped like a commit");
+        let wrong_type_data = wrong_type.to_data().expect("serialize fixture");
+        let wrong_type_id = ObjectHash::from_type_and_data_for_kind(
+            wrong_type.id.kind(),
+            ObjectType::Blob,
+            &wrong_type_data,
+        )
+        .expect("hash blob fixture");
+        client
+            .put(&wrong_type_id, &wrong_type_data, ObjectType::Blob)
+            .expect("store wrong-type fixture");
+        let error = client
+            .commit_parents_many(&[wrong_type_id])
+            .expect_err("blob must not be accepted as a commit");
+        assert!(error.to_string().contains("expected a commit"), "{error}");
+
+        let oversized = Commit::from_tree_id(tree, vec![], &"x".repeat(4 * 1024 * 1024));
+        client
+            .put(
+                &oversized.id,
+                &oversized.to_data().expect("serialize large commit"),
+                ObjectType::Commit,
+            )
+            .expect("store oversized fixture");
+        let error = client
+            .commit_parents_many(&[oversized.id])
+            .expect_err("oversized commit must be refused");
+        assert!(error.to_string().contains(&oversized.id.to_string()));
+        assert!(error.to_string().contains("4194304"), "{error}");
+    }
+
+    #[test]
+    fn commit_parent_batch_rejects_mismatched_local_oid() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[5; 20]);
+        let actual = Commit::from_tree_id(tree, vec![], "actual contents");
+        let requested = Commit::from_tree_id(tree, vec![], "requested contents");
+        client
+            .put(
+                &requested.id,
+                &actual.to_data().expect("serialize actual commit"),
+                ObjectType::Commit,
+            )
+            .expect("seed mismatched commit under requested OID");
+
+        let error = client
+            .commit_parents_many(&[requested.id])
+            .expect_err("bounded commit read must verify the requested OID");
+        assert!(error.to_string().contains("integrity check"), "{error}");
+        assert!(error.to_string().contains(&requested.id.to_string()));
+    }
+
+    #[test]
+    fn commit_parent_batch_reserves_in_flight_byte_budget() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[6; 20]);
+        let mut hashes = Vec::new();
+        let mut commit_bytes = 0u64;
+        for message in *b"abc" {
+            let mut data =
+                format!("tree {tree}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n")
+                    .into_bytes();
+            data.push(message);
+            commit_bytes = data.len() as u64;
+            let hash =
+                ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Commit, &data)
+                    .expect("hash commit fixture");
+            client
+                .put(&hash, &data, ObjectType::Commit)
+                .expect("store commit fixture");
+            hashes.push(hash);
+        }
+        let last_read_limit = commit_bytes / 2;
+        let error = client
+            .commit_parents_many_with_limits(
+                &hashes,
+                commit_bytes,
+                2 * commit_bytes + last_read_limit,
+                10,
+            )
+            .expect_err("third commit must be bounded by the remaining response budget");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("limit of {last_read_limit} bytes")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn commit_parent_batch_caps_total_parents() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[6; 20]);
+        let parent = ObjectHash::new(&[7; 20]);
+        let mut commits = Vec::new();
+        for index in 0..4 {
+            let commit =
+                Commit::from_tree_id(tree, vec![parent; 65_537], &format!("wide merge {index}"));
+            client
+                .put(
+                    &commit.id,
+                    &commit.to_data().expect("serialize wide commit"),
+                    ObjectType::Commit,
+                )
+                .expect("store wide commit");
+            commits.push(commit.id);
+        }
+
+        let error = client
+            .commit_parents_many(&commits)
+            .expect_err("aggregate parent cap must be enforced");
+        assert!(error.to_string().contains("262144 parents"), "{error}");
+    }
+
+    #[test]
+    fn commit_header_parser_accepts_binary_message_and_ignores_signature_continuation() {
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let commit = ObjectHash::new_for_kind(kind, b"commit");
+            let tree = ObjectHash::new_for_kind(kind, b"tree");
+            let parent = ObjectHash::new_for_kind(kind, b"parent");
+            let ignored_continuation = ObjectHash::new_for_kind(kind, b"ignored");
+            let mut bytes = format!(
+                "tree {tree}\nparent {parent}\nauthor Author <a@example.com> 0 +0000\ncommitter Committer <c@example.com> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n parent {ignored_continuation}\n\n"
+            )
+            .into_bytes();
+            bytes.extend_from_slice(&[0xff, 0x00, 0xfe]);
+
+            let (parsed_tree, parents) =
+                parse_commit_header_refs(&bytes, commit).expect("parse only commit headers");
+            assert_eq!(parsed_tree, tree);
+            assert_eq!(parents, vec![parent]);
+        }
+    }
+
+    #[test]
+    fn commit_header_parser_ignores_legacy_message_without_blank_separator() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        let message_oid = ObjectHash::new_for_kind(HashKind::Sha1, b"message text");
+        let body = format!(
+            "tree {tree}\nparent {parent}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\nparent {message_oid}\n"
+        );
+        let (parsed_tree, parents) =
+            parse_commit_header_refs(body.as_bytes(), commit).expect("legacy commit header");
+        assert_eq!(parsed_tree, tree);
+        assert_eq!(parents, vec![parent]);
+    }
+
+    #[test]
+    fn commit_header_parser_rejects_wrong_kind_and_malformed_parent() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha256, b"commit");
+        let wrong_kind = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let bad_tree =
+            format!("tree {wrong_kind}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n");
+        let error = parse_commit_header_refs(bad_tree.as_bytes(), commit)
+            .expect_err("tree kind mismatch must be rejected");
+        assert!(error.to_string().contains("invalid tree ID"));
+
+        let tree = ObjectHash::new_for_kind(HashKind::Sha256, b"tree");
+        let bad_parent = format!(
+            "tree {tree}\nparent {}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n",
+            "z".repeat(64)
+        );
+        let error = parse_commit_header_refs(bad_parent.as_bytes(), commit)
+            .expect_err("non-hex parent must be rejected");
+        assert!(error.to_string().contains("invalid parent ID"));
+    }
+
+    #[test]
+    fn commit_header_parser_stops_at_first_non_parent_line() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        let cases = [
+            format!(
+                "tree {tree}\nauthor A <a@b> 0 +0000\nparent {parent}\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!("tree {tree}\ncommitter C <c@d> 0 +0000\nauthor A <a@b> 0 +0000\n\n"),
+            format!(
+                "tree {tree}\nauthor A <a@b> 0 +0000\nauthor B <b@c> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!(
+                "tree {tree}\ntree {tree}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!("tree {tree}\n orphan\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"),
+        ];
+        for body in cases {
+            let (parsed_tree, parents) = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect("later noncanonical headers do not affect the parent graph");
+            assert_eq!(parsed_tree, tree);
+            assert!(parents.is_empty(), "later parent lines are not edges");
+        }
+    }
+
+    #[test]
+    fn commit_header_parser_accepts_missing_author_and_committer() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        for body in [
+            format!("tree {tree}\n\n"),
+            format!("tree {tree}\nparent {parent}\n\n"),
+            format!("tree {tree}\nparent {parent}\ncommitter before author\n"),
+        ] {
+            let (parsed_tree, parents) = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect("Git graph parser only requires tree and leading parents");
+            assert_eq!(parsed_tree, tree);
+            assert_eq!(
+                parents,
+                if body.contains("parent ") {
+                    vec![parent]
+                } else {
+                    vec![]
+                }
+            );
+        }
+
+        for body in [
+            format!("tree {tree}\n"),
+            format!("tree {tree}\nparent {parent}\n"),
+        ] {
+            let error = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect_err("a commit cannot end directly after a reference header");
+            assert!(error.to_string().contains("ends immediately"), "{error}");
+        }
+    }
+
+    #[test]
+    fn typed_bounded_read_preserves_type_and_enforces_limit() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("create object directory");
+        let storage = ClientStorage::init_local(dir.path().join("objects"));
+        let blob = Blob::from_content("bounded typed read");
+        storage
+            .put(&blob.id, &blob.data, ObjectType::Blob)
+            .expect("store local blob");
+
+        let (payload, object_type) = storage
+            .get_typed_with_limit(&blob.id, 1024)
+            .expect("read typed object within bound");
+        assert_eq!(payload, blob.data);
+        assert_eq!(object_type, ObjectType::Blob);
+        let error = storage
+            .get_typed_with_limit(&blob.id, 1)
+            .expect_err("small limit must reject the object");
+        assert!(error.to_string().contains("limit"), "{error}");
+
+        let mismatched = Blob::from_content("different object").id;
+        storage
+            .put(&mismatched, &blob.data, ObjectType::Blob)
+            .expect("seed payload under the wrong local OID");
+        let error = storage
+            .get_typed_with_limit(&mismatched, 1024)
+            .expect_err("bounded local tag/want reads must verify the requested OID");
+        assert!(error.to_string().contains("integrity check"), "{error}");
+        assert!(
+            error.to_string().contains(&mismatched.to_string()),
+            "{error}"
+        );
+    }
 
     /// Test helper that clears an env var on construction and restores it on drop.
     /// Combined with `#[serial]`, this lets tests assert behaviour when a specific
@@ -3228,20 +4380,413 @@ mod tests {
         let storage = tempdir().expect("create storage directory");
         let db_path = storage.path().join("libra.db");
         let oid = "a".repeat(40);
-        let _held = acquire_index_repair_lock(&db_path, &oid).expect("acquire first repair lock");
+        let _held = acquire_index_repair_lock(&db_path, &oid, "queued_update")
+            .expect("acquire first repair lock");
 
         let started = Instant::now();
-        let error = match acquire_index_repair_lock(&db_path, &oid) {
+        let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
             Ok(_) => panic!("a competing repair lock must time out"),
             Err(error) => error,
         };
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() >= super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT);
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("another Libra process may be stalled")
+            message.contains("timed out waiting for object-index repair lock"),
+            "{message}"
+        );
+        // The holder is this very process: the diagnostic must say so (M-DIAG
+        // D2) and must include the D4 note about never deleting lock files.
+        assert!(
+            message.contains("held by this Libra process itself"),
+            "{message}"
+        );
+        assert!(message.contains("must not be deleted"), "{message}");
+    }
+
+    #[test]
+    fn lock_timeout_reports_live_foreign_holder() {
+        #[cfg(unix)]
+        {
+            let storage = tempdir().expect("create storage directory");
+            let db_path = storage.path().join("libra.db");
+            let oid = "f".repeat(40);
+            let lock_path = super::index_repair_lock_path(&db_path, &oid).expect("lock path");
+
+            // Hold the shard lock from a helper process so the metadata reports
+            // a genuinely foreign live pid (M-DIAG D1).
+            let helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("utils::client_storage::tests::lock_holder_helper_process")
+                .arg("--exact")
+                .env("LIBRA_TEST_LOCK_HOLD_PATH", &lock_path)
+                .spawn()
+                .expect("spawn lock holder helper");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while super::read_index_repair_lock_metadata(&lock_path).is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "helper never wrote holder metadata"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
+                Ok(_) => panic!("the foreign holder must make the acquisition time out"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let message = error.to_string();
+            assert!(
+                message.contains("another live Libra process (pid"),
+                "{message}"
+            );
+            assert!(message.contains("purpose: marker_publication"), "{message}");
+            assert!(
+                message.contains("wait for that process to finish"),
+                "{message}"
+            );
+            let _ = helper.wait_with_output();
+        }
+        #[cfg(not(unix))]
+        {
+            // The foreign-holder reproduction needs flock semantics; on
+            // Windows the D5 read-failure path is covered by
+            // `lock_metadata_read_failure_falls_back_to_undetermined`.
+        }
+    }
+
+    /// Helper invoked as its own process by `lock_timeout_reports_live_foreign_holder`.
+    /// Holds the shard lock named by LIBRA_TEST_LOCK_HOLD_PATH with realistic
+    /// `marker_publication`-style metadata until the process exits.
+    #[test]
+    fn lock_holder_helper_process() {
+        let Ok(lock_path) = std::env::var("LIBRA_TEST_LOCK_HOLD_PATH") else {
+            return; // regular test run: nothing to hold
+        };
+        let lock_path = PathBuf::from(lock_path);
+        #[cfg(unix)]
+        {
+            use std::{io::Write, os::fd::AsRawFd};
+
+            if let Some(parent) = lock_path.parent() {
+                fs::create_dir_all(parent).expect("create lock directory");
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open helper lock file");
+            // SAFETY: flock on an owned descriptor held until process exit.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(result, 0, "helper flock must succeed");
+            let metadata = format!(
+                "{{\"pid\":{},\"purpose\":\"marker_publication\",\"started_at_ms\":{},\"invocation\":\"helper\"}}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            file.set_len(0).expect("truncate helper lock file");
+            file.write_all(metadata.as_bytes())
+                .expect("write helper metadata");
+            file.flush().expect("flush helper metadata");
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock_path;
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn lock_timeout_without_metadata_is_undetermined() {
+        #[cfg(unix)]
+        {
+            let storage = tempdir().expect("create storage directory");
+            let db_path = storage.path().join("libra.db");
+            let oid = "b".repeat(40);
+            let lock_path = super::index_repair_lock_path(&db_path, &oid).expect("lock path");
+
+            // Hold the lock with a raw flock and NO metadata payload: the
+            // timeout diagnostic must not claim anything about the holder
+            // (M-DIAG D3).
+            let _raw_holder = {
+                use std::os::fd::AsRawFd;
+                if let Some(parent) = lock_path.parent() {
+                    fs::create_dir_all(parent).expect("create lock directory");
+                }
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .expect("open raw lock file");
+                // SAFETY: flock on an owned descriptor held until the end of the test.
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                assert_eq!(result, 0, "raw flock must succeed");
+                file
+            };
+
+            let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
+                Ok(_) => panic!("the raw holder must make the acquisition time out"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let message = error.to_string();
+            assert!(
+                message.contains("the lock holder could not be determined"),
+                "{message}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // Raw flock reproduction is unix-only; non-unix read-failure
+            // coverage lives in `lock_metadata_read_failure_falls_back_to_undetermined`.
+        }
+    }
+
+    #[test]
+    fn lock_metadata_write_failure_does_not_fail_acquire() {
+        // A read-only handle cannot be truncated or written; the metadata write
+        // must degrade to a debug log without failing the acquisition (M-DIAG
+        // D6).
+        let dir = tempdir().expect("create metadata failure directory");
+        let path = dir.path().join("lock");
+        fs::write(&path, b"").expect("seed lock file");
+        let file = fs::File::open(&path).expect("open lock file read-only");
+        let mut lock = ObjectIndexRepairLock { file };
+        super::write_index_repair_lock_metadata(&mut lock, "marker_publication");
+        assert_eq!(
+            fs::read(&path).expect("read lock file"),
+            b"",
+            "a failed metadata write must leave the lock file unchanged"
+        );
+    }
+
+    #[test]
+    fn lock_metadata_read_failure_falls_back_to_undetermined() {
+        // Unreadable metadata (missing file, empty payload, invalid JSON, or
+        // oversized content) must all resolve to the undetermined clause.
+        // Windows zero-share handles hit the same open-failure branch (D5).
+        let dir = tempdir().expect("create read failure directory");
+        assert!(super::read_index_repair_lock_metadata(&dir.path().join("missing")).is_none());
+        let empty = dir.path().join("empty");
+        fs::write(&empty, b"").expect("write empty lock file");
+        assert!(super::read_index_repair_lock_metadata(&empty).is_none());
+        let invalid = dir.path().join("invalid");
+        fs::write(&invalid, b"not json").expect("write invalid lock file");
+        assert!(super::read_index_repair_lock_metadata(&invalid).is_none());
+        let oversized = dir.path().join("oversized");
+        fs::write(&oversized, vec![b'x'; 2048]).expect("write oversized lock file");
+        assert!(super::read_index_repair_lock_metadata(&oversized).is_none());
+    }
+
+    #[test]
+    fn lock_wait_uses_bounded_quadratic_backoff() {
+        // M-WAIT W3: 1ms × (attempt+1)², ±25% jitter, single sleep capped at 1s.
+        for (attempt, step_ms) in [
+            (0u32, 1u64),
+            (1, 4),
+            (2, 9),
+            (9, 100),
+            (30, 961),
+            (31, 1000),
+            (500, 1000),
+        ] {
+            let min = super::index_repair_lock_backoff_sleep(attempt, 0.0);
+            let max = super::index_repair_lock_backoff_sleep(attempt, 1.0);
+            assert_eq!(
+                min,
+                Duration::from_micros(step_ms * 750),
+                "attempt {attempt} lower bound"
+            );
+            assert_eq!(
+                max,
+                Duration::from_micros(step_ms * 1250),
+                "attempt {attempt} upper bound"
+            );
+            let mid = super::index_repair_lock_backoff_sleep(attempt, 0.5);
+            assert!(min <= mid && mid <= max, "attempt {attempt} midpoint");
+        }
+    }
+
+    #[test]
+    fn test_lock_wait_budget_stays_short_in_test_builds() {
+        // M-WAIT W7: the test-build budget must stay at 100ms so suites do
+        // not slow down behind the 10s production budget.
+        assert_eq!(
+            super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT,
+            Duration::from_millis(100)
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn batched_marker_publication_takes_generation_lock_per_batch() {
+        // M-BATCH B1: 300 markers publish under ⌈300/256⌉ = 2 generation locks.
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "batch-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        let before = super::BATCHED_MARKER_PUBLICATIONS.load(super::Ordering::Relaxed);
+        client.begin_object_index_batch();
+        for index in 0..300 {
+            let blob = Blob::from_content(&format!("batch payload {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object inside the batch");
+        }
+        client
+            .end_object_index_batch()
+            .expect("flush the final batch");
+        let delta = super::BATCHED_MARKER_PUBLICATIONS.load(super::Ordering::Relaxed) - before;
+        assert_eq!(
+            delta, 2,
+            "300 markers must publish in exactly 2 batch publications, got {delta}"
+        );
+        ClientStorage::wait_for_background_tasks();
+    }
+
+    #[test]
+    fn batch_failure_keeps_published_markers() {
+        // M-BATCH B2: when marker N fails, markers 1..N-1 already written stay
+        // on disk and the error propagates.
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let second_db = storage
+            .path()
+            .join("second")
+            .join(crate::utils::util::DATABASE);
+        let mk = |hash: &str, db: PathBuf| super::IndexUpdateMsg {
+            hash: hash.to_string(),
+            obj_type: "blob".to_string(),
+            size: 1,
+            db_path: db,
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let first_hash = format!("{:040x}", 1);
+        let second_hash = format!("{:040x}", 2);
+        // A directory squatting on the second marker path makes the atomic
+        // rename fail after the first marker was written.
+        let second_marker = super::index_repair_marker_path(&second_db, &second_hash, "blob")
+            .expect("second marker path");
+        fs::create_dir_all(second_marker.parent().expect("marker parent"))
+            .expect("create second marker parent");
+        fs::create_dir_all(&second_marker).expect("squat a directory on the marker path");
+
+        let msgs = vec![
+            mk(&first_hash, db_path.clone()),
+            mk(&second_hash, second_db),
+        ];
+        let result = super::persist_index_repair_marker_batch(&msgs);
+        assert!(result.is_err(), "the second marker must fail the batch");
+        let first_marker = super::index_repair_marker_path(&db_path, &first_hash, "blob")
+            .expect("first marker path");
+        assert!(
+            first_marker.is_file(),
+            "the already-written first marker must remain (B2)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn deletion_fence_waits_between_batches() {
+        // M-BATCH B3: after a full batch auto-flushes, the generation lock is
+        // free again before the next batch publishes.
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "fence-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        client.begin_object_index_batch();
+        for index in 0..300 {
+            let blob = Blob::from_content(&format!("fence payload {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object inside the batch");
+        }
+        // The first 256 markers flushed during the loop; the lock must be free
+        // for a deletion fence between batches.
+        let lock_path = super::index_repair_generation_lock_path(&db_path).expect("lock path");
+        let probe = super::try_acquire_index_repair_lock_file(&lock_path, "replay")
+            .expect("probe generation lock");
+        assert!(
+            probe.is_some(),
+            "the generation lock must be free between batches (B3)"
+        );
+        drop(probe);
+        client
+            .end_object_index_batch()
+            .expect("flush the final batch");
+        ClientStorage::wait_for_background_tasks();
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn nonblocking_preflight_skips_busy_generation_lock() {
+        // M-WAIT W5: with the generation lock busy, the uncontended preflight
+        // skips the replay immediately, without waiting and without an error.
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "skip-repo", false)
+            .await
+            .expect("set repo id");
+        let _held = super::acquire_index_repair_generation_lock(&db_path, "queued_update")
+            .expect("hold generation lock");
+
+        let started = Instant::now();
+        let outcome = ClientStorage::repair_pending_object_index_updates_if_uncontended(&db_path)
+            .await
+            .expect("busy preflight must not error");
+        assert!(
+            outcome.is_none(),
+            "a busy generation lock must skip the replay"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the skip must not wait for the lock"
         );
     }
 
@@ -3251,10 +4796,34 @@ mod tests {
         let db_path = storage.path().join("libra.db");
         let first_oid = format!("aa{}", "1".repeat(38));
         let second_oid = format!("aa{}", "2".repeat(38));
-        let _first = acquire_index_repair_lock(&db_path, &first_oid)
+        let _first = acquire_index_repair_lock(&db_path, &first_oid, "queued_update")
             .expect("acquire first object-index repair shard");
-        let _second = acquire_index_repair_lock(&db_path, &second_oid)
+        let _second = acquire_index_repair_lock(&db_path, &second_oid, "queued_update")
             .expect("objects in different shards must use independent repair locks");
+    }
+
+    #[test]
+    fn marker_publication_does_not_wait_for_unrelated_object_in_same_shard() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let held_oid = format!("abcd{}", "1".repeat(36));
+        let published_oid = format!("abcd{}", "2".repeat(36));
+        let _held = acquire_index_repair_lock(&db_path, &held_oid, "queued_update")
+            .expect("acquire unrelated object-index repair shard");
+
+        let marker_path = super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: published_oid,
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path,
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("a coarse shard collision must not block durable marker publication");
+
+        assert!(marker_path.is_file());
     }
 
     #[test]
@@ -3285,7 +4854,7 @@ mod tests {
     /// path that `clone`/`fetch` rely on so they can fall back to packs when the
     /// loose-object directory is absent.
     #[test]
-    #[serial]
+    #[serial(hash_kind)]
     fn client_storage_reads_pack_sha1() -> Result<(), GitError> {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         let blob = Blob::from_content("client-storage-sha1");
@@ -3369,7 +4938,7 @@ mod tests {
     /// header layout and crc table; this test pins backwards/forwards compatibility
     /// for repositories created with `core.objectformat=sha256`.
     #[test]
-    #[serial]
+    #[serial(hash_kind)]
     fn client_storage_reads_pack_sha256() -> Result<(), GitError> {
         let _guard = set_hash_kind_for_test(HashKind::Sha256);
         let blob = Blob::from_content("client-storage-sha256");
@@ -3434,7 +5003,7 @@ mod tests {
     /// silently returning an empty match list. This protects users from acting on
     /// stale or corrupt references without realising it.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_search_result_surfaces_corrupt_branch_storage() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -3470,7 +5039,7 @@ mod tests {
     /// object in the repository. The test verifies that we instead return an empty
     /// vector — the safe behaviour for invalid navigation requests.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn test_search_result_rejects_empty_base_ref_navigation() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -3509,7 +5078,7 @@ mod tests {
     /// from the process CWD. Regression guard for a bug where two repositories sharing
     /// a CWD could cross-pollinate their object indexes.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn background_index_update_uses_storage_database_instead_of_cwd() {
         let workspace = tempdir().unwrap();
         let storage_path = workspace.path().join(".libra");
@@ -3541,7 +5110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn durable_index_marker_survives_failure_and_repairs_idempotently() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -3633,7 +5202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn blob_save_returns_marker_error_and_retry_recreates_the_marker() {
         ClientStorage::wait_for_background_tasks();
         let repo = tempdir().expect("create temporary repository");
@@ -3678,7 +5247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn repair_queue_replays_bounded_pages_without_permanent_cap_failure() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -3962,13 +5531,13 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("durable cloud object-index repair marker could not be registered"),
+                .contains("cloud object-index repair markers could not be registered"),
             "unexpected error: {error}"
         );
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn marker_retirement_failure_is_counted_and_remains_repairable() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4010,7 +5579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn late_failure_stays_with_the_invocation_that_enqueued_it() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4058,7 +5627,59 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
+    async fn queued_update_never_takes_generation_lock() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "guard-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        // The foreground publisher takes the generation lock exactly once to
+        // persist the durable repair marker before queueing.
+        let before = super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed);
+        let blob = Blob::from_content("generation lock guard payload");
+        client
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("store object and enqueue index update");
+        let after_put = super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed);
+        assert_eq!(
+            after_put,
+            before + 1,
+            "foreground marker publication must take exactly one generation lock"
+        );
+
+        ClientStorage::wait_for_background_tasks();
+
+        // The queued consumer must apply the update through the OID-shard lock
+        // only: no additional generation lock acquisition may have happened.
+        assert_eq!(
+            super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed),
+            after_put,
+            "queued consumer must never acquire the generation lock"
+        );
+        let row = object_index::Entity::find()
+            .filter(object_index::Column::OId.eq(blob.id.to_string()))
+            .filter(object_index::Column::RepoId.eq("guard-repo"))
+            .one(&db_conn)
+            .await
+            .expect("query repaired row");
+        assert!(row.is_some(), "the queued update must land in the index");
+    }
+
+    #[tokio::test]
+    #[serial(env)]
     async fn concurrent_direct_storage_work_is_not_charged_to_cli_scope() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4111,7 +5732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn direct_fifo_backlog_does_not_delay_invocation_scoped_updates() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4157,7 +5778,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
+    #[serial(env)]
     async fn command_owned_spawn_is_registered_before_it_enqueues_index_work() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4207,7 +5828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn replay_retirement_fences_a_delayed_queued_writer_after_prune() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage dir");
@@ -4284,6 +5905,63 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn queued_reconciliation_ignores_an_unrelated_deletion_fence() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "queued-fence-repo", false)
+            .await
+            .expect("set repo id");
+
+        let queued_oid = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let mut msg = super::IndexUpdateMsg {
+            hash: queued_oid.clone(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let marker_path = super::persist_index_repair_marker(&msg)
+            .expect("persist marker before queued reconciliation");
+        msg.marker_path = Some(marker_path.clone());
+
+        let unrelated_oid = "fedcba9876543210fedcba9876543210fedcba98".to_string();
+        let fence = super::acquire_object_index_deletion_fence(&db_path, &[unrelated_oid])
+            .await
+            .expect("acquire unrelated deletion fence")
+            .expect("non-empty OID set must return a fence");
+
+        super::apply_queued_index_update(&msg)
+            .await
+            .expect("a durable queued marker must reconcile through an unrelated deletion fence");
+        assert!(
+            !marker_path.exists(),
+            "successful queued reconciliation must retire its marker"
+        );
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("queued-fence-repo"))
+                .filter(object_index::Column::OId.eq(queued_oid))
+                .count(&db_conn)
+                .await
+                .expect("count reconciled object-index row"),
+            1
+        );
+
+        drop(fence);
+    }
+
+    #[tokio::test]
     #[serial]
     async fn deletion_fence_blocks_new_marker_publication_until_released() {
         let storage = tempdir().expect("create storage dir");
@@ -4330,7 +6008,7 @@ mod tests {
     /// A missing database cannot be treated as successful reconciliation: doing
     /// so would let the queue retire its only durable repair marker.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn update_object_index_rejects_missing_database() {
         let missing_root = tempdir().unwrap();
         let missing_db = missing_root.path().join(crate::utils::util::DATABASE);
@@ -4341,7 +6019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn queued_update_keeps_marker_until_a_moved_database_is_restored() {
         ClientStorage::wait_for_background_tasks();
         let storage = tempdir().expect("create storage directory");
@@ -4447,7 +6125,7 @@ mod tests {
     /// tooling that filtered by o_type lost visibility on captured
     /// transcripts. We exercise the upgrade branch directly here.
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn update_object_index_upgrades_generic_blob_to_agent_specific_o_type() {
         use sea_orm::{ConnectionTrait, Statement};
 
@@ -4543,7 +6221,7 @@ mod tests {
     /// primary mechanism users rely on to keep storage credentials inside the
     /// repository config rather than in their shell rc.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn resolve_env_sync_reads_non_allowlisted_local_config_values() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();
@@ -4570,7 +6248,7 @@ mod tests {
     /// invalid global config would silently degrade remote storage to local-only
     /// without telling the user anything is wrong.
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn resolve_env_sync_surfaces_global_config_connection_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();

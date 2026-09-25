@@ -92,6 +92,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn preview_scratch_uses_common_storage_for_linked_worktree() {
         let root = tempfile::tempdir().expect("create linked-worktree fixture");
         let common = root.path().join("main/.libra");

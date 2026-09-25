@@ -513,6 +513,8 @@ async fn test_diff_after_init() {
 
     // Once staged, the file appears with the /dev/null old header via --staged.
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".libraignore")],
         all: false,
         update: false,
@@ -526,6 +528,10 @@ async fn test_diff_after_init() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     let staged_file = output_dir.path().join("diff_staged_output.txt");
@@ -556,6 +562,8 @@ async fn test_basic_diff() {
     create_file("file1.txt", "Initial content\nLine 2\nLine 3\n");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -569,6 +577,10 @@ async fn test_basic_diff() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -626,6 +638,8 @@ async fn test_diff_staged() {
     create_file("file1.txt", "Initial content\nLine 2\nLine 3\n");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -639,6 +653,10 @@ async fn test_diff_staged() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -663,6 +681,8 @@ async fn test_diff_staged() {
     modify_file("file1.txt", "Modified content\nLine 2\nLine 3 changed\n");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -676,6 +696,10 @@ async fn test_diff_staged() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -726,6 +750,8 @@ async fn test_diff_between_commits() {
     create_file("file1.txt", "Initial content\nLine 2\nLine 3\n");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -739,6 +765,10 @@ async fn test_diff_between_commits() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -765,6 +795,8 @@ async fn test_diff_between_commits() {
     modify_file("file1.txt", "Modified content\nLine 2\nLine 3 changed\n");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -778,6 +810,10 @@ async fn test_diff_between_commits() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -845,6 +881,8 @@ async fn test_diff_with_pathspec() {
     create_file("file2.txt", "File 2 content\nLine 2\nLine 3\n");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -858,6 +896,10 @@ async fn test_diff_with_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -923,6 +965,8 @@ async fn test_diff_output_to_file() {
     create_file("file1.txt", "Initial content\nLine 2\nLine 3\n");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -936,6 +980,10 @@ async fn test_diff_output_to_file() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -996,6 +1044,8 @@ async fn test_diff_algorithms() {
     );
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1009,6 +1059,10 @@ async fn test_diff_algorithms() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 

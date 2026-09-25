@@ -24,6 +24,12 @@ history range.
 When stdout is piped and the downstream command exits early, `libra log` exits quietly without
 printing panic/backtrace or `Broken pipe` diagnostics.
 
+In a shallow clone, commits listed in `.libra/shallow` are treated as roots: `log`
+does not follow their parents. A corrupt `.libra/shallow` file fails closed
+(`LBR-REPO-002`). Removing the file when parents were never fetched also fails
+closed and hints to run `libra fsck`. Recorded parent ids (`%P`, `--parents`)
+still come from the stored commit object.
+
 ## Options
 
 ### `-n, --number <N>`
@@ -210,6 +216,14 @@ Filter commits by message. `--grep` keeps commits whose message contains the
 (case-sensitive) substring. `-i` / `--regexp-ignore-case` makes the match
 case-insensitive (author/committer matching is already case-insensitive in
 Libra). `--invert-grep` keeps commits whose message does *not* match.
+
+The search covers the commit subject, body, and trailers. PGP or SSH signatures in
+a `gpgsig` or `gpgsig-sha256` header immediately after `committer` are excluded, including with `-i` and `--invert-grep`; text in
+the actual message remains searchable. This applies to human, `--json`, and
+`--machine` output. An empty `--grep` pattern leaves message filtering disabled.
+Leading spaces, tabs, and blank lines in the actual message remain searchable.
+Other imported header layouts (such as `encoding` before `gpgsig`) retain the
+existing parsing behavior.
 
 ```bash
 libra log --grep "fix(" -n 20
@@ -461,7 +475,10 @@ libra log -L1,10:src/main.rs
 ### `[PATHS...]`
 
 Limit diff output to the specified paths. Used with `-p`, `--name-only`, `--name-status`,
-`--stat`, or `--shortstat`.
+`--stat`, or `--shortstat`. Paths match through the shared pathspec engine, so plain
+prefixes, wildcards, and the `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`
+magic forms all work; `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` turns them
+literal.
 
 ```bash
 libra log -- src/

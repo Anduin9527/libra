@@ -1,7 +1,7 @@
 //! Implements status reporting with ignore policy support, computing staged/unstaged/untracked sets and printing concise summaries.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
@@ -31,6 +31,7 @@ use crate::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
         head::Head,
+        shallow::ShallowSet,
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -178,8 +179,12 @@ pub struct StatusArgs {
     pub null_terminated: bool,
 
     /// Detect renames in staged/unstaged changes.
-    /// The optional value is the similarity threshold percentage (default 50).
+    /// The optional value is the similarity threshold (`-M`, `-M<n>`, `-M<n>%`,
+    /// `--find-renames[=<n>]`, default 50%). `-M` keeps Git's glued-value short
+    /// form; the pre-clap argv scan records the raw value and applies the
+    /// shared `libra diff` score grammar.
     #[clap(
+        short = 'M',
         long = "find-renames",
         value_name = "PERCENT",
         num_args = 0..=1,
@@ -508,6 +513,18 @@ pub(crate) fn normalize_status_argv(
                 // Placeholder keeps clap from rejecting Git raw syntax the
                 // resolver validates later.
                 argv[j] = std::ffi::OsString::from("--find-renames=50");
+            } else if tok == "-M" {
+                // WT-02: `-M` is the short spelling of `--find-renames`; a
+                // bare `-M` is the default threshold. The raw value is
+                // recorded here and the token is rewritten so clap never
+                // sees Git's glued score syntax.
+                occurrences.push(RenameThresholdOccurrence::FindRaw(std::ffi::OsString::new()));
+                argv[j] = std::ffi::OsString::from("-M50");
+            } else if let Some(raw) = tok.strip_prefix("-M") {
+                occurrences.push(RenameThresholdOccurrence::FindRaw(
+                    std::ffi::OsString::from(raw),
+                ));
+                argv[j] = std::ffi::OsString::from("-M50");
             } else if tok == "--renames" {
                 occurrences.push(RenameThresholdOccurrence::EnableDefault);
             } else if tok == "--no-renames" {
@@ -533,12 +550,31 @@ pub(crate) fn normalize_status_argv(
                 // every character after that is a VALUE, not a flag. `-uno`
                 // is `-u=no` and `-J=ndjson` is a global with an attached
                 // value; neither contributes flags.
-                for ch in cluster.chars() {
+                for (idx, ch) in cluster.char_indices() {
                     if ch == '=' {
                         break;
                     }
                     match status_shorts.get(&ch) {
-                        Some(true) => break,
+                        Some(true) => {
+                            // `-M` is the one OPTIONAL-value short (WT-02): the
+                            // rest of the cluster after `M` is its raw
+                            // threshold, so `-sM90` is `-s` plus `-M90`. Every
+                            // other value-taking short keeps the plain break.
+                            if ch == 'M' {
+                                let rest = &cluster[idx + ch.len_utf8()..];
+                                let raw = if rest.is_empty() {
+                                    std::ffi::OsString::new()
+                                } else {
+                                    std::ffi::OsString::from(rest)
+                                };
+                                occurrences.push(RenameThresholdOccurrence::FindRaw(raw));
+                                // Preserve the preceding flags; only the value
+                                // is replaced by the clap-safe placeholder.
+                                argv[j] =
+                                    std::ffi::OsString::from(format!("-{}M50", &cluster[..idx]));
+                            }
+                            break;
+                        }
                         // An unknown letter means this is not a cluster we
                         // understand; clap will report it. Recording flags
                         // from the rest would be guessing.
@@ -793,6 +829,11 @@ declare_status_warning_enum! {
         /// with an empty structured list — §B.5 forbids a stderr-only
         /// channel.
         RepositoryPreflight = 14,
+        /// #486: the upstream ahead/behind counts could not be computed (a
+        /// commit in either history, or the shallow boundary list, could not
+        /// be read). The counts are omitted — never guessed — and the rest of
+        /// status is unaffected.
+        UpstreamCountsUnavailable = 15,
     }
 }
 
@@ -807,9 +848,9 @@ impl StatusWarningCode {
             StatusWarningCode::SimilarityBudgetExceeded
             | StatusWarningCode::RenameLimitProductSkipped
             | StatusWarningCode::RenamePathEncodingUnsupported => StatusWarningSource::RenameDetect,
-            StatusWarningCode::MetadataUnavailable | StatusWarningCode::MetadataBudgetExceeded => {
-                StatusWarningSource::Metadata
-            }
+            StatusWarningCode::MetadataUnavailable
+            | StatusWarningCode::MetadataBudgetExceeded
+            | StatusWarningCode::UpstreamCountsUnavailable => StatusWarningSource::Metadata,
             StatusWarningCode::WorktreeBudgetExceeded
             | StatusWarningCode::WorktreeReadFailed
             | StatusWarningCode::WorktreePermissionDenied
@@ -1167,9 +1208,10 @@ impl From<StatusError> for CliError {
 pub struct UpstreamInfo {
     /// Tracking ref display name, e.g. "origin/main"
     pub remote_ref: String,
-    /// Commits ahead of upstream (None when gone)
+    /// Commits ahead of upstream (None when gone, on an unborn branch, or when
+    /// the counts cannot be computed)
     pub ahead: Option<usize>,
-    /// Commits behind upstream (None when gone)
+    /// Commits behind upstream (None in the same cases as `ahead`)
     pub behind: Option<usize>,
     /// True when upstream is configured but tracking ref no longer exists
     pub gone: bool,
@@ -1334,10 +1376,14 @@ async fn collect_status_data(
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
+    // ADR-FM-05 (FM-04): mode-only worktree changes are reported only when
+    // core.fileMode is enabled.
+    let file_mode = crate::internal::config::core_file_mode().await?;
     let worktree = status_untracked::collect_status_worktree_changes(
         args.untracked_files.unwrap_or(UntrackedFiles::Normal),
         args.ignored,
         ignore_case,
+        file_mode,
     )
     .map_err(CliError::from)?;
     let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
@@ -1564,7 +1610,7 @@ async fn collect_status_data(
     };
 
     // Resolve upstream tracking info
-    let upstream = resolve_upstream_info(&head, head_oid.as_ref()).await?;
+    let upstream = resolve_upstream_info(&head, head_oid.as_ref(), &mut warnings).await?;
     let merge_state = match merge::MergeState::load_optional_sync().map_err(|detail| {
         CliError::fatal(format!("failed to inspect merge state: {detail}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
@@ -1613,11 +1659,13 @@ async fn collect_status_data(
             source: StatusWarningCode::RepositoryPreflight.source(),
         });
     }
+    // The upstream-count warning is a `metadata` read failure too, but it
+    // never touched rename detection.
     rename_scan_blocked |= warnings.iter().any(|warning| {
         matches!(
             warning.source,
             StatusWarningSource::Worktree | StatusWarningSource::Metadata
-        )
+        ) && warning.code != StatusWarningCode::UpstreamCountsUnavailable
     });
     let mut data = StatusData {
         head,
@@ -1828,6 +1876,7 @@ fn filter_status_data_by_pathspec(data: &mut StatusData, args: &StatusArgs) -> C
                     warning.source,
                     StatusWarningSource::Worktree | StatusWarningSource::Metadata
                 ) && !warning.message.starts_with("cannot inspect '")
+                    && warning.code != StatusWarningCode::UpstreamCountsUnavailable
             });
         }
     }
@@ -2652,6 +2701,11 @@ pub(crate) async fn execute_safe_with_resolution(
     // Fail closed on invalid `status.*` config before any mode runs or any
     // output is produced; CLI flags keep precedence inside the resolver.
     let mut extras = apply_status_config_defaults(&mut args).await?;
+    // ADR-FM-04 K6: an invalid `core.fileMode` fails status closed (no output,
+    // zero writes) with the commit.verbose mapping.
+    let _ = crate::internal::config::core_file_mode().await?;
+    crate::command::status::warn_sparse_checkout_unsupported_once().await;
+
     if let Some(resolution) = resolution {
         extras.rename_threshold = resolve_status_threshold(&args, Some(resolution))?;
         // The argv scan and clap must agree about which format flags were
@@ -3534,7 +3588,9 @@ async fn run_status_cache_mode(
     } else {
         None
     };
-    let upstream = resolve_upstream_info(&head, head_oid_hash.as_ref()).await?;
+    let mut upstream_warnings = Vec::new();
+    let upstream =
+        resolve_upstream_info(&head, head_oid_hash.as_ref(), &mut upstream_warnings).await?;
     let merge_state = match merge::MergeState::load_optional_sync().map_err(|detail| {
         CliError::fatal(format!("failed to inspect merge state: {detail}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
@@ -3608,6 +3664,7 @@ async fn run_status_cache_mode(
                 .collect::<Vec<_>>()
                 .into_iter()
                 .chain(preflight.drain(..))
+                .chain(upstream_warnings)
                 .collect()
         },
         quote_path: extras.quote_path,
@@ -6067,16 +6124,19 @@ fn print_branch_info(
                 if u.gone {
                     format!("## {tracking} [gone]")
                 } else if show_ahead_behind {
-                    let ahead = u.ahead.unwrap_or(0);
-                    let behind = u.behind.unwrap_or(0);
-                    if ahead > 0 && behind > 0 {
-                        format!("## {tracking} [ahead {ahead}, behind {behind}]")
-                    } else if ahead > 0 {
-                        format!("## {tracking} [ahead {ahead}]")
-                    } else if behind > 0 {
-                        format!("## {tracking} [behind {behind}]")
-                    } else {
-                        format!("## {tracking}")
+                    match (u.ahead, u.behind) {
+                        (Some(ahead), Some(behind)) if ahead > 0 && behind > 0 => {
+                            format!("## {tracking} [ahead {ahead}, behind {behind}]")
+                        }
+                        (Some(ahead), Some(_)) if ahead > 0 => {
+                            format!("## {tracking} [ahead {ahead}]")
+                        }
+                        (Some(_), Some(behind)) if behind > 0 => {
+                            format!("## {tracking} [behind {behind}]")
+                        }
+                        // Up to date, or no counts (unborn branch, or counts
+                        // that could not be computed).
+                        _ => format!("## {tracking}"),
                     }
                 } else {
                     format!("## {tracking}")
@@ -6129,9 +6189,13 @@ fn write_branch_info_v2(
     if let Some(u) = upstream {
         write!(writer, "# branch.upstream {}", u.remote_ref).map_err(write_err)?;
         writer.write_all(term).map_err(write_err)?;
-        if !u.gone && show_ahead_behind {
-            let ahead = u.ahead.unwrap_or(0);
-            let behind = u.behind.unwrap_or(0);
+        // Like Git, `# branch.ab` is only written when the counts exist: an
+        // unborn branch or uncountable history omits the line rather than
+        // claiming `+0 -0`.
+        if !u.gone
+            && show_ahead_behind
+            && let (Some(ahead), Some(behind)) = (u.ahead, u.behind)
+        {
             write!(writer, "# branch.ab +{ahead} -{behind}").map_err(write_err)?;
             writer.write_all(term).map_err(write_err)?;
         }
@@ -6160,9 +6224,13 @@ fn status_config_read_error(context: &str, error: anyhow::Error) -> CliError {
         .with_stable_code(StableErrorCode::IoReadFailed)
 }
 
+/// When the ahead/behind counts cannot be computed, the reason is pushed onto
+/// `warnings` as an `upstream_counts_unavailable` warning — this invocation's
+/// structured list, never the process-wide warning tracker (§B.4.3).
 async fn resolve_upstream_info(
     head: &Head,
     local_commit: Option<&ObjectHash>,
+    warnings: &mut Vec<StatusWarning>,
 ) -> CliResult<Option<UpstreamInfo>> {
     let branch_name = match head {
         Head::Branch(name) => name.clone(),
@@ -6182,7 +6250,11 @@ async fn resolve_upstream_info(
 
     let remote = &branch_config.remote;
     let merge_branch = &branch_config.merge;
-    let remote_ref_display = format!("{remote}/{merge_branch}");
+    let remote_ref_display = if remote == "." {
+        merge_branch.clone()
+    } else {
+        format!("{remote}/{merge_branch}")
+    };
 
     // Tracking refs are stored under their fully-qualified
     // `refs/remotes/<remote>/<branch>` name (clone/fetch/push writers), so the
@@ -6190,15 +6262,21 @@ async fn resolve_upstream_info(
     // every fresh clone report "upstream is gone" (#464). The short-name probe
     // is kept as a fallback for repositories written before the
     // fully-qualified convention.
-    let tracking_full_ref = format!("refs/remotes/{remote}/{merge_branch}");
-    let tracking_branch = Branch::find_branch_result(&tracking_full_ref, Some(remote))
-        .await
-        .map_err(|error| status_branch_store_error("resolve upstream branch", error))?;
-    let tracking_branch = match tracking_branch {
-        Some(branch) => Some(branch),
-        None => Branch::find_branch_result(merge_branch, Some(remote))
+    let tracking_branch = if remote == "." {
+        Branch::find_branch_result(merge_branch, None)
             .await
-            .map_err(|error| status_branch_store_error("resolve upstream branch", error))?,
+            .map_err(|error| status_branch_store_error("resolve upstream branch", error))?
+    } else {
+        let tracking_full_ref = format!("refs/remotes/{remote}/{merge_branch}");
+        let tracking_branch = Branch::find_branch_result(&tracking_full_ref, Some(remote))
+            .await
+            .map_err(|error| status_branch_store_error("resolve upstream branch", error))?;
+        match tracking_branch {
+            Some(branch) => Some(branch),
+            None => Branch::find_branch_result(merge_branch, Some(remote))
+                .await
+                .map_err(|error| status_branch_store_error("resolve upstream branch", error))?,
+        }
     };
 
     let tracking_commit = match tracking_branch {
@@ -6229,82 +6307,48 @@ async fn resolve_upstream_info(
         }
     };
 
-    let (ahead, behind) = compute_ahead_behind(local_commit, &tracking_commit);
+    let (ahead, behind) = match upstream_ahead_behind(local_commit, &tracking_commit) {
+        Ok((ahead, behind)) => (Some(ahead), Some(behind)),
+        Err(reason) => {
+            let code = StatusWarningCode::UpstreamCountsUnavailable;
+            warnings.push(StatusWarning {
+                code,
+                message: format!(
+                    "cannot count commits ahead/behind '{remote_ref_display}': {reason}"
+                ),
+                source: code.source(),
+            });
+            (None, None)
+        }
+    };
 
     Ok(Some(UpstreamInfo {
         remote_ref: remote_ref_display,
-        ahead: Some(ahead),
-        behind: Some(behind),
+        ahead,
+        behind,
         gone: false,
     }))
 }
 
-/// Compute the number of commits ahead/behind between two refs.
+/// Count how far `local` and `upstream` have diverged for the tracking segment
+/// of `status` and `branch -vv`, as `(ahead, behind)`.
 ///
-/// Performs a bidirectional BFS from both tips, classifying each commit as
-/// local-only, remote-only, or common (reachable from both sides).  Once a
-/// commit is found from the opposite side it is reclassified as common and
-/// its ancestors are not enqueued again, which reduces redundant work when
-/// the histories share a recent merge-base.
-///
-/// **Complexity**: proportional to the number of commits reachable from
-/// both tips until the queues are drained.  For disjoint histories (no
-/// common ancestor) this visits all reachable commits from both sides.
-/// Falls back gracefully when a commit object is missing or corrupt
-/// (e.g. shallow clone) by stopping traversal on that branch.
-pub(crate) fn compute_ahead_behind(local: &ObjectHash, remote: &ObjectHash) -> (usize, usize) {
-    if local == remote {
-        return (0, 0);
+/// Delegates to [`crate::internal::merge_base::ahead_behind`], the painting
+/// shared with merge-base, with the repository's shallow boundaries treated as
+/// roots. `Err` carries a human-readable reason when the counts cannot be known
+/// (unreadable shallow metadata, or a commit in either history that cannot be
+/// loaded); callers then show no counts instead of a guessed number.
+pub(crate) fn upstream_ahead_behind(
+    local: &ObjectHash,
+    upstream: &ObjectHash,
+) -> Result<(usize, usize), String> {
+    if local == upstream {
+        return Ok((0, 0));
     }
-
-    let mut local_only: HashSet<ObjectHash> = HashSet::new();
-    let mut remote_only: HashSet<ObjectHash> = HashSet::new();
-    let mut common: HashSet<ObjectHash> = HashSet::new();
-    let mut local_queue: VecDeque<ObjectHash> = VecDeque::new();
-    let mut remote_queue: VecDeque<ObjectHash> = VecDeque::new();
-
-    local_queue.push_back(*local);
-    remote_queue.push_back(*remote);
-
-    while !local_queue.is_empty() || !remote_queue.is_empty() {
-        // Expand one commit from the local side.
-        if let Some(hash) = local_queue.pop_front() {
-            if common.contains(&hash) {
-                // Already common — skip without expanding parents.
-                continue;
-            } else if remote_only.remove(&hash) {
-                // Discovered from the remote side too → merge-base.
-                common.insert(hash);
-            } else if local_only.insert(hash)
-                && let Some(commit) = Commit::try_load(&hash)
-            {
-                for parent in &commit.parent_commit_ids {
-                    if !common.contains(parent) {
-                        local_queue.push_back(*parent);
-                    }
-                }
-            }
-        }
-
-        // Expand one commit from the remote side.
-        if let Some(hash) = remote_queue.pop_front() {
-            if common.contains(&hash) {
-                continue;
-            } else if local_only.remove(&hash) {
-                common.insert(hash);
-            } else if remote_only.insert(hash)
-                && let Some(commit) = Commit::try_load(&hash)
-            {
-                for parent in &commit.parent_commit_ids {
-                    if !common.contains(parent) {
-                        remote_queue.push_back(*parent);
-                    }
-                }
-            }
-        }
-    }
-
-    (local_only.len(), remote_only.len())
+    let shallow = ShallowSet::load().map_err(|error| error.to_string())?;
+    crate::internal::merge_base::ahead_behind(local, upstream, shallow.oids())
+        .map(|counts| (counts.ahead, counts.behind))
+        .map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -6514,8 +6558,12 @@ fn changes_to_be_staged_with_policy_and_ignore_case(
         path: index_path.clone(),
         source,
     })?;
-    let (mut visible, ignored) =
-        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)?;
+    let (mut visible, ignored) = changes_to_be_staged_split_with_index(
+        &workdir,
+        &index,
+        ignore_case,
+        default_core_file_mode(),
+    )?;
     match policy {
         IgnorePolicy::Respect => Ok(visible),
         IgnorePolicy::OnlyIgnored => Ok(ignored),
@@ -6535,13 +6583,83 @@ pub fn changes_to_be_staged_split_safe() -> Result<(Changes, Changes), StatusErr
 pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
     ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
+    changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+        ignore_case,
+        default_core_file_mode(),
+    )
+}
+
+/// [`changes_to_be_staged_split_safe_with_ignore_case`] with an explicit
+/// `core.fileMode` value (FM-04): the callers already resolved the config.
+pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+    ignore_case: bool,
+    file_mode: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
+    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case, file_mode)
+}
+
+/// `changes_to_be_staged` with an explicit `core.fileMode` value (FM-04).
+pub fn changes_to_be_staged_with_file_mode(file_mode: bool) -> Result<Changes, StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
+    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
+        path: index_path.clone(),
+        source,
+    })?;
+    let (visible, _) =
+        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case, file_mode)?;
+    Ok(visible)
+}
+
+/// Platform default for `core.fileMode` when the config value is not resolved
+/// by a command entry: Unix enables mode comparison, other platforms do not.
+fn default_core_file_mode() -> bool {
+    cfg!(unix)
+}
+
+/// Owner-execute bit of a worktree file (false on platforms without POSIX
+/// permission bits).
+fn worktree_exec_bit(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// Emit the one-time `core.sparseCheckout=true` unsupported warning.
+///
+/// Libra honors the skip-worktree index bit but does not evaluate sparse
+/// patterns, so a repository that turns sparse checkout on gets one warning
+/// per process (ADR-SW-01 item 3).
+pub(crate) async fn warn_sparse_checkout_unsupported_once() {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if WARNED.get().is_some() {
+        return;
+    }
+    let Ok(Some(entry)) = ConfigKv::get("core.sparseCheckout").await else {
+        return;
+    };
+    if crate::internal::config::parse_git_bool(&entry.value) == Some(true) {
+        let _ = WARNED.set(());
+        eprintln!(
+            "warning: core.sparseCheckout=true is not supported; Libra honors the \
+             skip-worktree index bit only"
+        );
+    }
 }
 
 /// List changes to be staged with --force semantics (recurse into ignored directories)
@@ -6559,19 +6677,32 @@ fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError
 pub(crate) fn changes_to_be_staged_split_force_with_ignore_case(
     ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
+    changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+        ignore_case,
+        default_core_file_mode(),
+    )
+}
+
+/// [`changes_to_be_staged_split_force_with_ignore_case`] with an explicit
+/// `core.fileMode` value (FM-04).
+pub(crate) fn changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+    ignore_case: bool,
+    file_mode: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case)
+    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case, file_mode)
 }
 
 fn changes_to_be_staged_split_force_with_index(
     workdir: &PathBuf,
     index: &Index,
     ignore_case: bool,
+    file_mode: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
@@ -6610,16 +6741,30 @@ fn changes_to_be_staged_split_force_with_index(
             }
         }
         let file_abs = workdir.join(file);
-        if file_abs.symlink_metadata().is_err() {
-            visible.deleted.push(file.clone());
-        } else if index.is_modified(file_str, 0, workdir) {
-            let file_hash =
-                calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                    path: file_abs.clone(),
-                    source,
-                })?;
-            if !index.verify_hash(file_str, 0, &file_hash) {
-                visible.modified.push(file.clone());
+        match file_abs.symlink_metadata() {
+            Err(_) => visible.deleted.push(file.clone()),
+            Ok(metadata) => {
+                // ADR-FM-05: with core.fileMode=true a regular file whose owner
+                // execute bit differs from the index is a mode-only change.
+                let mode_only_change = file_mode
+                    && metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && index.get(file_str, 0).is_some_and(|entry| {
+                        entry.mode & 0o100000 == 0o100000
+                            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+                    });
+                if mode_only_change {
+                    visible.modified.push(file.clone());
+                } else if index.is_modified(file_str, 0, workdir) {
+                    let file_hash =
+                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
+                            path: file_abs.clone(),
+                            source,
+                        })?;
+                    if !index.verify_hash(file_str, 0, &file_hash) {
+                        visible.modified.push(file.clone());
+                    }
+                }
             }
         }
     }
@@ -6659,6 +6804,7 @@ fn changes_to_be_staged_split_with_index(
     workdir: &PathBuf,
     index: &Index,
     ignore_case: bool,
+    file_mode: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
@@ -6670,6 +6816,15 @@ fn changes_to_be_staged_split_with_index(
         let Some(file_str) = file.to_str() else {
             continue;
         };
+        // ADR-SW-04 item 1: a skip-worktree entry is a sparse-checkout path —
+        // its worktree copy may legitimately be absent or stale, so neither
+        // shape is a change. add -u/-A and commit -a share this computation.
+        if index
+            .get(file_str, 0)
+            .is_some_and(|entry| entry.flags.skip_worktree)
+        {
+            continue;
+        }
         // A `160000` gitlink names a SUBMODULE commit, not a blob of this
         // repository. Comparing one against the working tree as a file reports
         // every submodule as deleted — or, when the directory exists, fails the
@@ -6705,16 +6860,30 @@ fn changes_to_be_staged_split_with_index(
             }
         }
         let file_abs = workdir.join(file);
-        if file_abs.symlink_metadata().is_err() {
-            visible.deleted.push(file.clone());
-        } else if index.is_modified(file_str, 0, workdir) {
-            let file_hash =
-                calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                    path: file_abs.clone(),
-                    source,
-                })?;
-            if !index.verify_hash(file_str, 0, &file_hash) {
-                visible.modified.push(file.clone());
+        match file_abs.symlink_metadata() {
+            Err(_) => visible.deleted.push(file.clone()),
+            Ok(metadata) => {
+                // ADR-FM-05: with core.fileMode=true a regular file whose owner
+                // execute bit differs from the index is a mode-only change.
+                let mode_only_change = file_mode
+                    && metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && index.get(file_str, 0).is_some_and(|entry| {
+                        entry.mode & 0o100000 == 0o100000
+                            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+                    });
+                if mode_only_change {
+                    visible.modified.push(file.clone());
+                } else if index.is_modified(file_str, 0, workdir) {
+                    let file_hash =
+                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
+                            path: file_abs.clone(),
+                            source,
+                        })?;
+                    if !index.verify_hash(file_str, 0, &file_hash) {
+                        visible.modified.push(file.clone());
+                    }
+                }
             }
         }
     }
@@ -7009,11 +7178,72 @@ mod argv_normalization_test {
         );
     }
 
+    /// WT-02: `-M[<raw>]` is scanned as another `--find-renames` spelling —
+    /// standalone and inside a short cluster — recording the raw value for
+    /// the resolver while argv carries the clap-safe placeholder.
+    #[test]
+    fn short_m_rename_spellings_are_scanned() {
+        let resolution = normalize(&["libra", "status", "--porcelain", "-M"]);
+        assert_eq!(resolution.rename_occurrences.len(), 1, "bare -M");
+        assert_eq!(
+            resolution.argv[3],
+            std::ffi::OsString::from("-M50"),
+            "bare -M is rewritten so clap cannot eat the next token"
+        );
+
+        let resolution = normalize(&["libra", "status", "-M90%"]);
+        assert_eq!(resolution.rename_occurrences.len(), 1, "glued -M90%");
+        assert_eq!(resolution.argv[2], std::ffi::OsString::from("-M50"));
+
+        let resolution = normalize(&["libra", "status", "-sM90"]);
+        assert_eq!(resolution.rename_occurrences.len(), 1, "clustered -sM90");
+        assert_eq!(
+            resolution.argv[2],
+            std::ffi::OsString::from("-sM50"),
+            "the preceding flags survive the rewrite"
+        );
+        assert!(
+            resolution.format.short_explicit,
+            "-s is still a format flag"
+        );
+    }
+
+    /// WT-02/M4: `-M` takes part in the LAST-occurrence-wins ordering across
+    /// all rename spellings, and only the winning raw value is interpreted.
+    #[test]
+    fn short_m_takes_part_in_last_wins_ordering() {
+        for (argv, expected) in [
+            (&["libra", "status", "-M", "--no-renames"][..], None),
+            (&["libra", "status", "--no-renames", "-M"][..], Some(30000)),
+            (&["libra", "status", "-M90", "--renames"][..], Some(30000)),
+            (&["libra", "status", "--renames", "-M90"][..], Some(54000)),
+            (&["libra", "status", "-M90%"][..], Some(54000)),
+        ] {
+            let resolution = normalize(argv);
+            let threshold = resolve_status_threshold(&StatusArgs::default(), Some(&resolution))
+                .unwrap_or_else(|error| panic!("{argv:?}: {error}"));
+            assert_eq!(threshold, expected, "{argv:?}");
+        }
+
+        // An invalid `-M` that a later spelling overrides is never parsed...
+        let resolution = normalize(&["libra", "status", "-Mabc", "--no-renames"]);
+        assert_eq!(
+            resolve_status_threshold(&StatusArgs::default(), Some(&resolution)).expect("resolve"),
+            None
+        );
+        // ...while an invalid WINNER fails closed with LBR-CLI-002 (M5).
+        let resolution = normalize(&["libra", "status", "-Mabc"]);
+        let error = resolve_status_threshold(&StatusArgs::default(), Some(&resolution))
+            .expect_err("invalid winner");
+        assert_eq!(error.stable_code(), StableErrorCode::CliInvalidArguments);
+    }
+
     /// §B.4.3: the API percent field accepts ONLY 0..=100 — a struct-literal
     /// caller passing 101..=255 fails closed with LBR-CLI-002 instead of a
     /// silent clamp to exact-only, and the clap parser path refuses the
     /// value outright (2026-08-05 R0-4 review).
     #[test]
+    #[serial_test::serial(cwd)]
     fn api_percent_above_100_fails_closed() {
         use clap::Parser as _;
 
@@ -7139,7 +7369,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn sequence_notice_surfaces_corrupt_sequence_kind() {
         let repo = tempdir().expect("failed to create temp repo");
         test::setup_with_new_libra_in(repo.path()).await;
@@ -7171,7 +7401,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env)]
     async fn resolve_upstream_info_surfaces_branch_config_query_failures() {
         let repo = tempdir().expect("failed to create temp repo");
         test::setup_with_new_libra_in(repo.path()).await;
@@ -7188,7 +7418,7 @@ mod test {
         .await
         .expect("dropping config_kv table should succeed");
 
-        let err = resolve_upstream_info(&Head::Branch("main".to_string()), None)
+        let err = resolve_upstream_info(&Head::Branch("main".to_string()), None, &mut Vec::new())
             .await
             .expect_err("missing config_kv table should surface as an error");
 
@@ -7249,6 +7479,7 @@ mod test {
     /// no worktree problem is published as `metadata`, and no object problem
     /// is published as `worktree`.
     #[test]
+    #[serial_test::serial(cwd)]
     fn content_skips_map_to_metadata_and_worktree_warnings() {
         use rename_detect::SkipReason;
         let mut stats = rename_detect::RenameDetectStats::default();
@@ -7320,6 +7551,7 @@ mod rename_destination_budget_test {
     /// restore a detection pass added after it would restart with fresh
     /// budgets, silently doubling the call-level caps (§B.3.4).
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn destination_detector_restores_budgets_and_records_comparisons() {
         let repo = tempfile::tempdir().expect("temp repo");
         // Minimal bare-layout markers so path discovery treats the temp dir
@@ -7441,7 +7673,7 @@ mod seam_gate_test {
     /// test harness: without `LIBRA_TEST` the production cap stays in
     /// effect; with the gate the override bites.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn comparison_budget_override_requires_the_harness_gate() {
         // SAFETY: serialized test body; every variable is removed again
         // before the test returns.

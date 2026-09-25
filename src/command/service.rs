@@ -22,7 +22,7 @@
 //! transport (the lore row's OR is satisfied by the loopback branch), a
 //! filesystem watcher feeding marks (accelerator only — needs a new heavy
 //! dependency; marks flow through the token-gated endpoint), repo/status
-//! read passthroughs, MCP (already served by `libra code`), daemonization
+//! read passthroughs, daemonization
 //! (foreground + external supervision), and §7.7 automatic replay.
 
 use std::{
@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{
-    command::code_control_files::{
+    command::control_lock::{
         CONTROL_INFO_VERSION, ControlInfo, ControlPaths, ControlScopePolicy, acquire_control_lock,
         cleanup_control_files, current_pid_starttime, ensure_control_token_file,
         ensure_scope_takeover_allowed, pid_is_live, resolve_control_scope,
@@ -702,7 +702,6 @@ async fn run_service(host: &str, port: u16, output: &OutputConfig) -> CliResult<
         mode: "service".to_string(),
         pid: std::process::id(),
         base_url: base_url.clone(),
-        mcp_url: None,
         working_dir: util::working_dir(),
         thread_id: None,
         started_at: chrono::Utc::now(),
@@ -812,14 +811,16 @@ async fn service_status(output: &OutputConfig) -> CliResult<()> {
                     "stale".to_string()
                 } else {
                     let url = format!("{}/api/health", info.base_url);
-                    match reqwest::Client::new()
-                        .get(&url)
+                    let health_client = reqwest::Client::builder()
+                        .no_proxy()
                         .timeout(std::time::Duration::from_secs(2))
-                        .send()
-                        .await
-                    {
-                        Ok(response) if response.status().is_success() => "ok".to_string(),
-                        _ => "unreachable".to_string(),
+                        .build();
+                    match health_client {
+                        Ok(client) => match client.get(&url).send().await {
+                            Ok(response) if response.status().is_success() => "ok".to_string(),
+                            _ => "unreachable".to_string(),
+                        },
+                        Err(_) => "unreachable".to_string(),
                     }
                 };
                 ServiceStatusReport {
@@ -872,7 +873,13 @@ async fn service_events(output: &OutputConfig) -> CliResult<()> {
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
     let url = format!("{}/api/service/events", info.base_url);
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| {
+            CliError::failure(format!("failed to build service HTTP client: {e}"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?
         .get(&url)
         .header(SERVICE_TOKEN_HEADER, token.trim())
         .send()

@@ -22,10 +22,13 @@ libra cloud status [--verbose]
 
 ## 全局配置 Schema 保护
 
-`libra cloud` 在信任远端 / tiered 对象存储设置前，会读取全局存储配置（`~/.libra/config.db`，或 `LIBRA_CONFIG_GLOBAL_DB` 指定的路径）。如果该数据库的 schema 版本比当前二进制支持的版本更新，cloud 命令会以 `LBR-CONFIG-001` fail-closed，而不是静默忽略全局存储配置并回退到本地对象。诊断会包含二进制路径和版本、配置 DB 路径、schema 版本，以及升级命令：
-`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
+配置 schema 兼容性按角色判定。`libra cloud` 在信任配置前，以只读方式检查 GlobalConfig 与 SystemConfig 元数据。真正的配置 future schema，或未注册／名称不匹配的迁移 receipt，在命令需要该作用域时以 `LBR-CONFIG-001` fail-closed。当前 manifest 已知的 Repository-only receipt（包括 `2026090801`）不会使配置库被误判为 future，受支持的配置值仍可读取。本 build 能识别 configuration-owned legacy-reader barrier；详见[配置兼容性](config.md#配置-schema-兼容性)。
 
-只有在明确希望本地对象访问时，才使用 `libra --offline cloud ...` 或 `LIBRA_READ_POLICY=offline|local libra cloud ...`。Libra 会告警一次，并在本次运行中忽略全局存储配置。
+全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 XDG 配置目录（`$XDG_CONFIG_HOME/libra/config.db`，默认 `<home>/.config/libra/config.db`），在自动迁移前回退到 legacy `<home>/.libra/config.db`；系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储设置可以证明无需 GlobalConfig（`cloud` 还须满足 D1 设置），但不能证明无需 SystemConfig 默认值。诊断只说明受影响的 scope、ledger 与版本，不输出配置值或未信任 receipt 名称。
+
+本阶段对未知／不支持的状态只有升级路径，不执行自动修复。安装兼容的较新 Libra：
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
+禁止手工删除或修改 SQLite receipt。仅在明确需要本地对象访问时使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`；这些模式会告警，并不授权远端同步。
 
 ## 选项
 
@@ -454,4 +457,4 @@ Libra 已经通过 `LIBRA_STORAGE_*` 环境变量为分层对象缓存提供通�
 | `LBR-IO-002` | 恢复对象哈希不匹配 |
 | `LBR-IO-002` | 保存恢复对象到本地存储失败 |
 | `LBR-IO-002` | 元数据同步/恢复失败 |
-| `LBR-IO-002` | cloud 操作前无法重放耐久的本地 object-index repair marker |
+| `LBR-IO-002` | cloud 操作前无法重放耐久的本地 object-index repair marker；若原因为锁超时，错误信息会指出锁持有者（pid 与用途）或说明无法判定持有者——等待该进程结束后重试（锁等待采用 Git 式二次退避，最长 10 秒），且不要删除 `.libra/object-index-repair-locks` 下的锁文件。只读命令在锁忙时静默跳过回放并由下一条命令重试；`cloud sync` 保持阻塞等待并 fail-closed |

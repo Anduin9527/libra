@@ -401,7 +401,8 @@ async fn test_push_invalid_remote() {
         eprintln!("skipped (LIBRA_TEST_GITHUB_TOKEN not set)");
         return;
     }
-    let temp_repo = init_temp_repo();
+    // Need a born `main` so `--set-upstream-to origin/main` can target it.
+    let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
     let _guard = ChangeDirGuard::new(temp_path);
 
@@ -857,7 +858,7 @@ fn test_push_merge_commit_to_git_remote_succeeds() {
 
 #[cfg(unix)]
 #[test]
-#[serial(env)]
+#[serial(env, cwd)]
 fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -878,6 +879,10 @@ fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
         "initial content",
         "initial commit",
     );
+    // This scenario spans multiple child Git and Libra processes while it
+    // asserts against one remote. Hold the process CWD lock so another
+    // command test cannot change ambient repository discovery mid-scenario.
+    let _cwd_guard = ChangeDirGuard::new(&local_dir);
     add_fake_ssh_remote(&local_dir, &remote_dir);
     let current_branch = current_branch_name(&local_dir);
 
@@ -1028,6 +1033,14 @@ fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
     let json: Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("tags push should emit valid JSON, got: {stdout}\nerror: {e}"));
     assert_eq!(json["data"]["updates"][0]["remote_ref"], "refs/tags/v1.0");
+    assert_eq!(
+        json["data"]["objects_pushed"], 0,
+        "same-tip lightweight tag should reuse the advertised branch history: {json}"
+    );
+    assert_eq!(
+        json["data"]["bytes_pushed"], 32,
+        "same-tip lightweight tag should send only the required empty SHA-1 pack: {json}"
+    );
     let tag_ref_out = Command::new("git")
         .args([
             "--git-dir",
@@ -1798,6 +1811,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
 
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args(["init", "--bare", remote_dir.to_str().unwrap()])
             .status()
             .expect("failed to init bare remote")
@@ -1826,6 +1840,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
 
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "clone",
                 "--branch",
@@ -1839,6 +1854,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1852,6 +1868,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1866,6 +1883,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     fs::write(other_dir.join("remote.txt"), "remote change").expect("failed to write remote file");
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args(["-C", other_dir.to_str().unwrap(), "add", "remote.txt"])
             .status()
             .expect("failed to add remote file")
@@ -1873,6 +1891,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1886,6 +1905,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1897,21 +1917,25 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
             .expect("failed to push remote change")
             .success()
     );
-    let remote_diverged_head = String::from_utf8(
-        Command::new("git")
-            .args([
-                "--git-dir",
-                remote_dir.to_str().unwrap(),
-                "rev-parse",
-                &format!("refs/heads/{current_branch}"),
-            ])
-            .output()
-            .expect("failed to read diverged remote head")
-            .stdout,
-    )
-    .expect("remote head not utf8")
-    .trim()
-    .to_string();
+    let remote_diverged_out = Command::new("git")
+        .current_dir(temp_root.path())
+        .args([
+            "--git-dir",
+            remote_dir.to_str().unwrap(),
+            "rev-parse",
+            &format!("refs/heads/{current_branch}"),
+        ])
+        .output()
+        .expect("failed to read diverged remote head");
+    assert!(
+        remote_diverged_out.status.success(),
+        "failed to read diverged remote head: {}",
+        String::from_utf8_lossy(&remote_diverged_out.stderr)
+    );
+    let remote_diverged_head = String::from_utf8(remote_diverged_out.stdout)
+        .expect("remote head not utf8")
+        .trim()
+        .to_string();
 
     fs::write(local_dir.join("tracked.txt"), "local divergent change")
         .expect("failed to write local divergent file");
@@ -1963,21 +1987,25 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
         "quiet force push should preserve warning output, got: {stderr}"
     );
 
-    let final_remote_head = String::from_utf8(
-        Command::new("git")
-            .args([
-                "--git-dir",
-                remote_dir.to_str().unwrap(),
-                "rev-parse",
-                &format!("refs/heads/{current_branch}"),
-            ])
-            .output()
-            .expect("failed to read final remote head")
-            .stdout,
-    )
-    .expect("final remote head not utf8")
-    .trim()
-    .to_string();
+    let final_remote_out = Command::new("git")
+        .current_dir(temp_root.path())
+        .args([
+            "--git-dir",
+            remote_dir.to_str().unwrap(),
+            "rev-parse",
+            &format!("refs/heads/{current_branch}"),
+        ])
+        .output()
+        .expect("failed to read final remote head");
+    assert!(
+        final_remote_out.status.success(),
+        "failed to read final remote head: {}",
+        String::from_utf8_lossy(&final_remote_out.stderr)
+    );
+    let final_remote_head = String::from_utf8(final_remote_out.stdout)
+        .expect("final remote head not utf8")
+        .trim()
+        .to_string();
     assert_ne!(
         remote_diverged_head, final_remote_head,
         "force push should still update the remote ref"
@@ -2178,18 +2206,60 @@ async fn test_push_ssh_host_key_failure_is_reported() {
         String::from_utf8_lossy(&remote_add_out.stderr)
     );
 
-    let push_out = libra_command(&local_dir)
-        .env("LIBRA_SSH_COMMAND", &ssh_script)
-        .env("LIBRA_TEST_SSH_FAIL", "hostkey")
-        .args(["push", "origin", &current_branch])
-        .output()
-        .expect("failed to run push over fake ssh");
-    let stderr = String::from_utf8_lossy(&push_out.stderr);
-    assert!(
-        stderr.contains("Host key verification failed."),
-        "push should surface SSH host-key failures, stderr: {stderr}"
-    );
-
+    for mode in [None, Some("--json"), Some("--machine")] {
+        let mut command = libra_command(&local_dir);
+        command
+            .env("LIBRA_SSH_COMMAND", &ssh_script)
+            .env("LIBRA_TEST_SSH_FAIL", "hostkey");
+        if let Some(mode) = mode {
+            command.arg(mode);
+        }
+        let output = command
+            .args(["push", "origin", &current_branch])
+            .output()
+            .expect("failed to run push over fake ssh");
+        assert_eq!(output.status.code(), Some(128), "{mode:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("\"error_code\""),
+            "{mode:?}: missing structured error: {stderr}"
+        );
+        let (_, report) = super::parse_cli_error_stderr(&output.stderr);
+        assert_eq!(report.error_code, "LBR-NET-001", "{mode:?}: {report:?}");
+        assert_eq!(report.exit_code, 128, "{mode:?}: {report:?}");
+        for expected in [
+            "SSH host trust needs confirmation:",
+            "SSH host key could not be verified",
+            "verify the host fingerprint",
+            "trusted provider console",
+            "ssh.strictHostKeyChecking",
+        ] {
+            assert!(
+                report.message.contains(expected),
+                "{mode:?}: missing {expected:?}: {report:?}"
+            );
+        }
+        assert_eq!(
+            report.hints.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["check the remote URL and network connectivity"],
+            "{mode:?}: {report:?}"
+        );
+        assert!(
+            !report.message.contains("pkt-line protocol error:"),
+            "{mode:?}: {report:?}"
+        );
+        assert!(
+            !report.message.contains("ssh-keyscan"),
+            "{mode:?}: {report:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for text in [stderr.as_ref(), stdout.as_ref()] {
+            assert!(
+                !text.contains("Host key verification failed."),
+                "raw SSH stderr leaked in {mode:?}: {text}"
+            );
+        }
+    }
     let remote_head_out = Command::new("git")
         .args([
             "--git-dir",
@@ -2337,7 +2407,7 @@ fn interop_setup(
 /// unpack-objects below it), with a fixture guaranteeing a real delta win.
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn test_push_thin_roundtrip_real_git_both_unpack_paths() {
     for unpack_limit in ["1", "10000"] {
         let temp_root = tempfile::tempdir().expect("temp root");

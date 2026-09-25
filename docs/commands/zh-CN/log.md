@@ -18,6 +18,8 @@ libra log [OPTIONS] [<revision-range>] [[--] <path>...]
 
 当 stdout 被管道连接且下游命令提前退出时，`libra log` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
 
+浅克隆中，`.libra/shallow` 列出的提交会被当作根：`log` 不再跟随它们的父提交。损坏的 `.libra/shallow` 会 fail-closed（`LBR-REPO-002`）。若父提交从未获取却删除了该文件，同样 fail-closed，并提示运行 `libra fsck`。`%P` / `--parents` 仍打印对象里记录的父提交 ID。
+
 ## 选项
 
 ### `-n, --number <N>`
@@ -176,6 +178,12 @@ libra log --author "alice@example.com"
 按提交消息过滤。`--grep` 保留消息包含该（大小写敏感）子串的提交；`-i` /
 `--regexp-ignore-case` 改为大小写不敏感匹配（author/committer 在 Libra 中本就大小写不敏感）；
 `--invert-grep` 保留消息**不**匹配的提交。
+
+搜索范围包括提交标题、正文和 trailer；嵌入的 PGP/SSH 签名头不参与匹配，
+`-i` 和 `--invert-grep` 也遵循同一范围。实际消息中的文本仍可搜索。
+人类输出、`--json` 和 `--machine` 使用相同筛选范围。空 `--grep` 模式保持不过滤消息的既有行为。
+实际消息开头的空格、tab 和空行仍可搜索。
+此处识别紧跟 committer 的 gpgsig/gpgsig-sha256 签名头；其他导入头顺序（例如 encoding 在 gpgsig 前）沿用既有解析行为。
 
 ```bash
 libra log --grep "fix(" -n 20
@@ -366,7 +374,7 @@ libra log -L1,10:src/main.rs
 
 ### `[PATHS...]`
 
-将 diff 输出限制到指定路径。与 `-p`、`--name-only`、`--name-status`、`--stat` 或 `--shortstat` 一起使用。
+将 diff 输出限制到指定路径。与 `-p`、`--name-only`、`--name-status`、`--stat` 或 `--shortstat` 一起使用。路径经共享 pathspec 引擎匹配：普通前缀、通配符以及 `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` magic 均可用；`--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` 会将其转为字面匹配。
 
 ```bash
 libra log -- src/

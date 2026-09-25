@@ -16,6 +16,17 @@
 #                    resource universe or exclusion strength is LOST).
 # Idempotent: converted attributes map back to their own text, so a second
 # run writes nothing.
+#
+# HISTORICAL INPUT (DEFER-NP-02, 2026-09-17): the frozen manifest records
+# the 2026-08-28 conversion verdicts, in which fail-closed bodies carry the
+# full key universe (`lane:cloud_live+cwd+env+hash_kind+workspace_failpoints`).
+# Those attributes have since been narrowed in the tree to the in-process
+# closed set `#[serial(cwd, env, hash_kind)]`, and tests/SERIAL_REGISTRY.tsv
+# (guarded against the live classifier) is the source of truth. Re-running
+# this converter is NOT a way to "restore" the wide form: the manifest is
+# stale against today's tree, so the run refuses with exit 2 — and it
+# validates every site key BEFORE touching any file, so a stale manifest can
+# never leave the tree half-rewritten.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || { echo "FAIL: cannot reach the repository root" >&2; exit 2; }
 [ -f tests/SERIAL_MANIFEST.tsv ] || { echo "FAIL: tests/SERIAL_MANIFEST.tsv missing (freeze it first)" >&2; exit 2; }
@@ -43,17 +54,30 @@ for ln in io.open(os.environ['SITES'], encoding='utf-8'):
     sites.setdefault(path, []).append(
         (key, int(sl), int(sc), int(el), int(ec)))
 
+# Fail closed BEFORE the first write: every site key must be adjudicated by
+# the frozen manifest, otherwise a stale manifest would rewrite the files
+# sorted before the first unknown key and then abort, leaving the tree
+# half-converted.
+missing = sorted(
+    (path, key)
+    for path, rows in sites.items()
+    for key, _sl, _sc, _el, _ec in rows
+    if key not in manifest)
+if missing:
+    for path, key in missing:
+        print('FAIL: %s names %s, absent from the frozen manifest — '
+              'the tree drifted; investigate before converting'
+              % (path, key), file=sys.stderr)
+    print('FAIL: %d site key(s) absent from the frozen manifest; no file was '
+          'written' % len(missing), file=sys.stderr)
+    sys.exit(2)
+
 changed = 0
 for path, rows in sorted(sites.items()):
     lines = io.open(path, encoding='utf-8').read().split('\n')
     dirty = False
     # bottom-up so earlier spans stay valid
     for key, sl, sc, el, ec in sorted(rows, key=lambda r: (-r[1], -r[2])):
-        if key not in manifest:
-            print('FAIL: %s names %s, absent from the frozen manifest — '
-                  'the tree drifted; investigate before converting'
-                  % (path, key), file=sys.stderr)
-            sys.exit(2)
         verdict = manifest[key]
         span = lines[sl][sc:ec] if sl == el else (
             lines[sl][sc:] + '\n'

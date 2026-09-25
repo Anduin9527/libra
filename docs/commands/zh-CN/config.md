@@ -16,6 +16,9 @@ libra config import [--global]
 libra config path [--global | --system]
 libra config generate-ssh-key --remote <name>
 libra config generate-gpg-key [--name <name>] [--email <email>] [--usage <usage>]
+libra config import-gpg-key [--list] [--key <fpr>] [--file <path>] [--passphrase-file <path>] [--replace]
+libra config export-gpg-key [--fingerprint] [--out <path>]
+libra config remove-gpg-key [--force]
 ```
 
 也支持 Git 兼容的标志风格（从帮助中隐藏）：
@@ -28,7 +31,7 @@ libra config --rename-section <old-name> <new-name>
 
 ## 说明
 
-`libra config` 跨三个 scope 读写配置值：**local**（仓库级，存储在 `.libra/libra.db`）、**global**（用户级，存储在 `~/.libra/config.db`）和 **system**（机器级，存储在 `/etc/libra/config.db`；级联优先级最低，仅纯配置——无 vault）。各数据库都使用 SQLite 和 `config_kv` 表。
+`libra config` 跨三个 scope 读写配置值：**local**（仓库级，存储在 `.libra/libra.db`）、**global**（用户级，存储在 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`；既有的 legacy `~/.libra/config.db` 会在首次使用时自动复制过去，并原样保留为备份）和 **system**（机器级，存储在 `/etc/libra/config.db`；级联优先级最低，仅纯配置——无 vault）。各数据库都使用 SQLite 和 `config_kv` 表。
 
 不同于 Git 的明文 INI 文件或 jj 的 TOML 文件，Libra 将配置存储在事务型数据库中，并集成 vault 加密。敏感值（API keys、tokens、SSH 私钥）会使用 AES-256-GCM 自动静态加密。
 
@@ -44,6 +47,175 @@ libra config --rename-section <old-name> <new-name>
 只给一个位置参数、不给值时是**读取**，与 `git config <key>` 一致：把已存储的值写 stdout 并以 0 退出；多值 key 返回**最后一个**值；级联顺序与 `get` 完全相同（local → global → system）；加密值渲染为 `<REDACTED>`（要明文用 `config get --reveal`）。key 未设置时以 **exit 1** + `LBR-CLI-002` 失败。`-z`/`--null` 与 `get` 上的行为一致：值以 NUL 而非换行结尾。
 
 **与 Git 的有意差异**：对**受保护 key**——即 Libra 判定为机密的 key（`vault.env.*`、`auth.token.*`、`*.privkey`，或末段包含 `secret`、`token`、`password`、`credential`、`apikey`、`accesskey`、`privatekey`、`secretkey`）——裸读形式保留 Libra 的交互式安全赋值路径：它会**无回显地提示输入新值**，而不是打印已存储的值。没有终端时报 `missing value for protected key '<key>' (non-interactive environment)` 并以 2 退出。要读取受保护 key 请用 `libra config get <key>`，它返回 `<REDACTED>`。该差异已登记在 `COMPATIBILITY.md`。
+
+## 配置 schema 兼容性
+
+GlobalConfig 与 SystemConfig 使用独立的配置 ledger `configuration_schema_versions`。当前 manifest 已知的 Repository-only receipt（包括 `2026090801`）不会使配置库被误判为 future。未知或名称不匹配的 receipt、真正的配置 future schema 仍不受支持；remote/cloud 命令需要该作用域时，以 `LBR-CONFIG-001` fail-closed。
+
+显式的 global/system 配置修改会把 configuration-owned legacy-reader barrier 与配置数据放在同一个事务内。该标记是 legacy ledger 中的保留 receipt，使固定旧版 `0.22.16` 等旧 binary 在写入前拒绝此库；本 build 只有在精确匹配标记且存在有效 configuration base receipt 时才承认它。事务失败时，标记和本次配置修改一起回滚，原有 legacy receipt 不会被覆盖或删除。
+
+scoped get/list、默认值级联与 remote preflight 不写入 barrier；配置级联以只读方式查询，不创建缺失的库。此兼容性迁移只能前滚，旧 binary 必须升级；禁止通过删除 receipt 或手工编辑 SQLite 强行降级。识别受支持的 Repository receipt 不等于允许自动 repair；本版本对未知／不支持的状态仅提供升级路径。
+
+全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 XDG 配置目录（`$XDG_CONFIG_HOME/libra/config.db`，默认 `<home>/.config/libra/config.db`，各平台一致）；当只存在 legacy `<home>/.libra/config.db` 时，它仍是活动文件，因此读写不会分裂到两个库；第一条真正读写 global 配置的命令会把它一次性复制到 XDG 路径（见 [legacy global 库的首次使用自动迁移](#legacy-global-库的首次使用自动迁移)）。`LIBRA_CONFIG_GLOBAL_DB` 是逐字覆写，同时禁用 XDG 默认、legacy 回退与自动迁移。系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储配置可以证明无需 GlobalConfig，但不能绕过 remote/cloud 对 SystemConfig 默认值的兼容性检查。只有在明确需要本地对象访问时才使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`，不能借此绕过远端同步安全检查。
+
+## legacy global 库的首次使用自动迁移
+
+XDG 布局之前的版本把用户级配置存放在 `<home>/.libra/config.db`。当该文件存在
+而 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db` 不存在时，第一条真正读写
+global 配置的命令会执行一次性迁移：
+
+1. 创建配置目录（Unix 下 `0700`），并用 `.config.db.migrate.lock` 咨询锁串行化，
+   并发命令最多只迁移一次；
+2. 以**只读**方式打开 legacy 文件，用 SQLite 的 `VACUUM INTO` 复制到目标目录下的
+   `config.db.migrate.<pid>.<nonce>.tmp` —— 这是合并了 WAL 内容的一致性快照；
+3. 快照必须通过 `PRAGMA integrity_check`，且迁移 receipt 与 `config_kv` 行数
+   与 legacy 完全一致；
+4. 通过同目录 `rename` 原子发布，Unix 下再收紧为 `0600`。
+
+本次迁移不涉及 schema 变更：副本原样携带 legacy 的
+`configuration_schema_versions` receipt。
+
+legacy 文件永远不会被重命名、修改或删除 —— 它作为降级备份保留。新路径出现后
+Libra 不再读取它；当你不再需要运行旧版本时可以自行删除。`libra config path` 与
+`libra config doctor --global-schema` 是诊断命令：它们报告 `migration_pending`，
+但自身从不执行迁移。
+
+验证结果：
+
+```bash
+libra --json config path --global
+# "path": "/home/user/.config/libra/config.db", "source": "home",
+# "migration_pending": false, "legacy_exists": true
+```
+
+当迁移无法进行（例如配置目录不可写，或 legacy 文件不是 Libra 配置库）时，
+legacy 库继续生效：
+
+- **读**照常返回，并打印一条 `warning:`，说明目标路径、失败原因以及
+  `LIBRA_CONFIG_GLOBAL_DB` 兜底方案；
+- **写** fail-closed 并返回 `LBR-IO-002`，而不是写入一个即将被取代的库。
+
+### 全域 vault 密钥随之迁移
+
+加密 `vault.*` 与 `auth.token.*` 值的全域 unseal key（AES-256-GCM）与它保护的
+库同域，位于 `<XDG_CONFIG_HOME 或 ~/.config>/libra/vault-unseal-key`
+（文件 `0600`，父目录 `0700`）。XDG 之前的 `~/.libra/vault-unseal-key` 会在首次
+使用时复制过去，旧文件原样保留为备份；密钥内容不变，因此迁移前加密的值迁移后
+仍可解密。
+
+密钥绝不会为了绕过问题而轮换：
+
+- 两份文件内容**不同**时 fail-closed 并列出两个路径 —— 任选其一都会让用另一把
+  密钥加密的值永久不可读；
+- 密钥文件不可读或格式非法是错误，而不是生成新密钥的理由。
+
+per-repo 密钥（`~/.libra/vault-keys/<repo-id>`）与 vault 临时目录
+（`~/.libra/tmp`）属于仓库状态而非用户配置，保持留在 Libra home。
+
+降级到 XDG 布局之前的版本时，请先把迁移后的库与密钥复制回旧路径（幂等，legacy 文件仍在）：
+
+```bash
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/libra/config.db" ~/.libra/config.db
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/libra/vault-unseal-key" ~/.libra/vault-unseal-key
+```
+
+## 只读 global schema doctor
+
+使用 `libra config doctor --global-schema`，或
+`libra --json config doctor --global-schema`，只检查全局 schema 元数据。
+路径为解析后的 global 配置路径（env 覆写、XDG 默认或 legacy 回退）；无需仓库，不读取配置值、
+vault、System/Repository DB，不运行迁移、写 barrier、创建备份或触发自动升级／恢复。
+缺失目标保持缺失。冗余 `--global` 可用；`--local`、`--system` 和值／操作参数拒绝。
+成对的 `--repair --confirm` 选择下方独立写入流程；单独使用其中任意选项均失败。
+
+JSON envelope 的 `data.report_version=1`；human 与 JSON 使用同一报告，包含
+`scope`、`role`、`path_source`、configured/canonical path、`exists`、`size_bytes`、
+UTC `modified_at_utc`、`legacy_path`、`legacy_exists`、`migration_pending` 和
+`configuration`／`legacy` ledger。`path_source` 取值为 `LIBRA_CONFIG_GLOBAL_DB`
+（env 覆写）、`xdg`（绝对 `XDG_CONFIG_HOME`）、`home`（`<home>/.config/libra` 默认）或
+`legacy`（旧的 `<home>/.libra/config.db` 仍在使用；此时 `migration_pending` 为 true，
+`legacy_path`／`legacy_exists` 描述回退文件）。doctor 是诊断命令：它报告待迁移状态，
+但自身从不执行迁移。迁移完成后，只要备份文件还在磁盘上，`legacy_exists` 仍为 true，
+hints 会说明它只是一份未被读取的备份。
+每个 ledger 提供 `observed_version`、`latest_version`、`readable`、`verified_name`；
+版本使用字符串，避免 `i64::MAX` 的 JSON 数值精度丢失。null 表示缺失或不可用，
+不表示健康。仅显示通过 manifest 校验的 receipt 名称，不输出任意 receipt 文本或配置值。
+
+`classification` 包括 `absent`、`compatible`、`upgrade_required`、
+`unsupported_future`、`unsupported_receipt`、`unreadable`、`changed_during_inspection`。
+成功完成诊断仍以 0 退出，包括不支持的库；自动化必须检查 classification，不能仅看退出码。
+`issue` 只报告已证明不支持的 ledger/version；非法参数仍使用现有 CLI usage error。
+`producer_disposition` 区分已登记但未归因的 Repository receipt、合法配置 barrier 与未知来源。
+当前 manifest 将 `2026090801` 识别为 `operation_v2_branch_convergence`，但 receipt 或 mtime
+不能证明历史 writer PID/binary。**默认只读 doctor 的 `repair_eligible` 始终为 `false`**。
+不支持状态应升级到 producer-compatible build；禁止手工编辑 SQLite receipt，
+doctor 也不是 remote-sync bypass。
+
+使用标准 SQLite 只读 snapshot，不能以 `immutable` 跳过 live DB 的锁和变化检测。
+WAL-mode 缺失正常 WAL/SHM 文件时，保守报告 `unreadable`，不打开 SQLite 来创建这些文件。
+不要手工创建 sidecar；可在所属应用正常维护这些文件时重试，或诊断另行取得的 SQLite-consistent snapshot。
+稳定目标的主 DB/WAL 内容及 mtime 不变；前后检查文件 identity、size、mtime，发现变化时报告
+`changed_during_inspection`。检查并非文件系统锁，外部 rotation 可能与它竞态，SQLite 协调文件可能变化；
+OS access time 与 SHM 协调状态不保证恒定。即使检查通过也不提供 repair 权限。
+
+## 显式确认的 legacy global schema repair
+
+需要 Libra v0.22.26 或更新版本；v0.22.25 仅提供只读 doctor。
+
+修复与默认只读 doctor 分离，必须显式请求：
+
+```sh
+libra --json config doctor --global-schema
+libra --json config doctor --global-schema --repair --confirm /absolute/canonical/path/config.db
+```
+
+请使用自己报告中的精确 `canonical_path`，不要复制示例路径。确认值必须是逐字节匹配的
+绝对规范路径；配置路径中的符号链接／非规范部分、值操作参数及其他 scope 均拒绝。
+不运行 Repository preflight、System DB 读取或自动升级。
+
+当前只注册 **v0.22.19 Linux amd64 producer-format cohort**，并非出现 `2026090801`
+就能修复。source revision 为 `b94bfe12f2ec2f039b88ddb5c6f8871787d60f17`，producer binary
+SHA-256 为 `03447eb983178433425b5afffba351edae4044e7ded5b9e35c956dddb2bb68a6`。
+完整 293 个 schema objects（含 SQLite 内部结构）、60 个原始 receipts 和运行时 manifest
+都必须通过检查。Repository 数据／存储位置、未知表／trigger／receipt、被改动的 bootstrap
+metadata 均不合资格。格式 attestation **不能归因某个真实文件的历史 writer/PID**；未知状态
+仍须使用 producer-compatible binary，禁止改 receipt 来伪造匹配。
+
+写入修复目前仅支持 **Unix** 的已验证本地文件系统：Linux ext-family、XFS、Btrfs、tmpfs、
+overlayfs，以及 macOS APFS/HFS。Windows、其他／未知文件系统、网络文件系统在任何 repair
+副作用之前拒绝。文件及直接父目录须属于当前 effective uid，且不可 group/world-writable；
+文件只能有一个 hard link。不安全祖先和 SQLite sidecar 拒绝。私有固定锁
+`config.db.schema-repair.lock` 串行化 repair，结束后保留，不自动删除。
+这些措施无法抵抗同 uid/root 恶意进程；修复前应停止其他 writer、文件替换和 rotation 工具，
+发现替换或并发提交时终止。
+
+先由 SQLite `VACUUM INTO` 在不持有源库写事务的情况下建立一致逻辑备份，flush 后重新只读
+打开，检查完整性与格式。目标旁的私有 `.libra-config-repair-<random>/`（0700）保留
+`backup.sqlite`（0600）和 `recovery.json`。应用不枚举／解密配置值，由 SQLite 复制其逻辑
+内容；备份属于敏感数据。失败或中断的副本保留为 **unverified**，不会自动删除或复用。
+
+备份验证后才取得 SQLite 写锁，重新核对 manifest、attestation 和文件 identity；连接内 TEMP
+nonce 配合 `data_version` 拒绝连接替换或其他进程的提交。一个事务初始化
+`configuration_schema_versions`，并向 legacy ledger 追加配置拥有的
+`configuration_legacy_reader_barrier`。原 receipts、配置行、加密标记及 sequence 高水位均保留；
+不运行 Repository migration，不改变 journal mode，不显式 checkpoint。旧版 Repository-only
+binary 必须在写入前拒绝 barrier；后续应使用兼容的新 binary，没有自动降级。
+
+成功 JSON 为 `data.action="repair"`、`report_version=1`、`outcome="repaired"`、
+`backup_path`、`backup_verified=true`、`committed=true` 及已注册格式／source hashes。
+已经保护的配置返回 `outcome="already_protected"`，不创建备份、不写入、不声称 producer
+attestation；这也不是完整健康诊断。默认 doctor 的只读报告与 `repair_eligible=false` 不变。
+
+恢复必须显式进行。保留当前 DB 和 recovery directory；只有有效 `recovery.json` 中的
+`backup_verified=true` 才能作为考虑恢复 `backup.sqlite` 的前提，缺失／中断／未验证状态
+不能证明备份可用。崩溃或 commit 结果不明确时先跑只读 doctor，过时的状态文件不能决定事务
+是否提交。停止所有使用该库的进程，核验备份完整性及来源，保存当前 DB 和 sidecars 供分析，
+再由维护者将已验证一致备份作为整体恢复并设置正确私有权限。禁止覆盖 live DB、将旧 WAL/SHM
+混入恢复后的主库、恢复未验证副本或手工修改 receipt；保留 producer-compatible binary。
+
+非法确认使用 `LBR-CLI-002`，格式／路径／权限资格拒绝使用 `LBR-CONFIG-001`，锁、备份与事务
+失败使用 `LBR-IO-002`。错误不包含配置值或原始 SQLite schema 错误。备份存在不代表 repair
+已提交；应检查 commit 状态，不确定时重新诊断。
 
 ## 选项
 
@@ -176,7 +348,7 @@ libra config path
 
 # 显示全局配置路径
 libra config path --global
-# Output: /home/user/.libra/config.db
+# Output: /home/user/.config/libra/config.db
 ```
 
 #### `edit`
@@ -213,6 +385,55 @@ libra config generate-gpg-key --name "Jane Doe" --email "jane@example.com" --usa
 libra config get vault.gpg.pubkey
 ```
 
+#### `import-gpg-key`
+
+从本机 GnuPG home 或 armored 文件导入现有 OpenPGP 签名密钥，并使用该身份进行 commit/tag/merge 签名。
+
+| 标志 | 说明 |
+|------|------|
+| `--list` | 列出 GnuPG home 中可发现的私钥后退出（零写入） |
+| `--key <fpr>` | 通过指纹/key id 选择要导入的 key（存在多个候选时必填） |
+| `--file <path>` | 从 armored 文件导入私钥，而不是 GnuPG home |
+| `--passphrase-file <path>` | 从文件读取 key 口令（非交互下受保护 key 必填） |
+| `--replace` | 替换活动 key，先将当前公钥归档到历史 |
+
+**`libra init` 已经生成并启用了一把签名 key**（`source: generated`、`vault.signing=true`），因此在默认仓库里导入自己的 key **必须带 `--replace`**；否则导入会 fail-closed 报 `LBR-CONFLICT-002`（`an active GPG key already exists; pass --replace`）。被替换的 key 的公钥会先归档，使它此前签出的签名仍可验证。
+
+```bash
+libra config import-gpg-key --list
+libra config import-gpg-key --key ABCDEF...
+libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
+```
+
+#### `export-gpg-key`
+
+导出活动 GPG 公钥。永远不会导出私钥。
+
+| 标志 | 说明 |
+|------|------|
+| `--fingerprint` | 仅打印主指纹 |
+| `--out <path>` | 原子写入 armored 公钥到文件，而不是 stdout |
+
+**拒绝机器输出旗标：** `--json`/`--machine`/`--quiet` 一律以 `LBR-CLI-002` 失败，故 `export-gpg-key` 始终输出纯 armored 文本（stdout 或 `--out`）。
+
+```bash
+libra config export-gpg-key            # armored 公钥到 stdout
+libra config export-gpg-key --fingerprint
+libra config export-gpg-key --out pubkey.asc
+```
+
+#### `remove-gpg-key`
+
+移除活动导入的 GPG key 并回退到生成的 key（绝不删除历史或生成 key 元数据）。被移除的 key 自身的公钥会**先归档**为 `vault.gpg.history.<FPR>.pubkey`，使它此前签出的签名仍可验证；因此归档面只会**新增一行**，其余不变。移除是**单个事务**：四步中任一步失败，导入的 key 会原样保持活动。
+
+归档公钥存放于 `vault.gpg.history.<FPR>.pubkey`。显式丢弃单行就是普通的 config unset —— `libra config unset vault.gpg.history.<FPR>.pubkey` 只删除该指纹的快照，其它指纹不受影响。**后果：** 被丢弃密钥签出的签名将不再被 `libra tag -v` / `libra merge --verify-signatures` 接受——这正是归档要避免的情形，故仅在这些签名已无意义时才删除该行。
+
+**移除活动 key 必须带 `--force`**：不带时命令会拒绝并点明该旗标（防误删保护）。
+
+```bash
+libra config remove-gpg-key --force
+```
+
 ### Scope 标志
 
 这些标志是全局的（适用于任意子命令）：
@@ -220,7 +441,7 @@ libra config get vault.gpg.pubkey
 | 标志 | 说明 |
 |------|------|
 | `--local` | 使用仓库配置（`.libra/libra.db`）。这是写入的默认值。 |
-| `--global` | 使用全局用户配置（`~/.libra/config.db`）。 |
+| `--global` | 使用全局用户配置（`<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`；legacy `~/.libra/config.db` 在首次访问迁移之前仍是活动回退）。 |
 | `--system` | 使用系统级配置（`/etc/libra/config.db`，可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）。级联优先级最低；写入通常需要提升权限。该作用域**不**支持 vault 加密密钥（见设计动机）。 |
 
 ### 隐藏的 Git 兼容标志
@@ -371,12 +592,26 @@ libra config get vault.gpg.pubkey
 libra config list --gpg-keys
 ```
 
+支持的 `--usage` 值为 `signing` 与 `encrypt`。
+
+现有 OpenPGP 密钥可以从 GnuPG home 或 armored 文件导入：
+
+```bash
+libra config import-gpg-key --list
+libra config import-gpg-key --key ABCDEF...
+libra config import-gpg-key --file my-key.asc --passphrase-file pass.txt
+libra config export-gpg-key --fingerprint
+libra config remove-gpg-key --force
+```
+
+导入的私钥加密存储（`vault.gpg.seckey_enc`）并在所有读取路径上脱敏；`config get --reveal` 会拒绝它。签名使用 `vault.gpg.signing_key_id` 记录的 key，验证使用「活动、生成、历史」公钥的固定允许列表。
+
 支持的 `--usage` 值是 `signing` 和 `encrypt`。
 
 ## Scope
 
 - 默认 scope 是 local（`.libra/libra.db`）
-- `--global` 使用 `~/.libra/config.db`
+- `--global` 使用 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在首次访问迁移之前仍作为回退）
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
 
 ## `code.defaultProvider` 键
@@ -391,6 +626,15 @@ libra config unset --global code.defaultProvider
 ```
 
 合法取值即 `libra code --provider` 接受的 provider id：`anthropic`、`codex`、`deepseek`、`gemini`、`kimi`、`ollama`、`openai`、`zhipu`。配置命中时跳过凭据探测；未设置或空值下探到探测；无法识别的 id 使 `libra code` 以 129（`LBR-CLI-002`）退出并列出合法取值，且不回显已存储的值。该键只存放于本 SQLite config 数据库——与 `agents.toml` 的 `[code.*]` profile 段（`[code.multi_agent]`、`[code.goal]` 等）无关，两个载体互不回退。完整解析阶梯见 [code.md](code.md)。
+
+## `core.filemode` 键
+
+`core.filemode`（按大小写不敏感读取）决定 `add`、`update-index <path>` 与 `commit -a` 从工作树暂存时如何记录文件 mode。未设置时 Unix 默认为 `true`、其它平台为 `false`。为 `false` 时：重新暂存已有条目沿用索引中已记录的 mode，新路径记为 `100644`（工作树中的可执行文件不会被记为 `100755`）；`add --chmod=+x` 与 `update-index --cacheinfo` 携带显式 mode，不受影响。为 `true`（Unix 默认）时，仅 mode 变化（已跟踪普通文件的 owner-execute 位与索引不同、内容未变）会被 `status` 报告、被 `diff` 渲染、被 `add`/`commit -a`/`update-index <path>` 暂存，并被 `stash push` 视为本地修改；为 `false` 时这些命令忽略仅 mode 的差异，但条目类型变化（如普通文件被替换为符号链接）仍会显示。非法布尔值在任何索引写入前以 `bad boolean config value '<value>' for 'core.filemode'` 使 `add`/`status` fail-closed（与 `commit.verbose` 同一映射）。
+
+```bash
+libra config set core.filemode false
+libra config get core.filemode
+```
 
 ## 保留命名空间 `upgrade.*`
 
@@ -513,3 +757,53 @@ Git 在 key 未找到时以代码 1 退出，这在脚本中与其他错误难�
 - `libra vault` 已移除。请改用 `libra config generate-ssh-key`、`libra config generate-gpg-key` 和 `libra config get vault.*`。
 - 不支持 `libra config edit`（见上方设计动机）。
 - 旧仓库可能仍包含遗留的 `vault.gpg_pubkey` 条目；新写入使用 `vault.gpg.pubkey`。
+
+## SSH 认证与捕获诊断
+
+无论是否由终端调用，Libra 都以 `BatchMode=yes` 启动 SSH，不在 Libra 命令中
+询问私钥口令或进行交互式主机信任决定。重试前请先在 `ssh-agent` 中加载或解锁
+加密私钥。主机信任应先通过可信服务商控制台或其它可信渠道核对指纹，再手动
+更新 `~/.ssh/known_hosts`；也可以单独建立交互 SSH 连接，核对显示的指纹后才
+接受。`ssh -T git@github.com` 是 GitHub 示例，请使用实际仓库 SSH 用户、主机
+和端口，不要接受未经核验的指纹。
+
+`ssh.strictHostKeyChecking` 保留既有 `ask`、`yes`、`accept-new`、`no` 设置。
+`ask` 不向 SSH 传递该选项，由用户 SSH 配置决定；`BatchMode=yes` 仍禁止
+交互决定。显式设置会转交 SSH，请按仓库需求选择主机信任策略。
+
+SSH stderr 在终端会话中也始终捕获，从子程序启动时便持续读取，最多保留64 KiB，
+其余字节继续计数并计算摘要。用户错误只含固定文字与可用的本地退出状态，不
+打印或记录远端 stderr 原文。debug 诊断只含退出状态、总字节数、保留字节数及
+已收集字节流的 SHA-256；收集失败或取消时可能没有这些元数据，不声称已有完整
+摘要。摘要计算的工作量与实际读取字节数成正比。
+
+SSH 引用广告与 receive-pack 响应各有16 MiB累计上限。广告超限以 `LBR-NET-001`
+失败并提示在服务可用时使用仓库的 HTTPS URL，否则请维护者减少引用；push 响应超限以 `LBR-NET-001` 失败并提示减少推送
+引用，绝不把截断响应视为成功。极大的引用集或更新可能受到影响；流式 fetch
+pack 不受该上限约束。push 响应失败不代表服务端回滚了引用，重试前应检查远端
+实际状态。既有 IO 超时仍然生效。
+
+完整 discovery 广告之后，Libra 最多给 SSH 100毫秒退出，再请求终止；共用两秒
+清理截止时间。捕获任务在所属操作退出或截止时间到期时取消，也覆盖后代程序
+继续持有管道的情况。
+
+### SSH 主机身份变更与诊断收集
+
+SSH 报告主机身份已经变更时，Libra 保留独立的固定警告：可能发生拦截，也可能是合法密钥轮换。必须先通过可信渠道核对新指纹，才可替换 `~/.ssh/known_hosts` 中的旧条目；不要绕过主机密钥检查。此情况与首次未信任主机均使用 `LBR-NET-001`，但消息与操作提示不同。
+
+如果 stderr 管道在有界收集期限后仍未关闭，已取得的完整协议输出及本地退出状态仍可使用；不会仅因诊断收集失败而拒绝完整传输。已观察到的非零退出状态及主要读取错误仍会导致失败。缺失的诊断仅记录固定的 debug 提示，不伪造空流字节数或摘要；stdout 收集或进程等待失败仍按原错误处理。
+
+### SSH 上限与主机分类边界
+
+上述16 MiB广告与receive-pack响应累计上限仅适用于Libra的SSH传输。
+HTTPS和Git传输没有这一特定上限。若服务器提供HTTPS端点，SSH广告超限时可改用
+该仓库的HTTPS远端URL；只读用户无需修改服务器引用。否则请仓库维护者减少广告中的
+引用集合。流式fetch pack仍不受此累计上限约束。
+
+主机信任分类必须同时满足：首个必需标头未完成、未观察到任何stdout字节、本地退出码255，
+以及保留stderr前缀中的已知模式。一旦读到任何stdout字节（包括部分标头），
+类似主机密钥错误的stderr不能触发特定信任指引；完整广告之后的失败保留固定通用诊断。
+广告之前的模式仍只是诊断启发式，不等于指纹核验。
+
+成功discovery的子程序若等待请求，通常会耗尽100 ms原生退出观察窗口，每次discovery
+分别承担该成本。这与两秒直接子程序清理预算分开，不构成性能基准或任意后代清理保证。

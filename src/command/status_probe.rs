@@ -18,6 +18,7 @@ use git_internal::internal::index::Index;
 
 use crate::{
     command::status_untracked_paths::TrackedPaths,
+    internal::worktree_scope::{WorktreeScope, with_request_scope_sync},
     utils::{pathspec::PathspecSet, util},
 };
 
@@ -218,11 +219,12 @@ where
     // is supposed to match — the exact stage would silently degrade to
     // inexact and read objects it did not need. Carry it across.
     let hash_kind = git_internal::hash::get_hash_kind();
+    let request_scope = WorktreeScope::request_scope();
     let job: IoJob = Box::new(move || {
         git_internal::hash::set_hash_kind(hash_kind);
         // A closed receiver (timed-out caller) is expected; drop the value,
         // then release the slot so the pool accounting stays accurate.
-        let _ = tx.send(op());
+        let _ = tx.send(with_request_scope_sync(request_scope, op));
         IO_BUSY.fetch_sub(1, Ordering::SeqCst);
     });
     {
@@ -235,128 +237,6 @@ where
     pool.ready.notify_one();
 
     rx.recv_timeout(budget).map_err(|_| ())
-}
-
-/// Like [`with_io_deadline`], but the deadline measures LACK OF PROGRESS
-/// rather than total duration.
-///
-/// `progress` is a counter the operation bumps as it does useful work. The
-/// caller waits in slices and only gives up once a whole slice passes with
-/// the counter unchanged — so a genuinely large directory that keeps
-/// yielding entries is never mistaken for a hung mount, while a mount that
-/// truly stops answering is still reclaimed within one timeout window.
-#[allow(dead_code)] // WIO-03 / thread-pool fallback
-pub(crate) fn with_no_progress_deadline<T, F>(
-    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    op: F,
-) -> Result<T, ()>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    use std::sync::atomic::Ordering;
-
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let submitted = with_io_deadline_detached(move || {
-        let _ = tx.send(op());
-    });
-    if submitted.is_err() {
-        return Err(());
-    }
-    let window = io_op_timeout();
-    // Poll in slices so progress can extend the budget; the slice is small
-    // relative to the window but never so small that we spin.
-    let slice = window / 10;
-    let slice = if slice.is_zero() {
-        std::time::Duration::from_millis(1)
-    } else {
-        slice
-    };
-    let mut idle = std::time::Duration::ZERO;
-    let mut seen = progress.load(Ordering::SeqCst);
-    loop {
-        match rx.recv_timeout(slice) {
-            Ok(value) => return Ok(value),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(()),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let now = progress.load(Ordering::SeqCst);
-                if now != seen {
-                    seen = now;
-                    idle = std::time::Duration::ZERO;
-                } else {
-                    idle += slice;
-                    if idle >= window {
-                        return Err(());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Submit a job to the pooled workers without waiting for it. Shares the
-/// same bounded slot accounting as [`with_io_deadline`].
-#[allow(dead_code)] // used by with_no_progress_deadline
-fn with_io_deadline_detached<F>(op: F) -> Result<(), ()>
-where
-    F: FnOnce() + Send + 'static,
-{
-    use std::sync::atomic::Ordering;
-
-    let pool = IO_POOL.get_or_init(|| {
-        std::sync::Arc::new(IoWorkerPool {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            ready: std::sync::Condvar::new(),
-            handles: std::sync::Mutex::new(Vec::new()),
-        })
-    });
-    if IO_BUSY
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            (current < MAX_INFLIGHT_IO_WORKERS).then_some(current + 1)
-        })
-        .is_err()
-    {
-        return Err(());
-    }
-    let needed = IO_BUSY.load(Ordering::SeqCst);
-    if IO_WORKERS
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |workers| {
-            (workers < MAX_INFLIGHT_IO_WORKERS && workers < needed).then_some(workers + 1)
-        })
-        .is_ok()
-    {
-        let worker_pool = std::sync::Arc::clone(pool);
-        match std::thread::Builder::new()
-            .name("libra-status-io".to_string())
-            .spawn(move || run_io_worker(&worker_pool))
-        {
-            Ok(handle) => pool
-                .handles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(handle),
-            Err(_) => {
-                IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
-                IO_BUSY.fetch_sub(1, Ordering::SeqCst);
-                return Err(());
-            }
-        }
-    }
-    let hash_kind = git_internal::hash::get_hash_kind();
-    let job: IoJob = Box::new(move || {
-        git_internal::hash::set_hash_kind(hash_kind);
-        op();
-        IO_BUSY.fetch_sub(1, Ordering::SeqCst);
-    });
-    {
-        let mut queue = pool
-            .queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        queue.push_back(job);
-    }
-    pool.ready.notify_one();
-    Ok(())
 }
 
 fn run_io_worker(pool: &IoWorkerPool) {
@@ -379,6 +259,9 @@ fn run_io_worker(pool: &IoWorkerPool) {
         job();
     }
 }
+
+#[cfg(test)]
+mod scope_context_tests;
 
 #[cfg(test)]
 mod pool_smoke_tests {
@@ -1076,7 +959,7 @@ mod tests {
     /// harness: with the variables set but `LIBRA_TEST` absent, production
     /// defaults stay in effect; with the gate present, the overrides bite.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn seam_timeouts_and_probe_limits_require_the_harness_gate() {
         // SAFETY: serialized test body; every variable is removed again
         // before the test returns.

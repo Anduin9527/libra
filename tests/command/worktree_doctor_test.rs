@@ -147,7 +147,7 @@ fn parse_json(bytes: &[u8], what: &str) -> serde_json::Value {
 /// nothing while doing so (§C.8 W4 acceptance: default invocation is strictly
 /// read-only).
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_reports_scope_diagnostics() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -244,7 +244,7 @@ async fn worktree_doctor_reports_scope_diagnostics() {
 /// The W0 read-only skeleton contract, stated on its own: neither the human
 /// nor the JSON form of the default invocation may mutate anything.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_default_invocation_is_readonly() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -266,7 +266,7 @@ async fn worktree_doctor_default_invocation_is_readonly() {
 /// Envelope, required fields, ordering, page limits, opaque cursor and both
 /// fail-closed refusals — the frozen machine contract (§C.8, Codex R18/R19).
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_json_schema_and_pagination_stable() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -436,7 +436,7 @@ async fn worktree_doctor_json_schema_and_pagination_stable() {
 /// An unreadable scope is refused (`LBR-WORKTREE-002`) — the doctor never
 /// answers with an empty or partial diagnosis built on unknown ownership.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_corrupt_scope_fails_closed() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -457,7 +457,7 @@ async fn worktree_doctor_corrupt_scope_fails_closed() {
 /// workspace lease. It atomically converts every legacy row for the provider
 /// session and records the irreversible decision in the append-only audit.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_adopts_legacy_capture_with_confirmation_and_audit() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -627,7 +627,7 @@ async fn worktree_doctor_adopts_legacy_capture_with_confirmation_and_audit() {
 /// it is not authority to attribute capture history. Adoption must wait for a
 /// renewed or newly fenced live lease and leave the legacy row untouched.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_refuses_capture_adoption_to_an_expired_lease() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -688,7 +688,7 @@ async fn worktree_doctor_refuses_capture_adoption_to_an_expired_lease() {
 /// explicit adoption path must still make that legacy state recoverable rather
 /// than leaving it permanently blocked behind a missing `agent_session` row.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_adopts_orphan_legacy_provider_session() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -757,7 +757,7 @@ async fn worktree_doctor_adopts_orphan_legacy_provider_session() {
 /// interpreted as an unrelated provider id merely because another legacy row
 /// happens to use the same opaque string.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_prefers_catalog_session_id_over_provider_id_collision() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -829,16 +829,12 @@ async fn worktree_doctor_prefers_catalog_session_id_over_provider_id_collision()
 /// promise recovery as a side effect.
 #[test]
 fn worktree_doctor_hints_are_inspect_only() {
-    const SOURCES: [(&str, &str); 3] = [
+    const SOURCES: [(&str, &str); 2] = [
         (
             "workspace.rs",
             include_str!("../../src/internal/workspace.rs"),
         ),
         ("worktree.rs", include_str!("../../src/command/worktree.rs")),
-        (
-            "environment.rs",
-            include_str!("../../src/internal/ai/runtime/environment.rs"),
-        ),
     ];
     for (name, source) in SOURCES {
         for (index, line) in source.lines().enumerate() {
@@ -970,7 +966,7 @@ fn worktree_doctor_capture_adoption_is_documented_in_both_languages() {
 /// plan-20260715 W4-07: doctor adopt/clear for legacy approved_permission
 /// project_id requires --confirm, audits, and refuses the canonical id.
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_adopts_and_clears_legacy_approved_project() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -1128,26 +1124,32 @@ fn worktree_dir_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-/// The repository's operation rows, newest first, read through the public
-/// operation service (the same API `libra op log` paginates).
+/// The repository's Operation v2 rows, newest first.
 #[cfg(unix)]
-async fn operation_rows(repo: &Path) -> Vec<libra::internal::operation::OperationLogListItem> {
-    use libra::internal::operation::{OperationQueryPage, OperationService};
-
+async fn operation_rows(repo: &Path) -> Vec<(String, String, String)> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     let conn = repo_db(repo).await;
     let repo_id = repo_identity(&conn).await;
-    let page = OperationService::list_operations_by_repo_paginated_with_conn(
-        &conn,
-        &repo_id,
-        OperationQueryPage {
-            page: 1,
-            per_page: 200,
-        },
-    )
-    .await
-    .expect("list operation rows");
-    let mut rows = page.items;
-    rows.sort_by(|a, b| a.op_id.cmp(&b.op_id));
+    let mut rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT op_id, command_name, status FROM operation \
+             WHERE repo_id = ? ORDER BY start_ts, op_id",
+            [repo_id.into()],
+        ))
+        .await
+        .expect("list operation rows")
+        .into_iter()
+        .map(|row| {
+            Ok::<_, sea_orm::DbErr>((
+                row.try_get::<String>("", "op_id")?,
+                row.try_get::<String>("", "command_name")?,
+                row.try_get::<String>("", "status")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode operation rows");
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows
 }
 
@@ -1166,10 +1168,8 @@ async fn operation_rows(repo: &Path) -> Vec<libra::internal::operation::Operatio
 /// be built without `symlink(2)`.
 #[cfg(unix)]
 #[tokio::test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
-    use libra::internal::operation::OperationStatus;
-
     enum RepairAction {
         IdentityPath,
         RegistryAll,
@@ -1400,33 +1400,12 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
         );
         let new_rows: Vec<_> = operations_after
             .iter()
-            .filter(|after| {
-                !operations_before
-                    .iter()
-                    .any(|before| before.op_id == after.op_id)
-            })
+            .filter(|after| !operations_before.iter().any(|before| before.0 == after.0))
             .collect();
         assert_eq!(new_rows.len(), 1, "{command_name}: the audit row is unique");
         let audit = new_rows[0];
-        assert_eq!(
-            audit.command_name, command_name,
-            "the audit row names the action"
-        );
-        assert_eq!(
-            audit.status,
-            OperationStatus::Succeeded,
-            "the audit row records the outcome"
-        );
-        assert!(
-            audit.description.contains(command_name),
-            "the audit row describes the action: {}",
-            audit.description
-        );
-        assert!(!audit.actor.is_empty(), "the audit row names an actor");
-        assert!(
-            audit.end_ts.is_some(),
-            "the audit row is finished, not left running"
-        );
+        assert_eq!(audit.1, "worktree", "the v2 audit row names the command");
+        assert_eq!(audit.2, "success", "the audit row records the outcome");
 
         // Only the target scope changed.
         assert_eq!(

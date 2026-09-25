@@ -14,6 +14,7 @@ pub mod client_storage;
 pub mod convert;
 pub mod d1_client;
 pub mod ignore;
+pub mod index_ext;
 pub mod lfs;
 pub mod log_config;
 #[cfg(feature = "fastcdc")]
@@ -41,3 +42,4 @@ pub mod tree;
 pub mod tree_attributes;
 pub mod util;
 pub mod worktree;
+pub mod worktree_blob;

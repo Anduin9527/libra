@@ -26,7 +26,7 @@ use colored::Colorize;
 use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 use sea_orm::{ConnectionTrait, DbErr};
 use serde::Serialize;
-use uuid::Uuid;
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     command::{get_target_commit, load_object, log::get_reachable_commits},
@@ -40,10 +40,12 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
-        operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
+        operation::{current_operation_id, store},
+        workspace::RepoIdentity,
+        worktree_scope::WorktreeScope,
     },
     utils::{
-        error::{CliError, CliResult, StableErrorCode},
+        error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, emit_json_data},
         text::{levenshtein, short_display_hash},
         util::require_repo,
@@ -51,6 +53,7 @@ use crate::{
 };
 
 /// Which branch namespace to enumerate during `libra branch -l`.
+#[derive(Clone, Copy)]
 pub enum BranchListMode {
     /// Only branches stored under `refs/heads/`.
     Local,
@@ -71,10 +74,17 @@ NOTES:
 EXAMPLES:
     libra branch feature-x                Create a branch from HEAD
     libra branch feature-x main           Create a branch from another branch
+    libra branch --track t1 main          Create t1 tracking local main
+    libra branch --track=inherit t3 t1    Copy t1's upstream onto t3
+    libra branch --no-track t4 main       Create without tracking
     libra branch -d topic                 Delete a fully merged branch
     libra branch -D topic                 Force-delete a branch
     libra branch -c topic topic-backup    Copy a branch, keeping the original
     libra branch -u origin/main           Set upstream for the current branch
+    libra branch -u main alpha            Point alpha at the local branch main
+    libra branch --track t1 main          Create t1 tracking local branch main
+    libra branch --track=inherit t3 t1    Create t3 copying t1's upstream
+    libra branch --no-track t4 main       Create t4 without tracking
     libra branch --edit-description       Edit the current branch's description in an editor
     libra branch --merged main            List branches already merged into main
     libra branch --sort version:refname   List branches sorted by version-aware name
@@ -108,8 +118,9 @@ pub enum BranchOutput {
         show_unborn_head: bool,
         #[serde(skip_serializing)]
         ignore_case: bool,
-        /// When set, `branches` is already ordered by `--sort` (the renderer
-        /// must not re-sort with the default current-first ordering).
+        /// When set, `branches` is already ordered (`--sort`, `branch.sort`, or
+        /// the default refname order). The renderer must not re-promote the
+        /// current branch to the top.
         #[serde(skip_serializing)]
         sorted: bool,
     },
@@ -140,9 +151,18 @@ pub enum BranchOutput {
     /// the created copy.
     #[serde(rename = "copy")]
     Copy { old_name: String, new_name: String },
-    /// `--set-upstream-to` succeeded. `upstream` is in `remote/branch` form.
+    /// `--set-upstream-to` succeeded. `upstream` is the user-supplied spec.
+    /// `local` is skipped from JSON so the envelope stays `{branch,upstream}`.
     #[serde(rename = "set-upstream")]
-    SetUpstream { branch: String, upstream: String },
+    SetUpstream {
+        branch: String,
+        upstream: String,
+        #[serde(skip_serializing)]
+        local: bool,
+    },
+    /// `-u <branch> <branch>` (self-upstream): warning only, no config write.
+    #[serde(rename = "set-upstream-unchanged")]
+    SetUpstreamUnchanged { branch: String },
     /// `--unset-upstream` succeeded.
     #[serde(rename = "unset-upstream")]
     UnsetUpstream { branch: String },
@@ -280,6 +300,23 @@ pub struct BranchDiffArgs {
     pub paths: Vec<String>,
 }
 
+/// `--track[=direct|inherit]` mode for branch creation (ADR-HF-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchTrackMode {
+    Direct,
+    Inherit,
+}
+
+fn parse_track_mode(raw: &str) -> Result<BranchTrackMode, String> {
+    match raw {
+        "direct" => Ok(BranchTrackMode::Direct),
+        "inherit" => Ok(BranchTrackMode::Inherit),
+        other => Err(format!(
+            "invalid tracking mode '{other}'; expected 'direct' or 'inherit'"
+        )),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(after_help = BRANCH_AFTER_HELP)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -321,9 +358,45 @@ pub struct BranchArgs {
     #[clap(short = 'd', long = "delete", group = "action")]
     pub delete_safe: Option<String>,
 
-    /// Set up the branch's tracking information so `upstream` is considered its upstream branch.
-    #[clap(short = 'u', long, group = "action", value_name = "UPSTREAM")]
+    /// Set the branch's tracking information so UPSTREAM is considered its
+    /// upstream. An optional positional branch name selects which local branch
+    /// to configure (defaults to the current branch).
+    #[clap(
+        short = 'u',
+        long,
+        value_name = "UPSTREAM",
+        conflicts_with_all = [
+            "delete",
+            "delete_safe",
+            "unset_upstream",
+            "edit_description",
+            "show_current",
+            "rename",
+            "copy",
+            "copy_force"
+        ]
+    )]
     pub set_upstream_to: Option<String>,
+
+    /// When creating a branch, set up tracking (`direct`, default) or copy the
+    /// start-point's upstream (`inherit`). Ignored with delete/rename/list.
+    /// Mode is accepted only as `--track=direct|inherit`; `-t` / `--track`
+    /// alone means `direct`.
+    #[clap(
+        short = 't',
+        long = "track",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "direct",
+        value_name = "MODE",
+        value_parser = parse_track_mode,
+        overrides_with = "no_track"
+    )]
+    pub track: Option<BranchTrackMode>,
+
+    /// When creating a branch, do not write tracking configuration.
+    #[clap(long = "no-track", overrides_with = "track")]
+    pub no_track: bool,
 
     /// Remove the branch's upstream configuration. Defaults to current branch.
     #[clap(long = "unset-upstream", group = "action", value_name = "BRANCH", num_args = 0..=1, default_missing_value = "")]
@@ -447,7 +520,7 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
         .await
         .map_err(map_branch_store_error)
         .map_err(CliError::from)?;
-    let Some(existing) = existing else {
+    let Some(_) = existing else {
         return Err(CliError::from(branch_not_found_error(&branch).await));
     };
     if let Head::Branch(current) = Head::current().await
@@ -499,17 +572,8 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
         }
     }
 
-    let old_commit = existing.commit.to_string();
     let new_commit = target_commit.to_string();
-    let meta = OperationMeta {
-        command_name: "branch".to_string(),
-        description: format!("reset branch {branch} to {}", args.target),
-        actor: operation_actor().await,
-        repo_id: current_repo_id_for_operation()
-            .await
-            .map_err(CliError::from)?,
-        args_digest: Some(branch_operation_args_digest("reset", &branch, &new_commit)),
-    };
+    record_branch_reset_operation_digest(&branch, &new_commit).await?;
     // Sentinel prefixes preserve the TYPED refusal through DbErr::Custom so a
     // race-window refusal still surfaces as LBR-POLICY-001 / the current-
     // branch message rather than a generic storage error.
@@ -519,84 +583,79 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
     let branch_for_txn = branch.clone();
     let target_for_txn = args.target.clone();
     let new_for_txn = target_commit;
-    let result = with_operation_log(
-        meta,
-        // §C.9: recorded with the INVOKING worktree's scope, not `repository`.
-        // A branch ref is shared, but `op restore` is documented to restore
-        // HEAD/branches — and the protection §C.9 actually asks for is
-        // enforced by the checked-out-elsewhere guard, which refuses the whole
-        // restore before any ref moves. `repository` is reserved for operations
-        // with no worktree scope at all, and restore fails closed on it
-        // (Codex R24).
-        OperationScope::default(),
-        move |txn| {
-            Box::pin(async move {
-                // Authoritative, fail-closed policy gate (the 1.5 contract).
-                let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
-                    txn,
-                    &branch_for_txn,
-                )
-                .await
-                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-                if protected {
-                    return Err(DbErr::Custom(format!(
-                        "{SENTINEL_PROTECTED}{branch_for_txn}"
-                    )));
-                }
-                let archived = crate::internal::metadata::MetadataKv::is_archived_with_conn(
-                    txn,
-                    &branch_for_txn,
-                )
-                .await
-                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-                if archived {
-                    return Err(DbErr::Custom(format!(
-                        "{SENTINEL_ARCHIVED}{branch_for_txn}"
-                    )));
-                }
-                // Re-check the checked-out branch in-txn: a concurrent `switch`
-                // between preflight and here must not produce phantom staged
-                // diffs on a silently-moved current branch.
-                if let Head::Branch(current) = Head::current_with_conn(txn).await
-                    && current == branch_for_txn
-                {
-                    return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
-                }
-                let live = Branch::find_branch_result_with_conn(txn, &branch_for_txn, None)
-                    .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))?
-                    .ok_or_else(|| {
-                        DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
-                    })?;
-                Branch::update_branch_with_conn(
-                    txn,
-                    &branch_for_txn,
-                    &new_for_txn.to_string(),
-                    None,
-                )
-                .await?;
-                let context = crate::internal::reflog::ReflogContext {
-                    old_oid: live.commit.to_string(),
-                    new_oid: new_for_txn.to_string(),
-                    action: crate::internal::reflog::ReflogAction::Reset {
-                        target: target_for_txn.clone(),
-                    },
-                };
-                crate::internal::reflog::Reflog::insert_single_entry(
-                    txn,
-                    &context,
-                    &format!("refs/heads/{branch_for_txn}"),
-                )
-                .await
-                .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
-                Ok::<String, DbErr>(live.commit.to_string())
-            })
-        },
-    )
+    let database = crate::internal::db::get_db_conn_instance().await;
+    let transaction = crate::internal::db::begin_write_transaction(&database)
+        .await
+        .map_err(|error| CliError::fatal(format!("branch reset transaction failed: {error}")))?;
+    let result = async {
+        // Authoritative, fail-closed policy gate (the 1.5 contract).
+        let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
+            &transaction,
+            &branch_for_txn,
+        )
+        .await
+        .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+        if protected {
+            return Err(DbErr::Custom(format!(
+                "{SENTINEL_PROTECTED}{branch_for_txn}"
+            )));
+        }
+        let archived = crate::internal::metadata::MetadataKv::is_archived_with_conn(
+            &transaction,
+            &branch_for_txn,
+        )
+        .await
+        .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+        if archived {
+            return Err(DbErr::Custom(format!(
+                "{SENTINEL_ARCHIVED}{branch_for_txn}"
+            )));
+        }
+        if let Head::Branch(current) = Head::current_with_conn(&transaction).await
+            && current == branch_for_txn
+        {
+            return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
+        }
+        let live = Branch::find_branch_result_with_conn(&transaction, &branch_for_txn, None)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?
+            .ok_or_else(|| {
+                DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
+            })?;
+        Branch::update_branch_with_conn(
+            &transaction,
+            &branch_for_txn,
+            &new_for_txn.to_string(),
+            None,
+        )
+        .await?;
+        let context = crate::internal::reflog::ReflogContext {
+            old_oid: live.commit.to_string(),
+            new_oid: new_for_txn.to_string(),
+            action: crate::internal::reflog::ReflogAction::Reset {
+                target: target_for_txn,
+            },
+        };
+        crate::internal::reflog::Reflog::insert_single_entry(
+            &transaction,
+            &context,
+            &format!("refs/heads/{branch_for_txn}"),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
+        Ok::<String, DbErr>(live.commit.to_string())
+    }
     .await;
     let old_commit = match result {
-        Ok(op) => op.payload,
+        Ok(old_commit) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| CliError::fatal(format!("branch reset commit failed: {error}")))?;
+            old_commit
+        }
         Err(error) => {
+            let _ = transaction.rollback().await;
             let text = error.to_string();
             if let Some(name) = text.split(SENTINEL_PROTECTED).nth(1) {
                 return Err(CliError::from(BranchError::Protected(name.to_string())));
@@ -609,7 +668,6 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
                     name.to_string(),
                 )));
             }
-            let _ = &old_commit; // (superseded by the txn's own CAS read)
             return Err(CliError::fatal(format!("branch reset failed: {text}"))
                 .with_stable_code(StableErrorCode::IoWriteFailed));
         }
@@ -625,6 +683,39 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
     if reset_output.mutated_repo_state() {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_BRANCH).await;
     }
+    Ok(())
+}
+
+async fn record_branch_reset_operation_digest(branch: &str, new_commit: &str) -> CliResult<()> {
+    let Some(operation_id) = current_operation_id() else {
+        return Ok(());
+    };
+
+    let payload = format!("reset\0{branch}\0{new_commit}");
+    let args_digest = format!("sha256:{}", hex::encode(Sha256::digest(payload.as_bytes())));
+    let scope = WorktreeScope::for_request();
+    let worktree_id = scope.storage_key();
+    let database = get_db_conn_instance().await;
+    let repo_id = RepoIdentity::resolve(&database)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to read repository identity: {error}")))?;
+    if let Some(previous_operation) = store::find_recent_success_by_args_digest(
+        &database,
+        repo_id.as_str(),
+        worktree_id,
+        "branch",
+        &args_digest,
+    )
+    .await
+    .map_err(|error| CliError::fatal(format!("failed to read operation log: {error}")))?
+    {
+        return Err(CliError::fatal(format!(
+            "duplicate operation: branch reset matches recent operation {previous_operation}"
+        )));
+    }
+    store::update_operation_args_digest(&database, repo_id.as_str(), &operation_id, &args_digest)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to update operation log: {error}")))?;
     Ok(())
 }
 
@@ -674,13 +765,7 @@ async fn execute_diff_safe(args: BranchDiffArgs, output: &OutputConfig) -> CliRe
             match (remote, merge) {
                 (Some(remote), Some(merge)) => {
                     let merge_short = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
-                    if remote == "." {
-                        // Git's local-upstream form (branch.<n>.remote = "."):
-                        // the upstream is the LOCAL branch named by merge.
-                        merge_short.to_string()
-                    } else {
-                        format!("{remote}/{merge_short}")
-                    }
+                    format_upstream_ref(&remote, merge_short)
                 }
                 _ => {
                     return Err(CliError::failure(format!(
@@ -811,6 +896,11 @@ enum BranchError {
     #[error("branch '{name}' not found")]
     NotFound { name: String, similar: Vec<String> },
 
+    /// `-d` / `--delete` missing-branch refusal. Same wording and stable
+    /// code as [`Self::NotFound`], but Git exits 1 here.
+    #[error("branch '{name}' not found")]
+    DeleteNotFound { name: String, similar: Vec<String> },
+
     #[error("branch '{0}' is protected; refusing to reset it")]
     Protected(String),
 
@@ -829,7 +919,7 @@ enum BranchError {
     #[error("Cannot {0} branch '{1}': it is checked out at worktree '{2}'")]
     CheckedOutElsewhere(&'static str, String, String),
 
-    #[error("The branch '{0}' is not fully merged.")]
+    #[error("the branch '{0}' is not fully merged")]
     NotFullyMerged(String),
 
     #[error("the '{0}' branch is locked and cannot be modified")]
@@ -853,11 +943,17 @@ enum BranchError {
     #[error("failed to read config '{key}': {detail}")]
     SortConfigRead { key: &'static str, detail: String },
 
-    #[error("invalid upstream '{0}'")]
-    InvalidUpstream(String),
+    #[error("the requested upstream branch '{0}' does not exist")]
+    UpstreamMissing(String),
 
-    #[error("remote '{0}' not found")]
-    RemoteNotFound(String),
+    #[error("branch '{0}' does not exist")]
+    UpstreamTargetMissing(String),
+
+    #[error("too many arguments to set new upstream")]
+    TooManyUpstreamArgs,
+
+    #[error("cannot set up tracking information; starting point '{0}' is not a branch")]
+    TrackStartNotBranch(String),
 
     #[error("{0}")]
     ConfigReadFailed(String),
@@ -876,9 +972,6 @@ enum BranchError {
 
     #[error("failed to delete branch '{branch}': {detail}")]
     DeleteFailed { branch: String, detail: String },
-
-    #[error("failed to record branch operation: {0}")]
-    OperationLogFailed(String),
 
     #[error("failed to load commit {commit}: {detail}")]
     CommitLoadFailed { commit: String, detail: String },
@@ -946,10 +1039,21 @@ impl From<BranchError> for CliError {
                 }
                 err
             }
-            BranchError::DeleteCurrent(name) => CliError::fatal(format!(
+            BranchError::DeleteNotFound { name, similar } => {
+                let mut err = CliError::failure(format!("branch '{name}' not found"))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+                    .with_exit_code(1)
+                    .with_hint("use 'libra branch -l' to list branches");
+                for suggestion in similar {
+                    err = err.with_hint(format!("did you mean '{suggestion}'?"));
+                }
+                err
+            }
+            BranchError::DeleteCurrent(name) => CliError::failure(format!(
                 "Cannot delete the branch '{name}' which you are currently on"
             ))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_exit_code(1)
             .with_hint("switch to another branch first."),
             // §C.13: "branch checked out in another worktree" is a
             // CONFLICT, carrying the occupying worktree's id — not a
@@ -963,8 +1067,9 @@ impl From<BranchError> for CliError {
                 "switch that worktree to another branch first, or run the command there",
             ),
             BranchError::NotFullyMerged(name) => {
-                CliError::failure(format!("The branch '{name}' is not fully merged."))
+                CliError::failure(format!("the branch '{name}' is not fully merged"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    .with_exit_code(1)
                     .with_hint(format!(
                         "If you are sure you want to delete it, run 'libra branch -D {name}'."
                     ))
@@ -1004,16 +1109,30 @@ impl From<BranchError> for CliError {
             }
             BranchError::SortConfigRead { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::IoReadFailed),
-            BranchError::InvalidUpstream(upstream) => {
-                CliError::fatal(format!("invalid upstream '{upstream}'"))
+            BranchError::UpstreamMissing(upstream) => CliError::command_usage(format!(
+                "the requested upstream branch '{upstream}' does not exist"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint(
+                "If you meant to set the upstream to a local branch, use -u <local-branch> \
+                 or --set-upstream-to=<local-branch>. If the upstream is on a remote, \
+                 run 'libra fetch' first.",
+            ),
+            BranchError::UpstreamTargetMissing(name) => {
+                CliError::command_usage(format!("branch '{name}' does not exist"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
-                    .with_hint("expected format: 'remote/branch'")
+                    .with_hint("use 'libra branch -l' to list branches")
             }
-            BranchError::RemoteNotFound(remote) => {
-                CliError::fatal(format!("remote '{remote}' not found"))
-                    .with_stable_code(StableErrorCode::CliInvalidTarget)
-                    .with_hint("use 'libra remote -v' to inspect configured remotes")
+            BranchError::TooManyUpstreamArgs => {
+                CliError::command_usage("too many arguments to set new upstream")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("usage: libra branch -u <upstream> [<branch>]")
             }
+            BranchError::TrackStartNotBranch(start) => CliError::command_usage(format!(
+                "cannot set up tracking information; starting point '{start}' is not a branch"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("use a local branch or a remote-tracking name such as origin/main"),
             BranchError::ConfigReadFailed(detail) => CliError::fatal(detail)
                 .with_stable_code(StableErrorCode::IoReadFailed)
                 .with_hint("check whether the repository database is readable."),
@@ -1044,11 +1163,6 @@ impl From<BranchError> for CliError {
             BranchError::DeleteFailed { branch, detail } => {
                 CliError::fatal(format!("failed to delete branch '{branch}': {detail}"))
                     .with_stable_code(StableErrorCode::IoWriteFailed)
-            }
-            BranchError::OperationLogFailed(detail) => {
-                CliError::fatal(format!("failed to record branch operation: {detail}"))
-                    .with_stable_code(StableErrorCode::IoWriteFailed)
-                    .with_hint("check whether the repository database is writable.")
             }
             BranchError::CommitLoadFailed { commit, detail } => {
                 CliError::fatal(format!("failed to load commit {commit}: {detail}"))
@@ -1215,82 +1329,110 @@ fn branch_config_write_error(key: &str, error: impl ToString) -> BranchError {
     }
 }
 
-async fn operation_actor() -> String {
-    ConfigKv::get("user.name")
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.value)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "libra-user".to_string())
+/// Resolved form of an `-u/--set-upstream-to` argument (ADR-HF-08).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedUpstream {
+    Remote { remote: String, merge: String },
+    Local { name: String },
 }
 
-async fn current_repo_id_for_operation() -> Result<String, BranchError> {
-    if let Some(entry) = ConfigKv::get("libra.repoid").await.map_err(|error| {
-        BranchError::OperationLogFailed(format!(
-            "failed to read repository id from config: {error}"
-        ))
-    })? {
-        let repo_id = entry.value;
-        if !repo_id.trim().is_empty() && repo_id != "unknown-repo" {
-            return Ok(repo_id);
+enum SetUpstreamOutcome {
+    Written { local: bool },
+    Unchanged,
+}
+
+fn split_remote_tracking_name(upstream: &str) -> Option<(&str, &str)> {
+    let (remote, branch) = upstream.split_once('/')?;
+    if remote.is_empty() || branch.is_empty() {
+        None
+    } else {
+        Some((remote, branch))
+    }
+}
+
+async fn local_branch_exists(name: &str) -> Result<bool, BranchError> {
+    Ok(Branch::find_branch_result(name, None)
+        .await
+        .map_err(map_branch_store_error)?
+        .is_some())
+}
+
+async fn remote_tracking_exists(remote: &str, branch: &str) -> Result<bool, BranchError> {
+    let full = format!("refs/remotes/{remote}/{branch}");
+    if Branch::find_branch_result(&full, Some(remote))
+        .await
+        .map_err(map_branch_store_error)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(Branch::find_branch_result(branch, Some(remote))
+        .await
+        .map_err(map_branch_store_error)?
+        .is_some())
+}
+
+/// ADR-HF-08 parse order: configured `remote/branch` (preferring an existing
+/// tracking ref), then a local `refs/heads/<upstream>`, otherwise missing.
+async fn resolve_upstream_spec(upstream: &str) -> Result<ResolvedUpstream, BranchError> {
+    if let Some((remote, branch)) = split_remote_tracking_name(upstream) {
+        let configured = ConfigKv::remote_config(remote)
+            .await
+            .map_err(|e| branch_config_read_error(format!("remote '{remote}' configuration"), e))?
+            .is_some();
+        if configured {
+            let tracking = remote_tracking_exists(remote, branch).await?;
+            let local_same_name = local_branch_exists(upstream).await?;
+            if tracking || !local_same_name {
+                return Ok(ResolvedUpstream::Remote {
+                    remote: remote.to_string(),
+                    merge: branch.to_string(),
+                });
+            }
         }
     }
-
-    let repo_id = Uuid::new_v4().to_string();
-    ConfigKv::set("libra.repoid", &repo_id, false)
-        .await
-        .map_err(|error| {
-            BranchError::OperationLogFailed(format!(
-                "failed to write generated repository id to config: {error}"
-            ))
-        })?;
-    Ok(repo_id)
+    if local_branch_exists(upstream).await? {
+        return Ok(ResolvedUpstream::Local {
+            name: upstream.to_string(),
+        });
+    }
+    Err(BranchError::UpstreamMissing(upstream.to_string()))
 }
 
-fn branch_operation_args_digest(action: &str, branch: &str, commit: &str) -> String {
-    let payload = format!("{action}\0{branch}\0{commit}");
-    let digest = ring::digest::digest(&ring::digest::SHA256, payload.as_bytes());
-    format!("sha256:{}", hex::encode(digest.as_ref()))
+fn format_upstream_ref(remote: &str, merge_branch: &str) -> String {
+    if remote == "." {
+        merge_branch.to_string()
+    } else {
+        format!("{remote}/{merge_branch}")
+    }
 }
-async fn set_upstream_with_conn<C: ConnectionTrait>(
-    db: &C,
+
+async fn write_upstream_config(
     branch: &str,
-    upstream: &str,
+    remote: &str,
+    merge_short: &str,
 ) -> Result<(), BranchError> {
-    let (remote, remote_branch) = upstream
-        .split_once('/')
-        .ok_or_else(|| BranchError::InvalidUpstream(upstream.to_string()))?;
-    if remote.is_empty() || remote_branch.is_empty() {
-        return Err(BranchError::InvalidUpstream(upstream.to_string()));
-    }
-    if ConfigKv::remote_config_with_conn(db, remote)
-        .await
-        .map_err(|e| branch_config_read_error(format!("remote '{remote}' configuration"), e))?
-        .is_none()
-    {
-        return Err(BranchError::RemoteNotFound(remote.to_string()));
-    }
-    let branch_config = ConfigKv::branch_config_with_conn(db, branch)
+    let db = get_db_conn_instance().await;
+    let branch_config = ConfigKv::branch_config_with_conn(&db, branch)
         .await
         .map_err(|e| {
             branch_config_read_error(format!("upstream config for branch '{branch}'"), e)
         })?;
-    let merge_ref = format!("refs/heads/{remote_branch}");
+    let merge_ref = format!("refs/heads/{merge_short}");
     // `branch_config_with_conn()` normalizes `refs/heads/<name>` to `<name>`,
     // so the idempotency check must compare against the short branch name.
     let should_write = branch_config
         .as_ref()
-        .map(|config| config.remote != remote || config.merge != remote_branch)
+        .map(|config| config.remote != remote || config.merge != merge_short)
         .unwrap_or(true);
 
     if should_write {
         let remote_key = format!("branch.{branch}.remote");
-        ConfigKv::set_with_conn(db, &remote_key, remote, false)
+        ConfigKv::set_with_conn(&db, &remote_key, remote, false)
             .await
             .map_err(|e| branch_config_write_error(&remote_key, e))?;
         let merge_key = format!("branch.{branch}.merge");
-        ConfigKv::set_with_conn(db, &merge_key, &merge_ref, false)
+        ConfigKv::set_with_conn(&db, &merge_key, &merge_ref, false)
             .await
             .map_err(|e| branch_config_write_error(&merge_key, e))?;
     }
@@ -1298,11 +1440,49 @@ async fn set_upstream_with_conn<C: ConnectionTrait>(
     Ok(())
 }
 
-/// Convenience wrapper that grabs the global SQLite connection before
-/// calling [`set_upstream_with_conn`].
-async fn set_upstream_impl(branch: &str, upstream: &str) -> Result<(), BranchError> {
-    let db = get_db_conn_instance().await;
-    set_upstream_with_conn(&db, branch, upstream).await
+async fn set_upstream_impl(
+    branch: &str,
+    upstream: &str,
+) -> Result<SetUpstreamOutcome, BranchError> {
+    if !local_branch_exists(branch).await? {
+        return Err(BranchError::UpstreamTargetMissing(branch.to_string()));
+    }
+    let resolved = resolve_upstream_spec(upstream).await?;
+    let (remote, merge_short, local) = match &resolved {
+        ResolvedUpstream::Remote { remote, merge } => (remote.as_str(), merge.as_str(), false),
+        ResolvedUpstream::Local { name } => (".", name.as_str(), true),
+    };
+    if local && merge_short == branch {
+        emit_warning(format!("not setting branch '{branch}' as its own upstream"));
+        return Ok(SetUpstreamOutcome::Unchanged);
+    }
+    write_upstream_config(branch, remote, merge_short).await?;
+    Ok(SetUpstreamOutcome::Written { local })
+}
+
+/// An already configured upstream is a read-only branch invocation.  Keeping
+/// this small preflight outside the v2 mutation boundary preserves the
+/// idempotent path even when the repository database is read-only.
+pub(crate) async fn set_upstream_is_idempotent(args: &BranchArgs) -> bool {
+    let Some(upstream) = args.set_upstream_to.as_deref() else {
+        return false;
+    };
+    let Some((remote, remote_branch)) = upstream.split_once('/') else {
+        return false;
+    };
+    if remote.is_empty() || remote_branch.is_empty() {
+        return false;
+    }
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => return false,
+    };
+    let database = get_db_conn_instance().await;
+    let config = match ConfigKv::branch_config_with_conn(&database, &branch).await {
+        Ok(config) => config,
+        Err(_) => return false,
+    };
+    config.is_some_and(|config| config.remote == remote && config.merge == remote_branch)
 }
 
 async fn unset_upstream_impl(branch: &str) -> Result<(), BranchError> {
@@ -1507,52 +1687,51 @@ async fn create_branch_impl(
     })?;
 
     if record_operation {
-        let meta = OperationMeta {
-            command_name: "branch".to_string(),
-            description: format!("create branch {new_branch}"),
-            actor: operation_actor().await,
-            repo_id: current_repo_id_for_operation().await?,
-            args_digest: Some(branch_operation_args_digest(
-                "create",
-                &new_branch,
-                &commit_id_display,
-            )),
-        };
-
+        let database = crate::internal::db::get_db_conn_instance().await;
+        let transaction = crate::internal::db::begin_write_transaction(&database)
+            .await
+            .map_err(|error| BranchError::CreateFailed {
+                branch: new_branch.clone(),
+                detail: error.to_string(),
+            })?;
         let branch_for_operation = new_branch.clone();
         let commit_for_operation = commit_id_display.clone();
-        with_operation_log(
-            meta,
-            // Same as the reset path above: the invoking worktree's scope, so
-            // branch restore keeps working (Codex R24).
-            OperationScope::default(),
-            move |txn| {
-                Box::pin(async move {
-                    let exists = Branch::exists_result_with_conn(txn, &branch_for_operation, None)
-                        .await
-                        .map_err(|error| DbErr::Custom(error.to_string()))?;
-                    if exists {
-                        return Err(DbErr::Custom(format!(
-                            "a branch named '{}' already exists",
-                            branch_for_operation
-                        )));
-                    }
-                    Branch::update_branch_with_conn(
-                        txn,
-                        &branch_for_operation,
-                        &commit_for_operation,
-                        None,
-                    )
-                    .await?;
-                    Ok::<(), DbErr>(())
-                })
-            },
-        )
-        .await
-        .map_err(|error| BranchError::CreateFailed {
-            branch: new_branch.clone(),
-            detail: error.to_string(),
-        })?;
+        let result = async {
+            let exists = Branch::exists_result_with_conn(&transaction, &branch_for_operation, None)
+                .await
+                .map_err(|error| DbErr::Custom(error.to_string()))?;
+            if exists {
+                return Err(DbErr::Custom(format!(
+                    "a branch named '{}' already exists",
+                    branch_for_operation
+                )));
+            }
+            Branch::update_branch_with_conn(
+                &transaction,
+                &branch_for_operation,
+                &commit_for_operation,
+                None,
+            )
+            .await?;
+            Ok::<(), DbErr>(())
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(|error| BranchError::CreateFailed {
+                    branch: new_branch.clone(),
+                    detail: error.to_string(),
+                })?,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(BranchError::CreateFailed {
+                    branch: new_branch.clone(),
+                    detail: error.to_string(),
+                });
+            }
+        }
     } else {
         Branch::update_branch(&new_branch, &commit_id_display, None)
             .await
@@ -1566,6 +1745,120 @@ async fn create_branch_impl(
         name: new_branch,
         commit: commit_id_display,
     })
+}
+
+enum PlannedCreateTracking {
+    Write {
+        remote: String,
+        merge: String,
+        local: bool,
+        display: String,
+    },
+    None,
+}
+
+async fn start_point_label(explicit: Option<&str>) -> String {
+    match explicit {
+        Some(start) => start.to_string(),
+        None => match Head::current().await {
+            Head::Branch(name) => name,
+            Head::Detached(hash) => hash.to_string(),
+        },
+    }
+}
+
+async fn plan_create_tracking(
+    mode: BranchTrackMode,
+    start: &str,
+) -> Result<PlannedCreateTracking, BranchError> {
+    match mode {
+        BranchTrackMode::Direct => match resolve_upstream_spec(start).await {
+            Ok(ResolvedUpstream::Remote { remote, merge }) => Ok(PlannedCreateTracking::Write {
+                display: format_upstream_ref(&remote, &merge),
+                remote,
+                merge,
+                local: false,
+            }),
+            Ok(ResolvedUpstream::Local { name }) => Ok(PlannedCreateTracking::Write {
+                display: name.clone(),
+                remote: ".".to_string(),
+                merge: name,
+                local: true,
+            }),
+            Err(_) => Err(BranchError::TrackStartNotBranch(start.to_string())),
+        },
+        BranchTrackMode::Inherit => {
+            if local_branch_exists(start).await? {
+                match ConfigKv::branch_config(start).await.ok().flatten() {
+                    Some(config) => {
+                        let local = config.remote == ".";
+                        Ok(PlannedCreateTracking::Write {
+                            display: format_upstream_ref(&config.remote, &config.merge),
+                            remote: config.remote,
+                            merge: config.merge,
+                            local,
+                        })
+                    }
+                    None => Ok(PlannedCreateTracking::None),
+                }
+            } else {
+                match resolve_upstream_spec(start).await {
+                    Ok(ResolvedUpstream::Remote { remote, merge }) => {
+                        Ok(PlannedCreateTracking::Write {
+                            display: format_upstream_ref(&remote, &merge),
+                            remote,
+                            merge,
+                            local: false,
+                        })
+                    }
+                    Ok(ResolvedUpstream::Local { name }) => Ok(PlannedCreateTracking::Write {
+                        display: name.clone(),
+                        remote: ".".to_string(),
+                        merge: name,
+                        local: true,
+                    }),
+                    Err(_) => Err(BranchError::TrackStartNotBranch(start.to_string())),
+                }
+            }
+        }
+    }
+}
+
+async fn create_branch_with_optional_track(
+    new_branch: String,
+    args: &BranchArgs,
+) -> Result<BranchOutput, BranchError> {
+    let track_mode = if args.no_track { None } else { args.track };
+    let start_label = start_point_label(args.commit_hash.as_deref()).await;
+    let planned = match track_mode {
+        Some(mode) => Some(plan_create_tracking(mode, &start_label).await?),
+        None => None,
+    };
+
+    let created = create_branch_impl(new_branch.clone(), args.commit_hash.clone(), true).await?;
+    match planned {
+        Some(PlannedCreateTracking::Write {
+            remote,
+            merge,
+            local,
+            display,
+        }) => {
+            if local && merge == new_branch {
+                emit_warning(format!(
+                    "not setting branch '{new_branch}' as its own upstream"
+                ));
+                Ok(created)
+            } else {
+                write_upstream_config(&new_branch, &remote, &merge).await?;
+                Ok(BranchOutput::SetUpstream {
+                    branch: new_branch,
+                    upstream: display,
+                    local,
+                })
+            }
+        }
+        Some(PlannedCreateTracking::None) | None => Ok(created),
+    }
 }
 
 /// Body of `libra branch -d <name>` / `-D <name>`.
@@ -1584,7 +1877,13 @@ async fn delete_branch_impl(branch_name: String, force: bool) -> Result<BranchOu
         return Err(BranchError::Locked(branch_name));
     }
 
-    let branch = require_existing_local_branch(&branch_name).await?;
+    let branch = match require_existing_local_branch(&branch_name).await {
+        Ok(branch) => branch,
+        Err(BranchError::NotFound { name, similar }) => {
+            return Err(BranchError::DeleteNotFound { name, similar });
+        }
+        Err(error) => return Err(error),
+    };
     let head = Head::current().await;
     if let Head::Branch(name) = &head
         && name == &branch_name
@@ -1891,14 +2190,55 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
             name: branch.name,
         });
     }
-    for branch in remote_branches {
+    for branch in &remote_branches {
+        let plain_name = match list_mode {
+            BranchListMode::All => format!("remotes/{}", plain_branch_display_name(branch)),
+            _ => plain_branch_display_name(branch),
+        };
         entries.push(BranchListEntry {
             current: false,
             commit: branch.commit.to_string(),
-            display_name: format_branch_name(&branch),
-            plain_name: plain_branch_display_name(&branch),
-            name: branch.name,
+            display_name: match list_mode {
+                BranchListMode::All => plain_name.clone().red().to_string(),
+                _ => format_branch_name(branch),
+            },
+            plain_name,
+            name: branch.name.clone(),
         });
+    }
+
+    // Git `branch -a`/`-r` insert `[<remotes>/]<remote>/HEAD -> <remote>/<branch>`
+    // for each cached remote HEAD symref (issues/474 CL-15 / M-BRA D1–D2).
+    if matches!(list_mode, BranchListMode::Remote | BranchListMode::All) {
+        let db = get_db_conn_instance().await;
+        let remote_configs = ConfigKv::all_remote_configs_with_conn(&db)
+            .await
+            .map_err(|e| branch_config_read_error("remote configuration", e))?;
+        for remote in remote_configs {
+            match Head::remote_current_result_with_conn(&db, &remote.name).await {
+                Ok(Some(Head::Branch(target))) => {
+                    let target_ref = remote_tracking_refname(&remote.name, &target);
+                    let Some(target_branch) = remote_branches.iter().find(|branch| {
+                        remote_tracking_refname(&remote.name, &branch.name) == target_ref
+                    }) else {
+                        // Target was filtered out (--contains/--points-at/…) or is missing.
+                        continue;
+                    };
+                    let short_target = remote_tracking_short_name(&target);
+                    let plain_name =
+                        remote_head_symlink_plain_name(list_mode, &remote.name, &short_target);
+                    entries.push(BranchListEntry {
+                        current: false,
+                        commit: target_branch.commit.to_string(),
+                        display_name: plain_name.clone().red().to_string(),
+                        plain_name,
+                        name: format!("refs/remotes/{}/HEAD", remote.name),
+                    });
+                }
+                Ok(Some(Head::Detached(_)) | None) => {}
+                Err(error) => return Err(map_branch_store_error(error)),
+            }
+        }
     }
 
     let show_unborn_head = local_branches_empty
@@ -1907,12 +2247,13 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
         && matches!(list_mode, BranchListMode::Local | BranchListMode::All)
         && head_name.is_some();
 
-    // `--sort` orders the entries here (reflected in both human and JSON
-    // output); the renderer then preserves this order instead of applying its
-    // default current-first ordering. Without the flag, the Git-compatible
+    // `--sort` / `branch.sort` / the default refname order are applied here
+    // (human and JSON share the same sequence). The renderer must not
+    // re-promote the current branch. Without `--sort`, the Git-compatible
     // `branch.sort` config default applies (strict local→global→system
-    // cascade). The config is resolved here — after `has_commit_filters` and
-    // `show_unborn_head` — so a configured sort, unlike the flag, neither
+    // cascade); when that is also unset, locals then remotes are ordered by
+    // `plain_name`. The config is resolved here — after `has_commit_filters`
+    // and `show_unborn_head` — so a configured sort, unlike the flag, neither
     // implies `--list` nor suppresses the unborn-HEAD line (Git behavior).
     let config_sort = if args.sort.is_none() {
         configured_branch_sort().await?
@@ -1934,7 +2275,10 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
                 })?;
                 true
             }
-            None => false,
+            None => {
+                sort_entries_default_refname(&mut entries, args.ignore_case);
+                true
+            }
         },
     };
 
@@ -1961,8 +2305,27 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
 async fn run_branch(args: &BranchArgs) -> Result<BranchOutput, BranchError> {
     require_repo().map_err(|_| BranchError::NotInRepo)?;
 
-    if let Some(new_branch) = args.new_branch.clone() {
-        create_branch_impl(new_branch, args.commit_hash.clone(), true).await
+    if let Some(upstream) = args.set_upstream_to.as_deref() {
+        if args.commit_hash.is_some() {
+            return Err(BranchError::TooManyUpstreamArgs);
+        }
+        let branch = match args.new_branch.as_deref() {
+            Some(name) => name.to_string(),
+            None => match Head::current().await {
+                Head::Branch(name) => name,
+                Head::Detached(_) => return Err(detached_head_branch_error()),
+            },
+        };
+        match set_upstream_impl(&branch, upstream).await? {
+            SetUpstreamOutcome::Written { local } => Ok(BranchOutput::SetUpstream {
+                branch,
+                upstream: upstream.to_string(),
+                local,
+            }),
+            SetUpstreamOutcome::Unchanged => Ok(BranchOutput::SetUpstreamUnchanged { branch }),
+        }
+    } else if let Some(new_branch) = args.new_branch.clone() {
+        create_branch_with_optional_track(new_branch, args).await
     } else if let Some(branch_to_delete) = args.delete.clone() {
         delete_branch_impl(branch_to_delete, true).await
     } else if let Some(branch_to_delete) = args.delete_safe.clone() {
@@ -1985,16 +2348,6 @@ async fn run_branch(args: &BranchArgs) -> Result<BranchOutput, BranchError> {
             },
         };
         Ok(output)
-    } else if let Some(upstream) = args.set_upstream_to.as_deref() {
-        let branch = match Head::current().await {
-            Head::Branch(name) => name,
-            Head::Detached(_) => return Err(detached_head_branch_error()),
-        };
-        set_upstream_impl(&branch, upstream).await?;
-        Ok(BranchOutput::SetUpstream {
-            branch,
-            upstream: upstream.to_string(),
-        })
     } else if let Some(branch) = args.unset_upstream.as_deref() {
         let branch = if branch.is_empty() {
             match Head::current().await {
@@ -2094,8 +2447,9 @@ async fn branch_verbose_suffix(branch_name: &str, commit_hash: &str, verbose: u8
 
 /// Resolve the `[<upstream>: ahead N, behind M]` tracking segment for a local
 /// branch (`-vv`). Returns `None` when the branch has no configured upstream.
-/// When the remote-tracking ref cannot be resolved (e.g. never fetched), the
-/// ahead/behind counts are omitted and only `[<upstream>]` is shown.
+/// When the remote-tracking ref cannot be resolved (e.g. never fetched), or the
+/// counts cannot be computed (a warning says why), the ahead/behind counts are
+/// omitted and only `[<upstream>]` is shown.
 async fn branch_upstream_segment(branch_name: &str, branch_commit: &str) -> Option<String> {
     let remote = ConfigKv::get(&format!("branch.{branch_name}.remote"))
         .await
@@ -2108,15 +2462,29 @@ async fn branch_upstream_segment(branch_name: &str, branch_commit: &str) -> Opti
         .flatten()
         .map(|e| e.value)?;
     let merge_short = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
-    let upstream_display = format!("{remote}/{merge_short}");
-    let remote_ref = format!("refs/remotes/{remote}/{merge_short}");
+    let upstream_display = format_upstream_ref(&remote, merge_short);
+    let remote_ref = if remote == "." {
+        format!("refs/heads/{merge_short}")
+    } else {
+        format!("refs/remotes/{remote}/{merge_short}")
+    };
 
-    let counts = match get_target_commit(&remote_ref).await {
-        Ok(upstream_commit) => branch_commit
-            .parse::<ObjectHash>()
-            .ok()
-            .map(|local| super::status::compute_ahead_behind(&local, &upstream_commit)),
-        Err(_) => None,
+    let counts = match (
+        get_target_commit(&remote_ref).await,
+        branch_commit.parse::<ObjectHash>(),
+    ) {
+        (Ok(upstream_commit), Ok(local)) => {
+            match super::status::upstream_ahead_behind(&local, &upstream_commit) {
+                Ok(counts) => Some(counts),
+                Err(reason) => {
+                    crate::utils::error::emit_warning(format!(
+                        "cannot count commits ahead/behind '{upstream_display}': {reason}"
+                    ));
+                    None
+                }
+            }
+        }
+        _ => None,
     };
     let segment = match counts {
         Some((ahead, behind)) if ahead > 0 && behind > 0 => {
@@ -2134,9 +2502,11 @@ async fn branch_upstream_segment(branch_name: &str, branch_commit: &str) -> Opti
 /// Functional scope:
 /// - JSON mode emits via `emit_json_data`; quiet mode prints nothing.
 /// - Human mode formats the list with a `*` prefix on the current branch,
-///   sorts so the current branch sits at the top, prints a "detached at"
-///   banner when relevant, and shows an unborn HEAD label as appropriate.
-///   `--column` lays the list out in columns instead of one branch per line.
+///   keeps default refname order (current branch is not promoted), prints a
+///   Git-style detached HEAD row when relevant, and shows an unborn HEAD
+///   label as appropriate. `-v`/`-vv` pad the name column to the longest
+///   displayed name. `--column` lays the list out in columns instead of one
+///   branch per line.
 async fn render_branch_output(
     result: &BranchOutput,
     output: &OutputConfig,
@@ -2172,21 +2542,13 @@ async fn render_branch_output(
             ignore_case,
             sorted: presorted,
         } => {
-            // Order the entries (shared by `--format` and the default listing):
-            // `--sort` already ordered them; otherwise current-first, then name.
+            // Order the entries (shared by `--format` and the default listing).
+            // `--sort` / `branch.sort` / the default refname pass already ordered
+            // them; a leftover unsorted payload still uses refname, not
+            // current-first.
             let mut sorted = branches.clone();
             if !*presorted {
-                sorted.sort_by(|a, b| {
-                    if a.current {
-                        std::cmp::Ordering::Less
-                    } else if b.current {
-                        std::cmp::Ordering::Greater
-                    } else if *ignore_case {
-                        a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                    } else {
-                        a.name.cmp(&b.name)
-                    }
-                });
+                sort_entries_default_refname(&mut sorted, *ignore_case);
             }
 
             // `--format`: render each branch via the for-each-ref atom engine,
@@ -2203,10 +2565,10 @@ async fn render_branch_output(
                 let refs: Vec<(String, String)> = sorted
                     .iter()
                     .map(|b| {
-                        let refname = if b.plain_name == b.name {
-                            format!("refs/heads/{}", b.name)
+                        let refname = if b.name.starts_with("refs/") {
+                            b.name.clone()
                         } else {
-                            format!("refs/remotes/{}", b.plain_name)
+                            format!("refs/heads/{}", b.name)
                         };
                         (refname, b.commit.clone())
                     })
@@ -2219,16 +2581,13 @@ async fn render_branch_output(
                 return Ok(());
             }
 
-            if let Some(detached_head) = detached_head {
-                println!(
-                    "HEAD detached at {}",
-                    short_display_hash(detached_head).green()
-                );
-            }
+            let detached_label = detached_head
+                .as_ref()
+                .map(|oid| format!("(HEAD detached at {})", short_display_hash(oid)));
             if *show_unborn_head && let Some(head_name) = head_name {
                 println!("* {}", head_name.green());
             }
-            if branches.is_empty() {
+            if branches.is_empty() && detached_label.is_none() {
                 return Ok(());
             }
 
@@ -2240,29 +2599,54 @@ async fn render_branch_output(
             };
             if column_enabled {
                 // Plain names (current branch marked `* `) laid out in columns.
-                let entries: Vec<String> = sorted
-                    .iter()
-                    .map(|branch| {
-                        if branch.current {
-                            format!("* {}", branch.plain_name)
-                        } else {
-                            format!("  {}", branch.plain_name)
-                        }
-                    })
-                    .collect();
+                let mut entries: Vec<String> = Vec::new();
+                if let Some(label) = detached_label.as_ref() {
+                    entries.push(format!("* {label}"));
+                }
+                entries.extend(sorted.iter().map(|branch| {
+                    if branch.current {
+                        format!("* {}", branch.plain_name)
+                    } else {
+                        format!("  {}", branch.plain_name)
+                    }
+                }));
                 let width = super::tag::column_layout_width();
                 print!("{}", format_branch_columns(&entries, width));
             } else {
-                for branch in sorted {
+                let name_width = if verbose >= 1 {
+                    list_name_column_width(detached_label.as_deref(), &sorted)
+                } else {
+                    0
+                };
+                if let Some(label) = detached_label.as_ref() {
+                    let name = format_list_name_column(label, name_width, verbose >= 1);
                     let suffix = if verbose >= 1 {
+                        if let Some(oid) = detached_head.as_ref() {
+                            branch_verbose_suffix("", oid, verbose).await
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    println!("* {}{suffix}", name.green());
+                }
+                for branch in sorted {
+                    // Remote HEAD symlinks never carry `-v`/`-vv` tip metadata
+                    // (matches `git branch -a -v`: `remotes/origin/HEAD -> …`).
+                    let suffix = if verbose >= 1 && !is_remote_head_symlink(&branch) {
                         branch_verbose_suffix(&branch.name, &branch.commit, verbose).await
                     } else {
                         String::new()
                     };
+                    let name =
+                        format_list_name_column(&branch.plain_name, name_width, verbose >= 1);
                     if branch.current {
-                        println!("* {}{suffix}", branch.display_name.green());
+                        println!("* {}{suffix}", name.green());
+                    } else if is_remote_list_entry(&branch) {
+                        println!("  {}{suffix}", name.red());
                     } else {
-                        println!("  {}{suffix}", branch.display_name);
+                        println!("  {}{suffix}", name);
                     }
                 }
             }
@@ -2286,9 +2670,18 @@ async fn render_branch_output(
         BranchOutput::Copy { old_name, new_name } => {
             println!("Copied branch '{old_name}' to '{new_name}'");
         }
-        BranchOutput::SetUpstream { branch, upstream } => {
-            println!("Branch '{branch}' set up to track remote branch '{upstream}'");
+        BranchOutput::SetUpstream {
+            branch,
+            upstream,
+            local,
+        } => {
+            if *local {
+                println!("branch '{branch}' set up to track '{upstream}'.");
+            } else {
+                println!("Branch '{branch}' set up to track remote branch '{upstream}'");
+            }
         }
+        BranchOutput::SetUpstreamUnchanged { .. } => {}
         BranchOutput::UnsetUpstream { branch } => {
             println!("Branch '{branch}' no longer tracks an upstream branch");
         }
@@ -2337,13 +2730,22 @@ pub async fn set_upstream_safe_with_output(
     upstream: &str,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    set_upstream_impl(branch, upstream)
+    match set_upstream_impl(branch, upstream)
         .await
-        .map_err(CliError::from)?;
-    info_println!(
-        output,
-        "Branch '{branch}' set up to track remote branch '{upstream}'"
-    );
+        .map_err(CliError::from)?
+    {
+        SetUpstreamOutcome::Written { local } => {
+            if local {
+                info_println!(output, "branch '{branch}' set up to track '{upstream}'.");
+            } else {
+                info_println!(
+                    output,
+                    "Branch '{branch}' set up to track remote branch '{upstream}'"
+                );
+            }
+        }
+        SetUpstreamOutcome::Unchanged => {}
+    }
     Ok(())
 }
 
@@ -2421,6 +2823,8 @@ pub async fn list_branches(
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -2531,6 +2935,87 @@ async fn configured_branch_sort() -> Result<Option<String>, BranchError> {
         key: "branch.sort",
         detail: format!("{error:#}"),
     })
+}
+
+fn is_remote_list_entry(entry: &BranchListEntry) -> bool {
+    entry.name.starts_with("refs/remotes/")
+}
+
+/// `refs/remotes/<remote>/HEAD` list rows render as `<…>/HEAD -> <remote>/<branch>`.
+fn is_remote_head_symlink(entry: &BranchListEntry) -> bool {
+    entry.name.ends_with("/HEAD") && entry.plain_name.contains(" -> ")
+}
+
+/// Full remote-tracking ref for a short or already-qualified branch name.
+fn remote_tracking_refname(remote: &str, branch_name: &str) -> String {
+    if branch_name.starts_with("refs/remotes/") {
+        return branch_name.to_string();
+    }
+    let short = branch_name
+        .strip_prefix("refs/heads/")
+        .unwrap_or(branch_name);
+    format!("refs/remotes/{remote}/{short}")
+}
+
+fn remote_tracking_short_name(branch_name: &str) -> String {
+    branch_name
+        .strip_prefix("refs/heads/")
+        .or_else(|| {
+            branch_name
+                .strip_prefix("refs/remotes/")
+                .and_then(|rest| rest.split_once('/').map(|(_, name)| name))
+        })
+        .unwrap_or(branch_name)
+        .to_string()
+}
+
+/// Human label for a remote HEAD symlink (`-a` keeps the `remotes/` prefix).
+fn remote_head_symlink_plain_name(
+    list_mode: BranchListMode,
+    remote: &str,
+    short_target: &str,
+) -> String {
+    let arrow = format!("{remote}/HEAD -> {remote}/{short_target}");
+    match list_mode {
+        BranchListMode::All => format!("remotes/{arrow}"),
+        BranchListMode::Remote => arrow,
+        BranchListMode::Local => arrow,
+    }
+}
+
+fn sort_entries_default_refname(entries: &mut [BranchListEntry], ignore_case: bool) {
+    entries.sort_by(
+        |a, b| match (is_remote_list_entry(a), is_remote_list_entry(b)) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            _ => {
+                if ignore_case {
+                    a.plain_name
+                        .to_lowercase()
+                        .cmp(&b.plain_name.to_lowercase())
+                } else {
+                    a.plain_name.cmp(&b.plain_name)
+                }
+            }
+        },
+    );
+}
+
+fn list_name_column_width(detached_label: Option<&str>, branches: &[BranchListEntry]) -> usize {
+    branches
+        .iter()
+        .map(|branch| branch.plain_name.chars().count())
+        .chain(detached_label.map(|label| label.chars().count()))
+        .max()
+        .unwrap_or(0)
+}
+
+fn format_list_name_column(name: &str, width: usize, pad: bool) -> String {
+    if pad && width > name.chars().count() {
+        format!("{name:<width$}")
+    } else {
+        name.to_string()
+    }
 }
 
 fn sort_branch_entries(
@@ -2755,7 +3240,7 @@ pub fn is_valid_git_branch_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::PathBuf, str::FromStr};
+    use std::{collections::HashSet, str::FromStr};
 
     use clap::Parser;
     use git_internal::hash::{ObjectHash, get_hash_kind};
@@ -2763,8 +3248,12 @@ mod tests {
     use serial_test::serial;
 
     use super::{
-        Branch, BranchArgs, BranchError, clean_branch_description, commit_contains,
-        format_branch_name, load_remote_branches_with_conn, map_head_commit_store_error,
+        Branch, BranchArgs, BranchError, BranchListEntry, BranchListMode, ResolvedUpstream,
+        clean_branch_description, commit_contains, format_branch_name, format_list_name_column,
+        format_upstream_ref, is_remote_head_symlink, list_name_column_width,
+        load_remote_branches_with_conn, map_head_commit_store_error,
+        remote_head_symlink_plain_name, resolve_upstream_spec, set_upstream_impl,
+        sort_entries_default_refname,
     };
     use crate::utils::{
         error::{CliError, StableErrorCode},
@@ -2796,6 +3285,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn edit_description_flag_parses_optional_branch() {
         // Bare flag defaults to "" (the current branch).
         let args = BranchArgs::try_parse_from(["branch", "--edit-description"]).unwrap();
@@ -2808,31 +3298,143 @@ mod tests {
         assert_eq!(args.edit_description, None);
     }
 
+    #[test]
+    fn set_upstream_flag_parses_optional_target_branch() {
+        let args = BranchArgs::try_parse_from(["branch", "-u", "main", "alpha"]).unwrap();
+        assert_eq!(args.set_upstream_to.as_deref(), Some("main"));
+        assert_eq!(args.new_branch.as_deref(), Some("alpha"));
+        assert_eq!(args.commit_hash, None);
+
+        let args = BranchArgs::try_parse_from(["branch", "--set-upstream-to=main"]).unwrap();
+        assert_eq!(args.set_upstream_to.as_deref(), Some("main"));
+        assert_eq!(args.new_branch, None);
+
+        let args = BranchArgs::try_parse_from(["branch", "-u", "main", "alpha", "extra"]).unwrap();
+        assert_eq!(args.set_upstream_to.as_deref(), Some("main"));
+        assert_eq!(args.new_branch.as_deref(), Some("alpha"));
+        assert_eq!(args.commit_hash.as_deref(), Some("extra"));
+    }
+
+    #[test]
+    fn track_flag_parses_optional_equals_mode() {
+        let args = BranchArgs::try_parse_from(["branch", "--track", "t1", "main"]).unwrap();
+        assert_eq!(args.track, Some(super::BranchTrackMode::Direct));
+        assert_eq!(args.new_branch.as_deref(), Some("t1"));
+        assert_eq!(args.commit_hash.as_deref(), Some("main"));
+
+        let args = BranchArgs::try_parse_from(["branch", "-t", "t2", "main"]).unwrap();
+        assert_eq!(args.track, Some(super::BranchTrackMode::Direct));
+        assert_eq!(args.new_branch.as_deref(), Some("t2"));
+
+        let args = BranchArgs::try_parse_from(["branch", "--track=inherit", "t3", "t1"]).unwrap();
+        assert_eq!(args.track, Some(super::BranchTrackMode::Inherit));
+        assert_eq!(args.new_branch.as_deref(), Some("t3"));
+        assert_eq!(args.commit_hash.as_deref(), Some("t1"));
+
+        let args = BranchArgs::try_parse_from(["branch", "--no-track", "t4", "main"]).unwrap();
+        assert!(args.no_track);
+        assert_eq!(args.track, None);
+        assert_eq!(args.new_branch.as_deref(), Some("t4"));
+    }
+
+    #[test]
+    fn format_upstream_ref_omits_dot_remote() {
+        assert_eq!(format_upstream_ref(".", "main"), "main");
+        assert_eq!(format_upstream_ref("origin", "main"), "origin/main");
+    }
+
+    #[tokio::test]
+    #[serial(cwd)]
+    async fn resolve_upstream_spec_prefers_remote_then_local() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+
+        crate::command::commit::execute(crate::command::commit::CommitArgs {
+            message: Some("base".to_string()),
+            allow_empty: true,
+            disable_pre: true,
+            no_verify: true,
+            ..Default::default()
+        })
+        .await;
+
+        let head = crate::internal::head::Head::current_commit()
+            .await
+            .expect("HEAD commit");
+        crate::internal::branch::Branch::update_branch("alpha", &head.to_string(), None)
+            .await
+            .expect("create alpha");
+        crate::internal::config::ConfigKv::set(
+            "remote.origin.url",
+            "https://example.invalid/repo.git",
+            false,
+        )
+        .await
+        .expect("configure origin");
+        crate::internal::branch::Branch::update_branch(
+            "refs/remotes/origin/main",
+            &head.to_string(),
+            Some("origin"),
+        )
+        .await
+        .expect("create origin/main");
+
+        assert_eq!(
+            resolve_upstream_spec("origin/main").await.expect("remote"),
+            ResolvedUpstream::Remote {
+                remote: "origin".to_string(),
+                merge: "main".to_string(),
+            }
+        );
+        assert_eq!(
+            resolve_upstream_spec("alpha").await.expect("local"),
+            ResolvedUpstream::Local {
+                name: "alpha".to_string(),
+            }
+        );
+        let missing = resolve_upstream_spec("nosuch").await.expect_err("missing");
+        assert!(matches!(missing, BranchError::UpstreamMissing(_)));
+    }
+
+    #[tokio::test]
+    #[serial(cwd)]
+    async fn set_upstream_impl_warns_on_self_upstream() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+
+        crate::command::commit::execute(crate::command::commit::CommitArgs {
+            message: Some("base".to_string()),
+            allow_empty: true,
+            disable_pre: true,
+            no_verify: true,
+            ..Default::default()
+        })
+        .await;
+
+        let current = match crate::internal::head::Head::current().await {
+            crate::internal::head::Head::Branch(name) => name,
+            crate::internal::head::Head::Detached(_) => panic!("expected a named branch"),
+        };
+        let outcome = set_upstream_impl(&current, &current)
+            .await
+            .expect("self-upstream is a warning, not an error");
+        assert!(matches!(outcome, super::SetUpstreamOutcome::Unchanged));
+        assert!(
+            crate::internal::config::ConfigKv::get(&format!("branch.{current}.remote"))
+                .await
+                .expect("read")
+                .is_none(),
+            "self-upstream must not write branch.*.remote"
+        );
+    }
+
     struct ColorOverrideReset;
 
     impl Drop for ColorOverrideReset {
         fn drop(&mut self) {
             colored::control::unset_override();
-        }
-    }
-
-    #[allow(dead_code)]
-    struct CurrentDirGuard {
-        original: PathBuf,
-    }
-
-    #[allow(dead_code)]
-    impl CurrentDirGuard {
-        fn change_to(path: &std::path::Path) -> Self {
-            let original = std::env::current_dir().expect("failed to read current dir");
-            std::env::set_current_dir(path).expect("failed to change current dir");
-            Self { original }
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
         }
     }
 
@@ -2870,12 +3472,20 @@ mod tests {
             "branch 'topic/x' not found",
         );
         assert_eq!(
+            BranchError::DeleteNotFound {
+                name: "topic/x".to_string(),
+                similar: vec![],
+            }
+            .to_string(),
+            "branch 'topic/x' not found",
+        );
+        assert_eq!(
             BranchError::DeleteCurrent("main".to_string()).to_string(),
             "Cannot delete the branch 'main' which you are currently on",
         );
         assert_eq!(
             BranchError::NotFullyMerged("feature".to_string()).to_string(),
-            "The branch 'feature' is not fully merged.",
+            "the branch 'feature' is not fully merged",
         );
         assert_eq!(
             BranchError::Locked("intent".to_string()).to_string(),
@@ -2887,12 +3497,20 @@ mod tests {
             "not a valid object name: 'deadbeef'",
         );
         assert_eq!(
-            BranchError::InvalidUpstream("origin/missing".to_string()).to_string(),
-            "invalid upstream 'origin/missing'",
+            BranchError::UpstreamMissing("nosuch".to_string()).to_string(),
+            "the requested upstream branch 'nosuch' does not exist",
         );
         assert_eq!(
-            BranchError::RemoteNotFound("origin".to_string()).to_string(),
-            "remote 'origin' not found",
+            BranchError::UpstreamTargetMissing("nosuchbranch".to_string()).to_string(),
+            "branch 'nosuchbranch' does not exist",
+        );
+        assert_eq!(
+            BranchError::TooManyUpstreamArgs.to_string(),
+            "too many arguments to set new upstream",
+        );
+        assert_eq!(
+            BranchError::TrackStartNotBranch("abc1234".to_string()).to_string(),
+            "cannot set up tracking information; starting point 'abc1234' is not a branch",
         );
         assert_eq!(
             BranchError::RenameTooManyArgs.to_string(),
@@ -2901,7 +3519,31 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    fn delete_refusal_errors_override_exit_to_one() {
+        let not_merged = CliError::from(BranchError::NotFullyMerged("feat".to_string()));
+        assert_eq!(not_merged.exit_code(), 1);
+        assert_eq!(not_merged.stable_code(), StableErrorCode::RepoStateInvalid);
+
+        let current = CliError::from(BranchError::DeleteCurrent("main".to_string()));
+        assert_eq!(current.exit_code(), 1);
+        assert_eq!(current.stable_code(), StableErrorCode::RepoStateInvalid);
+
+        let missing = CliError::from(BranchError::DeleteNotFound {
+            name: "ghost".to_string(),
+            similar: vec![],
+        });
+        assert_eq!(missing.exit_code(), 1);
+        assert_eq!(missing.stable_code(), StableErrorCode::CliInvalidTarget);
+
+        let other_missing = CliError::from(BranchError::NotFound {
+            name: "ghost".to_string(),
+            similar: vec![],
+        });
+        assert_eq!(other_missing.exit_code(), 129);
+    }
+
+    #[test]
+    #[serial(cwd, env)]
     fn commit_contains_surfaces_typed_commit_load_failure() {
         let repo = tempfile::tempdir().expect("temp repo");
         let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -2982,5 +3624,95 @@ mod tests {
             crate::internal::branch::BranchStoreError::Query("database is locked".into()),
         ));
         assert_eq!(cli_error.stable_code(), StableErrorCode::IoReadFailed);
+    }
+
+    fn list_entry(name: &str, plain: &str) -> BranchListEntry {
+        BranchListEntry {
+            name: name.to_string(),
+            current: false,
+            commit: any_hash().to_string(),
+            display_name: plain.to_string(),
+            plain_name: plain.to_string(),
+        }
+    }
+
+    #[test]
+    fn default_list_order_locals_then_remotes_by_plain_name() {
+        let mut entries = vec![
+            list_entry("zeta", "zeta"),
+            list_entry("refs/remotes/origin/main", "remotes/origin/main"),
+            list_entry("main", "main"),
+            list_entry("refs/remotes/origin/dev", "remotes/origin/dev"),
+            list_entry(
+                "refs/remotes/origin/HEAD",
+                "remotes/origin/HEAD -> origin/main",
+            ),
+            list_entry("alpha", "alpha"),
+        ];
+        sort_entries_default_refname(&mut entries, false);
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.plain_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "alpha",
+                "main",
+                "zeta",
+                "remotes/origin/HEAD -> origin/main",
+                "remotes/origin/dev",
+                "remotes/origin/main"
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_head_symlink_plain_name_matches_git() {
+        assert_eq!(
+            remote_head_symlink_plain_name(BranchListMode::All, "origin", "main"),
+            "remotes/origin/HEAD -> origin/main"
+        );
+        assert_eq!(
+            remote_head_symlink_plain_name(BranchListMode::Remote, "origin", "main"),
+            "origin/HEAD -> origin/main"
+        );
+    }
+
+    #[test]
+    fn is_remote_head_symlink_detects_arrow_rows() {
+        let head = list_entry(
+            "refs/remotes/origin/HEAD",
+            "remotes/origin/HEAD -> origin/main",
+        );
+        let ordinary = list_entry("refs/remotes/origin/main", "remotes/origin/main");
+        assert!(is_remote_head_symlink(&head));
+        assert!(!is_remote_head_symlink(&ordinary));
+    }
+
+    #[test]
+    fn list_name_column_width_includes_detached_and_remote_labels() {
+        let entries = vec![
+            list_entry("main", "main"),
+            list_entry("refs/remotes/origin/main", "remotes/origin/main"),
+        ];
+        let detached = "(HEAD detached at abcdef0)";
+        assert_eq!(
+            list_name_column_width(Some(detached), &entries),
+            detached.chars().count()
+        );
+        assert_eq!(
+            list_name_column_width(Some("x"), &entries),
+            "remotes/origin/main".chars().count()
+        );
+        assert_eq!(
+            list_name_column_width(Some(detached), &[]),
+            detached.chars().count()
+        );
+        assert_eq!(
+            format_list_name_column("main", 20, true),
+            format!("{:<20}", "main")
+        );
+        assert_eq!(format_list_name_column("main", 20, false), "main");
     }
 }

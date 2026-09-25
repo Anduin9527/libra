@@ -958,6 +958,8 @@ fn stage_mode_overrides(overrides: &[(String, u32)]) -> CliResult<()> {
 
 async fn stage_targets(targets: &[String]) -> CliResult<()> {
     let args = AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: targets.to_vec(),
         all: false,
         update: false,
@@ -971,6 +973,10 @@ async fn stage_targets(targets: &[String]) -> CliResult<()> {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     };
     run_add(&args).await.map(|_| ()).map_err(|error| {
         am_state_error(format!(
@@ -1256,7 +1262,7 @@ fn cleanup_untracked_patch_targets(targets: &[String]) -> CliResult<()> {
 async fn reset_hard(target: &str, output: &OutputConfig) -> CliResult<()> {
     let mut child = output.child_output_config();
     child.quiet = true;
-    crate::command::reset::execute_safe(
+    crate::command::reset::execute_safe_internal(
         crate::command::reset::ResetArgs {
             target: Some(target.to_string()),
             soft: false,
@@ -1269,6 +1275,9 @@ async fn reset_hard(target: &str, output: &OutputConfig) -> CliResult<()> {
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &child,
     )

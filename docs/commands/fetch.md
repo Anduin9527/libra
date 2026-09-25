@@ -15,7 +15,7 @@ missing, downloads them as a pack file, indexes the pack, and updates the corres
 remote-tracking refs (e.g. `refs/remotes/origin/main`). It never modifies the working
 tree or the current branch -- use `libra pull` or `libra merge` for that.
 
-When invoked with no arguments, it fetches from the current branch's configured upstream.
+When invoked with no arguments, it fetches from the current branch's configured upstream. A configured local upstream (`branch.<name>.remote=.`) is refused before any network or `FETCH_HEAD` write (`LBR-CLI-003`, exit 129); Git 2.54 `fetch` can operate on a local upstream — that support is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path.
 When `--all` is given, every configured remote is fetched in sequence. When a specific
 `<repository>` is named, only that remote is contacted. An optional `<refspec>` selects
 one source ref and may map it to an exact local destination (`<src>:<dst>`). When no
@@ -32,17 +32,31 @@ are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
 
 ## Global Config Schema Guard
 
-`libra fetch` reads the global storage configuration (`~/.libra/config.db`, or
-`LIBRA_CONFIG_GLOBAL_DB`) before trusting remote/tiered object storage settings. If that
-database has a schema version newer than this binary supports, fetch fails closed with
-`LBR-CONFIG-001` instead of silently ignoring global storage config and falling back to
-local objects. The diagnostic includes the binary path and version, config DB path,
-schema versions, and the update command:
-`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Configuration schema compatibility is role-scoped. Before `libra fetch` trusts
+configuration, it inspects GlobalConfig and SystemConfig metadata read-only. A
+future configuration schema or an unregistered/mismatched migration receipt
+fails closed with `LBR-CONFIG-001` when that scope is required. Known
+Repository-only receipts, including `2026090801` in the current manifest, do
+not make a configuration store future; its supported values remain readable.
+The configuration-owned legacy-reader barrier is recognized by this build;
+see [configuration compatibility](config.md#configuration-schema-compatibility).
 
-Use `libra --offline fetch ...` or `LIBRA_READ_POLICY=offline|local libra fetch ...` only when
-you intentionally want local-only object access. Libra will warn once and ignore the
-global storage config for that run.
+Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or the XDG configuration
+directory (`$XDG_CONFIG_HOME/libra/config.db`, defaulting to
+`<home>/.config/libra/config.db`), falling back to the legacy
+`<home>/.libra/config.db` until it is migrated;
+system configuration uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
+Complete process/repo-local storage settings can make GlobalConfig unnecessary
+(`cloud` must also satisfy its D1 settings). They do not prove that SystemConfig
+defaults are unnecessary. Diagnostics identify the affected scope, ledger and
+version without printing configuration values or untrusted receipt names.
+
+Unknown or unsupported state is upgrade-only here, not automatically repaired.
+Install a compatible newer Libra binary:
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Do not delete or edit SQLite receipts manually. Use `--offline` or
+`LIBRA_READ_POLICY=offline|local` only for intentional local-only object access;
+these modes warn and are not authorization for remote synchronization.
 
 ### Prune config defaults (`fetch.prune`, `remote.<name>.prune`)
 
@@ -50,7 +64,7 @@ When neither `--prune`/`-p` nor `--no-prune` is given, Libra resolves the prune
 behavior from Git-compatible config defaults, per remote: `remote.<name>.prune`
 first, then `fetch.prune`, each read through the local → global → system cascade
 (case-insensitive keys; encrypted local/global values are decrypted; legacy rows
-are honored; an unreadable or unsupported system scope is skipped). When neither
+are honored; an unreadable system scope is skipped). When neither
 key is set the built-in default is `false` — the same shipped default as Git.
 CLI flags always win over config.
 
@@ -58,11 +72,12 @@ An invalid value fails closed with `LBR-CLI-002` and an unreadable local/global
 scope with `LBR-IO-001`, in both cases **before the fetch touches the network**
 (with `--all`, every remote's prune mode is validated before the first fetch),
 so a bad config can never produce a fetch whose prune semantics silently
-diverge from what was configured. Exception: a global config store whose
-schema is newer than this Libra binary is skipped for these defaults with a
-one-time deduplicated warning; the dispatch-level guard still fails `fetch`
-closed with `LBR-CONFIG-001` when the command genuinely needs global storage
-config.
+diverge from what was configured. An unsupported global schema is skipped for
+these defaults with one deduplicated warning only when dispatch proves Global
+storage config unnecessary. The dispatch guard fails `fetch` closed with
+`LBR-CONFIG-001` when it requires unsupported Global config, or when System
+has a future/unregistered receipt; Global credential overrides do not bypass
+System defaults. Known Repository receipts and valid barriers remain readable.
 
 ### Fetch refspecs
 
@@ -75,16 +90,20 @@ libra config set --add remote.origin.fetch \
   +refs/heads/*:refs/remotes/origin/*
 ```
 
-Explicit refspecs override configured mappings. `remote add -t` and `remote
+Explicit refspecs override configured mappings. A bare source such as `fetch origin dev`
+still downloads that ref and records it in `FETCH_HEAD`, but when `remote.<name>.fetch`
+is already set and does not map `dev`, no new remote-tracking branch is created
+(matching a single-branch clone; issues/474 CL-05). `remote add -t` and `remote
 set-branches` write concrete `remote.<name>.fetch` values that later fetches now enforce.
 Config variable names are case-insensitive, so spellings such as
 `remote.origin.Fetch` are honored. Destinations are currently limited to
-`refs/heads/*` and `refs/remotes/<remote>/*`; the reserved `HEAD` destination in
-either namespace, and every other namespace, fail before any write.
+`refs/heads/*` and `refs/remotes/<remote>/*` (reserved `HEAD` is refused);
+`+refs/*:refs/*` mirror refspecs also map other legal `refs/*` names.
 Multiple destination updates, their reflogs, and `refs/remotes/<name>/HEAD` are committed
 in one SQLite transaction; any rejected destination rolls back the complete ref update.
 Non-fast-forward updates require `+` on that mapping or `--force`. Fetching into the
-local branch checked out by any linked worktree is rejected. On a full fetch, a cached
+local branch checked out by any linked worktree is rejected (bare repositories with
+`core.bare=true` skip that check). On a full fetch, a cached
 remote HEAD is removed when the effective mapping no longer includes the remote's default
 source branch. Tag destinations remain controlled by `--tags` / `--no-tags`, not fetch
 refspec mappings.
@@ -101,12 +120,12 @@ libra config remote.origin.prune false  # but never for origin
 | `<repository>` | Remote name or URL to fetch from. When omitted, uses the current branch's upstream remote. | `libra fetch origin` |
 | `<refspec>` | Source ref or exact `<src>:<dst>` mapping. Requires `<repository>`. When omitted, `remote.<name>.fetch` mappings are used, falling back to all remote branches. | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | Fetch from every configured remote. Conflicts with `<repository>`. | `libra fetch --all` |
-| `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Supported for Git remotes that advertise shallow boundaries. Local Libra remotes fail closed with `LBR-REPO-002` — the accepted end state (decision D20), since that transport cannot advertise shallow metadata. | `libra fetch origin --depth 1` |
+| `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Network Git (`git://`), HTTP(S), and SSH servers must advertise the `shallow` capability; an in-process local Git path supports `--depth` without such an advertisement. Local Libra remotes fail closed with `LBR-REPO-002` — the accepted end state (decision D20), since that transport cannot provide shallow metadata. | `libra fetch origin --depth 1` |
 | `--tags` | Fetch every tag from the remote into the local `refs/tags/*` (overrides the default auto-follow and `remote.<name>.tagOpt`). | `libra fetch origin --tags` |
 | `--no-tags` | Fetch no tags at all, not even tags reachable from fetched commits (overrides the default auto-follow). | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | Do not run a repacking/gc pass after fetching. Accepted no-op for Git parity: Libra's fetch never triggers an automatic gc, so there is nothing to disable. | `libra fetch origin --no-auto-gc` |
 | `--no-progress` | Do not show the progress meter (the "Receiving objects" spinner / remote progress) on stderr, matching `git fetch --no-progress`. | `libra fetch origin --no-progress` |
-| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` that are not live destinations of the effective configured refspec mapping. A one-off explicit refspec retains the configured mapped destinations, ordinary advertised scope, and its selected destination. Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched. With `--dry-run`, stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
+| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` that are not live destinations of the effective configured refspec mapping. On a `--mirror` remote (`+refs/*:refs/*`), delete mirrored refs the source no longer advertises (locked short names such as `main` are skipped). A one-off explicit refspec retains the configured mapped destinations, ordinary advertised scope, and its selected destination. Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched on a non-mirror fetch. With `--dry-run`, stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
 | `--no-prune` | Do not prune remote-tracking refs, overriding the `remote.<name>.prune` / `fetch.prune` config defaults (the built-in default is no pruning). `--prune`/`--no-prune` form a last-one-wins toggle: when both are given, the last on the command line wins (Git semantics). | `libra fetch origin --no-prune` |
 | `--notes` | Also import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from the remote over a dedicated side-channel. Default OFF (Git never auto-fetches notes). v1 travels notes only from a **local Libra source**; a network or plain-Git remote emits an honest "not supported yet" warning and imports no graph (deferred, D17). Import union-merges into any local edges and re-validates every endpoint, and is per-note fault-tolerant (a malformed note, or one whose commit is absent locally, is skipped with a warning, never aborting the fetch). Persist the opt-in per remote with `remote.<name>.fetchNotesDeps=true`. | `libra fetch origin --notes` |
 | `-f`, `--force` | Allow non-fast-forward updates and overwrite (clobber) a local tag that points elsewhere. Forced updates are marked `+` in `--porcelain` / `(forced update)` in human output. | `libra fetch origin --tags --force` |
@@ -175,6 +194,40 @@ so a typo never leaves a fetch with a zero or nonsensical timeout.
 
 `--depth <N>` is accepted only when the selected transport can return shallow
 boundary metadata. Local Git repositories and network Git remotes can do this.
+A local Git remote uses the same shortest-distance union as clone: a commit is
+a shallow boundary when a parent was not sent, or when a root sits exactly on
+the depth cutoff (issues/474 CL-04).
+Git servers reached through `git://`, HTTP(S), or SSH can also advertise existing
+`shallow <oid>` boundaries without `--depth`. Fetch records an advertised
+boundary in `.libra/shallow` only when that commit exists locally and a parent
+is missing. Git-protocol clients request `shallow` only if the server advertises
+the capability; one advertisement may contain at most 4,096 distinct boundaries.
+An upload-pack response separately accepts at most 4,096 distinct OIDs across
+its `shallow` and `unshallow` boundary lines.
+Those response lines are capped at 8,192 in total, including duplicates; OIDs
+are checked against the server's object format, with violations returning
+`LBR-NET-002`.
+Inspecting advertised boundary commits is limited to 4 MiB of decoded payload
+per commit, 64 MiB of decoded commit payload per fetch, and 262,144 parent IDs
+in total. Exceeding a limit aborts the fetch; aggregate-limit errors suggest
+fetching fewer refs or asking the remote owner to reduce its shallow boundaries.
+Network Git (`git://`), HTTP(S), and SSH fetches verify wanted objects and
+fetched commit-parent links against final shallow boundaries before updating
+refs; an unmarked missing parent fails the fetch. These checks cap the temporary
+parent-edge spool at 1 GiB and the pack's temporary commit-ID buffer at 64 MiB
+(currently up to 2,097,152 commits) per fetch. Either resource limit can reject
+an otherwise valid large pack before refs are updated; it does not imply pack
+corruption.
+When depth-response shallow markers need further validation, at most 16,384
+requested objects or tag targets are inspected. The shallow-marker ancestry
+walk separately caps visited commits and parent edges at 262,144 each. Remote
+type probes and inspected tags share a 256 MiB decoded object-payload budget
+across each shallow response validation. If a limit is exceeded, split the
+fetch or reduce the selected refs.
+Smart HTTP additionally checks the advertisement again after the upload-pack
+POST; if the boundaries changed, it reports a `NetworkProtocol` error asking you
+to retry before writing the pack or refs.
+
 Local Libra repositories cannot (the accepted end state — decision D20 in the
 development compatibility register), so `libra fetch <local-libra-remote>
 --depth <N>` fails before downloading objects or writing `.libra/shallow`,
@@ -330,18 +383,19 @@ for some time; C3 surfaces it on the CLI and binds the contract:
 - `--depth N` limits fetching to the latest `N` commits per remote branch.
 - It composes with `--all`: a shallow fetch across all configured remotes is
   `libra fetch --all --depth N`.
-- A full-history fetch followed by `fetch --depth N` is idempotent.
-- Re-fetching an already-shallow repository at the same depth is also
-  idempotent: Libra persists server-advertised shallow boundaries in
-  `.libra/shallow` and sends them during later upload-pack negotiation.
+- `fetch --depth N` can add shallow boundaries to a complete repository.
+  Repeating it at the same depth against unchanged remote refs is idempotent:
+  Libra persists server-advertised boundaries in `.libra/shallow` and sends
+  them during later upload-pack negotiation.
 - Sparse checkout (`clone --sparse`) is **not** part of this contract — see
   [`docs/development/commands/_compatibility.md`](../development/commands/_compatibility.md)
   for why sparse-checkout is intentionally deferred.
 
 Shallow fetch does introduce the usual Git "shallow boundary" caveats (blame,
 log, merge-base computation may not see commits beyond the boundary). That
-trade-off is a user-visible knob, not a default — full-history fetch remains
-the default and the recommended posture for monorepo and AI-agent workflows.
+trade-off can be requested with `--depth`; without it, fetch requests all history
+available from the source, which may itself be shallow. Full history remains
+the recommended posture for monorepo and AI-agent workflows.
 Tiered cloud storage (S3/R2 + LRU caching) remains the bandwidth solution for
 the cases where full history is wanted.
 
@@ -383,6 +437,7 @@ by default for maximum script friendliness.
 |----------|-----------------|------|------|
 | No configured upstream / detached HEAD | `LBR-REPO-003` | 128 | "checkout a branch or specify a remote" |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
+| Configured local upstream (`branch.<name>.remote=.`) | `LBR-CLI-003` | 129 | "use 'libra branch --unset-upstream' to clear the local upstream"; network support is issues/480 HP-16 |
 | Remote branch not found | `LBR-CLI-003` | 129 | "verify the remote branch name and try again" |
 | Invalid/mismatched fetch refspec | `LBR-CLI-002` | 129 | Use a valid `<src>:<dst>` mapping with matching optional wildcards |
 | Configured refspec read failure | `LBR-IO-001` | 128 | Inspect `remote.<name>.fetch` configuration |
@@ -390,8 +445,229 @@ by default for maximum script friendliness.
 | Invalid remote spec (missing repo, malformed URL, unsupported scheme) | `LBR-CLI-003` or `LBR-REPO-001` | 129 / 128 | Varies by cause |
 | Authentication failure during discovery | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | Network timeout / transport failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
-| Packet / sideband / checksum / pack protocol failure | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
+| pkt-line discovery / transfer setup error / empty advertisement | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Packet-read connection reset / non-protocol IO failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
+| pkt-line truncation / sideband / checksum / pack protocol failure | `LBR-NET-002` | 128 | No additional hint, except for an incomplete pack: "the connection dropped mid-transfer — retry the fetch" |
 | Object format mismatch | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | Failed to create pack directory | `LBR-IO-002` | 128 | "check filesystem permissions" |
 | Failed to write pack/index/refs | `LBR-IO-002` | 128 | "check filesystem permissions and disk space" |
 | Local state corruption | `LBR-REPO-002` | 128 | "inspect repository state and object integrity" |
+
+## Truncated packets during fetch
+
+Fetch reports `LBR-NET-002` for truncation of a received pkt-line header or payload
+midway through the frame. These errors contain a fixed reason without the
+remote bytes. Lengths from one to three are rejected before allocating a payload;
+flush (`0000`), empty data (`0004`) and maximum-length (`ffff`) frames remain valid.
+Header decoding errors also use fixed reasons without echoing the received bytes.
+
+If a transfer stops inside a packet before the pack is complete, the error
+reports packet truncation without a received-byte count or an extra CLI hint.
+Ending between packets with an incomplete pack still reports the byte count and
+adds the hint "the connection dropped mid-transfer — retry the fetch".
+
+A complete, checksum-verified pack can still finish without a flush or connection
+close. Fetch also checks trailing packet bytes already available at completion;
+a partial frame in those bytes is an error. Check whether the connection or a
+proxy truncated the response, then retry the fetch.
+For network remotes, if a trailing frame starts but then stalls, the existing
+transport idle timeout applies; timing out fails the fetch with `LBR-NET-001`.
+
+## Malformed HTTP(S) discovery responses
+
+During HTTP(S) reference discovery, Libra rejects a zero-byte advertisement and
+malformed pkt-line frames, including short or non-hexadecimal headers, frame
+lengths below four, and truncated payloads. A valid `0000` flush remains distinct
+from an absent response; a valid empty-repository advertisement is supported.
+An unsupported object-format capability reports the fixed message
+`Unsupported object format capability` without echoing its remote value.
+Check that the URL points to a Git smart HTTP service and that a proxy has not
+truncated or replaced the response; then retry.
+
+Fetch discovery reports `LBR-NET-002` for an empty advertisement or malformed
+pkt-line response, without echoing its header or payload bytes. Ordinary network
+failures retain `LBR-NET-001`; verify the Git service and any proxy response
+before retrying a protocol failure.
+
+## pkt-line error classification
+
+Detected pkt-line framing errors return `LBR-NET-002` (exit 128), including an
+empty HTTP(S) discovery advertisement. Ordinary connection failures, resets and
+timeouts return `LBR-NET-001` (exit 128). Verify the Git service and any proxy
+response when a protocol error occurs. Discovery framing errors use the hint
+`check that the remote serves Git data and that a proxy has not altered the response`.
+
+Object-transfer setup reports detected pkt-line errors with the same protocol
+hint. A truncated header or payload while reading the fetch stream retains
+`LBR-NET-002` with no extra CLI hint. An incomplete pack ending at a clean frame
+boundary retains its byte count and `the connection dropped mid-transfer — retry
+the fetch` hint. A transport reset while reading a packet is `LBR-NET-001`.
+
+An upload-pack EOF at a frame boundary before pack data begins, including a
+zero-byte POST response, returns `LBR-NET-001` with
+`check network connectivity and retry`. An empty discovery advertisement remains
+`LBR-NET-002`.
+
+## Git and SSH advertisement frame boundaries
+
+The Git/SSH pkt-line advertisement readers reject declared lengths `0001` through
+`0003`, incomplete four-byte headers, and EOF inside a declared payload. Flush
+`0000`, empty-payload `0004` and maximum-size `ffff` frames retain their behavior.
+Their typed pkt-line errors classify as `LBR-NET-002` at the reader boundary;
+ordinary transport IO and idle timeouts remain `LBR-NET-001` when classified.
+
+During the `git://` object-fetch advertisement, fetch, clone and pull already
+report these failures as `LBR-NET-002`, including a zero-byte advertisement. The
+hint is `check that the remote serves Git data and that a proxy has not altered the response`.
+Lengths 1–3 previously could panic; truncated advertisements previously returned
+`LBR-NET-001` with a network/transfer hint. Git discovery now preserves these protocol errors through the command boundary.
+SSH propagation and bounded cleanup are described below. All readers require
+four ASCII hexadecimal header digits.
+
+This advertisement is distinct from an upload-pack response after negotiation:
+HTTP(S) discovery framing and empty upload-pack response classifications are unchanged.
+Reader tests exercise local TCP object-fetch advertisements and public error
+conversions. Separate command tests exercise malformed Git discovery and SSH
+cleanup. Check the remote Git service or proxy for malformed frames.
+
+## SSH advertisement error handling
+
+SSH advertisement lengths `0001` through `0003`, incomplete headers (including
+zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
+reason and marker are retained without captured SSH stdout/stderr.
+
+An incomplete required header has one host-trust exception: local SSH exit status
+255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
+returns fixed host-verification guidance and `LBR-NET-001`. This classification
+does not verify the remote fingerprint. Other missing advertisements, including
+authentication failures, still use `LBR-NET-002`; an available non-zero local exit
+status adds `SSH exited with status N` and fixed connectivity, trusted-host,
+ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+
+After an incomplete required header, Libra allows up to 100 milliseconds to
+observe the SSH exit status, then requests termination if needed. Other read
+errors request termination immediately. The status window, direct-child reap and
+output collection share a two-second cleanup deadline. Protocol and typed
+host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+and timeout errors keep their transport classification and may include a fixed
+local cleanup warning. Termination can change the observed exit status. This
+does not promise cleanup of arbitrary descendant processes.
+
+Clone places targeted host-verification guidance in its structured hints. The
+other command boundaries retain fixed host guidance in the message and their
+existing `LBR-NET-001` network hint. Human, JSON and machine diagnostics omit raw
+captured remote stderr in either case.
+
+The `git://` discovery and object-fetch paths preserve the listed frame errors as
+`LBR-NET-002`. All asynchronous readers reject non-ASCII/non-hexadecimal headers
+with fixed protocol reasons. HTTP(S) discovery/advertisement framing is unchanged.
+
+## SSH authentication and captured diagnostics
+
+Libra invokes SSH with `BatchMode=yes` for both terminal and non-terminal callers.
+It does not prompt for a private-key passphrase or an interactive host-key
+decision during a Libra command. Load or unlock an encrypted key in `ssh-agent`
+before retrying. For host trust, verify the fingerprint through a trusted
+provider console or another trusted channel before manually updating
+`~/.ssh/known_hosts`. Alternatively, make a separate interactive SSH connection
+and compare the displayed fingerprint before accepting it. For example,
+`ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
+port. Do not accept a fingerprint that has not been verified.
+
+`ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
+`no` values. `ask` leaves that SSH option to the user's SSH configuration;
+`BatchMode=yes` still prevents interactive decisions. Explicit values are
+forwarded to SSH. Choose a host-trust policy appropriate to your repository.
+
+SSH stderr is always captured, including in terminal sessions. It is drained
+from process startup, retaining at most 64 KiB while counting and hashing the
+remaining bytes. User-facing errors contain fixed text and a local exit status
+when available. Raw remote stderr is neither printed nor logged. Debug diagnostics
+contain only the status, total and retained byte counts, and a SHA-256 digest of
+the collected stream. Failed or cancelled collection may prevent these metadata
+from being reported; no completed digest is claimed in that case. Hashing work
+is proportional to the number of bytes drained.
+
+SSH reference advertisements and receive-pack responses each have a 16 MiB
+aggregate limit. An oversized advertisement fails with `LBR-NET-001` and guidance
+to use the repository’s HTTPS URL if available, or ask its maintainer to reduce refs. An oversized push response fails with `LBR-NET-001`
+and guidance to push fewer refs; it is not accepted as a truncated success.
+These limits can affect repositories with very large ref sets or updates. The
+streamed fetch pack is not subject to this cap. A failed push response does not
+prove that the server rolled back its refs: inspect the remote state before
+retrying. Existing IO timeouts still apply.
+
+After a complete discovery advertisement, Libra allows up to 100 milliseconds
+for SSH to exit before requesting termination, within a two-second total
+cleanup deadline. Captured-output tasks are cancelled when their owner exits or
+their deadline expires, including when a descendant keeps a pipe open.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.
+
+## Strict pkt-line headers
+
+A pkt-line header must contain exactly four ASCII hexadecimal digits (`0`–`9`,
+`a`–`f` or `A`–`F`). Fetch streaming, `git://` advertisements and SSH advertisements
+reject leading signs such as `+004`, whitespace, non-hexadecimal text and invalid
+UTF-8. These failures return `LBR-NET-002` (exit 128), with fixed reasons that do
+not echo the header or payload. A peer that previously sent a signed or otherwise
+nonconforming header must send four hexadecimal digits before retrying.
+
+Git discovery also preserves protocol classification for lengths `0001`–`0003`,
+missing or partial required headers and truncated payloads. The same discovery
+classification reaches clone, fetch, pull, ls-remote and push. Check the remote
+Git service or proxy response. Their existing structured error fields remain;
+push retains its own protocol hint and the other commands retain theirs.
+
+Flush `0000`, empty-data `0004` and maximum-length `ffff` frames keep their existing
+meaning. Ordinary network errors and timeouts retain their existing categories.
+An empty fetch data stream before any complete pack remains a network failure;
+EOF after a completed pack keeps the existing success behavior. The SSH host-trust
+exception, captured-diagnostic limits and cleanup deadlines described above remain.
+
+## Empty-repository discovery framing
+
+An HTTP(S) advertisement that declares an empty repository still has all remaining
+pkt-line frames checked. A malformed header, an unsupported length 1..3, or a truncated
+payload after the zero object ID returns `LBR-NET-002` (exit 128), with a fixed
+reason that does not echo the remote bytes. It is no longer reported as a
+successful empty response. Check the remote Git service or proxy response before
+retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
+existing command hints and structured error fields retain their behavior.
+
+## Issue #477 notes
+
+refuses a local upstream (`branch.<name>.remote=.`)

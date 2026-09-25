@@ -15,7 +15,7 @@ use crate::internal::ai::{
         Message, Text, ToolCall, UserContent, parse_tool_call_arguments_with_repair,
         request::CompletionRequest,
     },
-    tools::ToolDefinition,
+    tool_definition::ToolDefinition,
 };
 
 // ================================================================
@@ -226,6 +226,7 @@ pub fn parse_tools(tools: &[ToolDefinition]) -> Vec<ChatToolDefinition> {
 /// - Empty assistant text segments are dropped to keep the wire payload compact;
 ///   if all segments are empty, `content` is `None` (which the provider must accept
 ///   when at least one tool call is present).
+#[cfg(test)]
 pub fn build_messages(request: &CompletionRequest) -> Result<Vec<ChatMessage>, CompletionError> {
     build_messages_internal(request, false)
 }

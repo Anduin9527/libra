@@ -22,6 +22,8 @@ human-readable long format (default, also selectable explicitly with `--long`), 
 format, structured JSON for agent consumption, and `-z` NUL-terminated machine output. It can
 also detect renames (`--find-renames`), align output into columns (`--column`), and control
 whether upstream ahead/behind counts are shown (`--ahead-behind` / `--no-ahead-behind`).
+In a shallow clone, ahead/behind treats commits listed in `.libra/shallow` as
+roots. A corrupt shallow list hides the counts and warns rather than guessing.
 Optional pathspecs limit the reported staged, unstaged, unmerged, ignored, and
 untracked paths. They use the shared pathspec engine, including `:(top)`,
 `:(exclude)`, `:(icase)`, `:(literal)`, and `:(glob)` magic.
@@ -40,6 +42,14 @@ regular files. `status` treats the symlink itself as the worktree object,
 compares the stored link target bytes, and reports target changes as
 modifications instead of following the link or treating dangling symlinks as
 deleted.
+
+With `core.filemode=true` (the Unix default) a tracked regular file whose
+owner-execute bit differs from the index while its content is unchanged is a
+mode-only modification and is reported in every output format (short, long,
+porcelain v2, and JSON). With `core.filemode=false` mode-only differences are
+ignored; entry-type changes (for example a regular file replaced by a symlink)
+are always reported. An invalid `core.filemode` value fails `status` closed
+before any output.
 
 ### Display config defaults (`status.*`)
 
@@ -141,6 +151,18 @@ Control whether ahead/behind counts are shown in the branch tracking line. `--no
 suppresses the counts while still showing the upstream branch name. The default is to show the
 counts when an upstream is configured.
 
+The counts are the commits reachable from only one side — the same two numbers
+`libra rev-list --left-right --count <upstream>...HEAD` prints (behind, then ahead). They are
+computed with the painting walk shared with `merge-base`, so merges, criss-cross and date-skewed
+histories count exactly as Git counts them; in a shallow repository the boundary commits are
+treated as roots. When the counts cannot be computed (a commit in either history cannot be read),
+status still succeeds: the short format shows no bracket, porcelain v2 omits `# branch.ab`, the
+long format omits the tracking sentence, JSON reports `ahead`/`behind` as `null`, and a
+`cannot count commits ahead/behind '<upstream>'` warning is emitted (code
+`upstream_counts_unavailable`, source `metadata`; the same happens when the shallow boundary list
+is malformed or unreadable, where Git would die). On an unborn branch the
+counts are omitted the same way, without a warning.
+
 ```bash
 libra status --short --branch --no-ahead-behind
 libra status --porcelain --branch --no-ahead-behind
@@ -180,17 +202,19 @@ is not columnar by default, so on its own this is a no-op.
 libra status --no-column
 ```
 
-### `--find-renames [PERCENT]`
+### `-M [PERCENT]` / `--find-renames [PERCENT]`
 
-Set the rename-detection similarity threshold. Rename detection is **on by default** at 50%
-(matching Git), so `--find-renames` is only needed to change the threshold or to re-enable
-detection after `status.renames=false`. When a deleted file and a new file are similar enough,
+`-M[<n>]` is the short form of `--find-renames[=<n>]` (Git's spelling). Set the
+rename-detection similarity threshold. Rename detection is **on by default** at 50%
+(matching Git), so `-M` / `--find-renames` is only needed to change the threshold or to
+re-enable detection after `status.renames=false`. When a deleted file and a new file are similar enough,
 they are reported as one rename pair (`renamed: old -> new`) instead of separate delete/add
 entries. The CLI accepts Git's full raw score grammar — a bare integer is read as
 `0.<digits>` (so `505` is 50.5%), `N%` is a literal percent (`100%` = exact-only), and
-decimals work (`0.8`); `0`/bare re-enable the 50% default. The three spellings
-`--no-renames` / `--renames` / `--find-renames[=N]` obey true last-one-wins in argv order
-(so `--no-renames --find-renames=80` re-enables at 80%). `-z` also has the Git-parity
+decimals work (`0.8`); `0`/bare re-enable the 50% default. The four spellings
+`--no-renames` / `--renames` / `--find-renames[=N]` / `-M[<n>]` obey true last-one-wins in
+argv order (so `--no-renames -M80` re-enables at 80%), and `-M` composes with other short
+flags (`-sM90`). A non-numeric value such as `-Mabc` fails closed with `LBR-CLI-002`. `-z` also has the Git-parity
 `--null` long alias; a bare `-z`/`--null` with no explicit format forces porcelain v1, and
 combining it with `--long` or the cache modes fails closed. The embedding API's
 `find_renames: Option<u8>` keeps the simpler 0–100 percent range (documented narrowing —
@@ -262,6 +286,7 @@ other subsystems are folded into the same list (see below):
 | `dirty_cache_concurrent_invalidate` | `cache` | A concurrent writer invalidated the cache mid-read |
 | `dirty_cache_path_unencodable` | `cache` | A non-UTF-8 path could not be stored in the dirty cache; its row was omitted (the full status still reports it) |
 | `repository_preflight` | `config` | A repository-level advisory raised before the command ran (e.g. a pending durable object-index repair) |
+| `upstream_counts_unavailable` | `metadata` | The upstream ahead/behind counts could not be computed (a commit in either history, or the shallow boundary list, could not be read); the counts are omitted, never guessed |
 
 The `source` column is a frozen enum: `config`, `probe`, `rename_detect`, `worktree`,
 `metadata`, `cache`. `probe` and `rename_detect` are deliberately distinct — a `probe`
@@ -578,7 +603,10 @@ Detached HEAD:
   (the tracking ref is resolved under its fully-qualified
   `refs/remotes/<remote>/<branch>` name — the shape clone/fetch/push write —
   with a legacy short-name fallback; issue #464)
-- `upstream.ahead` / `upstream.behind` are `null` when `gone` is `true`
+- `upstream.ahead` / `upstream.behind` are `null` when `gone` is `true`, on an unborn branch,
+  or when the counts cannot be computed (a commit in either history cannot be read —
+  `data.warnings[]` then carries an `upstream_counts_unavailable` warning); otherwise they
+  equal `libra rev-list --left-right --count <upstream>...HEAD` (right, then left)
 - `is_clean` is `true` only when staged, unstaged, untracked, and unmerged
   lists are empty, no global merge state is active, **and** `io_blocked` is
   empty ("cannot inspect" is never clean)
@@ -691,7 +719,7 @@ a branch needs to be pushed or pulled, without having to run separate `libra log
 | Quiet mode | `git status -q` | N/A | `libra status --quiet` (global flag) |
 | Column display | `git status --column` | N/A | `libra status --column` (`--no-column` countermands) |
 | Ahead/behind display | `git status -sb` (text only) | N/A | Human + structured `upstream` object in JSON |
-| Find renames | `git status -M` | Automatic | `--find-renames` / `--renames` |
+| Find renames | `git status -M` | Automatic | `-M[<n>]` / `--find-renames` / `--renames` |
 | Ignore submodules | `git status --ignore-submodules` | N/A | N/A (no submodules) |
 | Structured JSON output | N/A | N/A | `--json` / `--machine` |
 | Error hints | Minimal | Minimal | Every error type has an actionable hint |
@@ -737,5 +765,5 @@ Every `StatusError` variant maps to an explicit `StableErrorCode`.
   base `??` row and only sits out rename scoring (with a
   `rename_path_encoding_unsupported` warning)
 - jj's `jj status` always uses a short format and does not distinguish staged from unstaged changes (jj has no staging area)
-- Rename detection is supported via `--find-renames[=<n>]` and the `--renames`/`--no-renames` toggles; Git's short `-M` alias is not exposed
+- Rename detection is supported via Git's `-M[<n>]` / `--find-renames[=<n>]` and the `--renames`/`--no-renames` toggles; all four spellings share the last-one-wins argv order
 - `--column` column-aligned display is supported; `--no-column` (equivalent to `--column=never`) countermands an earlier `--column` via clap's symmetric override (last one wins), and status is not columnar by default so `--no-column` alone is a no-op

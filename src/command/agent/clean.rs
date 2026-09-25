@@ -1118,7 +1118,7 @@ mod stderr_gc_tests {
     /// blobs are content-addressed, so one can collide with an ordinary
     /// committed file blob — removing it would corrupt the repository).
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn findings_gc_reclaims_unreferenced_blobs_but_never_reachable_ones() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo = tempdir().unwrap();

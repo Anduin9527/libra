@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use super::{fetch, merge, rebase, stash};
 use crate::{
+    git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
     internal::{
         config::{ConfigKv, LocalIdentityTarget, RemoteConfig, read_cascaded_config_value_strict},
         head::Head,
@@ -202,6 +203,12 @@ pub(crate) enum PullError {
     #[error("remote '{0}' not found")]
     RemoteNotFound(String),
 
+    #[error(
+        "cannot pull: branch '{branch}' tracks a local upstream; \
+         network commands do not operate on local upstreams (issues/480 HP-16)"
+    )]
+    LocalUpstream { branch: String },
+
     #[error("pull failed during fetch phase: {0}")]
     Fetch(#[source] fetch::FetchError),
 
@@ -264,6 +271,15 @@ impl From<PullError> for CliError {
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
                     .with_hint("use 'libra remote -v' to see configured remotes")
             }
+            PullError::LocalUpstream { branch } => CliError::command_usage(format!(
+                "cannot pull: branch '{branch}' tracks a local upstream; \
+                 network commands do not operate on local upstreams (issues/480 HP-16)"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_detail("remote", ".")
+            .with_detail("upstream_kind", "local")
+            .with_hint("use 'libra branch --unset-upstream' to clear the local upstream")
+            .with_hint("local-upstream network operations are tracked as issues/480 HP-16"),
             PullError::Fetch(error) => map_fetch_error_to_cli(&error).with_detail("phase", "fetch"),
             PullError::Merge(error) => map_merge_error_to_cli(&error).with_detail("phase", "merge"),
             PullError::Rebase(error) => CliError::from(error).with_detail("phase", "rebase"),
@@ -489,8 +505,13 @@ pub(crate) async fn run_pull(
                 // or unrelated-history override controls.
                 strategy: None,
                 favor: None,
+                whitespace: None,
+                renormalize: None,
                 allow_unrelated_histories: false,
                 message: None,
+                into_name: None,
+                cleanup: None,
+                edit: false,
                 squash: args.squash,
                 no_commit: args.no_commit,
                 skip_hooks: false,
@@ -500,12 +521,21 @@ pub(crate) async fn run_pull(
                 merge_log: 0,
                 // `pull` does not expose `--dry-run`.
                 dry_run: false,
+                // `pull` has no `--signoff` surface.
+                signoff: false,
+                // `pull` has no rerere per-invocation override; inherit config.
+                rerere_autoupdate: None,
+                // `pull` exposes no merge-commit signing controls. Keep its
+                // established unsigned merge behavior rather than inheriting
+                // the public `merge` command's new signing default.
+                signing_policy: Some(crate::command::history_config::CommitSigningPolicy::Disable),
                 // `pull --autostash` on the merge path rides the Git-faithful
                 // merge-owned autostash (held on conflict, applied by
                 // --continue/--abort); with no flag, `merge.autostash` config
                 // is resolved inside the merge — matching `git pull`.
                 autostash: if args.autostash { Some(true) } else { None },
                 preserve_held_autostash: false,
+                strategy_evaluation: None,
             },
         )
         .await
@@ -551,39 +581,18 @@ async fn current_branch_for_pull() -> Result<String, PullError> {
     })
 }
 
-/// Whether this `pull` will REBASE, resolved exactly as the command itself
-/// resolves it — flags first, then `branch.<name>.rebase`, then `pull.rebase`.
-///
-/// Dispatch needs the answer BEFORE the handler runs, because a pull that
-/// rebases must hold the worktree's sequencer control slot across the whole
-/// command: the fetch and a possible autostash happen before the rebase
-/// begins, and starting them beside another worktree-local sequence is how a
-/// pull ends up rebasing on top of someone else's half-finished work. A
-/// configured `pull.rebase = true` makes a bare `libra pull` such a command,
-/// so keying the slot on the `--rebase` FLAG would miss it.
-///
-/// Errors are answered `false`: a pull that cannot resolve its own branch or
-/// config is about to fail in the handler with a better message, and taking a
-/// control slot for it would only change which error the user sees.
-/// The pull's RESOLVED integration mode, for dispatch (W2 r8 #4):
-/// `Some(true)` = rebase, `Some(false)` = merge, `None` = the pull cannot
-/// resolve a mode at all — a detached HEAD or unreadable config is about to
-/// be refused by the handler, and claiming a sequencer control slot for it
-/// would persist a failed control operation for a command that never touched
-/// the sequencer.
+#[cfg(test)]
 pub(crate) async fn resolved_pull_mode(args: &PullArgs) -> Option<bool> {
-    // The branch is resolved FIRST, even for an explicit `--rebase`: on a
-    // detached HEAD the handler refuses the pull outright.
     let Ok(branch) = current_branch_for_pull().await else {
         return None;
     };
     if args.rebase {
         return Some(true);
     }
-    match resolve_effective_pull_options(args, &branch).await {
-        Ok(options) => Some(options.rebase),
-        Err(_) => None,
-    }
+    resolve_effective_pull_options(args, &branch)
+        .await
+        .ok()
+        .map(|options| options.rebase)
 }
 
 async fn resolve_effective_pull_options(
@@ -716,6 +725,11 @@ async fn resolve_pull_target(
             let Some(branch_config) = ConfigKv::branch_config(&branch).await.ok().flatten() else {
                 return Err(no_tracking_error(&branch, rebase).await);
             };
+            if branch_config.remote == "." {
+                return Err(PullError::LocalUpstream {
+                    branch: branch.clone(),
+                });
+            }
             let remote_config = ConfigKv::remote_config(&branch_config.remote)
                 .await
                 .ok()
@@ -938,6 +952,40 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         fetch::FetchError::Discovery { source, .. } => {
             map_fetch_discovery_error(error.to_string(), source)
         }
+        fetch::FetchError::ShallowAdvertisementChanged { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("retry after the remote repository stops changing")
+        }
+        fetch::FetchError::InvalidShallowResponse { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::NetworkProtocol)
+            .with_hint("fix or deepen the remote shallow repository and retry"),
+        fetch::FetchError::InvalidAdvertisedShallowBoundary { .. } =>
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("reduce advertised refs or fix and deepen the remote shallow repository"),
+        fetch::FetchError::IncompleteFetchedHistory { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::NetworkProtocol)
+            .with_hint("retry the pull or use a Git server with consistent shallow history"),
+        fetch::FetchError::FetchObjects { source, .. }
+            if crate::internal::protocol::is_missing_shallow_capability(source) =>
+        {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("use a Git server that advertises shallow support")
+        }
+        fetch::FetchError::FetchObjects { source, .. }
+            if crate::internal::protocol::is_shallow_advertisement_changed(source) =>
+        {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("retry after the remote repository stops changing")
+        }
+        fetch::FetchError::FetchObjects { source, .. } if fetch::is_pkt_line_io_error(source) => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         fetch::FetchError::FetchObjects { source, .. } => map_fetch_io_error(
             error.to_string(),
             source,
@@ -945,12 +993,13 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         )
         .with_hint("check network connectivity and retry"),
         fetch::FetchError::PacketRead { source } => {
-            if is_timeout_io_error(source) {
-                return CliError::fatal(error.to_string())
+            if fetch::is_pkt_line_io_error(source) {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::NetworkProtocol)
+            } else {
+                CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::NetworkUnavailable)
-                    .with_hint("check network connectivity and retry");
+                    .with_hint("check network connectivity and retry")
             }
-            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::NetworkProtocol)
         }
         fetch::FetchError::RemoteBranchNotFound { .. } => {
             CliError::command_usage(error.to_string())
@@ -1001,6 +1050,16 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
         GitError::UnAuthorized(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::AuthPermissionDenied)
             .with_hint("check SSH key / HTTP credentials and repository access rights"),
+        GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
+        GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         GitError::NetworkError(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::NetworkUnavailable)
             .with_hint("check network connectivity and retry"),
@@ -1057,6 +1116,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
                 "merge the branches' common ancestors together first, so the history has a single merge base",
             )
             .with_hint("or pull with --rebase, which replays commits one at a time"),
+        merge::PullMergeError::OctopusStrategyUnsupported { .. } => {
+            CliError::failure(error.to_string()).with_stable_code(StableErrorCode::Unsupported)
+        }
         merge::PullMergeError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::Unsupported)
             .with_hint(
@@ -1069,7 +1131,10 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
             .with_hint("or run 'libra pull --rebase' to replay local commits"),
-        merge::PullMergeError::Conflicts { .. }
+        merge::PullMergeError::Conflicts { squash: true, .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),
+        merge::PullMergeError::Conflicts { squash: false, .. }
         | merge::PullMergeError::DirtyWorktree
         | merge::PullMergeError::UntrackedOverwrite { .. }
         | merge::PullMergeError::MergeInProgress
@@ -1085,15 +1150,22 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         }
         merge::PullMergeError::InvalidConflictStyle(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
-            .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+            .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
         merge::PullMergeError::InvalidRenameConfig { .. } => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("set merge.renames to true/false and merge.renameLimit to an integer"),
         merge::PullMergeError::RenameConfigRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
-        merge::PullMergeError::ConflictStyleRead(..) => {
+        merge::PullMergeError::ConflictStyleRead(..)
+        | merge::PullMergeError::MergeDriverConfigRead(..)
+        | merge::PullMergeError::RenormalizeConfigRead(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        merge::PullMergeError::InvalidRenormalizeConfig(..) => {
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set merge.renormalize to true/false (or remove it)")
         }
         merge::PullMergeError::HistoryConfig(
             crate::command::history_config::HistoryConfigError::Read { .. },
@@ -1119,6 +1191,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         | merge::PullMergeError::WorkdirReset(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        merge::PullMergeError::CommitSigning(..) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::AuthMissingCredentials)
+            .with_hint("check vault configuration with 'libra config --list'"),
         // Mirrors `CommitError::IdentityMissing`: the merge commit `pull` creates
         // needs the same identity as any other commit, and fails the same way.
         merge::PullMergeError::IdentityMissing(..) => CliError::fatal(error.to_string())
@@ -1136,7 +1211,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         // match must stay exhaustive.
         merge::PullMergeError::UnsignedMergeCommit { .. }
         | merge::PullMergeError::BadMergeSignature { .. }
-        | merge::PullMergeError::SignatureCheck(..) => {
+        | merge::PullMergeError::SignatureCheck(..)
+        | merge::PullMergeError::OctopusUnbornHead
+        | merge::PullMergeError::OctopusConflict { .. } => {
             CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
         }
         merge::PullMergeError::RepositoryHook { .. } => CliError::failure(error.to_string())
@@ -1148,12 +1225,49 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::MessageFileRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
+        // `pull` never enables merge message sources, cleanup, or editing,
+        // but retain a stable, actionable mapping if an internal caller does.
+        merge::PullMergeError::InvalidCleanup(..) => CliError::command_usage(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("choose strip, whitespace, verbatim, scissors, or default"),
+        merge::PullMergeError::EmptyMessage | merge::PullMergeError::Editor(..) => {
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_conflict_hints_follow_the_pending_merge_state() {
+        for squash in [false, true] {
+            let error = merge::PullMergeError::Conflicts {
+                paths: "renamed.txt".to_string(),
+                squash,
+            };
+            let cli = map_merge_error_to_cli(&error);
+            assert_eq!(cli.stable_code(), StableErrorCode::ConflictOperationBlocked);
+            let rendered = cli.render();
+            assert!(rendered.contains("renamed.txt"));
+            assert_eq!(rendered.contains("libra merge --continue"), !squash);
+            assert_eq!(rendered.contains("libra merge --abort"), !squash);
+            assert_eq!(rendered.contains("'libra commit'"), squash);
+        }
+    }
+
+    #[test]
+    fn merge_vault_signing_error_maps_to_actionable_auth_failure() {
+        let error = merge::PullMergeError::CommitSigning("no unseal key".to_string());
+        let cli = map_merge_error_to_cli(&error);
+        assert_eq!(cli.stable_code(), StableErrorCode::AuthMissingCredentials);
+        assert!(
+            cli.render().contains("check vault configuration"),
+            "merge signing failures must retain an actionable vault hint"
+        );
+    }
 
     #[test]
     fn depth_and_no_ff_flags_parse() {
@@ -1219,6 +1333,46 @@ mod tests {
         assert_eq!(cli.stable_code(), StableErrorCode::AuthPermissionDenied);
     }
 
+    #[test]
+    fn changed_http_shallow_boundary_keeps_network_protocol_code() {
+        let error = fetch::FetchError::ShallowAdvertisementChanged {
+            remote: "https://example.test/repo.git".to_string(),
+        };
+        let cli = map_fetch_error_to_cli(&error);
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+    }
+
+    #[test]
+    fn shallow_fetch_protocol_errors_keep_network_protocol_code() {
+        use crate::internal::protocol::{ChangedShallowAdvertisement, MissingShallowCapability};
+
+        for error in [
+            fetch::FetchError::InvalidShallowResponse {
+                reason: "invalid object ID".to_string(),
+            },
+            fetch::FetchError::InvalidAdvertisedShallowBoundary {
+                reason: "commit exceeds size limit".to_string(),
+            },
+            fetch::FetchError::IncompleteFetchedHistory {
+                message: "missing parent".to_string(),
+            },
+            fetch::FetchError::FetchObjects {
+                remote: "origin".to_string(),
+                source: std::io::Error::other(MissingShallowCapability),
+            },
+            fetch::FetchError::FetchObjects {
+                remote: "origin".to_string(),
+                source: std::io::Error::other(ChangedShallowAdvertisement),
+            },
+        ] {
+            let cli = map_fetch_error_to_cli(&error);
+            assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+            assert!(!cli.hints().is_empty());
+        }
+    }
+
     /// Pin the `Display` format for the static-message and direct-message
     /// variants of [`PullError`]. These strings are used as the
     /// `CliError` message via `From<PullError> for CliError` and
@@ -1245,6 +1399,14 @@ mod tests {
         assert_eq!(
             PullError::RemoteNotFound("origin".to_string()).to_string(),
             "remote 'origin' not found",
+        );
+        assert_eq!(
+            PullError::LocalUpstream {
+                branch: "alpha".to_string(),
+            }
+            .to_string(),
+            "cannot pull: branch 'alpha' tracks a local upstream; \
+             network commands do not operate on local upstreams (issues/480 HP-16)",
         );
     }
 }

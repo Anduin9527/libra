@@ -1677,7 +1677,7 @@ mod tests {
                 "secret-probe-view".into(),
                 "secret-probe-view".into(),
                 "command".into(),
-                "repo".into(),
+                "repository".into(),
                 "memory-keyed-digest-probe".into(),
                 "non-secret operation-log control".into(),
                 "test-actor".into(),

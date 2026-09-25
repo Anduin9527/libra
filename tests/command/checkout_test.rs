@@ -209,6 +209,8 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
     test::ensure_file("foo.txt", Some("v1"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["foo.txt".into()],
             all: false,
             update: false,
@@ -222,6 +224,10 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -307,6 +313,8 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
     test::ensure_file("base.txt", Some("base"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["base.txt".into()],
             all: false,
             update: false,
@@ -320,6 +328,10 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -349,6 +361,8 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
     test::ensure_file("dirty.txt", Some("uncommitted"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["dirty.txt".into()],
             all: false,
             update: false,
@@ -362,6 +376,10 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -415,6 +433,8 @@ async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
     test::ensure_file("base.txt", Some("base"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["base.txt".into()],
             all: false,
             update: false,
@@ -428,6 +448,10 @@ async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -504,6 +528,8 @@ async fn test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_erro
     test::ensure_file("base.txt", Some("base"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["base.txt".into()],
             all: false,
             update: false,
@@ -517,6 +543,10 @@ async fn test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_erro
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -1171,5 +1201,119 @@ fn test_checkout_no_overlay_is_accepted_noop() {
     assert!(
         String::from_utf8_lossy(&current.stdout).contains("feature"),
         "checkout --no-overlay switched to feature"
+    );
+}
+
+#[test]
+fn test_checkout_literal_pathspecs_global() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    std::fs::write(p.join("x.txt"), "x2\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star2\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["--literal-pathspecs", "checkout", "--", "*.txt"], p),
+        "checkout literal",
+    );
+    assert_eq!(std::fs::read_to_string(p.join("*.txt")).unwrap(), "star\n");
+    assert_eq!(std::fs::read_to_string(p.join("x.txt")).unwrap(), "x2\n");
+}
+
+/// M-DETACH D1, D4 (checkout), D5, D6, D7: bare `checkout --detach` is not a
+/// current-branch no-op; dirty files are kept; unborn HEAD is refused.
+#[test]
+fn test_checkout_bare_detach_is_not_a_noop() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("tracked.txt"), "dirty\n").expect("dirty");
+
+    let d1 = run_libra_command(&["checkout", "--detach"], p);
+    assert_cli_success(&d1, "D1 checkout --detach");
+    let symbolic = run_libra_command(&["symbolic-ref", "HEAD"], p);
+    assert!(!symbolic.status.success(), "D1 symbolic-ref HEAD must fail");
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).expect("read dirty"),
+        "dirty\n",
+        "D5 keeps uncommitted edits"
+    );
+    let d1_json = run_libra_command(&["--json", "checkout", "--detach"], p);
+    assert_cli_success(&d1_json, "D6 checkout --json --detach");
+    let parsed = parse_json_stdout(&d1_json);
+    assert_eq!(parsed["data"]["detached"], true);
+    let status = run_libra_command(&["status"], p);
+    assert_cli_success(&status, "D7 status after D1");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("HEAD detached at"),
+        "D7: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    let unborn = tempdir().expect("unborn");
+    init_repo_via_cli(unborn.path());
+    let before = run_libra_command(&["symbolic-ref", "HEAD"], unborn.path());
+    assert_cli_success(&before, "unborn symbolic-ref");
+    let before_out = String::from_utf8_lossy(&before.stdout).into_owned();
+    let d4 = run_libra_command(&["checkout", "--detach"], unborn.path());
+    let (stderr, report) = parse_cli_error_stderr(&d4.stderr);
+    assert_eq!(d4.status.code(), Some(128), "D4: {stderr}");
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert!(
+        stderr.contains("You are on a branch yet to be born"),
+        "D4 wording: {stderr}"
+    );
+    let after = run_libra_command(&["symbolic-ref", "HEAD"], unborn.path());
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        before_out.trim(),
+        "D4 zero-write"
+    );
+}
+
+/// FM-01 (M-MAT T4): `checkout -- <path>` materializes a deleted 100755 entry
+/// with its execute bit.
+#[cfg(unix)]
+#[test]
+fn test_checkout_restores_entry_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("failed to create repository root");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    let script = repo_path.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "stage script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "executable", "--no-verify"], repo_path),
+        "commit script",
+    );
+    std::fs::remove_file(&script).expect("remove script");
+
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--", "run.sh"], repo_path),
+        "checkout -- run.sh",
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "checkout must restore the execute bit"
     );
 }

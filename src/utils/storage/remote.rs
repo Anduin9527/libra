@@ -8,7 +8,7 @@
 //!
 //! - Without prefix: `aa/bbcc...` (Standard Git object layout)
 //! - With prefix: `prefix/objects/aa/bbcc...` (Isolated layout, e.g. `repo_id/objects/...`)
-use std::{str::FromStr, sync::Arc};
+use std::{io::Read, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -131,6 +131,135 @@ impl Storage for RemoteStorage {
         let obj_type = ObjectType::from_string(obj_type_str)?;
 
         Ok((decompressed[end_of_header + 1..].to_vec(), obj_type))
+    }
+
+    async fn get_typed_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        const HEADER_BUDGET: u64 = 64;
+        const COMPRESSED_OVERHEAD_BUDGET: u64 = 64 * 1024;
+
+        let max_compressed_bytes = max_payload_bytes
+            .checked_add(COMPRESSED_OVERHEAD_BUDGET)
+            .ok_or_else(|| GitError::InvalidObjectInfo("object read limit overflows u64".into()))?;
+        let max_decoded_bytes = max_payload_bytes
+            .checked_add(HEADER_BUDGET)
+            .and_then(|bound| bound.checked_add(1))
+            .ok_or_else(|| GitError::InvalidObjectInfo("object read limit overflows u64".into()))?;
+        let path = self.hash_to_path(hash);
+        let result = self.inner.get(&path).await.map_err(|error| match error {
+            object_store::Error::NotFound { .. } => {
+                GitError::ObjectNotFound(format!("Remote object not found: {error}"))
+            }
+            _ => GitError::IOError(std::io::Error::other(error)),
+        })?;
+
+        // Check the reported size before consuming the body. Also bound each
+        // streamed chunk: a backend must not make a stale Content-Length turn
+        // into an unbounded allocation in `GetResult::bytes()`.
+        if result.meta.size > max_compressed_bytes || result.range != (0..result.meta.size) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "compressed object {hash} exceeds the bounded read or has invalid metadata"
+            )));
+        }
+        let reported_size = result.meta.size;
+        let mut compressed = Vec::new();
+        let mut stream = result.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| GitError::IOError(std::io::Error::other(error)))?;
+            let next_len = u64::try_from(compressed.len())
+                .ok()
+                .and_then(|length| length.checked_add(chunk.len() as u64))
+                .ok_or_else(|| {
+                    GitError::InvalidObjectInfo("compressed object size overflows u64".into())
+                })?;
+            if next_len > max_compressed_bytes {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "compressed object {hash} exceeds {max_compressed_bytes} bytes"
+                )));
+            }
+            compressed.extend_from_slice(&chunk);
+        }
+        if u64::try_from(compressed.len()).ok() != Some(reported_size) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "compressed object {hash} length differs from storage metadata"
+            )));
+        }
+
+        let decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
+        let mut decoded = Vec::new();
+        decoder
+            .take(max_decoded_bytes)
+            .read_to_end(&mut decoded)
+            .map_err(|error| {
+                GitError::InvalidObjectInfo(format!(
+                    "remote object {hash} has invalid zlib data: {error}; verify the remote object and retry the fetch"
+                ))
+            })?;
+        if u64::try_from(decoded.len()).map_or(true, |length| length == max_decoded_bytes) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "object {hash} exceeds {max_payload_bytes} bytes"
+            )));
+        }
+        let header_end = decoded.iter().position(|byte| *byte == 0).ok_or_else(|| {
+            GitError::InvalidObjectInfo(format!("remote object {hash} has no header terminator"))
+        })?;
+        if header_end > HEADER_BUDGET as usize {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "remote object {hash} header is too long"
+            )));
+        }
+        let header = std::str::from_utf8(&decoded[..header_end]).map_err(|_| {
+            GitError::InvalidObjectInfo(format!("remote object {hash} header is not UTF-8"))
+        })?;
+        let (kind, declared_length) = header.split_once(' ').ok_or_else(|| {
+            GitError::InvalidObjectInfo(format!("remote object {hash} header has no size"))
+        })?;
+        let object_type = ObjectType::from_string(kind).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "remote object {hash} has invalid type header: {error}"
+            ))
+        })?;
+        let declared_length = declared_length.parse::<u64>().map_err(|_| {
+            GitError::InvalidObjectInfo(format!("remote object {hash} header has invalid size"))
+        })?;
+        let payload = &decoded[header_end + 1..];
+        if u64::try_from(payload.len()).map_or(true, |length| length > max_payload_bytes) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "object {hash} exceeds {max_payload_bytes} bytes"
+            )));
+        }
+        if u64::try_from(payload.len()).ok() != Some(declared_length) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "object {hash} length differs from its header"
+            )));
+        }
+        let computed = ObjectHash::from_type_and_data_for_kind(hash.kind(), object_type, payload)
+            .map_err(|error| {
+            GitError::InvalidObjectInfo(format!("failed to verify remote object {hash}: {error}"))
+        })?;
+        if computed != *hash {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "remote object {hash} has mismatched content ID {computed}"
+            )));
+        }
+        Ok((payload.to_vec(), object_type))
+    }
+
+    async fn get_commit_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let (payload, object_type) = self.get_typed_bounded(hash, max_payload_bytes).await?;
+        if object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "object {hash} is {object_type}, expected a commit"
+            )));
+        }
+        Ok((payload, object_type))
     }
 
     /// Put object to remote storage
@@ -256,5 +385,241 @@ impl Storage for RemoteStorage {
             .buffered(max_concurrent)
             .collect()
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{str::FromStr, sync::Arc};
+
+    use bytes::Bytes;
+    use git_internal::{
+        hash::{HashKind, ObjectHash, set_hash_kind_for_test},
+        internal::object::types::ObjectType,
+    };
+    use object_store::{ObjectStoreExt, memory::InMemory};
+
+    use super::{RemoteStorage, Storage};
+
+    fn test_hash() -> ObjectHash {
+        ObjectHash::from_str("1111111111111111111111111111111111111111")
+            .expect("test hash is valid")
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_succeeds() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let payload = b"tree 2222222222222222222222222222222222222222\n\nmessage\n";
+        let hash =
+            ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Commit, payload)
+                .expect("commit hash is supported");
+        remote
+            .put(&hash, payload, ObjectType::Commit)
+            .await
+            .expect("store test commit");
+
+        let (actual, kind) = remote
+            .get_commit_bounded(&hash, payload.len() as u64)
+            .await
+            .expect("bounded commit read");
+        assert_eq!(actual, payload);
+        assert_eq!(kind, ObjectType::Commit);
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_rejects_large_compressed_object_before_materializing() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let store = Arc::new(InMemory::new());
+        let remote = RemoteStorage::new(store.clone());
+        let hash = test_hash();
+        store
+            .put(
+                &remote.hash_to_path(&hash),
+                Bytes::from(vec![0; 66_000]).into(),
+            )
+            .await
+            .expect("store oversized compressed bytes");
+
+        let error = remote
+            .get_commit_bounded(&hash, 100)
+            .await
+            .expect_err("large compressed object must be rejected");
+        assert!(error.to_string().contains("compressed object"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_rejects_compression_bomb() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let hash = test_hash();
+        remote
+            .put(&hash, &vec![b'a'; 200_000], ObjectType::Commit)
+            .await
+            .expect("store compressed test commit");
+
+        let error = remote
+            .get_commit_bounded(&hash, 1_024)
+            .await
+            .expect_err("large decoded object must be rejected");
+        assert!(error.to_string().contains("exceeds 1024 bytes"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_rejects_wrong_object_type() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let hash = ObjectHash::from_type_and_data_for_kind(
+            HashKind::Sha1,
+            ObjectType::Blob,
+            b"not a commit",
+        )
+        .expect("blob hash is supported");
+        remote
+            .put(&hash, b"not a commit", ObjectType::Blob)
+            .await
+            .expect("store test blob");
+
+        let error = remote
+            .get_commit_bounded(&hash, 100)
+            .await
+            .expect_err("blob is not a commit");
+        assert!(error.to_string().contains("expected a commit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_rejects_content_id_mismatch() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let requested_hash = test_hash();
+        let payload = b"tree 2222222222222222222222222222222222222222\n\nwrong object\n";
+        remote
+            .put(&requested_hash, payload, ObjectType::Commit)
+            .await
+            .expect("store commit under incorrect ID");
+
+        let error = remote
+            .get_commit_bounded(&requested_hash, 100)
+            .await
+            .expect_err("mismatched commit ID must be rejected");
+        assert!(
+            error.to_string().contains(&requested_hash.to_string()),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("mismatched content ID"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_reports_corrupt_zlib_as_invalid_object() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let store = Arc::new(InMemory::new());
+        let remote = RemoteStorage::new(store.clone());
+        let hash = test_hash();
+        store
+            .put(
+                &remote.hash_to_path(&hash),
+                Bytes::from_static(b"not a zlib stream").into(),
+            )
+            .await
+            .expect("store corrupted compressed bytes");
+
+        let error = remote
+            .get_commit_bounded(&hash, 100)
+            .await
+            .expect_err("corrupt zlib must fail as invalid object");
+        assert!(matches!(
+            &error,
+            git_internal::errors::GitError::InvalidObjectInfo(_)
+        ));
+        assert!(error.to_string().contains(&hash.to_string()), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_reports_unknown_type_as_invalid_object() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let store = Arc::new(InMemory::new());
+        let remote = RemoteStorage::new(store.clone());
+        let hash = test_hash();
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, b"unknown 3\0abc")
+            .expect("encode malformed object");
+        let compressed = encoder.finish().expect("finish malformed object");
+        store
+            .put(&remote.hash_to_path(&hash), Bytes::from(compressed).into())
+            .await
+            .expect("store malformed type header");
+
+        let error = remote
+            .get_commit_bounded(&hash, 100)
+            .await
+            .expect_err("unknown type must fail as invalid object");
+        assert!(matches!(
+            &error,
+            git_internal::errors::GitError::InvalidObjectInfo(_)
+        ));
+        assert!(error.to_string().contains(&hash.to_string()), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bounded_typed_read_accepts_annotated_tag_with_explicit_hash_kind() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let payload = b"object 2222222222222222222222222222222222222222\ntype commit\ntag v1\ntagger Test <test@example.com> 0 +0000\n\nrelease\n";
+        let hash =
+            ObjectHash::from_type_and_data_for_kind(HashKind::Sha256, ObjectType::Tag, payload)
+                .expect("tag hash is supported");
+        remote
+            .put(&hash, payload, ObjectType::Tag)
+            .await
+            .expect("store test tag");
+
+        let (actual, kind) = remote
+            .get_typed_bounded(&hash, payload.len() as u64)
+            .await
+            .expect("bounded tag read");
+        assert_eq!(actual, payload);
+        assert_eq!(kind, ObjectType::Tag);
+    }
+
+    #[tokio::test]
+    async fn bounded_typed_read_rejects_tag_with_wrong_oid() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let hash = test_hash();
+        remote
+            .put(&hash, b"tag payload", ObjectType::Tag)
+            .await
+            .expect("store tag under wrong ID");
+
+        let error = remote
+            .get_typed_bounded(&hash, 100)
+            .await
+            .expect_err("tag with wrong ID must be rejected");
+        assert!(error.to_string().contains(&hash.to_string()), "{error}");
+        assert!(
+            error.to_string().contains("mismatched content ID"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_typed_read_rejects_oversized_tag() {
+        let _hash_kind = set_hash_kind_for_test(HashKind::Sha1);
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let hash = test_hash();
+        remote
+            .put(&hash, &vec![b'a'; 200_000], ObjectType::Tag)
+            .await
+            .expect("store large compressed tag");
+
+        let error = remote
+            .get_typed_bounded(&hash, 1_024)
+            .await
+            .expect_err("oversized tag must be rejected");
+        assert!(error.to_string().contains("exceeds 1024 bytes"), "{error}");
     }
 }

@@ -43,6 +43,7 @@ EXAMPLES:
     libra checkout feature-x               Switch to another branch (prefer: libra switch feature-x)
     libra checkout -b feature-x            Create + switch to a new branch (prefer: libra switch -c feature-x)
     libra checkout --orphan fresh-start    Create an unborn orphan branch (prefer: libra switch --orphan fresh-start)
+    libra checkout --detach                Detach HEAD at the current commit
     libra checkout --detach main           Detach HEAD at a branch's commit instead of switching
     libra checkout -t origin/main          --track accepted; remote checkout tracks via DWIM
     libra checkout -- file.txt             Restore a path from the index (prefer: libra restore file.txt)
@@ -174,6 +175,9 @@ enum CheckoutError {
     #[error("'{0}' is not a valid object name for checkout")]
     InvalidObjectName(String),
 
+    #[error("You are on a branch yet to be born")]
+    UnbornHead,
+
     #[error("failed to create branch '{branch}': {detail}")]
     BranchCreate { branch: String, detail: String },
 
@@ -273,6 +277,8 @@ impl From<CheckoutError> for CliError {
                 };
                 wrapped.with_stable_code(stable_code)
             }
+            CheckoutError::UnbornHead => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid),
             CheckoutError::DelegatedCli(err) => err,
         }
     }
@@ -379,6 +385,35 @@ async fn run_checkout(
     let previous_branch = current_branch_result().await?;
     let previous_commit = current_commit_string().await?;
 
+    if args.detach && args.branch.is_none() {
+        let Some(commit) = previous_commit.as_deref() else {
+            return Err(CheckoutError::UnbornHead);
+        };
+        let commit_id =
+            ObjectHash::from_str(commit).map_err(|_| CheckoutError::BranchStoreCorrupt {
+                context: "resolve HEAD for --detach".to_string(),
+                detail: format!("invalid HEAD commit '{commit}'"),
+            })?;
+        switch::detach_head_in_place(commit_id, switch::NavigationCommand::Checkout)
+            .await
+            .map_err(map_switch_error)?;
+        return Ok(CheckoutOutput {
+            action: "detach".to_string(),
+            previous_branch,
+            previous_commit: previous_commit.clone(),
+            branch: None,
+            commit: Some(commit_id.to_string()),
+            short_commit: Some(short_oid(&commit_id.to_string())),
+            switched: true,
+            created: false,
+            pulled: false,
+            already_on: false,
+            detached: true,
+            tracking: None,
+            restore: None,
+        });
+    }
+
     // Match Git behavior: checking out the current branch is a no-op and should
     // not be blocked by unrelated local changes. `--detach` is the exception:
     // `checkout --detach <current-branch>` still detaches HEAD at its commit.
@@ -445,11 +480,8 @@ async fn run_checkout(
     if let Some(new_branch) = args.new_branch {
         let start_point = args.branch;
         let target_commit = resolve_checkout_create_startpoint(start_point.as_deref()).await?;
-        let clean_status = if args.force {
-            switch::ensure_no_untracked_overwrite(target_commit)
-        } else {
-            switch::ensure_clean_status_for_commit(target_commit, output).await
-        };
+        let clean_status =
+            switch::ensure_switch_clean_or_force(args.force, target_commit, output).await;
         map_switch_preflight(clean_status)?;
 
         let child_output = silent_child_output(output);
@@ -475,11 +507,8 @@ async fn run_checkout(
     if let Some(new_branch) = args.force_new_branch {
         let start_point = args.branch;
         let target_commit = resolve_checkout_create_startpoint(start_point.as_deref()).await?;
-        let clean_status = if args.force {
-            switch::ensure_no_untracked_overwrite(target_commit)
-        } else {
-            switch::ensure_clean_status_for_commit(target_commit, output).await
-        };
+        let clean_status =
+            switch::ensure_switch_clean_or_force(args.force, target_commit, output).await;
         map_switch_preflight(clean_status)?;
 
         if let Some(prev) = previous_branch.as_deref()
@@ -1188,6 +1217,10 @@ mod tests {
             CheckoutError::RemoteHeadMissing.to_string(),
             "checkout remote branch left HEAD without a commit",
         );
+        assert_eq!(
+            CheckoutError::UnbornHead.to_string(),
+            "You are on a branch yet to be born",
+        );
         let proxy_err = CliError::failure("remote not configured")
             .with_stable_code(StableErrorCode::NetworkUnavailable);
         assert_eq!(
@@ -1253,6 +1286,7 @@ mod tests {
                 CheckoutError::RemoteHeadMissing,
                 StableErrorCode::RepoStateInvalid,
             ),
+            (CheckoutError::UnbornHead, StableErrorCode::RepoStateInvalid),
         ];
 
         for (err, expected) in cases {

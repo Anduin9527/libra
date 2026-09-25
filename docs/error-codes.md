@@ -55,7 +55,13 @@ when the object is missing.
 
 Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2-8) described in the migration section below. When this variable is unset or `0`, Libra uses the Git-standard codes shown above.
 
-Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` are normal controlled `review --fix` or `investigate fix` CLI outcomes and exit `128`.
+### Per-command exit-code overrides
+
+`CliError::with_exit_code` wins over both the Git-standard 128/129 mapping and `LIBRA_FINE_EXIT_CODES=1`. The stable `error_code` is unchanged.
+
+- `branch -d` / `--delete` refusals (not fully merged, missing branch, currently checked-out branch) exit **1**. Codes stay `LBR-REPO-003` or `LBR-CLI-003`.
+
+Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` remain reserved for the retired controlled-fix execution outcomes and still map to exit `128`.
 
 ## Migration From Fine-Grained Exit Codes
 
@@ -85,7 +91,7 @@ structured report is always present.
 | Exit | Stable code | Category | Meaning | Typical examples |
 | --- | --- | --- | --- | --- |
 | `129` | `LBR-CLI-001` | `cli` | Unknown command | `libra wat` |
-| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags ; `update-ref` fatals exit `128` instead — see the note below the table |
+| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags, `init` targeting the per-user Libra home as repository storage; `update-ref` fatals exit `128` instead — see the note below the table |
 | `129` | `LBR-CLI-003` | `cli` | Invalid object, revision, pathspec, or move target | bad ref, invalid pathspec, outside-repo move target, `update-ref <newvalue>` naming an unresolvable revision or an object that is not a commit ; `update-ref` fatals exit `128` instead — see the note below the table |
 | `128` | `LBR-REPO-001` | `repo` | Not inside a Libra repository | running repo commands outside `.libra` |
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |
@@ -101,10 +107,10 @@ structured report is always present.
 | `128` | `LBR-MEMORY-FTS-UNAVAILABLE` | `repo` | Linked SQLite does not provide the required FTS5 capability | a custom or incorrectly linked Libra build without `ENABLE_FTS5` |
 | `128` | `LBR-WORKTREE-001` | `repo` | Pagination cursor is malformed, foreign, or expired | `libra worktree doctor --cursor <garbage>` |
 | `128` | `LBR-WORKTREE-002` | `repo` | A worktree/workspace scope is corrupt or unreadable, so the diagnosis would be incomplete | `libra worktree doctor` where a `workspace_record` row or the worktree registry cannot be read |
-| `128` | `LBR-CONFIG-001` | `config` | Global config DB schema is newer than this Libra binary supports | `pull`, `push`, `fetch`, `clone`, or `cloud` would otherwise silently ignore global storage config |
+| `128` | `LBR-CONFIG-001` | `config` | Required Global/System config has a future configuration schema or unsupported migration receipt | `pull`, `push`, `fetch`, `clone`, or `cloud` must not silently ignore unsupported defaults; `configuration_schema_versions` is role-scoped and known Repository receipts / valid configuration barriers are accepted |
 | `128` | `LBR-UPGRADE-001` | `config` | Reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt (unsupported `upgrade.*` config spellings are usage errors, `LBR-CLI-002`) | `libra config get --global upgrade.mode` on a hand-edited, non-JSON settings file |
 | `128` | `LBR-CONFLICT-001` | `conflict` | Unresolved conflict is present | merge/rebase conflict still unresolved |
-| `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree |
+| `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree, an unsafe v2 restore target/lease/CAS state, or an ambiguous undo/redo/revert transition |
 | `128` | `LBR-POLICY-001` | `conflict` | Branch policy (protect/archive metadata) blocked the ref update | `branch reset` / `update-ref` on a protected or archived branch |
 | `128` | `LBR-CASE-001` | `conflict` | Paths that differ only by case collide on a case-insensitive filesystem | `add`/`checkout`/`switch`/`mv` under `core.casehandling=error` |
 | `128` | `LBR-LAYER-001` | `conflict` | A layer overlay path collided with tracked content, or a layer path was staged | `layer apply` collision / `add` of a layer overlay path (lore.md 2.4) |
@@ -112,16 +118,16 @@ structured report is always present.
 | `128` | `LBR-OBLITERATE-002` | `repo` | Object exists only inside a packfile; v1 cannot rewrite packs | `file obliterate` on a packed-only object (lore.md 2.5) |
 | `128` | `LBR-OBLITERATE-003` | `conflict` | Obliteration not confirmed; it is irreversible and requires --yes | `file obliterate` without `--yes` (lore.md 2.5) |
 | `128` | `LBR-NET-001` | `network` | Remote unreachable or transport unavailable | DNS, timeout, TLS, connection refused |
-| `128` | `LBR-NET-002` | `network` | Protocol, negotiation, or pack failure | packet-line, sideband, unpack/ref update protocol errors |
+| `128` | `LBR-NET-002` | `network` | Protocol, negotiation, or pack failure | detected packet-line framing / empty discovery response, sideband, unpack/ref update protocol errors, unexpected receive-pack status lines / missing status-report flush |
 | `128` | `LBR-AUTH-001` | `auth` | Missing identity, token, or credentials | missing commit identity, missing API key, missing SSH material |
 | `128` | `LBR-AUTH-002` | `auth` | Credential present but permission denied | forbidden push, insufficient scope |
 | `128` | `LBR-IO-001` | `io` | Read/open/load failure | failed to open pack, failed to read index |
-| `128` | `LBR-IO-002` | `io` | Write/save/update/remove failure | failed to write index, failed to remove file |
+| `128` | `LBR-IO-002` | `io` | Write/save/update/remove failure | failed to write index, failed to remove file, failed to register its cloud object-index repair marker |
 | `128` | `LBR-INTERNAL-001` | `internal` | Unexpected internal invariant failure | invariant break, unclassified internal failure |
 | `128` | `LBR-BISECT-001` | `repo` | `bisect view` / `bisect run` invoked outside an active bisect session | running `bisect view` before `bisect start` |
 | `128` | `LBR-BISECT-002` | `internal` | `bisect run` command exited with code ≥ 128 or was killed by a signal | run script aborted via SIGINT, exit 130 |
 | `128` | `LBR-BISECT-003` | `repo` | `bisect run` cannot advance because no candidate commits remain | bisect already converged when `run` is invoked |
-| `129` | `LBR-ADD-001` | `cli` | `libra add` invoked with no matched paths and nothing already staged | `libra add nonexistent.txt` on an empty index |
+| `128` | `LBR-ADD-001` | `cli` | `libra add` invoked with no matched paths and nothing already staged | `libra add nonexistent.txt` on an empty index |
 | `128` | `LBR-UNSUPPORTED-001` | `internal` | Operation declined because the requested mode is intentionally unsupported in this batch | requesting a Git feature explicitly declined in `docs/development/commands/_compatibility.md`, such as a `merge`/`rebase`/`cherry-pick` that would have to arbitrate a `160000` gitlink (`D24`) |
 | `128` | `LBR-AGENT-001` | `internal` | AI agent run exceeded a configured budget dimension (tokens, tool calls, wall-clock, source calls, or cost) | a sub-agent ran 500 tool calls when `max_tool_calls = 200` |
 | `128` | `LBR-AGENT-002` | `internal` | External `libra-agent-*` agents are disabled (`agent.external_agents.enabled` defaults to `false`) | `libra agent rpc invoke` before opting in to external discovery |
@@ -132,8 +138,6 @@ structured report is always present.
 | `128` | `LBR-AGENT-007` | `internal` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed | a binary floods stderr past the 64 KiB cap |
 | `128` | `LBR-AGENT-008` | `internal` | Hook envelope failed validation before checkpoint persistence | a provider hook posts malformed JSON to `libra agent hooks` |
 | `128` | `LBR-AGENT-009` | `internal` | Agent checkpoint store inconsistent across ref/DB/object-index | `agent_checkpoint` row points at a missing traces object; run `libra agent doctor` |
-| `128` | `LBR-AGENT-010` | `internal` | `review --fix` or `investigate fix` could not discover or authorize an active `libra code --control write` AgentRuntime | either fix command with no live authorized Code control session |
-| `128` | `LBR-AGENT-011` | `internal` | Untrusted seed content was rejected before it could enter either controlled fix admission or another mutating workflow | an issue-link, review finding, investigation topic, stance, or finding attempting to drive a mutating fix |
 | `128` | `LBR-AGENT-012` | `internal` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed | a trusted `libra-agent-*` binary exits before answering the invoked method |
 | `128` | `LBR-AGENT-013` | `internal` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` | `libra agent checkpoint export --raw` (or equivalent) without `--allow-raw` |
 | `128` | `LBR-AGENT-014` | `internal` | A `review`/`investigate` run was refused because the shared run queue is full — more than `agent.max_concurrent_runs` runs are active and the wait queue is at its cap (10) | starting an 11th queued `libra review`/`libra investigate` run while the concurrency budget is saturated |
@@ -207,8 +211,26 @@ structured report is always present.
 
 | Stable code | Meaning |
 | --- | --- |
-| `LBR-CONFIG-001` | Global config database schema is newer than this Libra binary supports; update Libra or explicitly use `--offline` / `LIBRA_READ_POLICY=offline|local` when local-only object access is intended. |
+| `LBR-CONFIG-001` | Required Global/System configuration has a future schema or unsupported receipt. Upgrade Libra; never edit SQLite receipts manually. Use `--offline` / `LIBRA_READ_POLICY=offline|local` only for intentional local-only object access, not remote synchronization. Existing JSON fields remain stable; `config_scope`, `schema_ledger`, and `schema_reason` identify the issue without values or untrusted receipt names. |
 | `LBR-UPGRADE-001` | The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt; rewrite it with `libra config set --global upgrade.mode <auto\|manual\|off>`. Unsupported `upgrade.*` config spellings are usage errors (`LBR-CLI-002`). |
+
+`libra config doctor --global-schema` is a read-only diagnostic, so an
+unsupported/unreadable classification is a successful report, not
+`LBR-CONFIG-001`. Check `data.classification` in JSON (`report_version=1`),
+not only the exit code. `repair_eligible` is always false: even recognized
+`2026090801` does not attest its writer. Invalid doctor arguments use
+`LBR-CLI-002`. Missing WAL sidecars cause a conservative `unreadable` report
+without creating them; see [the doctor contract](commands/config.md#read-only-global-schema-doctor)
+for live-file race limits. Do not manually edit migration receipts.
+
+The separate explicit `doctor --global-schema --repair --confirm <canonical-path>`
+workflow uses `LBR-CLI-002` for invalid confirmation, `LBR-CONFIG-001` for
+ineligible format/path/permissions or changed attestation, and `LBR-IO-002` for
+lock, consistent-backup and transaction failures. Unsupported platforms reject
+before repair side effects. Errors are controlled and never forward raw SQLite
+schema text or configuration values. A retained `backup.sqlite` is not proof of
+a committed repair: inspect verification/commit state and preserve recovery
+evidence on uncertainty. See [repair recovery](commands/config.md#confirmed-legacy-global-schema-repair).
 
 ### Conflict
 
@@ -258,8 +280,6 @@ structured report is always present.
 | `LBR-AGENT-007` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed |
 | `LBR-AGENT-008` | Hook envelope failed validation before checkpoint persistence |
 | `LBR-AGENT-009` | Agent checkpoint store inconsistent across ref/DB/object-index |
-| `LBR-AGENT-010` | `review --fix` or `investigate fix` could not discover or authorize an active `libra code --control write` AgentRuntime |
-| `LBR-AGENT-011` | Untrusted seed content was rejected before it could enter either controlled fix admission or another mutating workflow |
 | `LBR-AGENT-012` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed |
 | `LBR-AGENT-013` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` |
 | `LBR-AGENT-014` | A `review`/`investigate` run was refused because the shared run queue is full (over `agent.max_concurrent_runs` active and the wait queue at its cap) |
@@ -334,7 +354,7 @@ failures as `-32000` with `data.status` and `data.code`.
 | `PLAN_EXECUTION_NOT_AVAILABLE` | `409` | Historical Web 409 while confirmed-plan execution was unwired. After W2-04, Network Allow admits execution onto the serialized runtime queue instead of producing this code. Older clients may still decode the catalogued 409. |
 | `PLAN_REVISION_NOTE_REQUIRED` | `400` | The message after Plan Modify was empty or whitespace-only. Revision authority remains pending and unconsumed; send a non-empty change description or Cancel. |
 | `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. For Code UI/control, retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |
-| `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart `libra code` or fix redactor configuration, then retry. |
+| `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart the agent bridge / capture session or fix redactor configuration, then retry. |
 | `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` `wire` query / `Accept;libra-wire=` value was not `2`/`v2` (the only wire; `1`/`v1` was removed in 0.22.0 — the error names `v0.21.29` as the last release serving wire v1). |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | `503` | SSE wire v2 was requested but no SessionStore-backed workflow hub is mounted (today: default Web headless persistence; managed Codex Web does not yet expose one). |
 | `WIRE_V2_CURSOR_AHEAD` | `409` | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (reconnecting with an ahead cursor would permanently skip live events). |
@@ -483,3 +503,133 @@ They parse the final JSON stderr line and assert both:
 - machine-readable fields are stable
 
 Shared helpers live in [`tests/command/mod.rs`](../tests/command/mod.rs).
+
+### SSH advertisement framing
+
+SSH advertisement lengths `0001` through `0003`, incomplete headers (including
+zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
+reason and marker are retained without captured SSH stdout/stderr.
+
+An incomplete required header has one host-trust exception: local SSH exit status
+255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
+returns fixed host-verification guidance and `LBR-NET-001`. This classification
+does not verify the remote fingerprint. Other missing advertisements, including
+authentication failures, still use `LBR-NET-002`; an available non-zero local exit
+status adds `SSH exited with status N` and fixed connectivity, trusted-host,
+ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+
+After an incomplete required header, Libra allows up to 100 milliseconds to
+observe the SSH exit status, then requests termination if needed. Other read
+errors request termination immediately. The status window, direct-child reap and
+output collection share a two-second cleanup deadline. Protocol and typed
+host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+and timeout errors keep their transport classification and may include a fixed
+local cleanup warning. Termination can change the observed exit status. This
+does not promise cleanup of arbitrary descendant processes.
+
+Clone places targeted host-verification guidance in its structured hints. The
+other command boundaries retain fixed host guidance in the message and their
+existing `LBR-NET-001` network hint. Human, JSON and machine diagnostics omit raw
+captured remote stderr in either case.
+
+The `git://` discovery and object-fetch paths preserve the listed frame errors as
+`LBR-NET-002`. All asynchronous readers reject non-ASCII/non-hexadecimal headers
+with fixed protocol reasons. HTTP(S) discovery/advertisement framing is unchanged.
+
+SSH output-limit failures use `LBR-NET-001`. See the command SSH authentication
+and captured-diagnostics sections for the 64 KiB stderr retention limit, 16 MiB
+advertisement/receive-pack limits, `BatchMode=yes` and `ssh.strictHostKeyChecking`.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+For host-key discovery failures, clone uses the fixed message and separate hints.
+Other command messages retain the fixed label `SSH host trust needs confirmation:`
+or `SSH host identity changed:` before the guidance; neither label contains remote
+stderr. Existing command-specific network hints are unchanged.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.
+
+### Strict pkt-line headers
+
+A pkt-line header must contain exactly four ASCII hexadecimal digits (`0`–`9`,
+`a`–`f` or `A`–`F`). Fetch streaming, `git://` advertisements and SSH advertisements
+reject leading signs such as `+004`, whitespace, non-hexadecimal text and invalid
+UTF-8. These failures return `LBR-NET-002` (exit 128), with fixed reasons that do
+not echo the header or payload. A peer that previously sent a signed or otherwise
+nonconforming header must send four hexadecimal digits before retrying.
+
+Git discovery also preserves protocol classification for lengths `0001`–`0003`,
+missing or partial required headers and truncated payloads. The same discovery
+classification reaches clone, fetch, pull, ls-remote and push. Check the remote
+Git service or proxy response. Their existing structured error fields remain;
+push retains its own protocol hint and the other commands retain theirs.
+
+Flush `0000`, empty-data `0004` and maximum-length `ffff` frames keep their existing
+meaning. Ordinary network errors and timeouts retain their existing categories.
+An empty fetch data stream before any complete pack remains a network failure;
+EOF after a completed pack keeps the existing success behavior. The SSH host-trust
+exception, captured-diagnostic limits and cleanup deadlines described above remain.
+
+## Remote push rejection messages
+
+When receive-pack reports `ng <refname> <reason>`, Libra first checks that the
+refname is one of the local refs submitted for this push. A rejection for any
+other ref fails with `LBR-NET-002` (exit 128) and the fixed reason
+`receive-pack rejected an unexpected ref`; the unrecognized name and its reason
+are not echoed. Its hint asks you to check the remote Git service or proxy.
+
+For a recognized ref, the remote rejection remains readable. Both its name and
+reason use the same sanitizer: Unicode control characters, including C0, DEL,
+and C1/CSI, become literal escape text. Each displayed field is limited to 200
+Unicode characters after escaping, plus `…` when truncated. An escape sequence
+or UTF-8 character is never split, so the visible prefix can be shorter than 200
+characters. Ordinary short rejection text is unchanged. These rules apply before
+human, JSON, and machine rendering, including the decoded JSON message.
+
+Known-ref rejection still returns `LBR-NET-002` / exit 128 with the existing branch
+protection hint. JSON keeps the existing message/hints envelope; a separate
+structured reason field is not introduced. Readable remote text is not a trusted
+local assertion. A rejected response leaves local tracking refs unchanged; it
+does not prove that the server rolled back a partial remote update. Inspect the
+remote state before retrying when the server's result is uncertain.
+
+## Empty-repository discovery framing
+
+An HTTP(S) advertisement that declares an empty repository still has all remaining
+pkt-line frames checked. A malformed header, an unsupported length 1..3, or a truncated
+payload after the zero object ID returns `LBR-NET-002` (exit 128), with a fixed
+reason that does not echo the remote bytes. It is no longer reported as a
+successful empty response. Check the remote Git service or proxy response before
+retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
+existing command hints and structured error fields retain their behavior.

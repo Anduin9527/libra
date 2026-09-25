@@ -24,6 +24,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::OutputConfig,
+        pathspec::PathspecSet,
         tree_attributes::{self, ExportIgnoreMatcher, TreeAttributeSource},
         util,
     },
@@ -316,10 +317,6 @@ fn validate_pathspec(pathspec: &str) -> Result<PathBuf, CliError> {
     Ok(path.to_path_buf())
 }
 
-fn entry_matches_pathspec(entry: &ArchiveEntry, pathspec: &Path) -> bool {
-    entry.path == pathspec || entry.path.starts_with(pathspec)
-}
-
 fn filter_entries_by_pathspecs(
     entries: Vec<ArchiveEntry>,
     pathspecs: &[String],
@@ -328,17 +325,17 @@ fn filter_entries_by_pathspecs(
         return Ok(entries);
     }
 
-    let normalized = pathspecs
-        .iter()
-        .map(|pathspec| validate_pathspec(pathspec))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Keep the lexical safety check (rejects absolute / `..` paths) so a
+    // malicious pathspec can never escape the archive tree.
+    for pathspec in pathspecs {
+        validate_pathspec(pathspec)?;
+    }
+    // `FIX-AD-01`: match through the shared pathspec engine so wildcards and
+    // `:(magic)` behave like Git (plain names still prefix-match).
+    let set = archive_pathspec_set(pathspecs)?;
     let filtered = entries
         .into_iter()
-        .filter(|entry| {
-            normalized
-                .iter()
-                .any(|pathspec| entry_matches_pathspec(entry, pathspec))
-        })
+        .filter(|entry| set.matches_path(&entry.path))
         .collect::<Vec<_>>();
 
     if filtered.is_empty() {
@@ -350,6 +347,22 @@ fn filter_entries_by_pathspecs(
     }
 
     Ok(filtered)
+}
+
+/// `FIX-AD-01`: build the shared-engine pathspec set for `archive`'s pathspecs.
+fn archive_pathspec_set(raw: &[String]) -> Result<PathspecSet, CliError> {
+    let current_dir = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!("failed to resolve current directory: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    // Pathspec matching is also covered by pure unit tests that intentionally
+    // run outside a repository. Archive execution has already resolved its
+    // tree-ish before reaching this helper, so using the current directory as
+    // the lexical worktree fallback preserves matching semantics without
+    // turning a path filter into an unrelated repository-discovery panic.
+    let workdir = util::try_working_dir().unwrap_or_else(|_| current_dir.clone());
+    PathspecSet::from_workdir(raw, &current_dir, &workdir)
+        .map_err(|error| CliError::command_usage(format!("invalid archive pathspec: {error}")))
 }
 
 /// Resolve a tree-ish string to the archiveable entries from that commit tree.
@@ -801,8 +814,11 @@ mod tests {
     use std::str::FromStr;
 
     use git_internal::internal::object::tree::TreeItem;
+    use serial_test::serial;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
 
     #[test]
     fn archive_format_accepts_supported_names() {
@@ -955,7 +971,14 @@ mod tests {
     }
 
     #[test]
+    #[serial(cwd)]
     fn filter_entries_by_pathspecs_keeps_matching_files_and_dirs() {
+        let repo = tempdir().expect("failed to create archive pathspec repository");
+        tokio::runtime::Runtime::new()
+            .expect("failed to create test runtime")
+            .block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
         let hash =
             ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
         let entries = vec![
@@ -981,6 +1004,55 @@ mod tests {
 
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|entry| entry.path.starts_with("src")));
+    }
+
+    /// FIX-AD-01: `archive` pathspecs match through the shared pathspec engine —
+    /// wildcards and `:(literal)` behave like Git, plain names still prefix-match.
+    #[test]
+    #[serial(cwd)]
+    fn filter_entries_by_pathspecs_supports_wildcards_and_magic() {
+        let repo = tempdir().expect("failed to create archive pathspec repository");
+        tokio::runtime::Runtime::new()
+            .expect("failed to create test runtime")
+            .block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
+        let hash =
+            ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
+        let entry = |path: &str| ArchiveEntry {
+            path: PathBuf::from(path),
+            source: ArchiveSource::Blob(hash),
+            mode: TreeItemMode::Blob,
+        };
+
+        // Glob matches both the literal `*.txt` and `a.txt`.
+        let filtered = filter_entries_by_pathspecs(
+            vec![entry("*.txt"), entry("a.txt"), entry("b.md")],
+            &["*.txt".to_string()],
+        )
+        .expect("glob pathspec");
+        let names: Vec<&str> = filtered.iter().map(|e| e.path.to_str().unwrap()).collect();
+        assert_eq!(names, vec!["*.txt", "a.txt"]);
+
+        // `:(literal)` matches only the literal name.
+        let filtered = filter_entries_by_pathspecs(
+            vec![entry("*.txt"), entry("a.txt")],
+            &[":(literal)*.txt".to_string()],
+        )
+        .expect("literal magic");
+        let names: Vec<&str> = filtered.iter().map(|e| e.path.to_str().unwrap()).collect();
+        assert_eq!(names, vec!["*.txt"]);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn archive_pathspec_set_works_outside_a_libra_repository() {
+        let outside = tempdir().expect("temporary non-repository directory");
+        let _cwd = ChangeDirGuard::new(outside.path());
+
+        let set = archive_pathspec_set(&["src".to_string()])
+            .expect("archive pathspec parsing must not require repository discovery");
+        assert!(set.matches_path("src/main.rs"));
     }
 
     #[test]

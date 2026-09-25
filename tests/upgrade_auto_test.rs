@@ -398,6 +398,30 @@ fn upgrade_probe_entry_self_checks_the_running_binary() {
     assert_eq!(malformed.status.code(), Some(1));
 }
 
+/// The detached background worker (`libra __upgrade-background`) must exit 0
+/// and print nothing even for a non-upgrade-manageable dev build: it runs
+/// only the auto check (which silently skips — here the temp `LIBRA_HOME`
+/// makes the effective mode `off`) and never a user command.
+#[test]
+fn upgrade_background_worker_is_silent_and_exits_zero_for_a_dev_build() {
+    let exe = env!("CARGO_BIN_EXE_libra");
+    let home = tempfile::tempdir().unwrap();
+    let out = Command::new(exe)
+        .arg("__upgrade-background")
+        .env("LIBRA_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "the background worker must be silent"
+    );
+}
+
 fn installed_version_string(exe: &str) -> String {
     let out = Command::new(exe).arg("--version").output().unwrap();
     String::from_utf8_lossy(&out.stdout)

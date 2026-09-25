@@ -108,6 +108,7 @@ fn this_object_format() -> String {
     match git_internal::hash::get_hash_kind() {
         git_internal::hash::HashKind::Sha1 => "sha1".to_string(),
         git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
+        git_internal::hash::HashKind::Blake3 => "blake3".to_string(),
     }
 }
 
@@ -131,7 +132,9 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
         return Ok(None);
     }
     let url = format!("sqlite://{}?mode=ro", db_path.display());
-    let conn = sea_orm::Database::connect(&url)
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options.map_sqlx_sqlite_pool_opts(crate::internal::db::sqlite_pool_options);
+    let conn = sea_orm::Database::connect(options)
         .await
         .map_err(|e| format!("cannot open the base repo's config database: {e}"))?;
     // objectformat (config table; default sha1).

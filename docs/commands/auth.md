@@ -71,7 +71,9 @@ SSO authorization. See GitHub's PAT documentation:
 ### Secret storage and key handling
 
 Tokens are AES-256-GCM-encrypted with the global vault key
-(`~/.libra/vault-unseal-key`, 0600) and stored as ciphertext in the global
+(`<XDG_CONFIG_HOME or ~/.config>/libra/vault-unseal-key`, 0600; a pre-XDG
+`~/.libra/vault-unseal-key` is copied there on first use and kept as an
+untouched backup) and stored as ciphertext in the global
 config DB — `libra config get/list/unset` can neither dump nor forge nor
 delete `auth.token.*` entries (the auth surface is the only door). One token
 per host:port scope; re-login overwrites. The **OS-keyring backend** (lore.md

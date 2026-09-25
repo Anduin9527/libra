@@ -10,6 +10,10 @@ use serial_test::serial;
 use tempfile::tempdir;
 
 use super::*;
+mod env_restore_tests;
+
+mod unmerged;
+
 #[tokio::test]
 #[serial(cwd)]
 /// A commit with no file changes should fail if `allow_empty` is false.
@@ -51,11 +55,8 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
     // leak into the cascade lookup and make the test pass incorrectly.
     let fake_global = temp_path.path().join("fake_global.db");
     let fake_system = temp_path.path().join("fake_system.db");
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::set_var("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
-        std::env::set_var("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
-    }
+    let _global_config = test::ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
+    let _system_config = test::ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
 
     use libra::internal::config::ConfigKv;
     ConfigKv::unset_all("user.name").await.unwrap();
@@ -66,6 +67,8 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
 
     test::ensure_file("identity.txt", Some("identity"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["identity.txt".into()],
         all: false,
         update: false,
@@ -79,6 +82,10 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -104,13 +111,6 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
     let rendered = result.unwrap_err().render();
     assert!(rendered.contains("fatal: author identity unknown"));
     assert!(rendered.contains("Hint:"));
-
-    // Restore env vars so subsequent serial tests are not affected.
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB");
-        std::env::remove_var("LIBRA_CONFIG_SYSTEM_DB");
-    }
 }
 
 #[test]
@@ -251,6 +251,8 @@ async fn test_execute_commit() {
         test::ensure_file("bb/b.txt", Some("b"));
         test::ensure_file("bb/c.txt", Some("c"));
         let args = AddArgs {
+            intent_to_add: false,
+            sparse: false,
             all: true,
             update: false,
             verbose: false,
@@ -265,6 +267,10 @@ async fn test_execute_commit() {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         };
         add::execute(args).await;
     }
@@ -349,6 +355,8 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["tracked.txt".into()],
         all: false,
         update: false,
@@ -362,6 +370,10 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -428,6 +440,8 @@ async fn test_commit_with_all_flag_records_deletions() {
 
     test::ensure_file("keep.txt", Some("keep"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["keep.txt".into()],
         all: false,
         update: false,
@@ -441,6 +455,10 @@ async fn test_commit_with_all_flag_records_deletions() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -532,6 +550,8 @@ async fn test_commit_sha256() {
     // Create and add a file
     test::ensure_file("a.txt", Some("hello sha256"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".to_string()],
         all: false,
         update: false,
@@ -545,6 +565,10 @@ async fn test_commit_sha256() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -625,6 +649,8 @@ async fn test_commit_with_custom_author() {
     // Create a file and add it
     test::ensure_file("test.txt", Some("test content"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["test.txt".into()],
         all: false,
         update: false,
@@ -638,6 +664,10 @@ async fn test_commit_with_custom_author() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -751,17 +781,17 @@ async fn test_commit_amend_preserves_author_unless_reset() {
 
     use libra::internal::config::ConfigKv;
 
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
     // Clear identity env vars so the config-driven identity below is authoritative.
-    unsafe {
-        std::env::remove_var("GIT_COMMITTER_NAME");
-        std::env::remove_var("GIT_COMMITTER_EMAIL");
-        std::env::remove_var("GIT_AUTHOR_NAME");
-        std::env::remove_var("GIT_AUTHOR_EMAIL");
-        std::env::remove_var("EMAIL");
-        std::env::remove_var("LIBRA_COMMITTER_NAME");
-        std::env::remove_var("LIBRA_COMMITTER_EMAIL");
-    }
+    let _identity_env = [
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "EMAIL",
+        "LIBRA_COMMITTER_NAME",
+        "LIBRA_COMMITTER_EMAIL",
+    ]
+    .map(test::ScopedEnvVar::unset);
 
     // Initial commit authored by the original identity.
     ConfigKv::unset_all("user.name").await.unwrap();
@@ -887,6 +917,8 @@ async fn test_commit_with_actual_changes() {
     std::fs::write(&test_file, "test content").unwrap();
 
     let add_args = add::AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["test.txt".to_string()],
         all: false,
         update: false,
@@ -900,6 +932,10 @@ async fn test_commit_with_actual_changes() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     };
     add::execute(add_args).await;
 
@@ -974,6 +1010,8 @@ async fn test_commit_signoff_persists_trailer() {
 
     test::ensure_file("signed.txt", Some("signed content"));
     add::execute(add::AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["signed.txt".into()],
         all: false,
         update: false,
@@ -987,6 +1025,10 @@ async fn test_commit_signoff_persists_trailer() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1123,19 +1165,18 @@ async fn test_commit_without_identity_fails_by_default() {
     // Isolate from host config so no user.name/email leaks in
     let fake_global = temp_path.path().join("fake_global.db");
     let fake_system = temp_path.path().join("fake_system.db");
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::set_var("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
-        std::env::set_var("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
-        // Clear env vars that could provide identity
-        std::env::remove_var("GIT_COMMITTER_NAME");
-        std::env::remove_var("GIT_COMMITTER_EMAIL");
-        std::env::remove_var("GIT_AUTHOR_NAME");
-        std::env::remove_var("GIT_AUTHOR_EMAIL");
-        std::env::remove_var("EMAIL");
-        std::env::remove_var("LIBRA_COMMITTER_NAME");
-        std::env::remove_var("LIBRA_COMMITTER_EMAIL");
-    }
+    let _global_config = test::ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
+    let _system_config = test::ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
+    let _identity_env = [
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "EMAIL",
+        "LIBRA_COMMITTER_NAME",
+        "LIBRA_COMMITTER_EMAIL",
+    ]
+    .map(test::ScopedEnvVar::unset);
 
     // Ensure useConfigOnly is NOT set (default)
     ConfigKv::unset_all("user.name").await.unwrap();
@@ -1143,6 +1184,8 @@ async fn test_commit_without_identity_fails_by_default() {
 
     test::ensure_file("autodetect.txt", Some("content"));
     add::execute(add::AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["autodetect.txt".into()],
         all: false,
         update: false,
@@ -1156,6 +1199,10 @@ async fn test_commit_without_identity_fails_by_default() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1182,13 +1229,6 @@ async fn test_commit_without_identity_fails_by_default() {
     let rendered = result.unwrap_err().render();
     assert!(rendered.contains("fatal: author identity unknown"));
     assert!(rendered.contains("Hint:"));
-
-    // Restore env vars so subsequent serial tests are not affected.
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB");
-        std::env::remove_var("LIBRA_CONFIG_SYSTEM_DB");
-    }
 }
 
 /// `libra commit --help` surfaces the EXAMPLES section so users see the
@@ -1236,6 +1276,8 @@ async fn test_commit_cleanup_strips_comments() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1249,6 +1291,10 @@ async fn test_commit_cleanup_strips_comments() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1427,6 +1473,8 @@ async fn test_commit_trailer_appended() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1440,6 +1488,10 @@ async fn test_commit_trailer_appended() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1465,6 +1517,8 @@ async fn test_commit_dry_run_does_not_create_commit() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1478,6 +1532,10 @@ async fn test_commit_dry_run_does_not_create_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1504,6 +1562,8 @@ async fn test_commit_reuse_message() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1517,6 +1577,10 @@ async fn test_commit_reuse_message() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1530,6 +1594,8 @@ async fn test_commit_reuse_message() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -1543,6 +1609,10 @@ async fn test_commit_reuse_message() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1570,6 +1640,8 @@ async fn test_commit_fixup_sets_subject() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1583,6 +1655,10 @@ async fn test_commit_fixup_sets_subject() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1594,6 +1670,8 @@ async fn test_commit_fixup_sets_subject() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -1607,6 +1685,10 @@ async fn test_commit_fixup_sets_subject() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1955,5 +2037,504 @@ fn commit_with_terminal_index_failure_is_repaired_without_recommitting() {
             .count(),
         0,
         "repair must not require creating a second commit"
+    );
+}
+
+fn merge_conflict_repo_for_commit() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("shared.txt"), "top\nl1\nORIG\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base shared", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    std::fs::write(p.join("shared.txt"), "top\nl1\nFEATURE\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add feature");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature edit", "--no-verify"], p),
+        "commit feature",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    std::fs::write(p.join("shared.txt"), "top\nl1\nMAIN\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main edit", "--no-verify"], p),
+        "commit main",
+    );
+    repo
+}
+
+fn resolve_merge_conflict(p: &std::path::Path) {
+    std::fs::write(p.join("shared.txt"), "top\nl1\nRESOLVED\nl3\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "stage resolution",
+    );
+}
+
+fn head_parent_count(p: &std::path::Path) -> usize {
+    let out = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+    assert_cli_success(&out, "cat-file HEAD");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.starts_with("parent "))
+        .count()
+}
+
+fn head_message_body(p: &std::path::Path) -> String {
+    let out = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+    assert_cli_success(&out, "cat-file HEAD message");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_once("\n\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default()
+}
+
+/// M-MCOMMIT MC1–MC9, MC11 (#477 HF-27): commit finishes an in-progress merge.
+#[test]
+fn test_commit_concludes_in_progress_merge_matrix() {
+    // MC5: unresolved conflicts still refuse.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    let refused = run_libra_command(&["commit", "-m", "nope", "--no-verify"], p);
+    assert_eq!(refused.status.code(), Some(128), "MC5");
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC5 keeps state"
+    );
+
+    // MC6: --amend during merge refuses and does not move HEAD.
+    let before = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let amend = run_libra_command(&["commit", "--amend", "--no-edit", "--no-verify"], p);
+    assert_eq!(amend.status.code(), Some(128), "MC6");
+    assert!(
+        String::from_utf8_lossy(&amend.stderr).contains("cannot amend"),
+        "MC6: {}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+    let after = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(before, after, "MC6 HEAD unchanged");
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC6 keeps state"
+    );
+
+    // MC9: --dry-run writes nothing and does not print a fake hash.
+    resolve_merge_conflict(p);
+    let dry = run_libra_command(&["commit", "--dry-run", "-m", "preview", "--no-verify"], p);
+    assert_cli_success(&dry, "MC9 dry-run");
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        dry_out.contains("Would finish the in-progress merge"),
+        "MC9 preview: {dry_out}"
+    );
+    assert!(
+        !dry_out.contains("[main "),
+        "MC9 must not print a fake commit: {dry_out}"
+    );
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC9 keeps state"
+    );
+
+    // MC7: partial commit stays a 129 usage error.
+    let partial = run_libra_command(&["commit", "shared.txt", "--no-verify"], p);
+    assert_eq!(partial.status.code(), Some(129), "MC7 path");
+    let only = run_libra_command(&["commit", "-o", "shared.txt", "--no-verify"], p);
+    assert_eq!(only.status.code(), Some(129), "MC7 -o");
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC7 keeps state"
+    );
+
+    // MC2 / MC2b / MC2c: -m creates a two-parent commit and clears merge state.
+    let committed = run_libra_command(&["commit", "-m", "finish merge", "--no-verify"], p);
+    assert_cli_success(&committed, "MC2");
+    assert_eq!(head_parent_count(p), 2, "MC2 two parents");
+    assert!(
+        head_message_body(p).contains("finish merge"),
+        "MC2 message: {}",
+        head_message_body(p)
+    );
+    assert!(!p.join(".libra/merge-state.json").exists(), "MC2 cleared");
+    let abort = run_libra_command(&["merge", "--abort"], p);
+    assert!(
+        String::from_utf8_lossy(&abort.stderr).contains("no merge in progress"),
+        "MC2b: {}",
+        String::from_utf8_lossy(&abort.stderr)
+    );
+    let cont = run_libra_command(&["merge", "--continue"], p);
+    assert!(
+        String::from_utf8_lossy(&cont.stderr).contains("no merge in progress"),
+        "MC2c: {}",
+        String::from_utf8_lossy(&cont.stderr)
+    );
+    let after_abort = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let after_commit = String::from_utf8_lossy(&committed.stdout);
+    assert!(!after_abort.is_empty(), "MC2b HEAD still exists");
+    let _ = after_commit;
+
+    // MC1: editor does not change the seeded merge message (comments stripped).
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    let mc1 = run_libra_command_with_env(&["commit", "--no-verify"], p, &[("GIT_EDITOR", "true")]);
+    assert_cli_success(&mc1, "MC1");
+    assert_eq!(head_parent_count(p), 2, "MC1 two parents");
+    let body = head_message_body(p);
+    assert!(
+        !body.contains("# Conflicts:"),
+        "MC1 editor cleanup strips comments: {body}"
+    );
+    assert!(!p.join(".libra/merge-state.json").exists(), "MC1 cleared");
+
+    // MC3: --no-edit keeps # Conflicts:.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    let mc3 = run_libra_command(&["commit", "--no-edit", "--no-verify"], p);
+    assert_cli_success(&mc3, "MC3");
+    assert_eq!(head_parent_count(p), 2, "MC3 two parents");
+    let body = head_message_body(p);
+    assert!(body.contains("# Conflicts:"), "MC3 keeps comments: {body}");
+
+    // MC4: -F overrides the message.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    std::fs::write(p.join("msg.txt"), "from file\n").unwrap();
+    let mc4 = run_libra_command(&["commit", "-F", "msg.txt", "--no-verify"], p);
+    assert_cli_success(&mc4, "MC4");
+    assert_eq!(head_parent_count(p), 2, "MC4 two parents");
+    assert!(
+        head_message_body(p).contains("from file"),
+        "{}",
+        head_message_body(p)
+    );
+
+    // MC8: commit -a after a resolved worktree edit.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    std::fs::write(p.join("shared.txt"), "top\nl1\nRESOLVED-A\nl3\nbottom\n").unwrap();
+    let mc8 = run_libra_command(&["commit", "-a", "-m", "via -a", "--no-verify"], p);
+    assert_cli_success(&mc8, "MC8");
+    assert_eq!(head_parent_count(p), 2, "MC8 two parents");
+    assert!(!p.join(".libra/merge-state.json").exists(), "MC8 cleared");
+
+    // MC11: clean --no-commit then commit.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    // Make a non-conflicting extra file merge via --no-commit on a clean-able pair.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "mc11 feature",
+    );
+    std::fs::write(p.join("extra.txt"), "only feature\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra.txt"], p), "mc11 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature extra", "--no-verify"], p),
+        "mc11 commit extra",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "mc11 main");
+    // Use a second repo that's clean: merge --no-commit of a non-conflicting branch.
+    let clean = create_committed_repo_via_cli();
+    let cp = clean.path();
+    std::fs::write(cp.join("base.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "base.txt"], cp), "base add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], cp),
+        "base commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], cp),
+        "clean branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], cp),
+        "clean feature",
+    );
+    std::fs::write(cp.join("feat.txt"), "feat\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "feat.txt"], cp), "feat add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feat", "--no-verify"], cp),
+        "feat commit",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], cp), "clean main");
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-commit", "feature"], cp),
+        "MC11 no-commit",
+    );
+    assert!(cp.join(".libra/merge-state.json").exists());
+    let mc11 = run_libra_command(&["commit", "--no-edit", "--no-verify"], cp);
+    assert_cli_success(&mc11, "MC11 commit");
+    assert_eq!(head_parent_count(cp), 2, "MC11 two parents");
+    assert!(
+        head_message_body(cp).to_ascii_lowercase().contains("merge"),
+        "MC11 prefilled merge message: {}",
+        head_message_body(cp)
+    );
+    assert!(!cp.join(".libra/merge-state.json").exists(), "MC11 cleared");
+}
+
+fn stage_one(repo: &std::path::Path, name: &str, body: &str) {
+    std::fs::write(repo.join(name), body).unwrap();
+    assert_cli_success(&run_libra_command(&["add", name], repo), name);
+}
+
+/// M-EMPTY E1–E3, E5, E6, E8–E10 (#477 HF-06).
+#[test]
+fn test_commit_allow_empty_message_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    stage_one(p, "e1.txt", "e1\n");
+    let e1 = run_libra_command(&["commit", "-m", "", "--no-verify"], p);
+    assert_eq!(e1.status.code(), Some(128), "E1 still aborts");
+    assert!(
+        String::from_utf8_lossy(&e1.stderr).contains("empty commit message"),
+        "E1: {}",
+        String::from_utf8_lossy(&e1.stderr)
+    );
+
+    let e2 = run_libra_command(
+        &["commit", "--allow-empty-message", "-m", "", "--no-verify"],
+        p,
+    );
+    assert_cli_success(&e2, "E2 empty -m");
+
+    stage_one(p, "e3.txt", "e3\n");
+    let empty_file = p.join("empty-msg.txt");
+    std::fs::write(&empty_file, "").unwrap();
+    let e3 = run_libra_command(
+        &[
+            "commit",
+            "--allow-empty-message",
+            "-F",
+            empty_file.to_str().unwrap(),
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e3, "E3 empty -F");
+
+    stage_one(p, "e5.txt", "e5\n");
+    let e5 = run_libra_command(
+        &[
+            "commit",
+            "--allow-empty-message",
+            "-m",
+            "   ",
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e5, "E5 whitespace -m");
+
+    let e6 = run_libra_command(
+        &[
+            "commit",
+            "--amend",
+            "--allow-empty-message",
+            "-m",
+            "",
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e6, "E6 amend empty");
+
+    // E8: commit-msg hook still rejects an empty message file.
+    stage_one(p, "e8.txt", "e8\n");
+    let hook_dir = p.join(".libra/hooks");
+    std::fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("commit-msg");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nif ! grep -q '[^[:space:]]' \"$1\"; then echo hook-empty; exit 1; fi\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+    }
+    let e8 = run_libra_command(&["commit", "--allow-empty-message", "-m", ""], p);
+    assert_ne!(e8.status.code(), Some(0), "E8 hook still refuses");
+    assert!(
+        String::from_utf8_lossy(&e8.stderr).contains("hook")
+            || String::from_utf8_lossy(&e8.stderr).contains("commit-msg"),
+        "E8: {}",
+        String::from_utf8_lossy(&e8.stderr)
+    );
+    std::fs::remove_file(&hook).unwrap();
+
+    // E9: empty message still signs when vault signing is already on
+    // (`create_committed_repo_via_cli` uses default `init`, which creates
+    // the PGP key — a second `generate-gpg-key` would LBR-CONFLICT-002).
+    stage_one(p, "e9.txt", "e9\n");
+    let e9 = run_libra_command(
+        &[
+            "--json",
+            "commit",
+            "--allow-empty-message",
+            "-m",
+            "",
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e9, "E9 signed empty");
+    assert_eq!(
+        parse_json_stdout(&e9)["data"]["signed"].as_bool(),
+        Some(true),
+        "E9 signed: {}",
+        String::from_utf8_lossy(&e9.stdout)
+    );
+
+    // E10: log / show / oneline render an empty subject.
+    let log = run_libra_command(&["log", "-1"], p);
+    assert_cli_success(&log, "E10 log");
+    let oneline = run_libra_command(&["log", "-1", "--oneline"], p);
+    assert_cli_success(&oneline, "E10 oneline");
+    let show = run_libra_command(&["show", "-s", "--oneline"], p);
+    assert_cli_success(&show, "E10 show");
+}
+
+/// SW-05 (M-HONOR H4, plan issues/490): `commit -a` keeps a skip-worktree
+/// entry whose worktree file is absent and preserves its extended bit.
+#[test]
+fn test_commit_all_keeps_skip_worktree_entry() {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("s"), "s\n").expect("write s");
+    fs::write(root.join("other"), "other\n").expect("write other");
+    assert_cli_success(&run_libra_command(&["add", "s", "other"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    let index_path = root.join(".libra/index");
+    {
+        let mut index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load");
+        let (hash, mode, size) = {
+            let entry = index.get("s", 0).expect("tracked");
+            (entry.hash, entry.mode, entry.size)
+        };
+        let mut entry = IndexEntry::new_from_blob("s".to_string(), hash, size);
+        entry.mode = mode;
+        entry.flags.skip_worktree = true;
+        index.update(entry);
+        index
+            .save_with_hash_kind(HashKind::Sha1, &index_path)
+            .expect("save");
+    }
+    fs::remove_file(root.join("s")).expect("remove s");
+    // Give `commit -a` a real change to commit; the skip-worktree deletion
+    // alone is correctly "nothing to commit".
+    fs::write(root.join("other"), "changed\n").expect("modify other");
+
+    assert_cli_success(
+        &run_libra_command(&["commit", "-a", "-m", "h4", "--no-verify"], root),
+        "commit -a",
+    );
+    let index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("reload");
+    let entry = index.get("s", 0).expect("s must stay tracked");
+    assert!(entry.flags.skip_worktree, "the bit must survive commit -a");
+}
+
+/// FM-04 (M-DET D4/D6, plan-20260918): `commit -a` records a mode-only change
+/// when `core.fileMode` is enabled and reports nothing to commit when false.
+#[cfg(unix)]
+#[test]
+fn test_commit_all_updates_mode_only_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    let run = root.join("run.sh");
+    fs::write(&run, "#!/bin/sh\n").expect("write");
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    assert_cli_success(&run_libra_command(&["add", "run.sh"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    // D4: mode-only change is committed.
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-a", "-m", "mode", "--no-verify"], root),
+        "commit -a",
+    );
+    let tree = run_libra_command(&["ls-tree", "HEAD", "run.sh"], root);
+    assert!(
+        String::from_utf8_lossy(&tree.stdout).starts_with("100644"),
+        "D4 tree mode: {}",
+        String::from_utf8_lossy(&tree.stdout)
+    );
+
+    // D6: with fileMode=false a further chmod is not a change to commit.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    let out = run_libra_command(&["commit", "-a", "-m", "ignored", "--no-verify"], root);
+    assert_ne!(out.status.code(), Some(0), "D6 must have nothing to commit");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nothing to commit")
+            || String::from_utf8_lossy(&out.stderr).contains("nothing added")
+            || String::from_utf8_lossy(&out.stderr).contains("no changes added"),
+        "D6 message: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

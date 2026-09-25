@@ -21,7 +21,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use git_internal::hash::{HashKind, set_hash_kind};
+use git_internal::hash::set_hash_kind;
 use serde_json::{Value, json};
 
 use super::{
@@ -37,8 +37,9 @@ use crate::{
         ai::{
             automation::dispatch_repo_hook_lifecycle_event_to_history,
             capture_scope::CaptureScope,
-            history::{AI_REF, HistoryManager},
+            history,
             session::{SessionState, SessionStore},
+            traces,
         },
         config::ConfigKv,
         db,
@@ -184,8 +185,9 @@ pub struct HookEnvelopeInvalid(pub String);
 /// For [`HookTarget::AiIntent`] the function is exactly the historical
 /// behaviour (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the
 /// function runs the external-Agent capture ingest — stdin parse, validate,
-/// redact, upsert into `agent_session`, and (on `SessionEnd`) write an
-/// E4-libra checkpoint commit on `refs/libra/traces`.
+/// redact, and upsert into `agent_session`. Checkpoint class comes from
+/// `session_capture::decide` and covers `TurnEnd`, `SessionEnd`,
+/// `SubagentStart`, and `SubagentEnd`.
 pub async fn process_hook_event_with_target(
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -369,7 +371,7 @@ pub async fn process_hook_event_with_target(
                     .insert("persisted_at".to_string(), json!(Utc::now().to_rfc3339()));
                 session
                     .metadata
-                    .insert("history_ref".to_string(), json!(AI_REF));
+                    .insert("history_ref".to_string(), json!(history::ai_ref_name()));
                 session
                     .metadata
                     .insert("object_hash".to_string(), json!(outcome.object_hash));
@@ -746,13 +748,7 @@ async fn ingest_agent_traces_payload_with_scope(
         }
     }
 
-    let new_state = match event.kind {
-        LifecycleEventKind::SessionStart => "active",
-        LifecycleEventKind::SessionEnd => "stopped",
-        LifecycleEventKind::Compaction => "condensed",
-        LifecycleEventKind::CompactionCompleted => "active",
-        _ => "active",
-    };
+    let new_state = super::session_capture::decide(event.kind).session_state;
 
     // UPSERT: insert a fresh row on first sight; otherwise just bump
     // `last_event_at`, `state`, and `redaction_report`. We key by
@@ -924,13 +920,9 @@ async fn ingest_agent_traces_payload_with_scope(
     // redacted transcript blob (now the agent's full on-disk transcript, see
     // the writer); events-blob inclusion remains a follow-up. Per-turn
     // checkpoints give `libra agent checkpoint rewind` turn-level granularity.
-    if matches!(
-        event.kind,
-        LifecycleEventKind::SessionEnd
-            | LifecycleEventKind::TurnEnd
-            | LifecycleEventKind::SubagentStart
-            | LifecycleEventKind::SubagentEnd
-    ) && let Some(repo) = repo_path
+    let checkpoint = super::session_capture::decide(event.kind).checkpoint;
+    if checkpoint != super::session_capture::CheckpointWrite::None
+        && let Some(repo) = repo_path
     {
         // AG-19 owner-race closure: the pre-upsert owner check above is a
         // fast path, but two providers racing on a fresh provider session
@@ -1004,10 +996,7 @@ async fn ingest_agent_traces_payload_with_scope(
         // `doctor` surface nested runs as first-class checkpoints instead of
         // leaving them as bounded `subagent_events` metadata on the main
         // checkpoint. `SessionEnd` / `TurnEnd` keep the `committed` path.
-        if matches!(
-            event.kind,
-            LifecycleEventKind::SubagentStart | LifecycleEventKind::SubagentEnd
-        ) {
+        if checkpoint == super::session_capture::CheckpointWrite::SubagentBoundary {
             write_subagent_checkpoint(
                 conn,
                 repo,
@@ -1221,7 +1210,7 @@ async fn session_concurrent_active(
 /// double-inserts.
 async fn cleanup_failed_registered_checkpoint(
     conn: &sea_orm::DatabaseConnection,
-    marker: &crate::internal::ai::history::TracesInflightMarker,
+    marker: &crate::internal::ai::traces::TracesInflightMarker,
     provider_session_id: &str,
     scope: &CaptureScope,
     claim_channel: &'static str,
@@ -1274,7 +1263,7 @@ async fn cleanup_failed_registered_checkpoint(
         );
     }
     if let Some(generation) = marker.generation.as_deref()
-        && let Err(error) = crate::internal::ai::history::clear_non_cleanup_traces_inflight_marker(
+        && let Err(error) = crate::internal::ai::traces::clear_non_cleanup_traces_inflight_marker(
             conn,
             &marker.session_id,
             &marker.attempt_id,
@@ -1391,12 +1380,13 @@ async fn write_committed_checkpoint(
 ) -> Result<()> {
     use crate::internal::ai::{
         coverage_gate,
-        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
+        history::HistoryManager,
         observed_agents::{
             AgentKind, RedactedBytes, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
             agent_for, normalize_claude_transcript, normalize_codex_rollout,
             resolve_transcript_source,
         },
+        traces::{self, CheckpointCommitParams, CheckpointScope},
     };
 
     let redacted_prompt = event.prompt.as_deref();
@@ -1793,7 +1783,7 @@ async fn write_committed_checkpoint(
         subagent_discovery_warning,
     );
     let metadata = serde_json::json!({
-        "schema_version": history::CHECKPOINT_METADATA_SCHEMA_VERSION,
+        "schema_version": traces::CHECKPOINT_METADATA_SCHEMA_VERSION,
         "checkpoint_id": null, // filled in below once we have the UUID
         "session_id": libra_session_id,
         "agent_kind": agent_kind,
@@ -1861,7 +1851,7 @@ async fn write_committed_checkpoint(
 
     // Window A/B guard: session/tombstone/coverage fences and marker creation
     // commit together BEFORE stage (a). Any failure aborts object creation.
-    let marker = history::TracesInflightMarker::new(
+    let marker = traces::TracesInflightMarker::new(
         libra_session_id,
         &checkpoint_id,
         Utc::now().timestamp_millis(),
@@ -1875,7 +1865,7 @@ async fn write_committed_checkpoint(
         .map(|(owner, _, claims)| {
             claims
                 .iter()
-                .map(|claim| history::TracesCoverageFence {
+                .map(|claim| traces::TracesCoverageFence {
                     logical_turn_key: &claim.logical_turn_key,
                     owner,
                     fence_token: claim.fence_token,
@@ -1889,7 +1879,7 @@ async fn write_committed_checkpoint(
         .as_ref()
         .map(|(owner, fence_token, _)| (owner.clone(), *fence_token));
     if let Err(error) =
-        history::register_traces_write_attempt(conn, &marker, &registration_fences).await
+        traces::register_traces_write_attempt(conn, &marker, &registration_fences).await
     {
         cleanup_failed_registered_checkpoint(
             conn,
@@ -1944,11 +1934,10 @@ async fn write_committed_checkpoint(
     let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
         objects_dir,
     ));
-    let manager = HistoryManager::new_with_ref(
+    let manager = HistoryManager::for_traces(
         storage,
         repo_path.to_path_buf(),
         std::sync::Arc::new(conn.clone()),
-        crate::internal::branch::TRACES_BRANCH,
     );
 
     // Resolve the user-branch HEAD via the typed helper so we can
@@ -2070,7 +2059,7 @@ async fn write_committed_checkpoint(
         written.tree_oid.to_string(),
         written.metadata_blob_oid.to_string(),
     ];
-    if let Err(err) = history::update_traces_inflight_marker_if_generation(
+    if let Err(err) = traces::update_traces_inflight_marker_if_generation(
         conn,
         &committed_marker,
         &written.marker_generation,
@@ -2092,7 +2081,7 @@ async fn write_committed_checkpoint(
 
     // Stage (d) complete — release the window guard (best-effort; an
     // orphaned marker expires via its TTL).
-    if let Err(err) = history::clear_non_cleanup_traces_inflight_marker(
+    if let Err(err) = traces::clear_non_cleanup_traces_inflight_marker(
         conn,
         libra_session_id,
         &checkpoint_id,
@@ -2155,11 +2144,11 @@ struct SubagentCommitPlan {
 }
 
 #[async_trait::async_trait]
-impl crate::internal::ai::history::TracesTxnExtra for SubagentCommitPlan {
+impl crate::internal::ai::traces::TracesTxnExtra for SubagentCommitPlan {
     async fn apply(
         &self,
         txn: &sea_orm::DatabaseTransaction,
-        ctx: &crate::internal::ai::history::TracesCommitCtx,
+        ctx: &crate::internal::ai::traces::TracesCommitCtx,
     ) -> Result<()> {
         use sea_orm::{ConnectionTrait, Statement};
 
@@ -2240,8 +2229,9 @@ async fn write_subagent_checkpoint(
     now: i64,
 ) -> Result<()> {
     use crate::internal::ai::{
-        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
+        history::HistoryManager,
         observed_agents::{RedactedBytes, Redactor},
+        traces::{self, CheckpointCommitParams, CheckpointScope},
     };
 
     // Resolve the parent `committed` checkpoint (if any) for linkage.
@@ -2357,7 +2347,7 @@ async fn write_subagent_checkpoint(
             }
         };
 
-    let marker = history::TracesInflightMarker::new(
+    let marker = traces::TracesInflightMarker::new(
         libra_session_id,
         &checkpoint_id,
         Utc::now().timestamp_millis(),
@@ -2366,7 +2356,7 @@ async fn write_subagent_checkpoint(
         .generation
         .as_deref()
         .context("new subagent checkpoint marker has no writer generation")?;
-    history::register_traces_write_attempt(conn, &marker, &[])
+    traces::register_traces_write_attempt(conn, &marker, &[])
         .await
         .context("register fail-closed subagent checkpoint attempt")?;
 
@@ -2375,7 +2365,7 @@ async fn write_subagent_checkpoint(
         .context("create objects dir for subagent checkpoint commit")
     {
         if let Some(generation) = marker.generation.as_deref() {
-            let _ = history::clear_non_cleanup_traces_inflight_marker(
+            let _ = traces::clear_non_cleanup_traces_inflight_marker(
                 conn,
                 libra_session_id,
                 &checkpoint_id,
@@ -2388,11 +2378,10 @@ async fn write_subagent_checkpoint(
     let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
         objects_dir,
     ));
-    let manager = HistoryManager::new_with_ref(
+    let manager = HistoryManager::for_traces(
         storage,
         repo_path.to_path_buf(),
         std::sync::Arc::new(conn.clone()),
-        crate::internal::branch::TRACES_BRANCH,
     );
     let commit_plan = SubagentCommitPlan {
         checkpoint_id: checkpoint_id.clone(),
@@ -2429,7 +2418,7 @@ async fn write_subagent_checkpoint(
         Ok(written) => written,
         Err(error) => {
             if let Some(generation) = marker.generation.as_deref() {
-                let _ = history::clear_non_cleanup_traces_inflight_marker(
+                let _ = traces::clear_non_cleanup_traces_inflight_marker(
                     conn,
                     libra_session_id,
                     &checkpoint_id,
@@ -2447,7 +2436,7 @@ async fn write_subagent_checkpoint(
         written.tree_oid.to_string(),
         written.metadata_blob_oid.to_string(),
     ];
-    if let Err(err) = history::update_traces_inflight_marker_if_generation(
+    if let Err(err) = traces::update_traces_inflight_marker_if_generation(
         conn,
         &committed_marker,
         &written.marker_generation,
@@ -2461,7 +2450,7 @@ async fn write_subagent_checkpoint(
         );
     }
 
-    if let Err(err) = history::clear_non_cleanup_traces_inflight_marker(
+    if let Err(err) = traces::clear_non_cleanup_traces_inflight_marker(
         conn,
         libra_session_id,
         &checkpoint_id,
@@ -2535,10 +2524,8 @@ pub async fn insert_subagent_checkpoint_row_idempotent(
 ) -> Result<bool> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    use crate::internal::ai::history;
-
     if let Some(existing_id) =
-        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+        traces::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
     {
         tracing::info!(
             checkpoint_id = %row.checkpoint_id,
@@ -2612,10 +2599,8 @@ pub async fn insert_agent_checkpoint_row_idempotent(
 ) -> Result<bool> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    use crate::internal::ai::history;
-
     if let Some(existing_id) =
-        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+        traces::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
     {
         tracing::info!(
             checkpoint_id = %row.checkpoint_id,
@@ -2998,21 +2983,34 @@ fn merge_redaction_report_into(
 /// Mirrors `cli::set_local_hash_kind_for_storage` but reads via the already-open
 /// connection that the hook runtime obtains. Defaults to `sha1` for repositories
 /// initialised before SHA-256 support landed.
+///
+/// Config **read errors** propagate (fail-closed). A missing key (`Ok(None)`)
+/// keeps the sha1 default so pre-objectformat repositories stay usable.
 async fn set_hash_kind_from_repo() -> Result<()> {
-    let object_format = ConfigKv::get("core.objectformat")
+    let lookup = ConfigKv::get("core.objectformat")
         .await
-        .ok()
-        .flatten()
-        .map(|e| e.value)
-        .unwrap_or_else(|| "sha1".to_string());
-
-    let hash_kind = match object_format.as_str() {
-        "sha1" => HashKind::Sha1,
-        "sha256" => HashKind::Sha256,
-        _ => bail!("unsupported object format: '{object_format}'"),
-    };
+        .map(|entry| entry.map(|e| e.value));
+    let hash_kind = hash_kind_from_object_format_lookup(lookup)?;
     set_hash_kind(hash_kind);
     Ok(())
+}
+
+/// Map a `core.objectformat` lookup onto [`HashKind`].
+///
+/// - `Ok(Some(value))` → [`object_format::parse_config_value`]
+/// - `Ok(None)` → `HashKind::Sha1` (legacy repos without the key)
+/// - `Err(_)` → propagated (fail-closed; never swallowed into sha1)
+fn hash_kind_from_object_format_lookup(
+    lookup: Result<Option<String>>,
+) -> Result<git_internal::hash::HashKind> {
+    let raw = match lookup {
+        Ok(Some(value)) => value,
+        Ok(None) => "sha1".to_string(),
+        Err(error) => {
+            return Err(error).context("failed to read core.objectformat from repository config");
+        }
+    };
+    crate::internal::object_format::parse_config_value(&raw)
 }
 
 /// Apply the canonical event together with bookkeeping into `session`.
@@ -3236,29 +3234,23 @@ async fn persist_session_history(
 
     let storage = Arc::new(ClientStorage::init(objects_dir));
     let db_conn = Arc::new(db::get_db_conn_instance().await.clone());
-    let history_manager = HistoryManager::new(storage, storage_path.to_path_buf(), db_conn);
-
-    if let Some(existing) = history_manager
-        .get_object_hash(AI_SESSION_TYPE, &session.id)
-        .await?
-    {
-        return Ok(PersistOutcome {
-            object_hash: existing.to_string(),
-            already_exists: true,
-        });
-    }
-
     let payload = build_ai_session_payload(session, provider);
     let blob_data = serde_json::to_vec(&normalize_json_value(payload))
         .context("failed to serialize ai_session payload")?;
     let blob_hash = write_git_object(storage_path, "blob", &blob_data)?;
-    history_manager
-        .append(AI_SESSION_TYPE, &session.id, blob_hash)
-        .await?;
+    let (object_hash, already_exists) = history::persist_ai_session(
+        storage,
+        storage_path.to_path_buf(),
+        db_conn,
+        AI_SESSION_TYPE,
+        &session.id,
+        blob_hash,
+    )
+    .await?;
 
     Ok(PersistOutcome {
-        object_hash: blob_hash.to_string(),
-        already_exists: false,
+        object_hash: object_hash.to_string(),
+        already_exists,
     })
 }
 
@@ -3332,7 +3324,7 @@ fn build_ai_session_payload(session: &SessionState, provider: &dyn HookProvider)
         "ingest_meta": {
             "source": provider.source_name(),
             "provider": provider.provider_name(),
-            "history_ref": AI_REF,
+            "history_ref": history::ai_ref_name(),
             "ingested_at": Utc::now().to_rfc3339(),
         }
     })
@@ -3384,12 +3376,42 @@ impl SessionPhase {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::Map;
     use serial_test::serial;
 
     use super::*;
     use crate::internal::ai::hooks::providers::{claude_provider, codex_provider, gemini_provider};
+
+    /// B3-00: config read errors fail closed; missing key stays sha1; blake3 parses.
+    #[test]
+    fn runtime_config_read_error_fail_closed() {
+        let blake3 = hash_kind_from_object_format_lookup(Ok(Some("blake3".to_string())))
+            .expect("blake3 accepted via object_format helper");
+        assert_eq!(blake3, git_internal::hash::HashKind::Blake3);
+
+        let missing =
+            hash_kind_from_object_format_lookup(Ok(None)).expect("missing key defaults to sha1");
+        assert_eq!(missing, git_internal::hash::HashKind::Sha1);
+
+        let err =
+            hash_kind_from_object_format_lookup(Err(anyhow!("simulated config read failure")));
+        let message = format!("{:#}", err.expect_err("Err must propagate"));
+        assert!(
+            message.contains("failed to read core.objectformat"),
+            "expected contextual fail-closed message, got: {message}"
+        );
+        assert!(
+            message.contains("simulated config read failure"),
+            "expected underlying cause preserved, got: {message}"
+        );
+
+        let bad = hash_kind_from_object_format_lookup(Ok(Some("SHA256".to_string())));
+        assert!(
+            bad.is_err(),
+            "mixed-case objectformat must fail closed via parse_config_value"
+        );
+    }
 
     /// AG-21 metadata persistence (codex review R2 P1): the generic E6
     /// path (codex/opencode) must persist `subagent_token_usage` and
@@ -3617,6 +3639,7 @@ mod tests {
     // Scenario: long IDs keep their first eight characters; short IDs are fully
     // masked.
     #[test]
+    #[serial_test::serial(cwd, hash_kind)]
     fn session_id_redaction_masks_suffix() {
         assert_eq!(redact_session_id("gemini__session-123"), "gemini__***");
         assert_eq!(redact_session_id("short"), "***");
@@ -3625,6 +3648,7 @@ mod tests {
     // Scenario: a synthetic ended session includes the schema id, state machine
     // counters, message-count summary, and transcript path in the payload.
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn v2_payload_contains_state_machine_and_summary() {
         let mut session = SessionState::new("/tmp/repo");
         session.id = "gemini__s-1".to_string();
@@ -3681,7 +3705,7 @@ mod tests {
 
     const LEGACY_BOOTSTRAP_SQL: &str = include_str!("../../../../sql/sqlite_20260309_init.sql");
 
-    async fn ingest_fresh_conn() -> (TempDir, DatabaseConnection) {
+    pub(crate) async fn ingest_fresh_conn() -> (TempDir, DatabaseConnection) {
         let dir = tempfile::tempdir().expect("tempdir");
         // Use the canonical `libra.db` filename here so the Phase 3.5c
         // object_index queue (`enqueue_agent_blob_object_index_update`)
@@ -3722,7 +3746,7 @@ mod tests {
         (dir, conn)
     }
 
-    fn ingest_envelope(
+    pub(crate) fn ingest_envelope(
         hook_event_name: &str,
         session_id: &str,
         extra: serde_json::Value,
@@ -4597,7 +4621,7 @@ mod tests {
     /// silently captured with empty transcripts (exactly what the A6.5
     /// real-CLI smoke observed with its isolated CODEX_HOME).
     #[test]
-    #[serial]
+    #[serial(env)]
     fn codex_transcript_root_honors_codex_home_override() {
         let adapter = crate::internal::ai::observed_agents::agent_for(
             crate::internal::ai::observed_agents::AgentKind::Codex,
@@ -4655,7 +4679,7 @@ mod tests {
     /// envelope at it, and asserts the persisted blob contains the marker
     /// (proving full capture) with the secret scrubbed.
     #[tokio::test]
-    #[serial]
+    #[serial(env)]
     async fn session_end_checkpoint_captures_full_transcript_via_adapter() {
         let (dir, conn) = ingest_fresh_conn().await;
         let repo_path = dir.path().to_path_buf();

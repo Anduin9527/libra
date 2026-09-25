@@ -29,6 +29,8 @@ use libra::{
 use serial_test::serial;
 use tempfile::tempdir;
 
+mod gitlink_preflight;
+
 /// Run the Libra binary with an isolated HOME so host config never leaks into tests.
 fn run_libra_command(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
     let home = cwd.join(".libra-test-home");
@@ -90,6 +92,8 @@ async fn create_linear_commits(count: usize) -> Vec<String> {
         };
 
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec,
             all: false,
             update: false,
@@ -103,6 +107,10 @@ async fn create_linear_commits(count: usize) -> Vec<String> {
             chmod: None,
             renormalize: false,
             ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
         commit::execute(commit::CommitArgs {

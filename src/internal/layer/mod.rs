@@ -1021,7 +1021,7 @@ mod tests {
     use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn add_list_order_and_unique() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -1075,7 +1075,7 @@ mod tests {
     /// path records independently; one scope's remove/rewrite never touches
     /// the other's rows.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn scopes_are_isolated() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -1177,7 +1177,7 @@ mod tests {
     /// worktrees would have one refresh replace the other's, and the second
     /// worktree would then exclude — or fail to exclude — the wrong paths.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn layer_exclusion_snapshot_keyed_by_scope() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
@@ -1252,7 +1252,7 @@ mod tests {
     /// mutation pinned to repository A would then be allowed to run against
     /// repository B's working tree.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn the_binding_refuses_another_repositorys_main_worktree() {
         let repo_a = tempfile::tempdir().expect("repo a");
         let repo_b = tempfile::tempdir().expect("repo b");
@@ -1283,7 +1283,7 @@ mod tests {
     /// and the mutation entry points (`apply`/`unapply`) surface the same
     /// refusal before touching anything.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn scope_workdir_binding_fails_closed_on_drift() {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());

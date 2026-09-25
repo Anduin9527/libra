@@ -8,18 +8,20 @@ Inspect and restore command-level operation history.
 libra op log [OPTIONS]
 libra op show [OPTIONS] <OP_REF>
 libra op restore [OPTIONS] <OP_REF>
+libra op reconcile [OPTIONS]
 ```
 
 ## Description
 
-`libra op` provides a command-line surface over the operation graph persisted by
-the operation service and wrapper layers.
+`libra op` provides a command-line surface over the Operation v2 graph.
 
-It currently supports three subcommands:
+It currently supports these subcommands:
 
 - `op log`: list recorded operations with pagination and optional command filter.
 - `op show`: inspect one operation and, optionally, the captured restore view.
 - `op restore`: move HEAD and branch refs back to a previously captured view.
+- `op reconcile`: converge concurrent operation heads when their states are
+  provably unambiguous.
 
 ## Operation References
 
@@ -28,6 +30,12 @@ It currently supports three subcommands:
 - A concrete operation id, for example `019e3f00-8ee5-7e62-a54c-0ab1f1bba0f9`
 - A reflog-style index, for example `@{0}` for the newest operation or `@{1}`
   for the previous one
+
+Indices use one newest-first history across Operation v2 records. Entries such
+as `external.snapshot`, undo, redo, and reconcile appear in that same history.
+The `index` in `op log --json` is the zero-based index for the complete history;
+command filters and pagination do not renumber it. Thus `op show @{n}` and
+`op restore @{n}` target the operation displayed at index `n`.
 
 ## `libra op log`
 
@@ -92,7 +100,8 @@ libra op show @{0} --view
 
 ## `libra op restore`
 
-Restore repository state to a previously captured operation view. HEAD and the
+Restore the supported HEAD/ref state from a previously captured operation view,
+not arbitrary working-tree or nested-repository contents. HEAD and the
 captured branch refs are reset to the target view, and local branches that are
 absent from that view are pruned, so the restore reproduces the operation's
 exact local-branch set. The restored HEAD branch is always kept; remote-tracking
@@ -113,7 +122,8 @@ libra op restore [--force] [--dry-run] <OP_REF>
 
 ### `--force`
 
-Allow restore to proceed even if the working tree is dirty.
+Allow restore to proceed even if the working tree is dirty. This does not add
+restore capabilities or turn a `Partial` capture into a complete snapshot.
 
 ```bash
 libra op restore @{0} --force
@@ -145,6 +155,24 @@ libra op restore @{1}
 # Preview a restore without changing repository state
 libra op restore @{1} --dry-run
 ```
+
+## `libra op doctor`
+
+Diagnose operation object closure, heads, unfinished journals, and the
+workspace pointer. Read-only by default; `--fix` performs journal recovery and
+pointer rebuild, `--dry-run` only reports the planned repairs.
+
+```bash
+libra op doctor [--fix] [--dry-run]
+```
+
+`--fix` recovers interrupted operations that never reached a terminal state.
+A command that already published its head (the operation completed its mutation
+before the process died) is advanced to `success` and, when it is the current
+head, the workspace pointer is rebuilt to its captured view. A globally
+orphaned running operation (crash before head publication) is failed closed;
+the next mutation boundary records any on-disk drift as an external snapshot.
+
 
 ## Notes
 

@@ -1,6 +1,9 @@
 //! Append-only JSONL session event storage.
 
-#[cfg(any(test, feature = "test-provider"))]
+// Code-era intent-revision / phase1 helpers stay so old `events.jsonl`
+// files still load. Their last in-tree callers were deleted with RC-23.
+
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     cell::Cell,
@@ -21,9 +24,7 @@ use uuid::Uuid;
 use super::state::SessionState;
 use crate::internal::ai::{
     agent_run::{AgentRunEvent, AgentRunEventEnvelope, AgentRunId},
-    context_budget::{CompactionEvent, ContextFrameEvent, MemoryAnchorEvent, MemoryAnchorReplay},
-    goal::GoalEventEnvelope,
-    runtime::event::Event,
+    event::Event,
 };
 
 pub const SESSION_EVENTS_FILE: &str = "events.jsonl";
@@ -226,9 +227,9 @@ const STALE_PROCESS_OWNER_RECORD_AGE: Duration = Duration::from_secs(30);
 #[allow(clippy::large_enum_variant)]
 pub enum SessionEvent {
     SessionSnapshot(SessionSnapshotEvent),
-    ContextFrame(ContextFrameEvent),
-    CompactionEvent(CompactionEvent),
-    MemoryAnchor(MemoryAnchorEvent),
+    ContextFrame(Value),
+    CompactionEvent(Value),
+    MemoryAnchor(Value),
     /// OC-Phase 3 sub-agent lifecycle event. These do not mutate the
     /// legacy `SessionState`; they are replayed by agent-run specific
     /// projections and skipped by older binaries through the unknown
@@ -246,7 +247,7 @@ pub enum SessionEvent {
     /// alongside normal session events; older binaries still skip unknown
     /// `goal_event` payloads via the `parse_session_event_value` `unknown`
     /// branch.
-    Goal(GoalEventEnvelope),
+    Goal(Value),
     /// OC-Phase 4 ArtifactLedger JSONL projection. The
     /// `ValidationReportStore::write_latest_with_session_mirror` and
     /// `DecisionProposalStore::write_latest_with_session_mirror` paths
@@ -421,7 +422,7 @@ pub enum CodeWorkflowEventKind {
         /// obsolete, rather than a speculative pre-ack continuation.
         #[serde(default)]
         supersedes_predecessor: bool,
-        repair: crate::internal::ai::runtime::PlanExecutionRepairState,
+        repair: Value,
     },
     InteractionResolved {
         interaction_id: String,
@@ -785,14 +786,6 @@ pub enum CodeCommandStatus {
     Succeeded { summary: String },
     Failed { reason: String },
     Indeterminate { effect: String, reason: String },
-}
-
-pub(crate) fn claimed_intent_revision_consumer_status(
-    replay: &CodeWorkflowReplay,
-    consumption: &IntentRevisionConsumption,
-) -> Result<CodeCommandStatus, CodeCommandStoreError> {
-    validated_intent_revision_consumption_receipts(replay)?
-        .claimed_intent_revision_consumer_status(consumption)
 }
 
 fn intent_revision_consumption_from_claim(
@@ -2217,6 +2210,7 @@ impl<'a> IntentRevisionReplayIndex<'a> {
         )
     }
 
+    #[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
     fn latest_recoverable_intent_revision_attempt_before_claim(
         &self,
         claim: &IntentRevisionConsumptionClaim,
@@ -2273,7 +2267,7 @@ impl<'a> IntentRevisionReplayIndex<'a> {
 /// One Modify terminal whose command, interaction, review lineage and optional
 /// HMAC commitment were validated against the shared replay index.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
 pub(crate) struct ValidatedIntentRevisionSourceTerminal<'a> {
     pub(crate) interaction_id: &'a str,
     pub(crate) command: &'a CodeCommandIdentity,
@@ -2291,7 +2285,7 @@ pub(crate) struct ValidatedIntentRevisionSourceTerminal<'a> {
 // The sibling Web startup reconciler consumes this complete projection through
 // the batch API; individual fields are intentionally available before that
 // caller is migrated away from its legacy per-terminal scans.
-#[allow(dead_code)]
+#[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
 pub(crate) struct ValidatedIntentRevisionReceipt<'a> {
     pub(crate) consumption: &'a IntentRevisionConsumption,
     pub(crate) source_terminal_index: usize,
@@ -2311,6 +2305,7 @@ pub(crate) struct ValidatedIntentRevisionReceipt<'a> {
 /// events plus indexed marker/attempt relationships; it never rescans the
 /// complete event log per receipt or per retry attempt.
 #[derive(Debug)]
+#[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
 pub(crate) struct ValidatedIntentRevisionReceiptIndex<'a> {
     replay_index: IntentRevisionReplayIndex<'a>,
     source_terminals: Vec<ValidatedIntentRevisionSourceTerminal<'a>>,
@@ -2318,15 +2313,15 @@ pub(crate) struct ValidatedIntentRevisionReceiptIndex<'a> {
     committed_consumer_statuses: HashMap<CodeCommandIdentity, CodeCommandStatus>,
 }
 
+#[allow(dead_code)] // frozen W2-03 anchors pinned by compat_matrix_alignment
 impl<'a> ValidatedIntentRevisionReceiptIndex<'a> {
-    #[allow(dead_code)]
     pub(crate) fn source_terminals(
         &self,
     ) -> impl ExactSizeIterator<Item = &ValidatedIntentRevisionSourceTerminal<'a>> {
         self.source_terminals.iter()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
     pub(crate) fn source_terminal_for_interaction(
         &self,
         interaction_id: &str,
@@ -2414,7 +2409,7 @@ impl<'a> ValidatedIntentRevisionReceiptIndex<'a> {
         .filter(|receipt| receipt.consumption == consumption)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
     pub(crate) fn committed_consumer_status(
         &self,
         identity: &CodeCommandIdentity,
@@ -2784,16 +2779,16 @@ impl SessionEvent {
         })
     }
 
-    pub fn context_frame(event: ContextFrameEvent) -> Self {
-        Self::ContextFrame(event)
+    pub fn context_frame(event: impl Serialize) -> Self {
+        Self::ContextFrame(opaque_session_payload(event))
     }
 
-    pub fn compaction(event: CompactionEvent) -> Self {
-        Self::CompactionEvent(event)
+    pub fn compaction(event: impl Serialize) -> Self {
+        Self::CompactionEvent(opaque_session_payload(event))
     }
 
-    pub fn memory_anchor(event: MemoryAnchorEvent) -> Self {
-        Self::MemoryAnchor(event)
+    pub fn memory_anchor(event: impl Serialize) -> Self {
+        Self::MemoryAnchor(opaque_session_payload(event))
     }
 
     pub fn agent_run(event: AgentRunEvent) -> Self {
@@ -2808,8 +2803,8 @@ impl SessionEvent {
         Self::ToolResult(event)
     }
 
-    pub fn goal(event: GoalEventEnvelope) -> Self {
-        Self::Goal(event)
+    pub fn goal(event: impl Serialize) -> Self {
+        Self::Goal(opaque_session_payload(event))
     }
 
     pub fn ai_artifact(event: AiArtifactEvent) -> Self {
@@ -2826,10 +2821,9 @@ impl SessionEvent {
                 *current = Some(event.state.clone());
             }
             // Goal envelopes do NOT mutate the legacy `SessionState`.
-            // Replay into a `GoalState` lives in
-            // `crate::internal::ai::goal::state::replay`. Listing the
-            // variant here makes the no-op explicit so a future
-            // maintainer does not assume an oversight.
+            // Replay into a GoalState lives with the Goal supervisor.
+            // Listing the variant here makes the no-op explicit so a
+            // future maintainer does not assume an oversight.
             //
             // AiArtifact envelopes also do not mutate the legacy
             // `SessionState`; they're a JSONL projection of
@@ -2853,13 +2847,13 @@ impl Event for SessionEvent {
     fn event_kind(&self) -> &'static str {
         match self {
             Self::SessionSnapshot(_) => "session_snapshot",
-            Self::ContextFrame(event) => event.event_kind(),
-            Self::CompactionEvent(event) => event.event_kind(),
-            Self::MemoryAnchor(event) => event.event_kind(),
+            Self::ContextFrame(_) => "context_frame",
+            Self::CompactionEvent(_) => "compaction_event",
+            Self::MemoryAnchor(_) => "memory_anchor",
             Self::AgentRun(_) => "agent_run",
             Self::ToolCall(_) => "tool_call",
             Self::ToolResult(_) => "tool_result",
-            Self::Goal(event) => event.event_kind(),
+            Self::Goal(_) => "goal",
             Self::AiArtifact(_) => "ai_artifact",
             Self::CodeWorkflow(_) => "code_workflow",
         }
@@ -2868,16 +2862,16 @@ impl Event for SessionEvent {
     fn event_id(&self) -> Uuid {
         match self {
             Self::SessionSnapshot(event) => event.event_id,
-            Self::ContextFrame(event) => event.event_id(),
-            Self::CompactionEvent(event) => event.event_id(),
-            Self::MemoryAnchor(event) => event.event_id(),
+            Self::ContextFrame(event)
+            | Self::CompactionEvent(event)
+            | Self::MemoryAnchor(event) => opaque_event_id(event),
             Self::AgentRun(event) => event
                 .known()
-                .map(crate::internal::ai::runtime::Event::event_id)
+                .map(Event::event_id)
                 .unwrap_or_else(uuid::Uuid::nil),
             Self::ToolCall(event) => event.event_id,
             Self::ToolResult(event) => event.event_id,
-            Self::Goal(event) => event.event_id(),
+            Self::Goal(event) => opaque_event_id(event),
             Self::AiArtifact(event) => event.event_id,
             Self::CodeWorkflow(event) => event.event_id,
         }
@@ -2890,12 +2884,12 @@ impl Event for SessionEvent {
                 event.state.id,
                 event.state.messages.len()
             ),
-            Self::ContextFrame(event) => event.event_summary(),
-            Self::CompactionEvent(event) => event.event_summary(),
-            Self::MemoryAnchor(event) => event.event_summary(),
+            Self::ContextFrame(event) => opaque_context_frame_summary(event),
+            Self::CompactionEvent(event) => opaque_compaction_summary(event),
+            Self::MemoryAnchor(event) => opaque_memory_anchor_summary(event),
             Self::AgentRun(event) => event
                 .known()
-                .map(crate::internal::ai::runtime::Event::event_summary)
+                .map(Event::event_summary)
                 .unwrap_or_else(|| "unknown agent_run event".to_string()),
             Self::ToolCall(event) => format!(
                 "sub-agent {} tool_call {} ({})",
@@ -2905,7 +2899,7 @@ impl Event for SessionEvent {
                 "sub-agent {} tool_result {} ({}) status={}",
                 event.subagent_name, event.call_id, event.tool_name, event.status
             ),
-            Self::Goal(event) => event.event_summary(),
+            Self::Goal(event) => opaque_goal_summary(event),
             Self::AiArtifact(event) => format!(
                 "ai_artifact {} (thread {}) {}",
                 event.artifact_kind,
@@ -3136,10 +3130,10 @@ fn apply_command_status_event(
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionContextReplay {
-    pub frames: Vec<ContextFrameEvent>,
-    pub compactions: Vec<CompactionEvent>,
+    pub frames: Vec<Value>,
+    pub compactions: Vec<Value>,
 }
 
 /// Fan-out after a successful Code workflow JSONL append (SSE wire v2 hub).
@@ -3155,11 +3149,11 @@ pub struct SessionJsonlStore {
     /// Optional fan-out after a successful Code workflow append (SSE wire v2).
     /// Shared across clones so every writer of this session log publishes once.
     on_code_workflow_append: Option<CodeWorkflowAppendHook>,
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     test_faults: Arc<SessionJsonlTestFaults>,
 }
 
-#[cfg(any(test, feature = "test-provider"))]
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct SessionJsonlTestFaults {
     fail_next_combined_terminal_append: AtomicBool,
@@ -3208,7 +3202,7 @@ impl SessionJsonlStore {
             session_root,
             command_status_cache: Arc::new(Mutex::new(None)),
             on_code_workflow_append: None,
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             test_faults: Arc::new(SessionJsonlTestFaults::default()),
         }
     }
@@ -3216,46 +3210,32 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped combined-terminal append failure. Clones of
     /// this session store share the fault, while unrelated tests/sessions do
     /// not race through a process-global flag.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_combined_terminal_append_for_test(&self) {
         self.test_faults
             .fail_next_combined_terminal_append
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_combined_terminal_append_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_combined_terminal_append
-            .swap(false, Ordering::AcqRel)
-    }
-
     /// Arm one instance-scoped non-terminal response checkpoint failure.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_pending_interaction_checkpoint_for_test(&self) {
         self.test_faults
             .fail_next_pending_interaction_checkpoint
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_pending_interaction_checkpoint_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_pending_interaction_checkpoint
-            .swap(false, Ordering::AcqRel)
-    }
-
     /// Arm one instance-scoped fault after a complete JSONL row is written but
     /// before its durability sync. A retry must re-sync an exact existing row
     /// before acknowledging success.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_durable_sync_after_write_for_test(&self) {
         self.test_faults
             .fail_next_durable_sync_after_write
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     fn take_durable_sync_after_write_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_durable_sync_after_write
@@ -3265,14 +3245,14 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped failure for an explicit event-log re-sync.
     /// This is distinct from the post-write fault above so exact retry tests
     /// can prove that observing an existing row never bypasses fsync.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_events_log_resync_for_test(&self) {
         self.test_faults
             .fail_next_events_log_resync
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     fn take_events_log_resync_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_events_log_resync
@@ -3282,34 +3262,20 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped failure before the Phase 1 seed parent sync.
     /// The initial write reaches this point after replacement; an exact retry
     /// reaches it after re-syncing the visible seed file.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_phase1_seed_parent_sync_for_test(&self) {
         self.test_faults
             .fail_next_phase1_seed_parent_sync
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_phase1_seed_parent_sync_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_phase1_seed_parent_sync
-            .swap(false, Ordering::AcqRel)
-    }
-
     /// Arm one instance-scoped failure after a Phase 1 start seed has been
     /// unlinked but before the containing directory is synced.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_phase1_seed_sync_after_remove_for_test(&self) {
         self.test_faults
             .fail_next_phase1_seed_sync_after_remove
             .store(true, Ordering::Release);
-    }
-
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_phase1_seed_sync_after_remove_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_phase1_seed_sync_after_remove
-            .swap(false, Ordering::AcqRel)
     }
 
     /// Register a callback invoked after each successful Code workflow append.
@@ -3644,7 +3610,7 @@ impl SessionJsonlStore {
                 ),
             )
         })?;
-        #[cfg(any(test, feature = "test-provider"))]
+        #[cfg(test)]
         if self.take_events_log_resync_failure_for_test() {
             return Err(io::Error::other(
                 "injected failure while re-syncing the durable session event log",
@@ -3711,7 +3677,7 @@ impl SessionJsonlStore {
             )
         })?;
         if durable {
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             if self.take_durable_sync_after_write_failure_for_test() {
                 return Err(io::Error::other(
                     "injected failure after durable JSONL row write and before sync",
@@ -3788,7 +3754,7 @@ impl SessionJsonlStore {
             )
         })?;
         if durable {
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             if self.take_durable_sync_after_write_failure_for_test() {
                 return Err(io::Error::other(
                     "injected failure after durable JSONL batch write and before sync",
@@ -3928,22 +3894,6 @@ impl SessionJsonlStore {
             Err(error) => return Err(error),
         }
         self.load_code_workflow_replay()
-    }
-
-    pub(crate) fn load_intent_revision_workflow_replay_committed(
-        &self,
-    ) -> io::Result<CodeWorkflowReplay> {
-        let _lock = self.acquire_code_workflow_append_lock()?;
-        match fs::metadata(self.events_path()) {
-            Ok(_) => self.sync_events_log()?,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        self.load_intent_revision_workflow_replay()
     }
 
     /// Read the bounded workflow suffix after a durable projection cursor.
@@ -4148,40 +4098,6 @@ impl SessionJsonlStore {
         }
         self.sync_events_log()?;
         Ok(consumption)
-    }
-
-    /// Resolve a pre-admission Claiming sidecar to its exact durable command
-    /// row without requiring that command to remain Pending. Startup uses the
-    /// returned status to rearm only a canonical pre-mutation cancellation;
-    /// all other terminal-without-receipt states remain fail-closed.
-    pub(crate) fn resolve_claimed_intent_revision_consumption(
-        &self,
-        claim: &IntentRevisionConsumptionClaim,
-    ) -> Result<(IntentRevisionConsumption, CodeCommandStatus), CodeCommandStoreError> {
-        let consumer_intent = &claim.consumer_intent;
-        if !consumer_intent.is_valid() || !intent_revision_consumption_claim_is_valid(claim) {
-            return Err(CodeCommandStoreError::InvalidIntent);
-        }
-        let _lock = self.acquire_code_workflow_append_lock()?;
-        self.invalidate_command_status_cache();
-        let replay = self.load_intent_revision_workflow_replay()?;
-        let consumption = intent_revision_consumption_from_claim(&replay, consumer_intent, claim)?;
-        let Some((consumer, status)) = self.code_command_status(&consumer_intent.identity)? else {
-            return Err(CodeCommandStoreError::MissingIntent {
-                command_id: consumer_intent.identity.command_id.clone(),
-            });
-        };
-        if consumer != *consumer_intent {
-            return Err(payload_conflict(&consumer_intent.identity));
-        }
-        let exact_status = claimed_intent_revision_consumer_status(&replay, &consumption)?;
-        if exact_status != status {
-            return Err(CodeCommandStoreError::TerminalConflict {
-                command_id: consumer_intent.identity.command_id.clone(),
-            });
-        }
-        self.sync_events_log()?;
-        Ok((consumption, status))
     }
 
     /// Commit the irreversible IntentSpec revision consume boundary. The
@@ -5412,9 +5328,8 @@ impl SessionJsonlStore {
                 SessionEvent::ToolCall(_) => {}
                 SessionEvent::ToolResult(_) => {}
                 // OC-Phase 6 P6.1: Goal envelopes do not contribute to
-                // `SessionContextReplay`. Goal state is replayed by
-                // `crate::internal::ai::goal::state::replay`, called by
-                // the supervisor (P6.3). Listed explicitly so an
+                // `SessionContextReplay`. Goal state is replayed by the
+                // Goal supervisor (P6.3). Listed explicitly so an
                 // exhaustiveness regression surfaces here.
                 SessionEvent::Goal(_) => {}
                 // OC-Phase 4 ArtifactLedger (v0.17.810): AiArtifact
@@ -5429,14 +5344,14 @@ impl SessionJsonlStore {
         Ok(replay)
     }
 
-    pub fn load_memory_anchors(&self) -> io::Result<MemoryAnchorReplay> {
-        let mut replay = MemoryAnchorReplay::default();
+    pub fn load_memory_anchors(&self) -> io::Result<Vec<Value>> {
+        let mut events = Vec::new();
         for event in self.load_events()? {
             if let SessionEvent::MemoryAnchor(anchor) = event {
-                replay.apply_event(anchor);
+                events.push(anchor);
             }
         }
-        Ok(replay)
+        Ok(events)
     }
 
     pub fn load_ai_artifacts(&self) -> io::Result<Vec<AiArtifactEvent>> {
@@ -5726,6 +5641,92 @@ fn parse_session_events_content(path: &Path, content: &str) -> io::Result<Vec<Se
 fn child_dir_name(child_id: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, child_id.as_bytes());
     format!("task-{}", hex::encode(digest.as_ref()))
+}
+
+fn opaque_session_payload(event: impl Serialize) -> Value {
+    // INVARIANT: KEEP session payloads are objects/arrays with string keys.
+    match serde_json::to_value(event) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "session event payload failed to serialize");
+            Value::Null
+        }
+    }
+}
+
+fn opaque_event_id(payload: &Value) -> Uuid {
+    payload
+        .get("event_id")
+        .or_else(|| payload.get("envelope_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(Uuid::nil)
+}
+
+fn opaque_context_frame_summary(payload: &Value) -> String {
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let frame_id = payload
+        .get("frame_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let segments = payload
+        .get("segments")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    format!("{kind} context frame {frame_id} with {segments} segment(s)")
+}
+
+fn opaque_compaction_summary(payload: &Value) -> String {
+    let reason = payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let frame_id = payload
+        .get("frame_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let tokens_before = payload
+        .get("tokens_before")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let tokens_after = payload
+        .get("tokens_after")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    format!("{reason} compaction for frame {frame_id}: {tokens_before} -> {tokens_after} token(s)")
+}
+
+fn opaque_memory_anchor_summary(payload: &Value) -> String {
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let anchor_id = payload
+        .get("anchor_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("{action} memory anchor {anchor_id} ({kind})")
+}
+
+fn opaque_goal_summary(payload: &Value) -> String {
+    let goal_id = payload
+        .get("goal_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let inner = payload
+        .get("event")
+        .and_then(|event| event.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("goal {goal_id} {inner}")
 }
 
 fn parse_session_event_value(value: Value) -> Result<Option<SessionEvent>, serde_json::Error> {
@@ -6112,7 +6113,7 @@ mod tests {
         // returns the new "ai_artifact" tag so observability
         // tooling can filter at the kind level without
         // deserialising the payload.
-        use crate::internal::ai::runtime::event::Event;
+        use crate::internal::ai::event::Event;
         assert_eq!(event.event_kind(), "ai_artifact");
         assert!(event.event_summary().starts_with("ai_artifact "));
     }
@@ -6161,7 +6162,7 @@ mod tests {
             "tool transcript events must not mutate legacy SessionState",
         );
 
-        use crate::internal::ai::runtime::event::Event;
+        use crate::internal::ai::event::Event;
         assert_eq!(tool_call.event_kind(), "tool_call");
         assert_eq!(tool_result.event_kind(), "tool_result");
         assert!(tool_call.event_summary().contains("grep_files"));

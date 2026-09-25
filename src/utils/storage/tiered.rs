@@ -1,5 +1,6 @@
 //! Tiered storage controller for Git objects. This module implements a tiered storage system that combines a local filesystem backend (LocalStorage) and a remote storage backend (RemoteStorage). The TieredStorage struct manages the logic for storing and retrieving Git objects based on their size, using an LRU cache to manage large objects stored locally as a cache layer.
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -60,6 +61,11 @@ pub(crate) fn verify_fetched_object(
         HashKind::Sha256 => {
             use sha2::{Digest, Sha256};
             ObjectHash::Sha256(Sha256::digest(&framed).into())
+        }
+        HashKind::Blake3 => {
+            let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+            hasher.update(&framed);
+            hasher.finalize_object_hash()
         }
     };
 
@@ -312,6 +318,189 @@ impl Storage for TieredStorage {
         self.local.get_with_limit(hash, limit).await
     }
 
+    async fn get_typed_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let policy = read_policy();
+        if policy == ReadPolicy::Remote {
+            match self.remote.get_typed_bounded(hash, max_payload_bytes).await {
+                Ok((data, object_type)) => {
+                    verify_fetched_object(hash, object_type, &data)?;
+                    self.cache_fetched_object(hash, &data, object_type).await?;
+                    return Ok((data, object_type));
+                }
+                Err(GitError::ObjectNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        match self.local.get_typed_bounded(hash, max_payload_bytes).await {
+            Ok((data, object_type)) => {
+                verify_fetched_object(hash, object_type, &data)?;
+                let mut lru = self
+                    .lru
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = lru.get(hash);
+                drop(lru);
+                return Ok((data, object_type));
+            }
+            Err(GitError::ObjectNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if policy == ReadPolicy::LocalOnly {
+            return Err(GitError::ObjectNotFound(format!(
+                "object {hash} is not in the local store; the offline/local read policy forbids fetching it from the durable tier (drop --offline/--local or run without it to fetch)"
+            )));
+        }
+
+        let (data, object_type) = self
+            .remote
+            .get_typed_bounded(hash, max_payload_bytes)
+            .await?;
+        verify_fetched_object(hash, object_type, &data)?;
+        self.cache_fetched_object(hash, &data, object_type).await?;
+        Ok((data, object_type))
+    }
+
+    async fn object_type_bounded_probe(&self, hash: &ObjectHash) -> Result<ObjectType, GitError> {
+        let policy = read_policy();
+        if policy == ReadPolicy::Remote {
+            match self.remote.object_type_bounded_probe(hash).await {
+                Ok(object_type) => return Ok(object_type),
+                Err(GitError::ObjectNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        match self.local.object_type_bounded_probe(hash).await {
+            Ok(object_type) => return Ok(object_type),
+            Err(GitError::ObjectNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if policy == ReadPolicy::LocalOnly {
+            return Err(GitError::ObjectNotFound(format!(
+                "object {hash} is not in the local store; the offline/local read policy forbids fetching it from the durable tier (drop --offline/--local or run without it to fetch)"
+            )));
+        }
+        self.remote.object_type_bounded_probe(hash).await
+    }
+
+    async fn object_types_bounded_probe(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        const MAX_TOTAL_TYPE_PROBE_BYTES: u64 = 256 * 1024 * 1024;
+        self.object_types_bounded_probe_with_budget(hashes, MAX_TOTAL_TYPE_PROBE_BYTES)
+            .await
+            .map(|(found, _)| found)
+    }
+
+    async fn object_types_bounded_probe_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        let unique: Vec<ObjectHash> = hashes
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if unique.is_empty() {
+            return Ok((HashMap::new(), 0));
+        }
+        let policy = read_policy();
+        if policy == ReadPolicy::Remote {
+            let (mut results, remote_bytes) = self
+                .remote
+                .object_types_bounded_probe_with_budget(&unique, remaining_remote_bytes)
+                .await?;
+            let misses: Vec<_> = unique
+                .iter()
+                .copied()
+                .filter(|hash| !results.contains_key(hash))
+                .collect();
+            let (local_results, _) = self
+                .local
+                .object_types_bounded_probe_with_budget(&misses, 0)
+                .await?;
+            results.extend(local_results);
+            return Ok((results, remote_bytes));
+        }
+
+        let (mut results, _) = self
+            .local
+            .object_types_bounded_probe_with_budget(&unique, 0)
+            .await?;
+        if policy == ReadPolicy::LocalOnly {
+            return Ok((results, 0));
+        }
+        let misses: Vec<_> = unique
+            .iter()
+            .copied()
+            .filter(|hash| !results.contains_key(hash))
+            .collect();
+        let (remote_results, remote_bytes) = self
+            .remote
+            .object_types_bounded_probe_with_budget(&misses, remaining_remote_bytes)
+            .await?;
+        results.extend(remote_results);
+        Ok((results, remote_bytes))
+    }
+
+    async fn get_commit_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let policy = read_policy();
+        if policy == ReadPolicy::Remote {
+            match self
+                .remote
+                .get_commit_bounded(hash, max_payload_bytes)
+                .await
+            {
+                Ok((data, object_type)) => {
+                    verify_fetched_object(hash, object_type, &data)?;
+                    self.cache_fetched_object(hash, &data, object_type).await?;
+                    return Ok((data, object_type));
+                }
+                Err(GitError::ObjectNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        match self.local.get_commit_bounded(hash, max_payload_bytes).await {
+            Ok(hit) => {
+                let mut lru = self
+                    .lru
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = lru.get(hash);
+                drop(lru);
+                return Ok(hit);
+            }
+            Err(GitError::ObjectNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if policy == ReadPolicy::LocalOnly {
+            return Err(GitError::ObjectNotFound(format!(
+                "object {hash} is not in the local store; the offline/local read policy forbids fetching it from the durable tier (drop --offline/--local or run without it to fetch)"
+            )));
+        }
+
+        let (data, object_type) = self
+            .remote
+            .get_commit_bounded(hash, max_payload_bytes)
+            .await?;
+        verify_fetched_object(hash, object_type, &data)?;
+        self.cache_fetched_object(hash, &data, object_type).await?;
+        Ok((data, object_type))
+    }
+
     async fn object_sizes(&self, hashes: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
         self.local.object_sizes(hashes).await
     }
@@ -373,10 +562,41 @@ impl Storage for TieredStorage {
     /// 429/`SlowDown`/5xx backoff (lore.md §0.2); `verify_fetched_object` is the
     /// same integrity check as verify-on-cache (lore.md §0.3).
     async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
-        if self.local.exist(hash).await {
+        if self.local.exist_checked(hash).await? {
             return Ok(true);
         }
         self.remote.exist_checked(hash).await
+    }
+
+    async fn exist_checked_batch(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, bool>, GitError> {
+        let mut results = self.local.exist_checked_batch(hashes).await?;
+        let mut misses = Vec::new();
+        for hash in hashes {
+            match results.get(hash) {
+                Some(true) => {}
+                Some(false) => misses.push(*hash),
+                None => {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "local batch probe omitted object {hash}"
+                    )));
+                }
+            }
+        }
+        if !misses.is_empty() {
+            let remote_results = self.remote.exist_checked_batch(&misses).await?;
+            for hash in misses {
+                let exists = remote_results.get(&hash).copied().ok_or_else(|| {
+                    GitError::InvalidObjectInfo(format!(
+                        "durable-tier batch probe omitted object {hash}"
+                    ))
+                })?;
+                results.insert(hash, exists);
+            }
+        }
+        Ok(results)
     }
 
     /// Obliteration payload purge (lore.md 2.5): drop the in-memory LRU entry
@@ -1000,6 +1220,189 @@ mod tests {
         let local_dir = tempdir().expect("tempdir");
         let local = LocalStorage::new(local_dir.path().to_path_buf());
         assert!(!local.heal(&hash).await.expect("heal"));
+    }
+
+    #[tokio::test]
+    async fn checked_batch_combines_local_and_remote_presence() {
+        let local_dir = tempdir().expect("tempdir");
+        let local = LocalStorage::new(local_dir.path().to_path_buf());
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+        let local_hit = ObjectHash::from_type_and_data(ObjectType::Blob, b"local only");
+        let remote_hit = ObjectHash::from_type_and_data(ObjectType::Blob, b"remote only");
+        let absent = ObjectHash::from_type_and_data(ObjectType::Blob, b"absent");
+        local
+            .put(&local_hit, b"local only", ObjectType::Blob)
+            .await
+            .expect("seed local");
+        remote
+            .put(&remote_hit, b"remote only", ObjectType::Blob)
+            .await
+            .expect("seed remote");
+        let tiered = TieredStorage::new(local, remote, 1 << 20, 1 << 20);
+
+        let found = tiered
+            .exist_checked_batch(&[local_hit, remote_hit, absent, local_hit])
+            .await
+            .expect("checked batch");
+        assert_eq!(found.len(), 3);
+        assert!(found[&local_hit]);
+        assert!(found[&remote_hit]);
+        assert!(!found[&absent]);
+    }
+
+    #[tokio::test]
+    async fn bounded_commit_read_checks_remote_hash_before_caching() {
+        use git_internal::internal::object::{ObjectTrait, commit::Commit};
+
+        let local_dir = tempdir().expect("tempdir");
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+        let tree = ObjectHash::new(&[8; 20]);
+        let commit = Commit::from_tree_id(tree, vec![], "remote bounded commit");
+        let data = commit.to_data().expect("serialize commit");
+        remote
+            .put(&commit.id, &data, ObjectType::Commit)
+            .await
+            .expect("seed valid remote commit");
+        let wrong_id = ObjectHash::new(&[9; 20]);
+        remote
+            .put(&wrong_id, &data, ObjectType::Commit)
+            .await
+            .expect("seed corrupted remote object");
+        let tiered = TieredStorage::new(
+            LocalStorage::new(local_dir.path().to_path_buf()),
+            remote,
+            1 << 20,
+            1 << 20,
+        );
+
+        let (payload, object_type) = tiered
+            .get_commit_bounded(&commit.id, 1024)
+            .await
+            .expect("read valid remote commit");
+        assert_eq!(payload, data);
+        assert_eq!(object_type, ObjectType::Commit);
+        let error = tiered
+            .get_commit_bounded(&wrong_id, 1024)
+            .await
+            .expect_err("wrong remote hash must fail before caching");
+        assert!(
+            error.to_string().contains("mismatched content ID"),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&wrong_id.to_string()), "{error}");
+        assert!(!tiered.local.exist(&wrong_id).await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bounded_typed_read_fetches_remote_tag_without_changing_preview_policy() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let local_dir = tempdir().expect("tempdir");
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+        let data =
+            b"object 1111111111111111111111111111111111111111\ntype commit\ntag v1\n\nmessage";
+        let hash = ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tag, data)
+            .expect("hash annotated tag");
+        remote
+            .put(&hash, data, ObjectType::Tag)
+            .await
+            .expect("seed remote tag");
+        let tiered = TieredStorage::new(
+            LocalStorage::new(local_dir.path().to_path_buf()),
+            remote,
+            1 << 20,
+            1 << 20,
+        );
+
+        tiered
+            .get_with_limit(&hash, 1024)
+            .await
+            .expect_err("preview must stay local-only");
+        let (payload, object_type) = tiered
+            .get_typed_bounded(&hash, 1024)
+            .await
+            .expect("fetch-specific typed read may use the remote tier");
+        assert_eq!(payload, data);
+        assert_eq!(object_type, ObjectType::Tag);
+        assert!(tiered.local.exist(&hash).await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bounded_type_probe_remote_policy_prefers_durable_type() {
+        use crate::utils::read_policy::{ReadPolicy, read_policy, set_read_policy};
+
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let local_dir = tempdir().expect("tempdir");
+        let local = LocalStorage::new(local_dir.path().to_path_buf());
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+        let tag =
+            b"object 1111111111111111111111111111111111111111\ntype commit\ntag v1\n\nmessage";
+        let hash = ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tag, tag)
+            .expect("hash annotated tag");
+        remote
+            .put(&hash, tag, ObjectType::Tag)
+            .await
+            .expect("seed valid durable tag");
+        local
+            .put(&hash, b"wrong local type", ObjectType::Blob)
+            .await
+            .expect("seed stale local header under the requested ID");
+        let tiered = TieredStorage::new(local, remote, 1 << 20, 1 << 20);
+
+        let previous = read_policy();
+        set_read_policy(ReadPolicy::Remote);
+        let type_result = tiered.object_type_bounded_probe(&hash).await;
+        set_read_policy(previous);
+        assert_eq!(
+            type_result.expect("durable type wins under remote policy"),
+            ObjectType::Tag
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bounded_type_probe_charges_remote_bytes_across_calls() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let local_dir = tempdir().expect("tempdir");
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+        let first_data =
+            b"object 1111111111111111111111111111111111111111\ntype commit\ntag first\n\nfirst";
+        let second_data =
+            b"object 2222222222222222222222222222222222222222\ntype commit\ntag second\n\nsecond";
+        let first =
+            ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tag, first_data)
+                .expect("hash first tag");
+        let second =
+            ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tag, second_data)
+                .expect("hash second tag");
+        remote
+            .put(&first, first_data, ObjectType::Tag)
+            .await
+            .expect("seed first tag");
+        remote
+            .put(&second, second_data, ObjectType::Tag)
+            .await
+            .expect("seed second tag");
+        let tiered = TieredStorage::new(
+            LocalStorage::new(local_dir.path().to_path_buf()),
+            remote,
+            1 << 20,
+            1 << 20,
+        );
+
+        let response_budget = (first_data.len() + second_data.len() - 1) as u64;
+        let (types, charged) = tiered
+            .object_types_bounded_probe_with_budget(&[first], response_budget)
+            .await
+            .expect("first peel round fits response budget");
+        assert_eq!(types.get(&first), Some(&ObjectType::Tag));
+        assert_eq!(charged, first_data.len() as u64);
+        let error = tiered
+            .object_types_bounded_probe_with_budget(&[second], response_budget - charged)
+            .await
+            .expect_err("second peel round must respect remaining response budget");
+        assert!(error.to_string().contains("remaining"), "{error}");
     }
 
     /// `RemoteStorage::exist_batch` reports presence per input hash, in order,

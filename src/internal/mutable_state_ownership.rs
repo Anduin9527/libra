@@ -3,7 +3,7 @@
 //! Code/Agent config registry ([`crate::internal::config_ownership`])
 //! enforces for configuration surfaces.
 //!
-//! Every mutable table must declare `Repository | Worktree | Composite`
+//! Every mutable repository table must declare `Repository | Worktree | Composite`
 //! ownership, and the guard below asserts that declaration against the
 //! actual SQL corpus in BOTH directions:
 //!
@@ -13,12 +13,14 @@
 //!   "新增 mutable state 未登记则测试失败" clause — a new scoped table
 //!   cannot ship unregistered).
 //!
-//! The registry is EXHAUSTIVE over persistent tables: a repository-owned
+//! The registry is EXHAUSTIVE over persistent repository tables: a repository-owned
 //! table carries no scope column to detect, so enumerating only the scoped
 //! ones would let a new repository-wide table ship unclassified. Transient
 //! tables that a single migration creates and drops (down-guards, rebuild
 //! scratch) are excluded by an EXPLICIT list, never by pattern — a new one
 //! is a reviewed decision.
+//! The source scan also sees the configuration-only ledger; its exact name
+//! and ownership come from the existing database role manifest, not this inventory.
 
 /// Ownership of one mutable state table (§C.4.1.1 vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,11 @@ pub struct MutableStateSurface {
 /// The §C.4.1.1 mutable-state registry.
 pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
     // ── Sequencer / operation state (W1) ─────────────────────────────────
+    MutableStateSurface {
+        table: "legacy_operation",
+        owner: StateOwner::Repository,
+        rationale: "historical v1 migration namespace retired by the forward-only retirement migration",
+    },
     MutableStateSurface {
         table: "sequence_state",
         owner: StateOwner::Worktree,
@@ -131,11 +138,6 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Composite,
         rationale: "the operation log is repository-wide, but its worktree_id is a real \
                      routing key: dedup windows and `op restore` are scope-fenced (§C.9)",
-    },
-    MutableStateSurface {
-        table: "legacy_operation",
-        owner: StateOwner::Composite,
-        rationale: "the active v1 operation logger remains scope-routed during the OL-02 staging window",
     },
     MutableStateSurface {
         table: "ai_operation_link",
@@ -556,41 +558,6 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
-    MutableStateSurface {
-        table: "publish_ai_objects",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_ai_versions",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_files",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_refs",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_revisions",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_sites",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_sync_runs",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
 ];
 
 /// Tables a SINGLE migration creates and drops within its own transaction —
@@ -615,21 +582,21 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "bisect_state__down_guard_2026072301",
     "context_selection_receipt_down_guard",
     "head_scope_unique_guard",
+    "legacy_operation__staging",
+    "legacy_operation_parent__staging",
+    "legacy_operation_view__staging",
+    "legacy_operation_view_ref__staging",
+    "legacy_operation_view_workspace__staging",
     "layer__down_guard_2026072303",
     "layer__legacy_rows_need_explicit_adopt_2026072303",
     "memory_core_down_guard",
     "memory_fts_search_down_guard",
     "operation__down_guard_2026073003",
     "operation__down_guard_2026073004",
-    "legacy_operation__staging",
-    "legacy_operation_parent__staging",
-    "legacy_operation_view__staging",
-    "legacy_operation_view_ref__staging",
-    "legacy_operation_view_workspace__staging",
+    "operation_scope_provenance_down_guard",
     "operation_view",
     "operation_view_ref",
     "operation_view_workspace",
-    "operation_scope_provenance_down_guard",
     "rebase_state__down_guard_2026072101",
     "sequence_state__down_guard_2026071901",
     "source_call_log__rebuild",
@@ -646,6 +613,99 @@ mod tests {
     use std::{collections::BTreeSet, fs, path::Path};
 
     use super::*;
+    use crate::internal::db::schema::{DatabaseRole, SchemaLedger, ledger_for_role};
+
+    fn configuration_owned_ledger() -> &'static str {
+        let ledger = SchemaLedger::Configuration;
+        for role in [DatabaseRole::GlobalConfig, DatabaseRole::SystemConfig] {
+            assert_eq!(
+                ledger_for_role(role).expect("configuration role ledger"),
+                ledger
+            );
+        }
+        assert_eq!(
+            ledger_for_role(DatabaseRole::Repository).expect("repository role ledger"),
+            SchemaLedger::Repository
+        );
+        assert_ne!(ledger.table_name(), SchemaLedger::Repository.table_name());
+        assert!(ledger_for_role(DatabaseRole::Derived).is_err());
+        ledger.table_name()
+    }
+
+    fn created_table_is_classified(table: &str) -> bool {
+        MUTABLE_STATE_OWNERSHIP
+            .iter()
+            .any(|surface| surface.table == table)
+            || MIGRATION_ONLY_TABLES.contains(&table)
+            || table == configuration_owned_ledger()
+    }
+
+    #[test]
+    fn configuration_ledger_scope_is_explicit() {
+        let ledger = configuration_owned_ledger();
+        assert!(
+            all_created_tables().contains(ledger),
+            "configuration ledger DDL is missing"
+        );
+        assert!(
+            !MUTABLE_STATE_OWNERSHIP
+                .iter()
+                .any(|surface| surface.table == ledger)
+        );
+        assert!(!MIGRATION_ONLY_TABLES.contains(&ledger));
+        assert!(created_table_is_classified(ledger));
+        for unknown in [
+            "unregistered_persistent_state",
+            "configuration_unregistered_state",
+        ] {
+            assert!(
+                !created_table_is_classified(unknown),
+                "unknown tables must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn configuration_materialization_is_not_repository_state() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        let fixture = crate::utils::test::ConfigDbFixture::new().expect("isolated configuration");
+        let ledger = configuration_owned_ledger();
+        for (role, path) in [
+            (DatabaseRole::GlobalConfig, fixture.global_db()),
+            (DatabaseRole::SystemConfig, fixture.system_db()),
+        ] {
+            let conn = crate::internal::db::create_database_for_role(
+                path.to_str().expect("utf-8 fixture path"),
+                role,
+            )
+            .await
+            .expect("materialize isolated configuration schema");
+            let rows = conn.query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )).await.expect("read configuration schema metadata");
+            let tables: BTreeSet<String> = rows
+                .iter()
+                .map(|row| row.try_get("", "name").expect("table name"))
+                .collect();
+            conn.close()
+                .await
+                .expect("close configuration database before cleanup");
+            assert!(
+                tables.contains(ledger),
+                "{role} must materialize its own ledger"
+            );
+            assert!(tables.contains("config") && tables.contains("config_kv"));
+            for table in tables {
+                assert!(
+                    created_table_is_classified(&table),
+                    "unclassified {role} table {table}"
+                );
+            }
+        }
+    }
 
     /// The table name following a `create table` occurrence, skipping the
     /// optional `if not exists` keywords TOKEN BY TOKEN. A literal
@@ -676,7 +736,7 @@ mod tests {
     /// Listed explicitly so a new such file is a reviewed decision.
     const NON_REPOSITORY_DDL_SOURCES: &[&str] = &[
         // The Cloudflare D1 backup mirror: a separate remote database with
-        // its own schema (`sql/publish/` + the mirror tables). Local
+        // its own schema (object/index mirror tables). Local
         // worktree scoping does not apply to it.
         "src/utils/d1_client.rs",
     ];
@@ -917,12 +977,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut scoped = BTreeSet::new();
-        // `legacy_operation` is created by the copy-first Rust migration
-        // helper, whose final table name is assembled outside a standalone
-        // SQL file. Keep that known production shape in the scope inventory;
-        // the broader Rust corpus contains remote D1 schemas that are not
-        // part of the local repository database.
-        scoped.insert("legacy_operation".to_string());
         for chunk in lowered.split("create table").skip(1) {
             let after = body_after_create_table(chunk);
             let name = table_name_after(chunk);
@@ -1012,7 +1066,7 @@ mod tests {
                  let _ = "CREATE TABLE `after_use` (id TEXT)";
              }
 
-             #[cfg(feature = "test-provider")]
+             #[cfg(feature = "test-network")]
              fn feature_gated_is_production() {
                  let _ = "CREATE TABLE `after_feature_gate` (id TEXT)";
              }
@@ -1146,6 +1200,13 @@ mod tests {
             .iter()
             .map(|row| row.try_get::<String>("", "name").expect("name column"))
             .collect();
+        conn.close()
+            .await
+            .expect("close repository database before cleanup");
+        assert!(
+            !materialized.contains(configuration_owned_ledger()),
+            "a repository must not materialize the configuration-only ledger"
+        );
 
         // Self-check: an empty read would make every assertion below vacuous.
         assert!(
@@ -1270,7 +1331,7 @@ mod tests {
             );
         }
 
-        // EXHAUSTIVE over persistent tables (§C.4.1.1 line 2246: "每个
+        // EXHAUSTIVE over persistent repository tables (§C.4.1.1 line 2246: "每个
         // mutable SQLite table … 必须在集中 inventory 中声明"). Scoped-only
         // coverage would let a new REPOSITORY-owned table ship
         // unclassified, since it carries no column to detect.
@@ -1278,14 +1339,21 @@ mod tests {
             .iter()
             .map(|surface| surface.table)
             .collect();
-        let migration_only: BTreeSet<&str> = MIGRATION_ONLY_TABLES.iter().copied().collect();
+        let configuration_ledger = configuration_owned_ledger();
+        assert!(
+            created.contains(configuration_ledger),
+            "configuration ledger DDL is missing"
+        );
+        assert!(!declared.contains(configuration_ledger));
+        assert!(!MIGRATION_ONLY_TABLES.contains(&configuration_ledger));
         for table in all_created_tables() {
             assert!(
-                declared.contains(table.as_str()) || migration_only.contains(table.as_str()),
+                created_table_is_classified(&table),
                 "mutable table `{table}` is not classified: add a row to \
                   MUTABLE_STATE_OWNERSHIP with its Repository|Worktree|Composite \
                   ownership, or — if a single migration creates AND drops it — to \
-                  MIGRATION_ONLY_TABLES (plan-20260714 §C.4.1.1, line 2246)"
+                  MIGRATION_ONLY_TABLES; only the exact Configuration role ledger \
+                  belongs to its separate manifest (plan-20260714 §C.4.1.1, line 2246)"
             );
         }
         // ...and no registry row may name a table the schema never creates

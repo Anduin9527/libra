@@ -1078,7 +1078,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, env)]
     fn discover_returns_empty_when_no_binaries_match() {
         // Point PATH at an empty tempdir — we expect no matches.
         let dir = tempfile::tempdir().unwrap();
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, env)]
     fn discover_picks_up_libra_agent_prefix() {
         let dir = tempfile::tempdir().unwrap();
         // Plant a file named `libra-agent-test-fixture` and chmod it
@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, env)]
     fn discover_skips_files_without_executable_bit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("libra-agent-no-exec");
@@ -1161,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, env)]
     fn discover_skips_files_with_empty_slug() {
         // `libra-agent-` (no slug) must NOT match.
         let dir = tempfile::tempdir().unwrap();
@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(rpc_path_env)]
+    #[serial(rpc_path_env, env)]
     fn discover_dedups_across_path_entries() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();

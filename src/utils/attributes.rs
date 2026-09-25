@@ -170,12 +170,7 @@ impl BeneathAttributeCache {
         let (contents, descriptor_fingerprint) =
             match read_regular_beneath_attribute_source(root, source) {
                 Ok(contents) => contents,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                    ) =>
-                {
+                Err(error) if is_absent_beneath_attribute_source(&error) => {
                     return Ok(Arc::new(Vec::new()));
                 }
                 Err(error) => return Err(error),
@@ -212,6 +207,23 @@ thread_local! {
     /// negative sources are reused only for one explicit invocation nonce.
     static BENEATH_ATTRIBUTE_CACHE: RefCell<Option<BeneathAttributeCache>> =
         const { RefCell::new(None) };
+}
+
+fn is_absent_beneath_attribute_source(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<BeneathRootIdentity> {
@@ -265,7 +277,9 @@ fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<Beneat
 }
 
 pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeState> {
-    let workdir = util::working_dir();
+    // Pure merge helpers are also used before a Libra repository is initialized.
+    // Outside one there are no repository attribute sources to apply.
+    let workdir = util::try_working_dir().ok()?;
     let absolute = absolute_in_workdir(path, &workdir)?;
     let mut state = None;
     for source in attribute_sources_for_path(&workdir, &absolute) {
@@ -287,7 +301,9 @@ pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeStat
 }
 
 pub fn all_attribute_states_for_path(path: &Path) -> BTreeMap<String, AttributeState> {
-    let workdir = util::working_dir();
+    let Ok(workdir) = util::try_working_dir() else {
+        return BTreeMap::new();
+    };
     let Some(absolute) = absolute_in_workdir(path, &workdir) else {
         return BTreeMap::new();
     };
@@ -437,12 +453,7 @@ fn apply_beneath_attribute_source(
     let source_kind = match crate::utils::beneath::lstat_beneath(root, source) {
         Ok(stat) if stat.is_file => Some(BeneathSourceFingerprint::from(&stat)),
         Ok(_) => None,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
+        Err(error) if is_absent_beneath_attribute_source(&error) => {
             if cache.session.is_some() {
                 cache.remember_missing_source(key);
             }
@@ -464,12 +475,7 @@ fn apply_beneath_attribute_source(
             // classifying it from lstat alone would change timeout semantics.
             let contents = match read_beneath_attribute_source(root, source) {
                 Ok(contents) => contents,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                    ) =>
-                {
+                Err(error) if is_absent_beneath_attribute_source(&error) => {
                     return Ok(());
                 }
                 Err(error) => return Err(error),

@@ -1334,3 +1334,207 @@ fn test_restore_diff3_rejects_nonempty_directory_before_mutating_any_path() {
         "nested user data\n"
     );
 }
+
+/// FM-01 (plan issues/470, M-MAT T3/T5/T6): restore materializes the entry
+/// mode, and a mode-only difference on an existing file is repaired rather
+/// than silently kept.
+#[cfg(unix)]
+#[test]
+fn test_restore_applies_entry_mode_matrix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("failed to create repository root");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    let script = repo_path.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    std::fs::write(repo_path.join("plain.txt"), "plain\n").expect("write plain file");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh", "plain.txt"], repo_path),
+        "stage files",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "modes", "--no-verify"], repo_path),
+        "commit files",
+    );
+
+    // Fresh restore: removed files come back with the entry permissions.
+    std::fs::remove_file(&script).expect("remove script");
+    std::fs::remove_file(repo_path.join("plain.txt")).expect("remove plain file");
+    assert_cli_success(
+        &run_libra_command(&["restore", "run.sh", "plain.txt"], repo_path),
+        "restore deleted files",
+    );
+    let script_mode = std::fs::symlink_metadata(&script)
+        .expect("script metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let plain_mode = std::fs::symlink_metadata(repo_path.join("plain.txt"))
+        .expect("plain metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        script_mode, 0o755,
+        "restored 100755 entry must be executable"
+    );
+    assert_eq!(
+        plain_mode, 0o644,
+        "restored 100644 entry must not be executable"
+    );
+
+    // Mode-only difference on an existing file: the execute bit is cleared.
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(
+        &run_libra_command(&["restore", "run.sh"], repo_path),
+        "restore over existing file",
+    );
+    let repaired_mode = std::fs::symlink_metadata(&script)
+        .expect("script metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        repaired_mode, 0o755,
+        "restoring a 100755 entry must set the execute bit even when content is current"
+    );
+}
+
+/// FM-01 (M-MAT T10): the permission bits are derived at creation time, so the
+/// process umask applies — `umask 077` yields 700/600, not 755/644.
+#[cfg(unix)]
+#[test]
+fn test_restore_honors_process_umask_for_entry_modes() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    let repo = tempdir().expect("failed to create repository root");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    let script = repo_path.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    std::fs::write(repo_path.join("plain.txt"), "plain\n").expect("write plain file");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh", "plain.txt"], repo_path),
+        "stage files",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "modes", "--no-verify"], repo_path),
+        "commit files",
+    );
+    std::fs::remove_file(&script).expect("remove script");
+    std::fs::remove_file(repo_path.join("plain.txt")).expect("remove plain file");
+
+    let home = repo_path.join(".libra-test-home");
+    std::fs::create_dir_all(home.join(".config")).expect("create isolated home");
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "umask 077; exec {} restore run.sh plain.txt",
+            env!("CARGO_BIN_EXE_libra")
+        ))
+        .current_dir(repo_path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LIBRA_CONFIG_GLOBAL_DB", home.join(".libra/config.db"))
+        .env(
+            "LIBRA_CONFIG_SYSTEM_DB",
+            home.join(".libra/system-config.db"),
+        )
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env(libra::utils::pager::LIBRA_TEST_ENV, "1")
+        .output()
+        .expect("run libra under umask 077");
+    assert!(
+        output.status.success(),
+        "restore under umask 077 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "100755 entry under umask 077 must be 700"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(repo_path.join("plain.txt"))
+            .expect("plain metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "100644 entry under umask 077 must be 600"
+    );
+}
+
+/// WT-01 (M-GUARD G7, issues/476): issue-verified restore `--staged` / `-S -W` / `--source=HEAD`.
+#[test]
+fn test_restore_issue476_verified_surface_guard() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+
+    std::fs::write(root.join("tracked.txt"), "staged\n").expect("stage");
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], root), "G7 add");
+    let staged = run_libra_command(&["restore", "--staged", "tracked.txt"], root);
+    assert_cli_success(&staged, "G7 --staged");
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).contains("Updated 1 path(s) from HEAD"),
+        "G7 --staged: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("worktree"),
+        "staged\n",
+        "G7 --staged leaves the worktree"
+    );
+    let status = run_libra_command(&["status", "--porcelain"], root);
+    assert_cli_success(&status, "G7 status after --staged");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains(" M tracked.txt"),
+        "G7 --staged leaves an unstaged edit: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    std::fs::write(root.join("tracked.txt"), "both\n").expect("both");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], root),
+        "G7 add both",
+    );
+    let both = run_libra_command(&["restore", "-S", "-W", "tracked.txt"], root);
+    assert_cli_success(&both, "G7 -S -W");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("both worktree"),
+        "tracked\n",
+        "G7 -S -W restores the worktree"
+    );
+    let status = run_libra_command(&["status", "--porcelain"], root);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+        "G7 -S -W leaves a clean tree: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    std::fs::write(root.join("tracked.txt"), "source\n").expect("source dirty");
+    let source = run_libra_command(&["restore", "--source=HEAD", "tracked.txt"], root);
+    assert_cli_success(&source, "G7 --source=HEAD");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("source worktree"),
+        "tracked\n",
+        "G7 --source=HEAD restores HEAD content"
+    );
+}

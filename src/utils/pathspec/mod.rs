@@ -8,11 +8,40 @@
 use std::{
     ffi::OsStr,
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use regex::{Regex, RegexBuilder};
 
 use crate::utils::util;
+
+static LITERAL_PATHSPECS: AtomicBool = AtomicBool::new(false);
+
+/// Process-wide Git `GIT_LITERAL_PATHSPECS` / `--literal-pathspecs` switch.
+/// `apply_global_runtime_flags` resets this on every CLI invocation.
+pub fn set_literal_pathspecs(enabled: bool) {
+    LITERAL_PATHSPECS.store(enabled, Ordering::SeqCst);
+}
+
+pub fn literal_pathspecs() -> bool {
+    LITERAL_PATHSPECS.load(Ordering::SeqCst)
+}
+
+/// Parse `GIT_LITERAL_PATHSPECS`. `1/true/yes/on` enable; `0/false/no/off`
+/// and unset disable; any other value disables and returns `invalid`.
+pub fn literal_pathspecs_from_env() -> (bool, Option<String>) {
+    match std::env::var("GIT_LITERAL_PATHSPECS") {
+        Err(_) => (false, None),
+        Ok(raw) => {
+            let folded = raw.trim().to_ascii_lowercase();
+            match folded.as_str() {
+                "1" | "true" | "yes" | "on" => (true, None),
+                "0" | "false" | "no" | "off" | "" => (false, None),
+                _ => (false, Some(raw)),
+            }
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathspecError {
@@ -177,6 +206,23 @@ impl PathspecSet {
             .collect()
     }
 
+    /// Return the normalized workdir-relative match path (magic stripped,
+    /// current-dir prefix applied) and its case-fold flag for a raw positive
+    /// spec, or `None` when no positive spec carries that raw spelling. Read-
+    /// only: matching semantics are untouched. Used by `add --dry-run
+    /// --ignore-missing` to classify unmatched pathspecs against ignore rules.
+    ///
+    /// Limitation: the ignore engine matches case-sensitively, so a caller that
+    /// forwards the path to `should_ignore` cannot honor the returned `icase`
+    /// flag (the M-MISS M10 row is therefore only asserted under
+    /// `core.ignorecase`).
+    pub fn positive_spec_match_path(&self, raw: &str) -> Option<(&str, bool)> {
+        self.specs
+            .iter()
+            .find(|spec| !spec.exclude && spec.raw == raw)
+            .map(|spec| (spec.normalized.as_str(), spec.icase))
+    }
+
     /// Return plain positive prefix pathspecs that can be passed to older
     /// command engines as a pre-filter without changing behavior.
     pub fn plain_positive_prefixes(&self) -> Option<Vec<PathBuf>> {
@@ -244,10 +290,21 @@ impl Pathspec {
         workdir: &Path,
         default_icase: bool,
     ) -> Result<Self, PathspecError> {
-        let (magic, body) = parse_magic(raw)?;
+        let force_literal = literal_pathspecs();
+        let (magic, body) = if force_literal {
+            (
+                Magic {
+                    literal: true,
+                    ..Magic::default()
+                },
+                raw,
+            )
+        } else {
+            parse_magic(raw)?
+        };
         let normalized = resolve_body(raw, body, magic.top, current_dir, workdir)?;
         let icase = magic.icase || default_icase;
-        let matcher = if magic.literal || !has_wildcard(&normalized) {
+        let matcher = if force_literal || magic.literal || !has_wildcard(&normalized) {
             PathMatcher::Prefix {
                 pattern: normalized.clone(),
                 icase,
@@ -536,9 +593,14 @@ fn char_class(chars: &[char]) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
+    static PARSE_LOCK: Mutex<()> = Mutex::new(());
+
     fn set(raw: &[&str], cwd: &str) -> PathspecSet {
+        let _guard = PARSE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let workdir = Path::new("/repo");
         let cwd = workdir.join(cwd);
         PathspecSet::from_workdir(
@@ -653,5 +715,97 @@ mod tests {
                 icase: true,
             }]
         );
+    }
+
+    fn with_literal_mode<T>(enabled: bool, body: impl FnOnce() -> T) -> T {
+        let _guard = PARSE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let previous = literal_pathspecs();
+        set_literal_pathspecs(enabled);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        set_literal_pathspecs(previous);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn parse_at_root(raw: &[&str]) -> PathspecSet {
+        let workdir = Path::new("/repo");
+        PathspecSet::from_workdir(
+            &raw.iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            workdir,
+            workdir,
+        )
+        .expect("pathspec compiles")
+    }
+
+    #[test]
+    fn literal_mode_disables_glob_and_magic() {
+        with_literal_mode(true, || {
+            let specs = parse_at_root(&["*.txt"]);
+            assert!(specs.matches_path("*.txt"));
+            assert!(!specs.matches_path("x.txt"));
+
+            let magic = parse_at_root(&[":(glob)*.txt"]);
+            assert!(magic.matches_path(":(glob)*.txt"));
+            assert!(!magic.matches_path("foo.txt"));
+        });
+        with_literal_mode(false, || {
+            let specs = parse_at_root(&["*.txt"]);
+            assert!(specs.matches_path("x.txt"));
+        });
+    }
+
+    #[test]
+    fn positive_spec_match_path_normalizes_and_preserves_icase() {
+        // Plain spec at the workdir root: no magic, no prefix, case-sensitive.
+        let root = set(&["a.txt"], "");
+        assert_eq!(
+            root.positive_spec_match_path("a.txt"),
+            Some(("a.txt", false))
+        );
+
+        // Relative specs are resolved from the current directory prefix.
+        let sub = set(&["a.txt"], "sub");
+        assert_eq!(
+            sub.positive_spec_match_path("a.txt"),
+            Some(("sub/a.txt", false))
+        );
+
+        // :(top) anchors at the workdir root regardless of cwd.
+        let top = set(&[":(top)README.md"], "src");
+        assert_eq!(
+            top.positive_spec_match_path(":(top)README.md"),
+            Some(("README.md", false))
+        );
+
+        // :(literal) keeps wildcard characters verbatim.
+        let literal = set(&[":(literal)we*ird.txt"], "");
+        assert_eq!(
+            literal.positive_spec_match_path(":(literal)we*ird.txt"),
+            Some(("we*ird.txt", false))
+        );
+
+        // :(icase) surfaces the case-fold flag.
+        let icase = set(&[":(icase)X.log"], "");
+        assert_eq!(
+            icase.positive_spec_match_path(":(icase)X.log"),
+            Some(("X.log", true))
+        );
+
+        // :(glob) keeps the raw match body (wildcard intact), no case-fold.
+        let glob = set(&[":(glob)foo.*"], "");
+        assert_eq!(
+            glob.positive_spec_match_path(":(glob)foo.*"),
+            Some(("foo.*", false))
+        );
+
+        // Unknown raw spelling (or an exclude-only spec) yields None.
+        let missing = set(&["a.txt"], "");
+        assert_eq!(missing.positive_spec_match_path("b.txt"), None);
+        let excluded = set(&[":(exclude)a.txt"], "");
+        assert_eq!(excluded.positive_spec_match_path(":(exclude)a.txt"), None);
     }
 }

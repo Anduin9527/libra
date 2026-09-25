@@ -245,14 +245,14 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn pager_mode_defaults_to_auto() {
         let _pager = EnvGuard::set(LIBRA_PAGER_ENV, "unexpected-value");
         assert_eq!(PagerMode::from_env(), PagerMode::Auto);
     }
 
     #[test]
-    #[serial]
+    #[serial(env)]
     fn libra_test_disables_auto_pager() {
         let _test = EnvGuard::set(LIBRA_TEST_ENV, "1");
         let _pager = EnvGuard::set(LIBRA_PAGER_ENV, "auto");

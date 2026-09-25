@@ -314,6 +314,225 @@ fn create_cli_rebase_success_repo() -> tempfile::TempDir {
     repo
 }
 
+/// A rename on the new base must carry the replayed commit's edit to the new
+/// path. This exercises rebase through merge's rename arbitration instead of
+/// treating the change as a delete plus an unrelated add.
+#[test]
+fn test_rebase_rename_uses_shared_tree_engine() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    let base = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let feature_edit = "line1\nfeature edit\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    commit_file_via_cli(root, "old.txt", base, "base tracks old path");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], root),
+        "create feature branch",
+    );
+    commit_file_via_cli(root, "old.txt", feature_edit, "feature edits old path");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    fs::rename(root.join("old.txt"), root.join("new.txt")).expect("rename base path");
+    assert_cli_success(
+        &run_libra_command(&["add", "-A", "."], root),
+        "stage base rename",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main renames path", "--no-verify"], root),
+        "commit base rename",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], root),
+        "switch to feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], root),
+        "rebase edit across renamed path",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("new.txt")).expect("read replayed rename result"),
+        feature_edit
+    );
+    assert!(
+        !root.join("old.txt").exists(),
+        "the old path must not return after the replay"
+    );
+}
+
+/// Attribute-selected drivers are part of the shared tree engine. The union
+/// driver makes an otherwise overlapping replay clean and preserves both sides.
+#[test]
+fn test_rebase_driver_uses_shared_tree_engine() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    fs::write(root.join("driver.txt"), "top\nbase\nbottom\n").expect("write driver base");
+    fs::write(root.join(".gitattributes"), "*.txt merge=union\n").expect("write driver attributes");
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt", ".gitattributes"], root),
+        "stage driver base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver base", "--no-verify"], root),
+        "commit driver base",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], root),
+        "create feature branch",
+    );
+    commit_file_via_cli(
+        root,
+        "driver.txt",
+        "top\ntheirs\nbottom\n",
+        "feature driver change",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    commit_file_via_cli(
+        root,
+        "driver.txt",
+        "top\nours\nbottom\n",
+        "main driver change",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], root),
+        "switch to feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], root),
+        "rebase through union driver",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("driver.txt")).expect("read union result"),
+        "top\nours\ntheirs\nbottom\n"
+    );
+}
+
+/// A flattened replay of a merge commit still has every original parent as a
+/// tree-merge base. Here the merge resolution differs from its first parent:
+/// using that parent alone would replay cleanly, while the shared engine's
+/// recursive virtual ancestor correctly exposes a conflict.
+#[test]
+fn test_rebase_recursive_uses_all_merge_parents() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    commit_file_via_cli(root, "shared.txt", "base\n", "root");
+    assert_cli_success(
+        &run_libra_command(&["branch", "target"], root),
+        "create target branch",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], root),
+        "create topic branch",
+    );
+    commit_file_via_cli(root, "shared.txt", "topic\n", "topic change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    commit_file_via_cli(root, "shared.txt", "main\n", "main change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "topic"], root),
+        "switch to topic",
+    );
+    let merge = run_libra_command(&["merge", "main"], root);
+    assert_eq!(merge.status.code(), Some(128), "topic/main merge conflicts");
+    fs::write(root.join("shared.txt"), "resolution\n").expect("write merge resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], root),
+        "stage merge resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--continue"], root),
+        "complete merge commit",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "target"], root),
+        "switch to target",
+    );
+    commit_file_via_cli(root, "target.txt", "target\n", "target-only change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "topic"], root),
+        "return to topic",
+    );
+    let output = run_libra_command(&["rebase", "target"], root);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "recursive virtual base must expose the merge-resolution conflict"
+    );
+    let markers = fs::read_to_string(root.join("shared.txt")).expect("read recursive markers");
+    assert!(
+        markers.contains("topic") && markers.contains("resolution"),
+        "the virtual-base replay must compare the rewritten topic with the merge resolution: {markers:?}"
+    );
+}
+
+/// Rebase conflict presentation and index stages are written by the same
+/// materializer as merge. `diff3` exposes the ancestor block while the index
+/// retains the base/ours/theirs roles required by `rebase --continue`.
+#[test]
+fn test_rebase_refine_uses_shared_tree_engine() {
+    let repo = create_cli_rebase_conflict_ready_repo();
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "diff3"], root),
+        "configure diff3 markers",
+    );
+
+    let output = run_libra_command(&["rebase", "main"], root);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "rebase must stop on conflict"
+    );
+    let marker_file = fs::read_to_string(root.join("conflict.txt")).expect("read markers");
+    assert!(
+        marker_file.contains("||||||| base\nbase\n=======\n"),
+        "diff3 ancestor section comes from the shared renderer: {marker_file:?}"
+    );
+
+    let stages = run_libra_command(&["ls-files", "-s"], root);
+    assert_cli_success(&stages, "inspect conflicted index stages");
+    let stage_stdout = String::from_utf8_lossy(&stages.stdout);
+    let stage_lines: Vec<_> = stage_stdout
+        .lines()
+        .filter(|line| line.ends_with("\tconflict.txt"))
+        .collect();
+    assert_eq!(
+        stage_lines.len(),
+        3,
+        "expected three conflict stages: {stage_lines:?}"
+    );
+    for stage in [" 1\t", " 2\t", " 3\t"] {
+        assert!(
+            stage_lines.iter().any(|line| line.contains(stage)),
+            "missing stage {stage:?}: {stage_lines:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn test_rebase_preserves_executable_mode_in_rewritten_commit() {
@@ -469,6 +688,344 @@ fn test_rebase_autosquash_folds_fixup_commit() {
         !log.contains("fixup! Feature adds file"),
         "autosquashed history should fold the fixup commit, got: {log}"
     );
+}
+
+/// M-AUTOSQUASH A1–A4 / A6 (HF-12): explicit `--autosquash` skips the
+/// already-up-to-date shortcut; `--no-autosquash` and `rebase.autosquash`
+/// do not fold a linear history.
+#[test]
+fn test_rebase_autosquash_on_up_to_date_branch_matrix() {
+    let linear_fixup = |name: &str| -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        let output = run_libra_command(&["switch", "-c", name], p);
+        assert_cli_success(&output, "create topic");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        commit_file_via_cli(p, "a.txt", "A\nfixup\n", "fixup! A");
+        repo
+    };
+
+    let linear_plain = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        let output = run_libra_command(&["switch", "-c", "topic"], p);
+        assert_cli_success(&output, "create topic");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        repo
+    };
+
+    let log_oneline = |p: &Path| -> String {
+        let output = run_libra_command(&["log", "--oneline"], p);
+        assert_cli_success(&output, "log --oneline");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // A1: linear `init ← A ← fixup! A`, `rebase --autosquash main` folds to A, init.
+    let repo = linear_fixup("topic-a1");
+    let p = repo.path();
+    let before_a1 = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "--autosquash", "main"], p);
+    assert_cli_success(&out, "A1 rebase --autosquash main");
+    let json = parse_json_stdout(&out);
+    assert_ne!(
+        json["data"]["status"], "already-up-to-date",
+        "A1 must skip the shortcut: {json}"
+    );
+    let log = log_oneline(p);
+    assert!(log.contains("A"), "A1 keeps A: {log}");
+    assert!(log.contains("init"), "A1 keeps init: {log}");
+    assert!(!log.contains("fixup! A"), "A1 must fold the fixup: {log}");
+    assert_eq!(log.lines().count(), 2, "A1 history is A then init: {log}");
+    assert_ne!(
+        rev_parse_cli(p, "HEAD"),
+        before_a1,
+        "A1 folded commit must be rewritten"
+    );
+
+    // A2: linear history without fixup/squash keeps original hashes.
+    let repo = linear_plain();
+    let p = repo.path();
+    let head_before = rev_parse_cli(p, "HEAD");
+    let main_before = rev_parse_cli(p, "main");
+    let out = run_libra_command(&["--json", "rebase", "--autosquash", "main"], p);
+    assert_cli_success(&out, "A2 rebase --autosquash main");
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "A2 HEAD hash");
+    assert_eq!(rev_parse_cli(p, "HEAD~1"), main_before, "A2 parent hash");
+
+    // A3: `--no-autosquash` keeps the existing already-up-to-date shortcut.
+    let repo = linear_fixup("topic-a3");
+    let p = repo.path();
+    let head_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "--no-autosquash", "main"], p);
+    assert_cli_success(&out, "A3 rebase --no-autosquash main");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["status"], "already-up-to-date",
+        "A3 shortcut: {json}"
+    );
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "A3 no rewrite");
+    assert!(
+        log_oneline(p).contains("fixup! A"),
+        "A3 must not fold: {}",
+        log_oneline(p)
+    );
+
+    // A4: last flag wins.
+    let repo = linear_fixup("topic-a4-off");
+    let p = repo.path();
+    let out = run_libra_command(
+        &[
+            "--json",
+            "rebase",
+            "--autosquash",
+            "--no-autosquash",
+            "main",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "A4 --autosquash --no-autosquash");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["status"], "already-up-to-date",
+        "A4 latter --no-autosquash: {json}"
+    );
+    assert!(
+        log_oneline(p).contains("fixup! A"),
+        "A4 must not fold: {}",
+        log_oneline(p)
+    );
+
+    let repo = linear_fixup("topic-a4-on");
+    let p = repo.path();
+    let out = run_libra_command(
+        &[
+            "--json",
+            "rebase",
+            "--no-autosquash",
+            "--autosquash",
+            "main",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "A4 --no-autosquash --autosquash");
+    let json = parse_json_stdout(&out);
+    assert_ne!(
+        json["data"]["status"], "already-up-to-date",
+        "A4 latter --autosquash: {json}"
+    );
+    assert!(
+        !log_oneline(p).contains("fixup! A"),
+        "A4 latter --autosquash must fold: {}",
+        log_oneline(p)
+    );
+
+    // A6: `rebase.autosquash=true` without a flag does not fold (t3415).
+    let repo = linear_fixup("topic-a6");
+    let p = repo.path();
+    let cfg = run_libra_command(&["config", "rebase.autosquash", "true"], p);
+    assert_cli_success(&cfg, "set rebase.autosquash");
+    let head_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "main"], p);
+    assert_cli_success(&out, "A6 rebase main with config");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["status"], "already-up-to-date",
+        "A6 config must not fold: {json}"
+    );
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "A6 no rewrite");
+    assert!(
+        log_oneline(p).contains("fixup! A"),
+        "A6 must not fold: {}",
+        log_oneline(p)
+    );
+}
+
+#[test]
+fn test_rebase_root_matrix() {
+    let linear_plain = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        repo
+    };
+    let linear_fixup = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        commit_file_via_cli(p, "a.txt", "A\nfixup\n", "fixup! A");
+        repo
+    };
+    let log_oneline = |p: &Path| -> String {
+        let output = run_libra_command(&["log", "--oneline"], p);
+        assert_cli_success(&output, "log --oneline");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let current_branch = |p: &Path| -> String {
+        let output = run_libra_command(&["branch", "--show-current"], p);
+        assert_cli_success(&output, "branch --show-current");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    // R1: unchanged linear history keeps hashes.
+    let repo = linear_plain();
+    let p = repo.path();
+    let head_before = rev_parse_cli(p, "HEAD");
+    let root_before = rev_parse_cli(p, "HEAD~1");
+    let out = run_libra_command(&["--json", "rebase", "--root"], p);
+    assert_cli_success(&out, "R1 rebase --root");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["status"], "completed", "R1/R6 status: {json}");
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "R1 HEAD hash");
+    assert_eq!(rev_parse_cli(p, "HEAD~1"), root_before, "R1 root hash");
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A\n",
+        "R1 worktree"
+    );
+
+    // R2: `--root --autosquash` folds fixup! A, keeping init.
+    let repo = linear_fixup();
+    let p = repo.path();
+    let init_before = rev_parse_cli(p, "HEAD~2");
+    let out = run_libra_command(&["--json", "rebase", "--root", "--autosquash"], p);
+    assert_cli_success(&out, "R2 rebase --root --autosquash");
+    let log = log_oneline(p);
+    assert!(log.contains("A"), "R2 keeps A: {log}");
+    assert!(log.contains("init"), "R2 keeps init: {log}");
+    assert!(!log.contains("fixup! A"), "R2 must fold the fixup: {log}");
+    assert_eq!(log.lines().count(), 2, "R2 history is A then init: {log}");
+    assert_eq!(rev_parse_cli(p, "HEAD~1"), init_before, "R2 init hash");
+
+    // R3: `--root --onto other` replays the full history onto other.
+    let repo = tempdir().expect("failed to create temp repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    commit_file_via_cli(p, "base.txt", "base\n", "init");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "other"], p),
+        "R3 create other",
+    );
+    commit_file_via_cli(p, "other.txt", "other\n", "other");
+    let other_tip = rev_parse_cli(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "R3 switch main");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "R3 create topic",
+    );
+    commit_file_via_cli(p, "topic.txt", "topic\n", "topic");
+    let topic_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "--root", "--onto", "other"], p);
+    assert_cli_success(&out, "R3 rebase --root --onto other");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["status"], "completed", "R3/R6 status: {json}");
+    assert_eq!(rev_parse_cli(p, "HEAD~2"), other_tip, "R3 lands on other");
+    assert_ne!(
+        rev_parse_cli(p, "HEAD"),
+        topic_before,
+        "R3 must rewrite topic"
+    );
+    assert_eq!(fs::read_to_string(p.join("other.txt")).unwrap(), "other\n");
+    assert_eq!(fs::read_to_string(p.join("topic.txt")).unwrap(), "topic\n");
+    assert_eq!(fs::read_to_string(p.join("base.txt")).unwrap(), "base\n");
+
+    // R4: `--root <branch>` checks the branch out, then replays from the root.
+    let repo = linear_plain();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "R4 create topic",
+    );
+    let topic_head = rev_parse_cli(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "R4 switch main");
+    assert_eq!(current_branch(p), "main");
+    let out = run_libra_command(&["rebase", "--root", "topic"], p);
+    assert_eq!(out.status.code(), Some(0), "R4 exit 0");
+    assert_eq!(current_branch(p), "topic");
+    assert_eq!(rev_parse_cli(p, "HEAD"), topic_head, "R4 topic hashes");
+
+    // `--root` plus two positionals is a usage error (ADR-HF-13).
+    let repo = linear_plain();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "usage create topic",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "usage switch");
+    let out = run_libra_command(&["rebase", "--root", "main", "topic"], p);
+    assert_eq!(out.status.code(), Some(129), "root+upstream usage");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--root cannot be used together with <upstream>"),
+        "usage stderr: {stderr}"
+    );
+
+    // R5: `--root --onto other` add/add conflict, then --continue / --abort.
+    let conflict_repo = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        assert_cli_success(
+            &run_libra_command(&["switch", "-c", "other"], p),
+            "R5 create other",
+        );
+        commit_file_via_cli(p, "conflict.txt", "other\n", "other adds conflict");
+        assert_cli_success(&run_libra_command(&["switch", "main"], p), "R5 switch main");
+        assert_cli_success(
+            &run_libra_command(&["switch", "-c", "topic"], p),
+            "R5 create topic",
+        );
+        commit_file_via_cli(p, "conflict.txt", "topic\n", "topic adds conflict");
+        repo
+    };
+
+    let repo = conflict_repo();
+    let p = repo.path();
+    let topic_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["rebase", "--root", "--onto", "other"], p);
+    assert_eq!(out.status.code(), Some(128), "R5 conflict exit");
+    let conflicted = fs::read_to_string(p.join("conflict.txt")).unwrap();
+    assert!(
+        conflicted.contains("<<<<<<<"),
+        "R5 conflict markers: {conflicted}"
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "R5 rebase --abort",
+    );
+    assert_eq!(rev_parse_cli(p, "HEAD"), topic_before, "R5 abort restores");
+    assert_eq!(current_branch(p), "topic");
+
+    let repo = conflict_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["rebase", "--root", "--onto", "other"], p);
+    assert_eq!(out.status.code(), Some(128), "R5 continue setup");
+    fs::write(p.join("conflict.txt"), "resolved\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "conflict.txt"], p),
+        "R5 stage resolution",
+    );
+    let cont = run_libra_command(&["--json", "rebase", "--continue"], p);
+    assert_cli_success(&cont, "R5 rebase --continue");
+    assert_eq!(
+        fs::read_to_string(p.join("conflict.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert_eq!(current_branch(p), "topic");
 }
 
 #[test]
@@ -926,8 +1483,8 @@ fn test_rebase_no_autostash_flag_is_accepted_noop() {
 fn test_rebase_no_rerere_autoupdate_flag_is_accepted_noop() {
     let repo = create_cli_rebase_success_repo();
 
-    // `--no-rerere-autoupdate` is accepted and a no-op: Libra has no rerere, so
-    // the rebase proceeds normally.
+    // Rerere is disabled by default, so an explicit override remains a no-op
+    // for an otherwise clean rebase.
     let output = run_libra_command(
         &["--json", "rebase", "--no-rerere-autoupdate", "main"],
         repo.path(),
@@ -937,6 +1494,153 @@ fn test_rebase_no_rerere_autoupdate_flag_is_accepted_noop() {
     let json = parse_json_stdout(&output);
     assert_eq!(json["data"]["status"], "completed");
     assert_eq!(json["data"]["replay_count"], 1);
+}
+
+#[test]
+fn rebase_rerere_autoupdate_flags_override_configured_staging() {
+    let repo = create_cli_rebase_conflict_ready_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Seed the reusable resolution cache, then restore the feature branch.
+    assert_eq!(
+        run_libra_command(&["rebase", "main"], p).status.code(),
+        Some(128)
+    );
+    fs::write(p.join("conflict.txt"), "resolved\n").expect("write resolution");
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record resolution");
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "abort seed rebase",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--no-rerere-autoupdate", "main"], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit off still reports the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("conflict.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit off must leave replayed content unstaged despite true config"
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "abort explicit-off rebase",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "false"], p),
+        "configure no auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--rerere-autoupdate", "main"], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit on still reports the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("conflict.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit on must stage replayed content despite false config"
+    );
+}
+
+#[test]
+fn rebase_rerere_autoupdate_off_survives_conflict_resume() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for path in ["first.txt", "second.txt"] {
+        commit_file_via_cli(p, path, "base\n", &format!("base {path}"));
+    }
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "topic branch",
+    );
+    commit_file_via_cli(p, "first.txt", "topic first\n", "topic f1");
+    commit_file_via_cli(p, "second.txt", "topic second\n", "topic f2");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    commit_file_via_cli(p, "first.txt", "main first\n", "main f1");
+    commit_file_via_cli(p, "second.txt", "main second\n", "main f2");
+    assert_cli_success(&run_libra_command(&["switch", "topic"], p), "switch topic");
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Populate resolutions for both replayed commits, then restore the topic.
+    assert_eq!(
+        run_libra_command(&["rebase", "main"], p).status.code(),
+        Some(128)
+    );
+    fs::write(p.join("first.txt"), "resolved first\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f1 resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "stage f1 seed",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 seed conflict"
+    );
+    fs::write(p.join("second.txt"), "resolved second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f2 resolution");
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "abort seed rebase",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--no-rerere-autoupdate", "main"], p)
+            .status
+            .code(),
+        Some(128),
+        "f1 replay stops unstaged"
+    );
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "manually stage f1 before the new-process continue",
+    );
+
+    // The fresh --continue must use the sidecar's explicit off value for f2.
+    assert_eq!(
+        run_libra_command(&["rebase", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 replay stops after continue"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("second.txt")).unwrap(),
+        "resolved second\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "persisted explicit off must leave f2's replayed resolution unstaged"
+    );
 }
 
 #[test]
@@ -1212,6 +1916,8 @@ async fn test_basic_rebase() {
     // 1. Create initial commits on master
     fs::write(temp_path.path().join("file.txt"), "content1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -1226,6 +1932,10 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1246,6 +1956,8 @@ async fn test_basic_rebase() {
 
     fs::write(temp_path.path().join("file.txt"), "content1\ncontent2").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -1260,6 +1972,10 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1297,6 +2013,8 @@ async fn test_basic_rebase() {
     // 3. Create commits on feature branch
     fs::write(temp_path.path().join("feature_a.txt"), "featureA").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature_a.txt".to_string()],
         all: false,
         update: false,
@@ -1311,6 +2029,10 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1331,6 +2053,8 @@ async fn test_basic_rebase() {
 
     fs::write(temp_path.path().join("feature_b.txt"), "featureB").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature_b.txt".to_string()],
         all: false,
         update: false,
@@ -1345,6 +2069,10 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1381,6 +2109,8 @@ async fn test_basic_rebase() {
 
     fs::write(temp_path.path().join("master_only.txt"), "master_change").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["master_only.txt".to_string()],
         all: false,
         update: false,
@@ -1395,6 +2125,10 @@ async fn test_basic_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1430,6 +2164,7 @@ async fn test_basic_rebase() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -1447,7 +2182,11 @@ async fn test_basic_rebase() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -1503,6 +2242,8 @@ async fn test_rebase_preserves_untracked_files() {
     // Base commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -1517,6 +2258,10 @@ async fn test_rebase_preserves_untracked_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1553,6 +2298,8 @@ async fn test_rebase_preserves_untracked_files() {
 
     fs::write(temp_path.path().join("feature.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature.txt".to_string()],
         all: false,
         update: false,
@@ -1567,6 +2314,10 @@ async fn test_rebase_preserves_untracked_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1603,6 +2354,8 @@ async fn test_rebase_preserves_untracked_files() {
 
     fs::write(temp_path.path().join("file.txt"), "base\nmaster").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -1617,6 +2370,10 @@ async fn test_rebase_preserves_untracked_files() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1655,6 +2412,7 @@ async fn test_rebase_preserves_untracked_files() {
     fs::write(temp_path.path().join("notes.txt"), "keep me").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -1672,7 +2430,11 @@ async fn test_rebase_preserves_untracked_files() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -1700,6 +2462,8 @@ async fn test_rebase_already_up_to_date() {
     // Create commits on master
     fs::write(temp_path.path().join("file1.txt"), "content1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file1.txt".to_string()],
         all: false,
         update: false,
@@ -1714,6 +2478,10 @@ async fn test_rebase_already_up_to_date() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1734,6 +2502,8 @@ async fn test_rebase_already_up_to_date() {
 
     fs::write(temp_path.path().join("file2.txt"), "content2").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file2.txt".to_string()],
         all: false,
         update: false,
@@ -1748,6 +2518,10 @@ async fn test_rebase_already_up_to_date() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1784,6 +2558,7 @@ async fn test_rebase_already_up_to_date() {
 
     // Try to rebase feature onto master (should be up to date)
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -1801,7 +2576,11 @@ async fn test_rebase_already_up_to_date() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -1821,6 +2600,8 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
     // Create initial commit on master
     fs::write(temp_path.path().join("file.txt"), "base content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -1835,6 +2616,10 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1871,6 +2656,8 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     fs::write(temp_path.path().join("feature.txt"), "feature content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature.txt".to_string()],
         all: false,
         update: false,
@@ -1885,6 +2672,10 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1921,6 +2712,8 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     fs::write(temp_path.path().join("master.txt"), "master content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["master.txt".to_string()],
         all: false,
         update: false,
@@ -1935,6 +2728,10 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1971,6 +2768,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     // Start rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -1988,7 +2786,11 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2003,6 +2805,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
     // Rebase should complete (no conflict in this case)
     // But let's test abort when no rebase is in progress
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2020,7 +2823,11 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2058,6 +2865,8 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     // Create base commit on master
     fs::write(temp_path.path().join("base.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -2072,6 +2881,10 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2107,6 +2920,8 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     .await;
     fs::write(temp_path.path().join("feature.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature.txt".to_string()],
         all: false,
         update: false,
@@ -2121,6 +2936,10 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2157,6 +2976,8 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     .await;
     fs::write(temp_path.path().join("master.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["master.txt".to_string()],
         all: false,
         update: false,
@@ -2171,6 +2992,10 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2206,6 +3031,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     })
     .await;
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2223,7 +3049,11 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2266,6 +3096,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
     // Abort should restore the original branch ref.
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2283,7 +3114,11 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2319,6 +3154,8 @@ async fn test_rebase_continue_no_rebase() {
     // Create initial commit
     fs::write(temp_path.path().join("file.txt"), "content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -2333,6 +3170,10 @@ async fn test_rebase_continue_no_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2353,6 +3194,7 @@ async fn test_rebase_continue_no_rebase() {
 
     // Try to continue when no rebase is in progress
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2370,7 +3212,11 @@ async fn test_rebase_continue_no_rebase() {
         continue_rebase: true,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2388,6 +3234,8 @@ async fn test_rebase_skip_no_rebase() {
     // Create initial commit
     fs::write(temp_path.path().join("file.txt"), "content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -2402,6 +3250,10 @@ async fn test_rebase_skip_no_rebase() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2422,6 +3274,7 @@ async fn test_rebase_skip_no_rebase() {
 
     // Try to skip when no rebase is in progress
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2439,7 +3292,11 @@ async fn test_rebase_skip_no_rebase() {
         continue_rebase: false,
         abort: false,
         skip: true,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2459,6 +3316,8 @@ async fn test_rebase_with_conflict_and_abort() {
     // 1. Create initial commit on master with a file
     fs::write(temp_path.path().join("conflict.txt"), "base content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -2473,6 +3332,10 @@ async fn test_rebase_with_conflict_and_abort() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2513,6 +3376,8 @@ async fn test_rebase_with_conflict_and_abort() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -2527,6 +3392,10 @@ async fn test_rebase_with_conflict_and_abort() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2563,6 +3432,8 @@ async fn test_rebase_with_conflict_and_abort() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master modification").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -2577,6 +3448,10 @@ async fn test_rebase_with_conflict_and_abort() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2612,6 +3487,7 @@ async fn test_rebase_with_conflict_and_abort() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2629,7 +3505,11 @@ async fn test_rebase_with_conflict_and_abort() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2651,6 +3531,7 @@ async fn test_rebase_with_conflict_and_abort() {
 
     // 6. Abort the rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2668,7 +3549,11 @@ async fn test_rebase_with_conflict_and_abort() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2719,6 +3604,8 @@ async fn test_rebase_binary_conflict_writes_markers() {
     // 1. Base commit on master with binary content
     fs::write(&file_path, &base_bytes).unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["binary.bin".to_string()],
         all: false,
         update: false,
@@ -2733,6 +3620,10 @@ async fn test_rebase_binary_conflict_writes_markers() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2768,6 +3659,8 @@ async fn test_rebase_binary_conflict_writes_markers() {
     .await;
     fs::write(&file_path, &feature_bytes).unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["binary.bin".to_string()],
         all: false,
         update: false,
@@ -2782,6 +3675,10 @@ async fn test_rebase_binary_conflict_writes_markers() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2817,6 +3714,8 @@ async fn test_rebase_binary_conflict_writes_markers() {
     .await;
     fs::write(&file_path, &master_bytes).unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["binary.bin".to_string()],
         all: false,
         update: false,
@@ -2831,6 +3730,10 @@ async fn test_rebase_binary_conflict_writes_markers() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2865,6 +3768,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
     })
     .await;
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2882,7 +3786,11 @@ async fn test_rebase_binary_conflict_writes_markers() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2907,6 +3815,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
     // Cleanup: abort rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2924,7 +3833,11 @@ async fn test_rebase_binary_conflict_writes_markers() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2949,6 +3862,8 @@ async fn test_rebase_with_conflict_and_skip() {
     fs::write(temp_path.path().join("conflict.txt"), "base content").unwrap();
     fs::write(temp_path.path().join("other.txt"), "other base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "other.txt".to_string()],
         all: false,
         update: false,
@@ -2963,6 +3878,10 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3004,6 +3923,8 @@ async fn test_rebase_with_conflict_and_skip() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3018,6 +3939,10 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3043,6 +3968,8 @@ async fn test_rebase_with_conflict_and_skip() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature_only.txt".to_string()],
         all: false,
         update: false,
@@ -3057,6 +3984,10 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3093,6 +4024,8 @@ async fn test_rebase_with_conflict_and_skip() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master modification").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3107,6 +4040,10 @@ async fn test_rebase_with_conflict_and_skip() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3142,6 +4079,7 @@ async fn test_rebase_with_conflict_and_skip() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3159,7 +4097,11 @@ async fn test_rebase_with_conflict_and_skip() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3173,6 +4115,7 @@ async fn test_rebase_with_conflict_and_skip() {
     );
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3190,7 +4133,11 @@ async fn test_rebase_with_conflict_and_skip() {
         continue_rebase: false,
         abort: false,
         skip: true,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3220,6 +4167,8 @@ async fn test_rebase_with_conflict_and_continue() {
     // 1. Create initial commit on master
     fs::write(temp_path.path().join("conflict.txt"), "base content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3234,6 +4183,10 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3274,6 +4227,8 @@ async fn test_rebase_with_conflict_and_continue() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3288,6 +4243,10 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3324,6 +4283,8 @@ async fn test_rebase_with_conflict_and_continue() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master modification").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3338,6 +4299,10 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3373,6 +4338,7 @@ async fn test_rebase_with_conflict_and_continue() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3390,7 +4356,11 @@ async fn test_rebase_with_conflict_and_continue() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3412,6 +4382,8 @@ async fn test_rebase_with_conflict_and_continue() {
 
     // Stage the resolved file
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3426,11 +4398,16 @@ async fn test_rebase_with_conflict_and_continue() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
     // Continue the rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3448,7 +4425,11 @@ async fn test_rebase_with_conflict_and_continue() {
         continue_rebase: true,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3489,6 +4470,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     fs::write(temp_path.path().join("file2.txt"), "base2").unwrap();
     fs::write(temp_path.path().join("file3.txt"), "base3").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![
             "file1.txt".to_string(),
             "file2.txt".to_string(),
@@ -3507,6 +4490,10 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3544,6 +4531,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     // Commit 1: modify file1 (will conflict)
     fs::write(temp_path.path().join("file1.txt"), "feature1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file1.txt".to_string()],
         all: false,
         update: false,
@@ -3558,6 +4547,10 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3583,6 +4576,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["new_feature.txt".to_string()],
         all: false,
         update: false,
@@ -3597,6 +4592,10 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3618,6 +4617,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     // Commit 3: modify file3 (no conflict)
     fs::write(temp_path.path().join("file3.txt"), "feature3").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file3.txt".to_string()],
         all: false,
         update: false,
@@ -3632,6 +4633,10 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3668,6 +4673,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     fs::write(temp_path.path().join("file1.txt"), "master1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file1.txt".to_string()],
         all: false,
         update: false,
@@ -3682,6 +4689,10 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3717,6 +4728,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3734,7 +4746,11 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3749,6 +4765,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     // Skip the conflicting commit (F1)
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3766,7 +4783,11 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         continue_rebase: false,
         abort: false,
         skip: true,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3812,6 +4833,8 @@ async fn test_rebase_state_persistence() {
     // 1. Create initial commit
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -3826,6 +4849,10 @@ async fn test_rebase_state_persistence() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3862,6 +4889,8 @@ async fn test_rebase_state_persistence() {
 
     fs::write(temp_path.path().join("file.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -3876,6 +4905,10 @@ async fn test_rebase_state_persistence() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3912,6 +4945,8 @@ async fn test_rebase_state_persistence() {
 
     fs::write(temp_path.path().join("file.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -3926,6 +4961,10 @@ async fn test_rebase_state_persistence() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3961,6 +5000,7 @@ async fn test_rebase_state_persistence() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3978,7 +5018,11 @@ async fn test_rebase_state_persistence() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4010,6 +5054,7 @@ async fn test_rebase_state_persistence() {
 
     // Clean up - abort the rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4027,7 +5072,11 @@ async fn test_rebase_state_persistence() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4057,6 +5106,8 @@ async fn test_rebase_fast_forward_branch_behind() {
     // Initial commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4071,6 +5122,10 @@ async fn test_rebase_fast_forward_branch_behind() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4123,6 +5178,8 @@ async fn test_rebase_fast_forward_branch_behind() {
 
     fs::write(temp_path.path().join("file.txt"), "master-advance").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4137,6 +5194,10 @@ async fn test_rebase_fast_forward_branch_behind() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4174,6 +5235,7 @@ async fn test_rebase_fast_forward_branch_behind() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4191,7 +5253,11 @@ async fn test_rebase_fast_forward_branch_behind() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4223,6 +5289,8 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
     // Base commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4237,6 +5305,10 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4289,6 +5361,8 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 
     fs::write(temp_path.path().join("file.txt"), "master-advance").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4303,6 +5377,10 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4341,6 +5419,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
     fs::write(temp_path.path().join("file.txt"), "local-modification").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4358,7 +5437,11 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4390,6 +5473,8 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
     // Base commit on master
     fs::write(temp_path.path().join("base.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -4404,6 +5489,10 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4456,6 +5545,8 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 
     fs::write(temp_path.path().join("new.txt"), "master-content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["new.txt".to_string()],
         all: false,
         update: false,
@@ -4470,6 +5561,10 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4508,6 +5603,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
     fs::write(temp_path.path().join("new.txt"), "local-untracked").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4525,7 +5621,11 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4557,6 +5657,8 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
     // Base commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4571,6 +5673,10 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4607,6 +5713,8 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
     fs::write(temp_path.path().join("file.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4621,6 +5729,10 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4657,6 +5769,8 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
     fs::write(temp_path.path().join("file.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4671,6 +5785,10 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4709,6 +5827,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
     fs::write(temp_path.path().join("file.txt"), "dirty").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4726,7 +5845,11 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4765,6 +5888,8 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     fs::write(temp_path.path().join("conflict.txt"), "base").unwrap();
     fs::write(temp_path.path().join("clean.txt"), "base-clean").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "clean.txt".to_string()],
         all: false,
         update: false,
@@ -4779,6 +5904,10 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4816,6 +5945,8 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     fs::write(temp_path.path().join("conflict.txt"), "feature-conflict").unwrap();
     fs::write(temp_path.path().join("clean.txt"), "feature-clean").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "clean.txt".to_string()],
         all: false,
         update: false,
@@ -4830,6 +5961,10 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4866,6 +6001,8 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master-conflict").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -4880,6 +6017,10 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4915,6 +6056,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4932,7 +6074,11 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4952,6 +6098,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     // Clean up
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4969,7 +6116,11 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4987,6 +6138,8 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     // Base commit on master
     fs::write(temp_path.path().join("conflict.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -5001,6 +6154,10 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5038,6 +6195,8 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     fs::write(temp_path.path().join("conflict.txt"), "feature").unwrap();
     fs::write(temp_path.path().join("new.txt"), "added").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "new.txt".to_string()],
         all: false,
         update: false,
@@ -5052,6 +6211,10 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5106,6 +6269,8 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     fs::write(temp_path.path().join("conflict.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -5120,6 +6285,10 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5157,6 +6326,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     fs::write(temp_path.path().join("new.txt"), "keep me").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5174,7 +6344,11 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5191,6 +6365,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     // Clean up
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5208,7 +6383,11 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5226,6 +6405,8 @@ async fn test_rebase_continue_requires_resolution() {
     // Base commit on master
     fs::write(temp_path.path().join("conflict.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -5240,6 +6421,10 @@ async fn test_rebase_continue_requires_resolution() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5276,6 +6461,8 @@ async fn test_rebase_continue_requires_resolution() {
 
     fs::write(temp_path.path().join("conflict.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -5290,6 +6477,10 @@ async fn test_rebase_continue_requires_resolution() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5326,6 +6517,8 @@ async fn test_rebase_continue_requires_resolution() {
 
     fs::write(temp_path.path().join("conflict.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -5340,6 +6533,10 @@ async fn test_rebase_continue_requires_resolution() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5375,6 +6572,7 @@ async fn test_rebase_continue_requires_resolution() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5392,7 +6590,11 @@ async fn test_rebase_continue_requires_resolution() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5408,6 +6610,7 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Continue without resolving conflicts
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5425,7 +6628,11 @@ async fn test_rebase_continue_requires_resolution() {
         continue_rebase: true,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5441,6 +6648,7 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Clean up
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5458,7 +6666,11 @@ async fn test_rebase_continue_requires_resolution() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -6291,5 +7503,73 @@ fn test_rebase_autosquash_keeps_target_author_and_current_committer() {
     assert_eq!(
         line, "Target Author|target@example.com|Test User|test@example.com",
         "a fold keeps the target commit's author and stamps the running user as committer"
+    );
+}
+
+/// FM-02 (M-MAT2 U5): rebasing a rewrite that clears the execute bit
+/// materializes a non-executable file (the set direction is pinned by
+/// `test_rebase_preserves_executable_mode_in_rewritten_commit`).
+#[cfg(unix)]
+#[test]
+fn test_rebase_clears_executable_bit_in_rewritten_commit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+    commit_file_via_cli(repo_path, "base.txt", "base\n", "Base");
+
+    let script = repo_path.join("script.sh");
+    fs::write(&script, "#!/bin/sh\necho v1\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "script.sh"], repo_path),
+        "stage executable",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "executable", "--no-verify"], repo_path),
+        "commit executable",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], repo_path),
+        "create feature",
+    );
+    fs::write(&script, "#!/bin/sh\necho v2\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "script.sh"], repo_path),
+        "stage non-executable",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "non-executable", "--no-verify"],
+            repo_path,
+        ),
+        "commit non-executable",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo_path),
+        "switch main",
+    );
+    commit_file_via_cli(repo_path, "main.txt", "main\n", "Main adds file");
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], repo_path),
+        "switch feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], repo_path),
+        "rebase onto main",
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "rebase must materialize the cleared execute bit"
     );
 }

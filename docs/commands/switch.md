@@ -23,6 +23,8 @@ libra switch [--guess | --no-guess] <branch>
 
 The command supports multiple modes: switching to an existing local branch (default), returning to the previous checkout target with `-`, creating a new branch with `-c`, force-creating or resetting a branch with `-C`, creating an unborn orphan branch with `--orphan`, detaching HEAD with `-d`, and tracking a remote branch with `--track`. When the target branch is already the current branch, the command is a no-op and skips the cleanliness check entirely.
 
+Libra does not manage submodule contents. If switching to a branch or detached target would remove or replace a tracked gitlink (mode `160000`) whose directory is nonempty, it refuses with `LBR-CONFLICT-002` before changing HEAD, branch refs, reflogs, the index, or the working tree. This check also applies to branch creation/reset (`-c` / `-C`) and cannot be bypassed with `--force`. Move the nested files safely aside before retrying. An empty Libra-owned directory placeholder can be removed successfully. This is Libra's protection boundary; Git's default checkout can instead leave a nonempty submodule directory in place.
+
 `libra switch -` selects the source of the most recent `switch` or `checkout` movement in this worktree's HEAD reflog. A branch source follows that local branch's current tip; a detached source uses the full stored object ID. Every successful movement is recorded, so repeating `switch -` toggles between the two targets. If there is no navigation record, the recorded branch was deleted, or the newest record is malformed, Libra fails before changing HEAD, the index, or the working tree.
 
 Fuzzy branch name suggestions are provided via Levenshtein distance when a branch is not found, helping catch typos without requiring exact matches.
@@ -32,6 +34,8 @@ OID, new OID, and branch flag `1`. Already-on no-ops do not invoke it. Set
 `LIBRA_NO_HOOKS=1` only for an explicit policy bypass. See
 [Repository hooks](repository-hooks.md) for sandbox and output behavior.
 
+Switching materializes the target entry's permission bits under the process `umask`, setting or clearing the execute bit as the entry mode requires (plan issues/470 FM-01).
+
 ## Options
 
 | Flag | Long | Value | Description |
@@ -40,7 +44,7 @@ OID, new OID, and branch flag `1`. Already-on no-ops do not invoke it. Set
 | `-c` | `--create` | `<name>` | Create a new branch and switch to it |
 | `-C` | `--force-create` | `<name>` | Create a new branch or reset an existing one and switch to it |
 | | `--orphan` | `<name>` | Create a new unborn orphan branch with no parents and switch to it |
-| `-d` | `--detach` | | Detach HEAD at the given commit, tag, or branch |
+| `-d` | `--detach` | | Detach HEAD at the given commit, tag, or branch. With no target, detach at the current HEAD (unborn HEAD is refused: `You are on a branch yet to be born`, `LBR-REPO-003`, exit 128) |
 | | `--track` | | Create a local branch tracking the given remote branch and switch to it |
 | | `--guess` | | Auto-create a tracking branch when `<branch>` uniquely matches one remote (default; DWIM) |
 | | `--no-guess` | | Disable the remote-tracking guess; require a local branch or explicit `--track` |
@@ -323,6 +327,7 @@ Every `SwitchError` variant maps to an explicit `StableErrorCode`.
 | Unstaged changes | `LBR-REPO-003` | 128 | "commit or stash your changes before switching." |
 | Uncommitted changes | `LBR-REPO-003` | 128 | "commit or stash your changes before switching." |
 | Untracked file would be overwritten | `LBR-CONFLICT-002` | 128 | "move or remove it before switching." |
+| Nonempty tracked gitlink directory would be removed or replaced | `LBR-CONFLICT-002` | 128 | Move nested files safely aside before retrying; an empty Libra-owned directory placeholder can be removed. |
 | Status check failed | `LBR-IO-001` | 128 | -- |
 | Commit resolve failed | `LBR-CLI-003` | 129 | "check the revision name and try again." |
 | Branch creation failed | `LBR-IO-002` | 128 | -- |
@@ -333,3 +338,7 @@ Every `SwitchError` variant maps to an explicit `StableErrorCode`.
 command conflict contract through `DelegatedCli`, so that path keeps the branch
 command's existing error shape instead of adding the `SwitchError::BranchAlreadyExists`
 hint.
+
+## Issue #477 notes
+
+`--detach` with no target detaches at the current commit

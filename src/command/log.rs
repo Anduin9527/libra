@@ -7,7 +7,7 @@ use std::{
     cmp::min,
     collections::{HashMap, HashSet, VecDeque},
     io::IsTerminal,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     str::FromStr,
 };
@@ -33,6 +33,7 @@ use crate::{
             date_parser::parse_date,
             formatter::{CommitFormatter, FormatContext, FormatType, LogPreset},
         },
+        shallow::ShallowSet,
         tag::{self, TagObject},
     },
     utils::{
@@ -40,6 +41,7 @@ use crate::{
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
+        pathspec::PathspecSet,
         util,
     },
 };
@@ -118,6 +120,25 @@ fn log_invalid_object_error(object: &str) -> CliError {
 
 fn log_repo_corrupt_error(message: impl Into<String>) -> CliError {
     CliError::fatal(message.into()).with_stable_code(StableErrorCode::RepoCorrupt)
+}
+
+fn load_walk_shallow() -> CliResult<ShallowSet> {
+    ShallowSet::load()
+        .map_err(|error| log_repo_corrupt_error(error.to_string()).with_hint(error.hint()))
+}
+
+fn history_parents<'a>(shallow: &ShallowSet, commit: &'a Commit) -> &'a [ObjectHash] {
+    shallow.parents_for_walk(&commit.id, &commit.parent_commit_ids)
+}
+
+fn first_history_parent(commit: &Commit) -> CliResult<Option<ObjectHash>> {
+    let shallow = load_walk_shallow()?;
+    Ok(history_parents(&shallow, commit).first().copied())
+}
+
+fn log_missing_history_error(error: impl std::fmt::Display) -> CliError {
+    log_repo_corrupt_error(format!("storage broken, object not found: {error}"))
+        .with_hint("run 'libra fsck' to inspect missing history")
 }
 
 #[derive(Parser, Debug)]
@@ -441,6 +462,9 @@ struct CommitFilter {
     since: Option<i64>,
     until: Option<i64>,
     paths: Vec<PathBuf>,
+    /// `FIX-AD-01`: the same path filters as a shared-engine pathspec set
+    /// (wildcards and `:(magic)` supported). `None` keeps prefix matching.
+    path_specs: Option<PathspecSet>,
     grep: Option<String>,
     /// `-i`/`--regexp-ignore-case`: case-insensitive `--grep` message match.
     grep_ignore_case: bool,
@@ -513,6 +537,7 @@ impl CommitFilter {
             since,
             until,
             paths,
+            path_specs: None,
             grep,
             grep_ignore_case: false,
             invert_grep: false,
@@ -527,6 +552,29 @@ impl CommitFilter {
     fn with_trailer_filters(mut self, trailer_filters: Vec<TrailerFilter>) -> Self {
         self.trailer_filters = trailer_filters;
         self
+    }
+
+    /// `FIX-AD-01`: attach the shared-engine pathspec set used for path
+    /// filtering (wildcards and `:(magic)`). `None` keeps prefix matching.
+    fn with_pathspec(mut self, path_specs: Option<PathspecSet>) -> Self {
+        self.path_specs = path_specs;
+        self
+    }
+
+    /// `FIX-AD-01`: the changed files for `commit` under this filter's path
+    /// constraints — the shared pathspec engine when one is attached, the
+    /// legacy prefix matcher otherwise.
+    async fn changed_files_for(
+        &self,
+        commit: &Commit,
+        prefix_filters: &[PathBuf],
+    ) -> Result<Vec<FileChange>, CliError> {
+        match self.path_specs.as_ref() {
+            Some(set) if !set.is_empty() => {
+                get_changed_files_for_commit_matching_pathspec(commit, set).await
+            }
+            _ => get_changed_files_for_commit(commit, prefix_filters).await,
+        }
     }
 
     /// Apply `-i`/`--regexp-ignore-case` and `--invert-grep` to the `--grep`
@@ -577,7 +625,7 @@ impl CommitFilter {
             }
         }
 
-        let parent_count = commit.parent_commit_ids.len();
+        let parent_count = commit.parent_commit_ids.len(); // SHALLOW-DISPLAY: recorded parents, not a walk
         if let Some(min) = self.min_parents
             && parent_count < min
         {
@@ -604,13 +652,24 @@ impl CommitFilter {
         if let Some(pattern) = &self.grep
             && !pattern.is_empty()
         {
-            let matches = if self.grep_ignore_case {
-                commit
-                    .message
-                    .to_lowercase()
-                    .contains(&pattern.to_lowercase())
+            // Recognize the embedded signature with the shared parser, but keep
+            // actual message whitespace: its display slice uses trim_start().
+            let message = if let Some(signature) = parse_commit_msg(&commit.message).1 {
+                // INVARIANT: the shared parser returns a signature subslice of
+                // commit.message, ending at a UTF-8 boundary within that string.
+                let signature_end = signature.as_ptr() as usize - commit.message.as_ptr() as usize
+                    + signature.len();
+                let after_signature = &commit.message[signature_end..];
+                after_signature
+                    .strip_prefix("\n\n")
+                    .unwrap_or(after_signature)
             } else {
-                commit.message.contains(pattern.as_str())
+                commit.message.strip_prefix('\n').unwrap_or(&commit.message)
+            };
+            let matches = if self.grep_ignore_case {
+                message.to_lowercase().contains(&pattern.to_lowercase())
+            } else {
+                message.contains(pattern.as_str())
             };
             // `--invert-grep` keeps the non-matching commits: exclude exactly
             // when `matches == invert_grep` (matches & !invert, or !matches & invert).
@@ -634,7 +693,7 @@ impl CommitFilter {
         if let Some(changes) = cached_changes {
             Ok(!changes.is_empty())
         } else {
-            commit_touches_paths(commit, &self.paths).await
+            commit_touches_paths(commit, &self.paths, self.path_specs.as_ref()).await
         }
     }
 
@@ -728,6 +787,7 @@ pub async fn get_reachable_commits(
     let mut queue = VecDeque::new();
     let mut commit_set: HashSet<ObjectHash> = HashSet::new();
     let mut reachable_commits: Vec<Commit> = Vec::new();
+    let shallow = load_walk_shallow()?;
 
     // Push the initial commit with depth 0
     let initial_hash =
@@ -740,9 +800,7 @@ pub async fn get_reachable_commits(
             continue;
         }
 
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("storage broken, object not found: {e}"))
-        })?;
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
 
         // If depth is limited and the current depth exceeds the limit, skip further processing
         if let Some(max_depth) = depth
@@ -752,7 +810,7 @@ pub async fn get_reachable_commits(
         }
 
         // Add parent commits to the queue with incremented depth
-        for parent_commit_id in &commit.parent_commit_ids {
+        for parent_commit_id in history_parents(&shallow, &commit) {
             queue.push_back((*parent_commit_id, current_depth + 1));
         }
 
@@ -883,15 +941,14 @@ async fn parse_revision_expr(spec: &str) -> CliResult<RevisionExpr> {
 async fn reachable_commit_ids(tip: ObjectHash) -> CliResult<HashSet<ObjectHash>> {
     let mut reachable: HashSet<ObjectHash> = HashSet::new();
     let mut queue: VecDeque<ObjectHash> = VecDeque::new();
+    let shallow = load_walk_shallow()?;
     queue.push_back(tip);
     while let Some(commit_id) = queue.pop_front() {
         if !reachable.insert(commit_id) {
             continue;
         }
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("failed to load commit {commit_id}: {e}"))
-        })?;
-        for parent in &commit.parent_commit_ids {
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
+        for parent in history_parents(&shallow, &commit) {
             queue.push_back(*parent);
         }
     }
@@ -995,6 +1052,22 @@ async fn resolve_log_inputs(args: &LogArgs) -> CliResult<(Vec<String>, Vec<Strin
     Ok((ranges, paths))
 }
 
+/// Build the shared-engine pathspec set for `log`'s effective pathspecs
+/// (`FIX-AD-01`). `None` when there are no pathspecs.
+fn log_pathspec_set(raw: &[String]) -> CliResult<Option<PathspecSet>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let workdir = util::working_dir();
+    let current_dir = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!("failed to resolve current directory: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    PathspecSet::from_workdir(raw, &current_dir, &workdir)
+        .map(Some)
+        .map_err(|error| CliError::command_usage(format!("invalid pathspec: {error}")))
+}
+
 fn configured_follow_path(paths: &[PathBuf], enabled: bool) -> Option<PathBuf> {
     (enabled && paths.len() == 1 && util::workdir_to_absolute(&paths[0]).is_file())
         .then(|| paths[0].clone())
@@ -1091,14 +1164,13 @@ async fn get_reachable_commits_excluding(
     // closure ignores `--first-parent`/`depth`, which shape only the shown set.)
     let mut excludes: HashSet<ObjectHash> = HashSet::new();
     let mut exclude_queue: VecDeque<ObjectHash> = exclude_tips.into_iter().collect();
+    let shallow = load_walk_shallow()?;
     while let Some(commit_id) = exclude_queue.pop_front() {
         if !excludes.insert(commit_id) {
             continue;
         }
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("storage broken, object not found: {e}"))
-        })?;
-        for parent_commit_id in &commit.parent_commit_ids {
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
+        for parent_commit_id in history_parents(&shallow, &commit) {
             exclude_queue.push_back(*parent_commit_id);
         }
     }
@@ -1112,9 +1184,7 @@ async fn get_reachable_commits_excluding(
             continue;
         }
 
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("storage broken, object not found: {e}"))
-        })?;
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
 
         if let Some(max_depth) = depth
             && current_depth >= max_depth
@@ -1122,7 +1192,7 @@ async fn get_reachable_commits_excluding(
             continue;
         }
 
-        for (idx, parent_commit_id) in commit.parent_commit_ids.iter().enumerate() {
+        for (idx, parent_commit_id) in history_parents(&shallow, &commit).iter().enumerate() {
             // `--first-parent` follows only the first parent of merge commits,
             // collapsing merged side branches out of the traversal.
             if first_parent && idx > 0 {
@@ -1149,7 +1219,7 @@ fn sort_commits_newest_first(commits: &mut [Commit], by_author_date: bool) {
 
 /// Parsed line-range specifier for `-L`.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // -L parsing validates the spec; range-aware filtering is a best-effort stub
 struct LineRange {
     start: usize,
     end: usize,
@@ -1202,11 +1272,11 @@ async fn commit_touches_path_follow(
     let current_items: HashMap<PathBuf, ObjectHash> = tree.get_plain_items().into_iter().collect();
     let current_blob = current_items.get(target).copied();
 
-    if commit.parent_commit_ids.is_empty() {
+    let Some(parent_id) = first_history_parent(commit)? else {
         return Ok(current_blob.map(|_| target.clone()));
-    }
+    };
 
-    let parent_commit = load_object::<Commit>(&commit.parent_commit_ids[0])
+    let parent_commit = load_object::<Commit>(&parent_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
     let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -1307,11 +1377,11 @@ async fn commit_affects_line_range(
         return Ok(true);
     };
 
-    if commit.parent_commit_ids.is_empty() {
+    let Some(parent_id) = first_history_parent(commit)? else {
         return Ok(true);
-    }
+    };
 
-    let parent_commit = load_object::<Commit>(&commit.parent_commit_ids[0])
+    let parent_commit = load_object::<Commit>(&parent_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
     let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -1365,6 +1435,13 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     } else {
         path_filters.clone()
     };
+    // `FIX-AD-01`: the shared-engine pathspec set mirrors the effective path
+    // filters (empty while `--follow` does its own path walking).
+    let path_specs = if effective_follow.is_some() {
+        None
+    } else {
+        log_pathspec_set(&paths)?
+    };
     let (min_parents, max_parents) = resolve_parent_bounds(
         args.merges,
         args.no_merges,
@@ -1384,7 +1461,8 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         pickaxe,
     )
     .with_grep_options(args.ignore_case, args.invert_grep)
-    .with_trailer_filters(parse_trailer_filters(&args.trailers)?);
+    .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
+    .with_pathspec(path_specs);
 
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
     let (start_commits, excludes) = resolve_log_start_commits(&args, &ranges).await?;
@@ -1504,6 +1582,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         for selected in &selected_commits {
             let child = selected.commit.id.to_string();
             for parent in &selected.commit.parent_commit_ids {
+                // SHALLOW-DISPLAY: edges among already-shown commits, not a walk
                 let parent_id = parent.to_string();
                 if visible.contains(&parent_id) {
                     map.entry(parent_id).or_default().push(child.clone());
@@ -1609,7 +1688,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         let abbreviate = |id: &str| id.chars().take(abbrev_len).collect::<String>();
         let extra_hashes = if args.parents {
             commit
-                .parent_commit_ids
+                .parent_commit_ids // SHALLOW-DISPLAY: --parents prints recorded ids
                 .iter()
                 .map(|p| abbreviate(&p.to_string()))
                 .collect::<Vec<_>>()
@@ -1710,6 +1789,13 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
     } else {
         path_filters.clone()
     };
+    // `FIX-AD-01`: the shared-engine pathspec set mirrors the effective path
+    // filters (empty while `--follow` does its own path walking).
+    let path_specs = if effective_follow.is_some() {
+        None
+    } else {
+        log_pathspec_set(&paths)?
+    };
     let (min_parents, max_parents) = resolve_parent_bounds(
         args.merges,
         args.no_merges,
@@ -1729,7 +1815,8 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
         pickaxe,
     )
     .with_grep_options(args.ignore_case, args.invert_grep)
-    .with_trailer_filters(parse_trailer_filters(&args.trailers)?);
+    .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
+    .with_pathspec(path_specs);
 
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
     let (start_commits, excludes) = resolve_log_start_commits(args, &ranges).await?;
@@ -1765,7 +1852,9 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
             continue;
         }
 
-        let files = get_changed_files_for_commit(&commit, effective_path_filters).await?;
+        let files = filter
+            .changed_files_for(&commit, effective_path_filters)
+            .await?;
         if !filter.matches(&commit, Some(&files)).await? {
             continue;
         }
@@ -1805,7 +1894,7 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
             subject,
             body,
             parents: commit
-                .parent_commit_ids
+                .parent_commit_ids // SHALLOW-DISPLAY: JSON lists recorded parents
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
@@ -1863,7 +1952,11 @@ async fn select_log_commits(
         let cached_changes = if filter.paths.is_empty() && !keep_changed_files {
             None
         } else {
-            Some(get_changed_files_for_commit(&commit, &effective_path_filters).await?)
+            Some(
+                filter
+                    .changed_files_for(&commit, &effective_path_filters)
+                    .await?,
+            )
         };
 
         if !filter.matches(&commit, cached_changes.as_deref()).await? {
@@ -1876,10 +1969,19 @@ async fn select_log_commits(
             continue;
         }
 
+        // `FIX-AD-01` (review P1-1): the renderers must see the engine-expanded
+        // concrete paths, not the raw prefixes — otherwise `-p`/`--stat`/
+        // `--shortstat` would still filter the rendered diff literally.
+        let render_paths = match (filter.path_specs.as_ref(), cached_changes.as_ref()) {
+            (Some(set), Some(changes)) if !set.is_empty() => {
+                changes.iter().map(|change| change.path.clone()).collect()
+            }
+            _ => effective_path_filters.clone(),
+        };
         selected.push(SelectedLogCommit {
             commit,
             cached_changes,
-            path_filters: effective_path_filters,
+            path_filters: render_paths,
         });
     }
 
@@ -1927,8 +2029,8 @@ fn commit_changes_string_count(commit: &Commit, needle: &str) -> Result<bool, Cl
     }
 
     let new_blobs = load_tree_blobs(&commit.tree_id)?;
-    let old_blobs = if let Some(parent_id) = commit.parent_commit_ids.first() {
-        let parent = load_object::<Commit>(parent_id).map_err(|e| {
+    let old_blobs = if let Some(parent_id) = first_history_parent(commit)? {
+        let parent = load_object::<Commit>(&parent_id).map_err(|e| {
             log_repo_corrupt_error(format!("failed to load parent commit {parent_id}: {e}"))
         })?;
         load_tree_blobs(&parent.tree_id)?
@@ -2004,8 +2106,8 @@ fn commit_diff_matches_regex(commit: &Commit, regex: &regex::Regex) -> Result<bo
     }
 
     let new_blobs = load_tree_blobs(&commit.tree_id)?;
-    let old_blobs = if let Some(parent_id) = commit.parent_commit_ids.first() {
-        let parent = load_object::<Commit>(parent_id).map_err(|e| {
+    let old_blobs = if let Some(parent_id) = first_history_parent(commit)? {
+        let parent = load_object::<Commit>(&parent_id).map_err(|e| {
             log_repo_corrupt_error(format!("failed to load parent commit {parent_id}: {e}"))
         })?;
         load_tree_blobs(&parent.tree_id)?
@@ -2153,7 +2255,21 @@ fn build_commit_diff_items(
     Ok(diffs)
 }
 
-async fn commit_touches_paths(commit: &Commit, filters: &[PathBuf]) -> Result<bool, CliError> {
+async fn commit_touches_paths(
+    commit: &Commit,
+    filters: &[PathBuf],
+    pathspecs: Option<&PathspecSet>,
+) -> Result<bool, CliError> {
+    // `FIX-AD-01`: when a shared-engine pathspec set was built, use it so
+    // wildcards and `:(magic)` match like Git. An empty set matches
+    // everything (the caller passed no path filters).
+    if let Some(set) = pathspecs {
+        if set.is_empty() {
+            return Ok(true);
+        }
+        let changes = get_changed_files_for_commit_matching_pathspec(commit, set).await?;
+        return Ok(!changes.is_empty());
+    }
     if filters.is_empty() {
         return Ok(true);
     }
@@ -2166,13 +2282,32 @@ pub(crate) async fn get_changed_files_for_commit(
     commit: &Commit,
     paths: &[PathBuf],
 ) -> Result<Vec<FileChange>, CliError> {
+    changed_files_for_commit_with(commit, |path| {
+        paths.is_empty() || paths.iter().any(|filter| util::is_sub_path(path, filter))
+    })
+    .await
+}
+
+/// `FIX-AD-01`: like [`get_changed_files_for_commit`], but matches each changed
+/// path against the shared pathspec engine (wildcards and `:(magic)`).
+pub(crate) async fn get_changed_files_for_commit_matching_pathspec(
+    commit: &Commit,
+    pathspecs: &PathspecSet,
+) -> Result<Vec<FileChange>, CliError> {
+    changed_files_for_commit_with(commit, |path| pathspecs.matches_path(path)).await
+}
+
+async fn changed_files_for_commit_with(
+    commit: &Commit,
+    matches: impl Fn(&Path) -> bool,
+) -> Result<Vec<FileChange>, CliError> {
     let tree = load_object::<Tree>(&commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
     let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items();
 
-    let old_blobs: Vec<(PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
-        let parent = &commit.parent_commit_ids[0];
-        let parent_commit = load_object::<Commit>(parent)
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -2181,20 +2316,13 @@ pub(crate) async fn get_changed_files_for_commit(
         Vec::new()
     };
 
-    let matches_filter = |path: &PathBuf, filters: &[PathBuf]| -> bool {
-        if filters.is_empty() {
-            return true;
-        }
-        filters.iter().any(|filter| util::is_sub_path(path, filter))
-    };
-
     let old_files: HashSet<PathBuf> = old_blobs.iter().map(|(path, _)| path.clone()).collect();
     let new_files: HashSet<PathBuf> = new_blobs.iter().map(|(path, _)| path.clone()).collect();
 
     let mut changed_files = Vec::new();
 
     for file in &new_files {
-        if !old_files.contains(file) && matches_filter(file, paths) {
+        if !old_files.contains(file) && matches(file.as_path()) {
             changed_files.push(FileChange {
                 path: file.clone(),
                 status: ChangeType::Added,
@@ -2205,7 +2333,7 @@ pub(crate) async fn get_changed_files_for_commit(
     for (file, new_hash) in &new_blobs {
         if let Some((_, old_hash)) = old_blobs.iter().find(|(old_file, _)| old_file == file)
             && new_hash != old_hash
-            && matches_filter(file, paths)
+            && matches(file.as_path())
         {
             changed_files.push(FileChange {
                 path: file.clone(),
@@ -2215,7 +2343,7 @@ pub(crate) async fn get_changed_files_for_commit(
     }
 
     for file in &old_files {
-        if !new_files.contains(file) && matches_filter(file, paths) {
+        if !new_files.contains(file) && matches(file.as_path()) {
             changed_files.push(FileChange {
                 path: file.clone(),
                 status: ChangeType::Deleted,
@@ -2314,9 +2442,9 @@ pub async fn compute_commit_stat(
         .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
     let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items();
 
-    let old_blobs: Vec<(PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
-        let parent = &commit.parent_commit_ids[0];
-        let parent_commit = load_object::<Commit>(parent)
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -2475,7 +2603,7 @@ impl GraphState {
     /// A string containing the ASCII graph prefix for the commit.
     pub fn render(&mut self, commit: &Commit) -> String {
         let commit_id = commit.id;
-        let parent_ids = &commit.parent_commit_ids;
+        let parent_ids = &commit.parent_commit_ids; // SHALLOW-DISPLAY: graph columns for shown commits
 
         let mut prefix = String::new();
 
@@ -2608,9 +2736,9 @@ pub(crate) async fn generate_diff_with_options(
     let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items();
 
     // old_blobs from first parent if exists
-    let old_blobs: Vec<(PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
-        let parent = &commit.parent_commit_ids[0];
-        let parent_commit = load_object::<Commit>(parent)
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -2737,6 +2865,113 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial(hash_kind)]
+    fn log_grep_ignores_embedded_signature_headers() {
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        for (name, kind) in [
+            ("gpgsig", "PGP"),
+            ("gpgsig", "SSH"),
+            ("gpgsig-sha256", "PGP"),
+            ("gpgsig-sha256", "SSH"),
+        ] {
+            let signature = format!(
+                "{name} -----BEGIN {kind} SIGNATURE-----\n FiX OnlySignatureToken\n -----END {kind} SIGNATURE-----"
+            );
+            let message = crate::common_utils::format_commit_msg(
+                "add beta\n\nBody Needle\n\nTicket: 42\n",
+                Some(&signature),
+            );
+            let commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &message);
+            for (pattern, ignore_case, invert, expected) in [
+                ("OnlySignatureToken", false, false, false),
+                ("onlysignaturetoken", true, false, false),
+                ("OnlySignatureToken", false, true, true),
+                ("Fix", true, false, false),
+                ("Fix", true, true, true),
+                ("add beta", false, false, true),
+                ("Body Needle", false, false, true),
+                ("body needle", false, false, false),
+                ("body needle", true, false, true),
+                ("Body Needle", false, true, false),
+                ("Ticket: 42", false, false, true),
+                ("", false, true, true),
+            ] {
+                let filter = CommitFilter::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(pattern.to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .with_grep_options(ignore_case, invert);
+                assert_eq!(
+                    filter.passes_non_path_filters(&commit),
+                    expected,
+                    "{name}/{kind}: {pattern:?}, ignore_case={ignore_case}, invert={invert}"
+                );
+            }
+        }
+        for signature in [
+            None,
+            Some("gpgsig -----BEGIN PGP SIGNATURE-----\n FiX\n -----END PGP SIGNATURE-----"),
+            Some("gpgsig -----BEGIN SSH SIGNATURE-----\n FiX\n -----END SSH SIGNATURE-----"),
+            Some("gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n FiX\n -----END PGP SIGNATURE-----"),
+            Some("gpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n FiX\n -----END SSH SIGNATURE-----"),
+        ] {
+            for body in [
+                "  leading spaces",
+                "\n\tleading blank and tab",
+                "\n-----END PGP SIGNATURE-----",
+            ] {
+                let stored = crate::common_utils::format_commit_msg(body, signature);
+                let commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &stored);
+                for invert in [false, true] {
+                    let filter = CommitFilter::new(
+                        None,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        Some(body.into()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_grep_options(false, invert);
+                    assert_eq!(
+                        filter.passes_non_path_filters(&commit),
+                        !invert,
+                        "verbatim body {body:?}, signature={signature:?}"
+                    );
+                }
+            }
+        }
+        // A signature-looking literal in an unsigned message remains searchable.
+        let literal = crate::common_utils::format_commit_msg(
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n literal body\n -----END PGP SIGNATURE-----",
+            None,
+        );
+        let unsigned = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &literal);
+        let filter = CommitFilter::new(
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some("literal body".into()),
+            None,
+            None,
+            None,
+        );
+        assert!(filter.passes_non_path_filters(&unsigned));
+    }
 
     // Test parameter parsing
     #[test]

@@ -2711,6 +2711,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd, env)]
     fn index_drain_timeout_remains_a_structured_batch_failure() {
         let candidate = Candidate {
             kind: AgentKind::ClaudeCode,
@@ -2776,6 +2777,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn failed_subagent_discovery_keeps_full_reserved_allowance_charged() {
         let mut cumulative = 10_u64;
         reserve_subagent_input_allowance(&mut cumulative, 20).expect("reserve allowance");
@@ -2825,6 +2827,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn agent_import_path_needs_agent() {
         let args = ImportArgs {
             session: None,

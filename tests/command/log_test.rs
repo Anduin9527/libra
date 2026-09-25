@@ -2,7 +2,7 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::{cmp::min, str::FromStr};
+use std::{cmp::min, fs, str::FromStr};
 
 use clap::Parser;
 use git_internal::{
@@ -812,6 +812,8 @@ async fn test_log_patch_no_pathspec() {
     // Create file A and commit
     test::ensure_file("A.txt", Some("Content A\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("A.txt")],
         all: false,
         update: false,
@@ -825,6 +827,10 @@ async fn test_log_patch_no_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -846,6 +852,8 @@ async fn test_log_patch_no_pathspec() {
     // Create file B and commit
     test::ensure_file("B.txt", Some("Content B\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("B.txt")],
         all: false,
         update: false,
@@ -859,6 +867,10 @@ async fn test_log_patch_no_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -941,6 +953,8 @@ async fn test_log_patch_with_pathspec() {
     test::ensure_file("B.txt", Some("Content B\n"));
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -954,6 +968,10 @@ async fn test_log_patch_with_pathspec() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1075,6 +1093,8 @@ async fn test_log_stat() {
 
     test::ensure_file("file1.txt", Some("line1\nline2\nline3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1088,6 +1108,10 @@ async fn test_log_stat() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1108,6 +1132,8 @@ async fn test_log_stat() {
 
     test::ensure_file("file2.txt", Some("content A\ncontent B\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
         update: false,
@@ -1121,6 +1147,10 @@ async fn test_log_stat() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1169,6 +1199,8 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
 
     test::ensure_file("file1.txt", Some("line1\nline2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1182,6 +1214,10 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1202,6 +1238,8 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
 
     test::ensure_file("file1.txt", Some("line1\nline2\nline3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1215,6 +1253,10 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1281,6 +1323,8 @@ async fn test_log_stat_with_modifications() {
 
     test::ensure_file("test.txt", Some("line1\nline2\nline3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test.txt")],
         all: false,
         update: false,
@@ -1294,6 +1338,10 @@ async fn test_log_stat_with_modifications() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1314,6 +1362,8 @@ async fn test_log_stat_with_modifications() {
 
     test::ensure_file("test.txt", Some("line1\nline2 modified\nline3\nline4\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test.txt")],
         all: false,
         update: false,
@@ -1327,6 +1377,10 @@ async fn test_log_stat_with_modifications() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1526,6 +1580,8 @@ async fn test_log_graph_simple_chain() {
 
     test::ensure_file("file1.txt", Some("content1\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1539,6 +1595,10 @@ async fn test_log_graph_simple_chain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1559,6 +1619,8 @@ async fn test_log_graph_simple_chain() {
 
     test::ensure_file("file2.txt", Some("content2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
         update: false,
@@ -1572,6 +1634,10 @@ async fn test_log_graph_simple_chain() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1610,6 +1676,8 @@ async fn test_log_stat_and_graph_combined() {
 
     test::ensure_file("combo.txt", Some("line1\nline2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("combo.txt")],
         all: false,
         update: false,
@@ -1623,6 +1691,10 @@ async fn test_log_stat_and_graph_combined() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1746,6 +1818,8 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
     // Commit a normal file first.
     test::ensure_file("a.txt", Some("A\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("a.txt")],
         all: false,
         update: false,
@@ -1759,6 +1833,10 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1780,6 +1858,8 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
     // Commit a file named "-2" to validate pathspec handling.
     test::ensure_file("-2", Some("dash\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("-2")],
         all: false,
         update: false,
@@ -1793,6 +1873,10 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2030,6 +2114,8 @@ async fn test_log_grep_filtering() {
     // Create first commit: fix message
     test::ensure_file("file1.txt", Some("content1\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -2043,6 +2129,10 @@ async fn test_log_grep_filtering() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2064,6 +2154,8 @@ async fn test_log_grep_filtering() {
     // Create second commit: feat message
     test::ensure_file("file2.txt", Some("content2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
         update: false,
@@ -2077,6 +2169,10 @@ async fn test_log_grep_filtering() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2098,6 +2194,8 @@ async fn test_log_grep_filtering() {
     // Create third commit: docs message
     test::ensure_file("file3.txt", Some("content3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file3.txt")],
         all: false,
         update: false,
@@ -2111,6 +2209,10 @@ async fn test_log_grep_filtering() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2187,6 +2289,8 @@ async fn test_log_reverse_outputs_oldest_first() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2200,6 +2304,10 @@ async fn test_log_reverse_outputs_oldest_first() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2211,6 +2319,8 @@ async fn test_log_reverse_outputs_oldest_first() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -2224,6 +2334,10 @@ async fn test_log_reverse_outputs_oldest_first() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2251,6 +2365,8 @@ async fn test_log_range_excludes_start_commit() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2264,6 +2380,10 @@ async fn test_log_range_excludes_start_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2276,6 +2396,8 @@ async fn test_log_range_excludes_start_commit() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -2289,6 +2411,10 @@ async fn test_log_range_excludes_start_commit() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2315,6 +2441,8 @@ async fn test_log_all_includes_branches() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2328,6 +2456,10 @@ async fn test_log_all_includes_branches() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2347,6 +2479,8 @@ async fn test_log_all_includes_branches() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -2369,6 +2503,8 @@ async fn test_log_all_includes_branches() {
 
     test::ensure_file("side.txt", Some("side\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["side.txt".into()],
         all: false,
         update: false,
@@ -2382,6 +2518,10 @@ async fn test_log_all_includes_branches() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2411,6 +2551,8 @@ async fn test_log_follow_detects_rename() {
 
     test::ensure_file("old.txt", Some("content\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["old.txt".into()],
         all: false,
         update: false,
@@ -2424,6 +2566,10 @@ async fn test_log_follow_detects_rename() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2436,6 +2582,8 @@ async fn test_log_follow_detects_rename() {
     std::fs::remove_file(temp_path.path().join("old.txt")).unwrap();
     test::ensure_file("new.txt", Some("content\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["old.txt".into(), "new.txt".into()],
         all: false,
         update: false,
@@ -2449,6 +2597,10 @@ async fn test_log_follow_detects_rename() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2476,6 +2628,8 @@ async fn test_log_line_range_flag_accepted() {
 
     test::ensure_file("a.txt", Some("line1\nline2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2489,6 +2643,10 @@ async fn test_log_line_range_flag_accepted() {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2964,6 +3122,8 @@ fn test_log_pretty_named_presets() {
 async fn commit_file(path: &str, content: &str, message: &str) -> String {
     test::ensure_file(path, Some(content));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![path.into()],
         all: false,
         update: false,
@@ -2977,6 +3137,10 @@ async fn commit_file(path: &str, content: &str, message: &str) -> String {
         chmod: None,
         renormalize: false,
         ignore_missing: false,
+        resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3078,7 +3242,7 @@ async fn test_log_positional_ambiguous_rev_and_path_errors() {
 /// the full ancestor closure of the excluded side, verified on a DIVERGENT
 /// history (a regression guard for both the symmetric-range and exclusion fixes).
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_positional_symmetric_and_exclusion_divergent() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -3133,7 +3297,7 @@ fn test_log_positional_symmetric_and_exclusion_divergent() {
 /// A pathspec that merely contains `..` (a parent-directory path) is NOT
 /// misclassified as a revision range — it falls back to a pathspec filter.
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_positional_parent_dir_path_not_misclassified() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -3207,7 +3371,7 @@ fn trailer_repo() -> tempfile::TempDir {
 }
 
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_trailer_filter_and_json() {
     let repo = trailer_repo();
     let p = repo.path();
@@ -3268,7 +3432,7 @@ fn test_log_trailer_filter_and_json() {
 }
 
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn test_log_only_trailers_display_and_errors() {
     let repo = trailer_repo();
     let p = repo.path();
@@ -3305,4 +3469,325 @@ fn test_log_only_trailers_display_and_errors() {
     assert_eq!(out.status.code(), Some(129), "conflicts with --oneline");
     let out = run_libra_command(&["log", "--trailer", "=x", "--no-pager"], p);
     assert_eq!(out.status.code(), Some(129), "empty key is a usage error");
+}
+
+#[test]
+fn test_log_literal_pathspecs_global() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], p), "add x");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "x", "--no-verify"], p),
+        "commit x",
+    );
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "*.txt"], p), "add star");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "star", "--no-verify"], p),
+        "commit star",
+    );
+    let out = run_libra_command(
+        &["--literal-pathspecs", "log", "--oneline", "--", "*.txt"],
+        p,
+    );
+    assert_cli_success(&out, "log literal");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("star"), "{text}");
+    assert_eq!(
+        text.lines().filter(|line| !line.is_empty()).count(),
+        1,
+        "only the *.txt commit: {text}"
+    );
+}
+
+/// FIX-AD-01: `log -- <pathspec>` matches through the shared pathspec engine
+/// (wildcards and `:(literal)`), like Git. `--literal-pathspecs` still turns
+/// them literal (see the test above).
+#[test]
+fn test_log_pathspec_globs_match_via_shared_engine() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], p), "add x");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "x-commit", "--no-verify"], p),
+        "commit x",
+    );
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "*.txt"], p), "add star");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "star-commit", "--no-verify"], p),
+        "commit star",
+    );
+
+    // `*.txt` matches both the literal `*.txt` and `x.txt` (Git glob parity).
+    let glob = run_libra_command(&["log", "--oneline", "--", "*.txt"], p);
+    assert_cli_success(&glob, "glob pathspec");
+    let text = String::from_utf8_lossy(&glob.stdout);
+    assert!(
+        text.contains("x-commit") && text.contains("star-commit"),
+        "{text}"
+    );
+
+    // A narrower wildcard matches only the one commit.
+    let narrow = run_libra_command(&["log", "--oneline", "--", "x*"], p);
+    assert_cli_success(&narrow, "narrow wildcard");
+    let text = String::from_utf8_lossy(&narrow.stdout);
+    assert!(text.contains("x-commit"), "{text}");
+    assert!(!text.contains("star-commit"), "{text}");
+
+    // `:(literal)` disables the wildcard and matches the literal name.
+    let literal = run_libra_command(&["log", "--oneline", "--", ":(literal)*.txt"], p);
+    assert_cli_success(&literal, "literal magic");
+    let text = String::from_utf8_lossy(&literal.stdout);
+    assert!(text.contains("star-commit"), "{text}");
+    assert!(!text.contains("x-commit"), "{text}");
+
+    // `--stat` must render the engine-expanded paths too, not the raw prefix
+    // (FIX-AD-01 review P1-1).
+    let stat = run_libra_command(&["log", "--oneline", "--stat", "--", "*.txt"], p);
+    assert_cli_success(&stat, "log --stat glob");
+    let text = String::from_utf8_lossy(&stat.stdout);
+    assert!(text.contains("x.txt"), "the glob reaches --stat: {text}");
+    assert!(text.contains("*.txt"), "{text}");
+}
+
+#[test]
+fn log_grep_signed_commit_uses_message_only() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let tree_output = run_libra_command(&["rev-parse", "HEAD^{tree}"], p);
+    assert_cli_success(&tree_output, "resolve fixture tree");
+    let tree = String::from_utf8(tree_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let branch_output = run_libra_command(&["symbolic-ref", "HEAD"], p);
+    assert_cli_success(&branch_output, "resolve fixture branch");
+    let branch = String::from_utf8(branch_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    for (header, kind) in [
+        ("gpgsig", "PGP"),
+        ("gpgsig", "SSH"),
+        ("gpgsig-sha256", "PGP"),
+        ("gpgsig-sha256", "SSH"),
+        ("", "unsigned"),
+    ] {
+        // An opaque signature fixture is sufficient: this gate checks message
+        // selection, not cryptographic verification. The search token occurs
+        // only in the signature header, never in the actual subject/body.
+        let signature_header = if header.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{header} -----BEGIN {kind} SIGNATURE-----\n FiX OnlySignatureToken\n -----END {kind} SIGNATURE-----\n"
+            )
+        };
+        // The first blank line ends the object headers; the next newline and
+        // spaces belong to the user's message and must remain searchable.
+        let raw = format!(
+            "tree {tree}\nauthor fixture <fixture@example.invalid> 1700000000 +0000\ncommitter fixture <fixture@example.invalid> 1700000000 +0000\n{signature_header}\n\n  add beta\n\nBody Needle\n\nTicket: 42\n"
+        );
+        let object = run_libra_command_with_stdin(
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            p,
+            &raw,
+        );
+        assert_cli_success(&object, "store signature-header fixture commit");
+        let oid = String::from_utf8(object.stdout).unwrap().trim().to_string();
+        assert_eq!(oid.len(), 40);
+        assert_cli_success(
+            &run_libra_command(&["update-ref", &branch, &oid], p),
+            "point fixture branch at signed-body commit",
+        );
+
+        for mode in ["human", "json", "machine"] {
+            for (pattern, ignore_case, invert, expected) in [
+                ("OnlySignatureToken", false, false, 0),
+                ("Fix", true, false, 0),
+                ("Fix", true, true, 1),
+                ("Body Needle", false, false, 1),
+                ("body needle", true, false, 1),
+                ("Body Needle", false, true, 0),
+                ("\n  add beta", false, false, 1),
+            ] {
+                let mut args = match mode {
+                    "human" => vec!["log", "--oneline"],
+                    "json" => vec!["--json", "log"],
+                    "machine" => vec!["--machine", "log"],
+                    _ => unreachable!(),
+                };
+                args.extend(["--grep", pattern]);
+                if ignore_case {
+                    args.push("-i");
+                }
+                if invert {
+                    args.push("--invert-grep");
+                }
+                let output = run_libra_command(&args, p);
+                assert_cli_success(&output, "log signed fixture selection");
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    !text.contains("OnlySignatureToken"),
+                    "signature must not be presented as message text"
+                );
+                if mode == "human" {
+                    assert_eq!(
+                        text.lines().count(),
+                        expected,
+                        "{header}/{kind} {args:?}: {text}"
+                    );
+                    assert_eq!(text.contains("add beta"), expected == 1);
+                } else {
+                    let output = parse_json_stdout(&output);
+                    let commits = output["data"]["commits"].as_array().unwrap();
+                    assert_eq!(commits.len(), expected, "{header}/{kind} {args:?}");
+                    assert_eq!(output["data"]["total"], expected);
+                    if expected == 1 {
+                        assert_eq!(commits[0]["hash"], oid);
+                        assert_eq!(commits[0]["subject"], "add beta");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn two_commit_shallow_repo(delete_parent: bool) -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("second.txt"), "second\n").expect("write second");
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add second",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "second commit",
+    );
+    let log = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    assert_cli_success(&log, "log hashes");
+    let hashes: Vec<String> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    assert!(hashes.len() >= 2, "expected two commits: {hashes:?}");
+    let child = hashes[0].clone();
+    let parent = hashes[1].clone();
+    if delete_parent {
+        fs::remove_file(loose_object_path(repo.path(), &parent)).expect("delete parent");
+    }
+    fs::write(
+        repo.path().join(".libra").join("shallow"),
+        format!("{child}\n"),
+    )
+    .expect("write shallow");
+    (repo, child, parent)
+}
+
+/// M-WALK W1/W3: log stops at the shallow boundary and does not error.
+#[test]
+fn test_log_stops_at_shallow_boundary_matrix() {
+    let (repo, child, parent) = two_commit_shallow_repo(true);
+    let oneline = run_libra_command(&["log", "--oneline"], repo.path());
+    assert_cli_success(&oneline, "log --oneline on shallow");
+    let text = String::from_utf8_lossy(&oneline.stdout);
+    assert!(
+        text.contains(&child[..7]),
+        "oneline must show the boundary commit: {text}"
+    );
+    assert!(
+        !text.contains(&parent[..7]),
+        "oneline must not walk past shallow: {text}"
+    );
+
+    let one = run_libra_command(&["log", "--format=%s", "-1", "HEAD"], repo.path());
+    assert_cli_success(&one, "log -1 HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&one.stdout).trim(),
+        "second",
+        "W1 subject"
+    );
+
+    let graph = run_libra_command(&["log", "--graph", "--oneline"], repo.path());
+    assert_cli_success(&graph, "log --graph on shallow");
+
+    let path = run_libra_command(&["log", "--oneline", "--", "second.txt"], repo.path());
+    assert_cli_success(&path, "log -- path on shallow");
+
+    let (range_repo, range_child, range_parent) = two_commit_shallow_repo(false);
+    let range = run_libra_command(
+        &[
+            "log",
+            "--oneline",
+            &format!("{range_parent}..{range_child}"),
+        ],
+        range_repo.path(),
+    );
+    assert_cli_success(&range, "log A..B crossing shallow");
+    let range_text = String::from_utf8_lossy(&range.stdout);
+    assert!(
+        range_text.contains(&range_child[..7]),
+        "range must include the boundary: {range_text}"
+    );
+    assert!(
+        !range_text.contains(&range_parent[..7]),
+        "range must stop at the boundary: {range_text}"
+    );
+}
+
+/// M-WALK W4: deleting `.libra/shallow` exposes the missing parent.
+#[test]
+fn test_log_missing_parent_without_shallow_fails() {
+    let (repo, _child, _parent) = two_commit_shallow_repo(true);
+    fs::remove_file(repo.path().join(".libra").join("shallow")).expect("remove shallow");
+    let output = run_libra_command(&["log", "--oneline"], repo.path());
+    assert!(
+        !output.status.success(),
+        "log must fail when the parent is missing and shallow is gone"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("LBR-REPO-002") || combined.contains("storage broken"),
+        "must report missing history: {combined}"
+    );
+    assert!(
+        combined.contains("fsck"),
+        "must hint to run fsck: {combined}"
+    );
+}
+
+/// M-WALK W5: a complete repository is unchanged.
+#[test]
+fn test_log_complete_repo_still_walks_parents() {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("second.txt"), "second\n").expect("write second");
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add second",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "second commit",
+    );
+    let output = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    assert_cli_success(&output, "log on complete repo");
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(count, 2, "complete history must still list both commits");
 }

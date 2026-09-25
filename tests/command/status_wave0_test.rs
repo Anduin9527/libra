@@ -848,6 +848,10 @@ fn json_warnings_schema_snapshot() {
             libra::command::status::StatusWarningCode::RepositoryPreflight,
             "repository_preflight",
         ),
+        (
+            libra::command::status::StatusWarningCode::UpstreamCountsUnavailable,
+            "upstream_counts_unavailable",
+        ),
     ] {
         assert_eq!(serde_json::to_value(code).expect("serialize code"), name);
     }
@@ -855,7 +859,7 @@ fn json_warnings_schema_snapshot() {
     // without a pinned wire name here would be free to change spelling.
     assert_eq!(
         libra::command::status::StatusWarningCode::ALL.len(),
-        15,
+        16,
         "a warning code was added or removed; pin its wire name in this snapshot"
     );
 
@@ -892,6 +896,7 @@ fn json_warnings_schema_snapshot() {
         ("dirty_cache_concurrent_invalidate", 12),
         ("dirty_cache_path_unencodable", 13),
         ("repository_preflight", 14),
+        ("upstream_counts_unavailable", 15),
     ] {
         assert!(
             discriminants
@@ -4170,7 +4175,7 @@ fn check_dirty_ioblocked_does_not_mutate_cache() {
 /// in `io_blocked[]`, and the cache row is not rewritten, metadata
 /// included (proven by a full-row DB snapshot, not just the visible list).
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 #[cfg(unix)]
 fn check_dirty_modified_row_content_hash_failure_is_blocked_and_kept() {
     use std::os::unix::fs::PermissionsExt;

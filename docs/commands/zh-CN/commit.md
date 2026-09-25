@@ -23,6 +23,25 @@ libra commit --amend [--no-edit]
 
 在计算暂存变更或写入 tree/commit 对象之前，`commit` 会校验 stage-0 index 条目是否指向缺失或类型不匹配的 blob/tree 对象。损坏的 index 条目会 fail-closed，返回 `LBR-REPO-002`，并保持 `HEAD` 不变。
 
+索引仍有未解决冲突（stage 1/2/3 且没有 stage-0 解决结果）时，真实提交会返回
+`LBR-CONFLICT-001`，`--amend`、`--allow-empty` 和 `--no-verify` 均不能绕过。
+冲突的 `merge --squash` 虽不保留 merge 生命周期状态，也受此保护。先解决报错中
+点名的文件，再用 `libra add <path>` 暂存解决结果。
+拒绝发生在 hook 和 tree/commit 写入前，保持 `HEAD`、index 和工作树不变。
+与 Git 一致，`-a` 先将冲突普通文件和符号链接的当前内容或删除暂存，再检查最终
+索引；它不检查内容是否仍含冲突标记。未解决的 gitlink 必须显式暂存解决结果
+（例如 `libra update-index --cacheinfo 160000,<commit>,<path>`）：Libra 不物化
+子模块，因此 `-a` 不会把缺失的子模块目录推断为删除。dry-run 和 porcelain
+预览始终保持 live index、`HEAD` 与工作树，包括用 `-a` 预览解决结果时。
+成功且非 `--dry-run` 的提交在更新 HEAD 后，会清除已停止的单提交 cherry-pick 或 revert 状态（或停在最后一项的序列）。多提交序列会保留剩余待办，并标记停止项已在序列外结束。`--dry-run` 与 `--porcelain` 不改该状态。
+
+merge 进行中时，`commit` 会结束该 merge：新提交的父提交为 HEAD 加上 merge 状态记录的对方提交，消息默认取已保存的合并消息（编辑器模式剥离 `# Conflicts:` 注释，`--no-edit` 保留，`-m`/`-F` 覆盖），然后清除 merge 状态并应用持有的 autostash。merge 进行中拒绝 `--amend`（退出 128）。`--dry-run` 不写入、保留 merge 状态，并输出预演说明而不打印伪提交 hash。`merge --squash` 之后的 `commit` 为单父提交，预填 `SQUASH_MSG`，提交后删除该文件。部分提交 `commit <path>` / `commit -o <path>` 仍为用法错误（退出 129；Git 为 128，有意差异）。
+
+删除冲突文件后，仅当所有 tracked 变更都应进入本次提交时才用 `commit -a` 暂存。
+父目录被普通文件或符号链接替换时，其已跟踪子路径视为删除；`-a` 不会通过该
+符号链接读取外部内容。冲突文件被含有 `.git` 或 `.libra` 元数据的目录替换时，
+同样需要显式暂存 gitlink 解决结果，不会自动暂存为删除。
+
 作者身份来自 `--author`，其次是 `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`，再回退到配置的 `user.name`/`user.email`；提交者身份来自 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`，再回退到配置。除非设置了 `user.useConfigOnly=true`，Git 环境变量优先于配置。既有 `LIBRA_COMMITTER_NAME`/`LIBRA_COMMITTER_EMAIL` 仍作为更低优先级后备，兼容旧自动化。
 
 ## 选项
@@ -43,9 +62,13 @@ libra commit -m "Add new feature"
 libra commit -F message.txt
 ```
 
+### `--allow-empty-message`
+
+允许清理后为空的提交消息，同时绕过未编辑模板中止。不隐含 `--allow-empty`。`commit-msg` hook 仍可拒绝空文件。
+
 ### `-t, --template <FILE>`
 
-以 `FILE` 内容作为初始提交消息：打开编辑器时（无其它消息源的默认情形）用作编辑器初始缓冲，`--no-edit` 时直接用作消息。`-t` 未给时回落到 `commit.template` 配置（文件路径，前导 `~/` 展开为 `$HOME`）。当提供消息源（`-m`/`-F`/`-C`/`-c`/`--fixup`/`--squash`）时模板被忽略——该源胜出，模板文件甚至不会被读取。与 Git 一致：若编辑器未改动模板，则中止提交（"you did not edit the message"）；`--no-edit` 不触发该检查。
+以 `FILE` 内容作为初始提交消息：打开编辑器时（无其它消息源的默认情形）用作编辑器初始缓冲，`--no-edit` 时直接用作消息。`-t` 未给时回落到 `commit.template` 配置（文件路径，前导 `~/` 展开为 `$HOME`）。当提供消息源（`-m`/`-F`/`-C`/`-c`/`--fixup`/`--squash`）时模板被忽略——该源胜出，模板文件甚至不会被读取。与 Git 一致：若编辑器未改动模板，则中止提交（"you did not edit the message"）；清理后为空（`strip`/`default` 下的纯注释模板）则报 `aborting commit due to empty commit message`。`--no-edit` 不触发未编辑检查。
 
 ```bash
 libra commit -t .libra/commit-template.txt
@@ -82,7 +105,7 @@ libra commit -m "fix(auth): handle expired tokens" --conventional
 
 ### `-a, --all`
 
-提交前自动暂存已修改或已删除的已跟踪文件。等价于在 `libra commit` 前运行 `libra add -u`。不会添加新的未跟踪文件。
+提交前自动暂存已修改或已删除的已跟踪文件。等价于在 `libra commit` 前运行 `libra add -u`。不会添加新的未跟踪文件。文件 mode 遵循 `core.filemode`：为 `true`（Unix 默认）时，仅 mode 变化也会被提交；为 `false` 时忽略该变化（非法值会使提交 fail-closed）。
 
 ```bash
 libra commit -a -m "Fix typo"
@@ -410,9 +433,12 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 | 场景 | 错误码 | 退出码 | 提示 |
 |----------|-----------|------|------|
 | 索引损坏 | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
+| 索引存在未解决冲突 | `LBR-CONFLICT-001` | 128 | 用 `libra add` 暂存文件；删除冲突仅在所有 tracked 变更都应提交时用 `commit -a` |
 | index 对象缺失或类型不匹配 | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | 无法保存索引 | `LBR-IO-002` | 128 | -- |
 | 无内容可提交（干净） | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
+| 未跟踪文件未加入提交 | `LBR-REPO-003` | 128 | "use 'libra add' to track files" |
+| 已跟踪改动未暂存 | `LBR-REPO-003` | 128 | "use 'libra add' and/or 'libra commit -a'" |
 | 无内容可提交（无已跟踪文件） | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |
 | 缺少 author 身份 | `LBR-AUTH-001` | 128 | "run 'libra config user.name ...' and 'libra config user.email ...'" |
 | 没有可 amend 的提交 | `LBR-REPO-003` | 128 | "create a commit before using --amend" |
@@ -422,7 +448,7 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 | 无法读取消息文件 | `LBR-IO-001` | 128 | -- |
 | 空提交消息 | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree 创建失败 | `LBR-INTERNAL-001` | 128 | Issues URL |
-| 对象存储失败 | `LBR-IO-002` | 128 | -- |
+| 对象存储失败 | `LBR-IO-002` | 128 | 若原因为云索引 repair marker 注册失败，采用规范文案：负载已安全写入、未暂存任何路径，直接重试复用负载、无需锁文件清理；锁超时另附持有者说明，锁文件永不删除 |
 | 父提交缺失 | `LBR-REPO-002` | 128 | "the parent commit is missing or corrupted" |
 | HEAD 更新失败 | `LBR-IO-002` | 128 | -- |
 | Blocking 仓库 hook 失败 | `LBR-REPO-003` | 128 | "use --no-verify to bypass repository hooks" |
@@ -442,3 +468,12 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 - 支持 `--fixup` 和 `--squash`（autosquash 提交重组）
 - Vault signing 替代外部 keyring；`commit.gpgSign` 已生效，`user.signingkey` 仍由 vault 管理
 - 支持 `--cleanup=<mode>` 消息清理（`strip`/`whitespace`/`verbatim`/`scissors`/`default`），未给时回退到 `commit.cleanup` 配置；`commit.verbose` 配置可使 `-v` 成为默认
+- Change identity 仅写入 sidecar 投影（`change_identity`/`change_revision`）；Libra 不向 Git commit 写入 `change-id` header。已有 header 只用于导入兼容。
+- 其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-p`/`--patch`/`--interactive`，D15）。请先 `libra add <pathspec>` 再提交。
+
+## Issue #477 notes
+
+结束进行中的 merge 并生成双亲提交
+无可提交内容时按工作树状态分三种提示
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`
+允许提交消息为空

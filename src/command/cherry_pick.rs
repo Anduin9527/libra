@@ -37,6 +37,7 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
+        change::{RelationKind, record_current_repo_commit_revision_for_active_operation},
         config::ConfigKv,
         head::Head,
         reflog::{ReflogAction, ReflogContext, with_reflog},
@@ -61,6 +62,7 @@ type ConflictEntry = (
     Option<ObjectHash>,
     Option<ObjectHash>,
     Option<ObjectHash>,
+    merge::BuiltinMergeDriver,
 );
 
 const CHERRY_PICK_EXAMPLES: &str = "\
@@ -79,6 +81,17 @@ EXAMPLES:
     libra cherry-pick --json abc1234       Structured JSON output for agents";
 
 // ── Typed error ──────────────────────────────────────────────────────
+
+/// Where an untracked-overwrite refusal stopped a pick (ADR-HF-04 U8-U14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UntrackedStop {
+    /// No commit of this invocation was applied yet: nothing was written.
+    BeforeAnyWrite,
+    /// A commit-per-pick sequence stopped before this commit and saved its state.
+    SequenceStopped,
+    /// A `--no-commit` pick stopped after earlier commits were already staged.
+    NoCommitPartial,
+}
 
 #[derive(Debug, thiserror::Error)]
 enum CherryPickError {
@@ -124,6 +137,45 @@ enum CherryPickError {
     #[error("failed to cherry-pick {commit}: {reason}")]
     Conflict { commit: String, reason: String },
 
+    /// ADR-HF-04: a new pick refuses to start while the index still has
+    /// unmerged entries, before any index, worktree, ref or sequence write.
+    #[error("cherry-pick is not possible because the index has unmerged entries")]
+    UnmergedIndex(Vec<String>),
+
+    /// A `--no-commit` pick stopped on conflicts. No resumable sequence is
+    /// written, so the guidance points at `libra add`, not `--continue`.
+    #[error(
+        "failed to cherry-pick {commit}: conflicts in {paths} path(s); a '--no-commit' pick leaves no sequence to continue"
+    )]
+    NoCommitConflict { commit: String, paths: usize },
+
+    /// ADR-HF-04 (U8-U10): a pick would overwrite an untracked working tree
+    /// file. Refused before any index, worktree, ref or sequence write.
+    #[error(
+        "failed to cherry-pick {commit}: untracked working tree file would be overwritten: {path}"
+    )]
+    UntrackedOverwrite {
+        commit: String,
+        path: String,
+        stop: UntrackedStop,
+    },
+
+    /// #477 HF-31: an interrupted `--skip`/`--abort` left its phase marker;
+    /// the same verb must finish before the sequence can continue.
+    #[error("an interrupted 'libra cherry-pick --{0}' has not finished")]
+    ControlPending(ControlPhase),
+
+    /// #477 HF-02 / M-CONT C4: `--continue` after an external conclusion
+    /// refuses when the index already has staged changes the next pick would
+    /// overwrite.
+    #[error("your local changes would be overwritten by cherry-pick")]
+    LocalChangesWouldBeOverwritten,
+
+    /// #477 HF-01: the row claims an externally concluded stop but has no
+    /// remaining commits, which no writer produces.
+    #[error("cherry-pick state is inconsistent: {0}")]
+    CorruptState(String),
+
     #[error("a cherry-pick is already in progress")]
     InProgress,
 
@@ -144,13 +196,16 @@ enum CherryPickError {
     /// The repository configures an unsupported `merge.conflictStyle` value —
     /// a hard error before any conflicted index/worktree state is written,
     /// consistent with `libra merge`.
-    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge' or 'diff3')")]
+    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge', 'diff3', or 'zdiff3')")]
     InvalidConflictStyle(String),
 
     /// The `merge.conflictStyle` config could not be read (config-store I/O
     /// failure) — never a silent default-style fall-back.
     #[error("failed to read merge.conflictStyle config: {0}")]
     ConflictStyleRead(String),
+
+    #[error("failed to read merge.default config: {0}")]
+    MergeDriverConfigRead(String),
 }
 
 impl CherryPickError {
@@ -168,13 +223,20 @@ impl CherryPickError {
             Self::RedundantCommit(_) => StableErrorCode::CliInvalidArguments,
             Self::EmptyMessage(_) => StableErrorCode::CliInvalidArguments,
             Self::Conflict { .. } => StableErrorCode::ConflictUnresolved,
+            Self::UnmergedIndex(_)
+            | Self::NoCommitConflict { .. }
+            | Self::UntrackedOverwrite { .. }
+            | Self::LocalChangesWouldBeOverwritten => StableErrorCode::ConflictUnresolved,
             Self::InProgress => StableErrorCode::ConflictOperationBlocked,
             Self::NoCherryPickInProgress => StableErrorCode::RepoStateInvalid,
+            Self::CorruptState(_) => StableErrorCode::RepoCorrupt,
+            Self::ControlPending(_) => StableErrorCode::RepoStateInvalid,
             Self::WrongBranch { .. } => StableErrorCode::RepoStateInvalid,
             Self::LoadObject(_) => StableErrorCode::IoReadFailed,
             Self::SaveFailed(_) => StableErrorCode::IoWriteFailed,
             Self::InvalidConflictStyle(_) => StableErrorCode::RepoStateInvalid,
             Self::ConflictStyleRead(_) => StableErrorCode::IoReadFailed,
+            Self::MergeDriverConfigRead(_) => StableErrorCode::IoReadFailed,
         }
     }
 }
@@ -229,6 +291,29 @@ impl From<CherryPickError> for CliError {
                     "resolve conflicts and 'libra add' them, then 'libra cherry-pick --continue' \
                      (or --skip / --abort / --quit)",
                 ),
+            CherryPickError::UnmergedIndex(paths) => unmerged_index_cli_error(message, &paths),
+            CherryPickError::NoCommitConflict { .. } => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint(
+                    "resolve the conflicts and 'libra add' (or 'libra rm') the paths, then 'libra commit'",
+                )
+                .with_hint("or discard the staged pick with 'libra reset --hard'"),
+            CherryPickError::UntrackedOverwrite { path, stop, .. } => {
+                let hint = match stop {
+                    UntrackedStop::BeforeAnyWrite => format!(
+                        "move or remove '{path}', then run the same command again; nothing was written"
+                    ),
+                    UntrackedStop::SequenceStopped => format!(
+                        "the sequence stopped before this commit and nothing of it was written; move or remove '{path}', then run 'libra cherry-pick --continue' (or --skip / --abort)"
+                    ),
+                    UntrackedStop::NoCommitPartial => format!(
+                        "earlier picks of this '--no-commit' run stay staged; move or remove '{path}', then pick the remaining commits again, or discard everything with 'libra reset --hard'"
+                    ),
+                };
+                CliError::failure(message)
+                    .with_stable_code(stable_code)
+                    .with_hint(hint)
+            }
             CherryPickError::InProgress => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint(
@@ -237,6 +322,18 @@ impl From<CherryPickError> for CliError {
             CherryPickError::NoCherryPickInProgress => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint("there is no cherry-pick to --continue/--skip/--abort/--quit"),
+            CherryPickError::CorruptState(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("cancel the sequence with 'libra cherry-pick --abort'")
+                .with_hint("or forget it with 'libra cherry-pick --quit'"),
+            CherryPickError::LocalChangesWouldBeOverwritten => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint("commit or stash the staged changes before continuing")
+                .with_hint("or skip the stopped commit with 'libra cherry-pick --skip'"),
+            CherryPickError::ControlPending(phase) => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint(format!("run 'libra cherry-pick --{phase}' again to finish it"))
+                .with_hint("or forget the sequence with 'libra cherry-pick --quit'"),
             CherryPickError::WrongBranch { expected, .. } => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint(format!("switch back to '{expected}' before continuing")),
@@ -248,12 +345,61 @@ impl From<CherryPickError> for CliError {
                 .with_hint("check filesystem permissions and repository writability"),
             CherryPickError::InvalidConflictStyle(_) => CliError::failure(message)
                 .with_stable_code(stable_code)
-                .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+                .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
             CherryPickError::ConflictStyleRead(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("check repository integrity and retry"),
+            CherryPickError::MergeDriverConfigRead(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("check repository config readability and retry"),
         }
     }
+}
+
+/// Most conflicted paths named in the unmerged-index refusal hint (ADR-HF-04).
+const UNMERGED_HINT_LIMIT: usize = 10;
+
+/// Paths that still carry unmerged (stage 1-3) index entries, sorted by path.
+/// A missing index file is a clean index.
+pub(crate) fn unmerged_index_paths() -> Result<Vec<String>, String> {
+    let index_file = path::index();
+    if !index_file.exists() {
+        return Ok(Vec::new());
+    }
+    let index = Index::load(&index_file).map_err(|e| e.to_string())?;
+    Ok(crate::command::unmerged::collect(&index)
+        .into_iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect())
+}
+
+/// `unmerged paths: a, b (and N more)`, naming at most [`UNMERGED_HINT_LIMIT`] paths.
+fn unmerged_paths_hint(paths: &[String]) -> String {
+    let mut listed = paths
+        .iter()
+        .take(UNMERGED_HINT_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > UNMERGED_HINT_LIMIT {
+        listed.push_str(&format!(
+            " (and {} more)",
+            paths.len() - UNMERGED_HINT_LIMIT
+        ));
+    }
+    format!("unmerged paths: {listed}")
+}
+
+/// The refusal a new cherry-pick or revert returns on an unmerged index
+/// (ADR-HF-04): exit 128 with `LBR-CONFLICT-001`, the conflicted paths, and how
+/// to resolve or discard them.
+pub(crate) fn unmerged_index_cli_error(message: String, paths: &[String]) -> CliError {
+    CliError::fatal(message)
+        .with_stable_code(StableErrorCode::ConflictUnresolved)
+        .with_hint(unmerged_paths_hint(paths))
+        .with_hint(
+            "resolve each path and 'libra add' (or 'libra rm') it, or discard the conflict with 'libra reset --hard'",
+        )
 }
 
 #[derive(Debug)]
@@ -267,7 +413,9 @@ enum CherryPickSingleError {
     /// (stages 1/2/3) and worktree (conflict markers). The caller persists the
     /// sequencer state (commit-per-pick mode) before exiting.
     Conflicted(Vec<String>),
-    Conflict(String),
+    /// A pick would overwrite an untracked working tree file; raised before the
+    /// index or worktree is written (ADR-HF-04 U8-U10).
+    UntrackedOverwrite(String),
     LoadObject(String),
     SaveFailed(String),
     /// Unsupported `merge.conflictStyle` value — raised BEFORE the conflicted
@@ -275,6 +423,7 @@ enum CherryPickSingleError {
     InvalidConflictStyle(String),
     /// `merge.conflictStyle` config-store read failure.
     ConflictStyleRead(String),
+    MergeDriverConfigRead(String),
     /// The pick's three-way inputs carry a gitlink the cherry-pick would have to
     /// arbitrate — refused before any index/worktree write (ADR-MG-01).
     GitlinkUnsupported(String),
@@ -293,6 +442,31 @@ struct CherryPickOpts {
     /// on every resume, absent (= false) in rows from older binaries.
     #[serde(default)]
     stopped_on_conflict: bool,
+    /// #477 HF-31: set while an interrupted `--skip`/`--abort` still has to
+    /// finish; every position write clears it. Absent in older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_phase: Option<ControlPhase>,
+    /// #477 HF-31: `--ff` is a sequence option, so resumed picks fast-forward
+    /// the way the starting run would have. Absent (= false) in older rows.
+    #[serde(default)]
+    ff: bool,
+    /// #477 HF-31: the commit a fast-forward pick is about to move HEAD to,
+    /// written just before its `reset --hard`. `--continue` skips the stopped
+    /// commit only when this names it and HEAD already points at it; every
+    /// position write clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ff_landing: Option<String>,
+    /// #477 HF-31: identifies the run that claimed a multi-commit sequence, so
+    /// releasing that claim after an early refusal cannot erase a row another
+    /// start claimed since. Absent in older rows and single-commit picks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_token: Option<String>,
+    /// #477 HF-01: the stopped commit was concluded from outside the sequence
+    /// (a later `reset`, and from HF-29 a later `commit`). Additive, so a row
+    /// written here still loads on binaries that predate the field (ER-HF-02),
+    /// which keep seeing an ordinary stopped sequence.
+    #[serde(default)]
+    stop_concluded: bool,
     #[serde(default)]
     append_source: bool,
     #[serde(default)]
@@ -307,10 +481,10 @@ struct CherryPickOpts {
     keep_redundant_commits: bool,
     #[serde(default)]
     gpg_sign: bool,
-    /// `--rerere-autoupdate`: stage a rerere-replayed resolution. Persisted so a
-    /// later pick in a resumed sequence keeps auto-staging replayed conflicts.
-    #[serde(default)]
-    rerere_autoupdate: bool,
+    /// Explicit rerere staging policy. `None` inherits `rerere.autoUpdate`;
+    /// either value must survive a conflict + resumed sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rerere_autoupdate: Option<bool>,
     /// Mainline parent for merge-commit picks; applies to every commit in the
     /// `-m <n>` invocation, so it must survive a conflict + resume.
     #[serde(default)]
@@ -333,6 +507,11 @@ impl CherryPickOpts {
     fn from_args(args: &CherryPickArgs) -> Self {
         Self {
             stopped_on_conflict: false,
+            control_phase: None,
+            ff: args.ff,
+            ff_landing: None,
+            claim_token: None,
+            stop_concluded: false,
             append_source: args.append_source,
             signoff: args.signoff,
             edit: args.edit,
@@ -340,7 +519,7 @@ impl CherryPickOpts {
             allow_empty_message: args.allow_empty_message,
             keep_redundant_commits: args.keep_redundant_commits,
             gpg_sign: args.gpg_sign,
-            rerere_autoupdate: args.rerere_autoupdate,
+            rerere_autoupdate: rerere_autoupdate_override(args),
             mainline: args.mainline,
             cleanup: args.cleanup.clone(),
             empty: args.empty.clone(),
@@ -355,6 +534,7 @@ impl CherryPickOpts {
     /// applying later merge commits along the chosen parent.
     fn into_args(self) -> CherryPickArgs {
         CherryPickArgs {
+            ff: self.ff,
             append_source: self.append_source,
             signoff: self.signoff,
             edit: self.edit,
@@ -362,13 +542,44 @@ impl CherryPickOpts {
             allow_empty_message: self.allow_empty_message,
             keep_redundant_commits: self.keep_redundant_commits,
             gpg_sign: self.gpg_sign,
-            rerere_autoupdate: self.rerere_autoupdate,
+            rerere_autoupdate: self.rerere_autoupdate == Some(true),
+            no_rerere_autoupdate: self.rerere_autoupdate == Some(false),
             mainline: self.mainline,
             cleanup: self.cleanup,
             empty: self.empty,
             strategy_option: self.strategy_option.into_iter().collect(),
             ..Default::default()
         }
+    }
+}
+
+/// A `--skip`/`--abort` that recorded its intent before resetting (#477 HF-31).
+/// An interruption after the reset leaves the marker, so the same verb can be
+/// re-run to finish, and `--continue` refuses instead of committing the reset
+/// index as the stopped commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ControlPhase {
+    Skip,
+    Abort,
+}
+
+impl std::fmt::Display for ControlPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ControlPhase::Skip => "skip",
+            ControlPhase::Abort => "abort",
+        })
+    }
+}
+
+const fn rerere_autoupdate_override(args: &CherryPickArgs) -> Option<bool> {
+    if args.rerere_autoupdate {
+        Some(true)
+    } else if args.no_rerere_autoupdate {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -599,17 +810,13 @@ pub struct CherryPickArgs {
     // ── Unsupported Git options captured for explicit rejection ──
     #[clap(long = "strategy", value_name = "name", hide = true)]
     pub strategy: Option<String>,
-    #[clap(
-        long = "rerere-autoupdate",
-        overrides_with = "no_rerere_autoupdate",
-        hide = true
-    )]
+    /// Auto-stage a rerere-replayed resolution for this pick, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "rerere-autoupdate", overrides_with = "no_rerere_autoupdate")]
     pub rerere_autoupdate: bool,
-    #[clap(
-        long = "no-rerere-autoupdate",
-        overrides_with = "rerere_autoupdate",
-        hide = true
-    )]
+    /// Do not auto-stage a rerere-replayed resolution for this pick, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "no-rerere-autoupdate", overrides_with = "rerere_autoupdate")]
     pub no_rerere_autoupdate: bool,
     #[clap(long = "commit", hide = true)]
     pub commit: bool,
@@ -672,9 +879,10 @@ fn map_single_error(err: CherryPickSingleError, commit_label: &str) -> CherryPic
         CherryPickSingleError::EmptyCommit(c) => CherryPickError::EmptyCommit(c),
         CherryPickSingleError::RedundantCommit(c) => CherryPickError::RedundantCommit(c),
         CherryPickSingleError::EmptyMessage(c) => CherryPickError::EmptyMessage(c),
-        CherryPickSingleError::Conflict(reason) => CherryPickError::Conflict {
+        CherryPickSingleError::UntrackedOverwrite(path) => CherryPickError::UntrackedOverwrite {
             commit: commit_label.to_string(),
-            reason,
+            path,
+            stop: UntrackedStop::BeforeAnyWrite,
         },
         CherryPickSingleError::Conflicted(paths) => CherryPickError::Conflict {
             commit: commit_label.to_string(),
@@ -684,6 +892,9 @@ fn map_single_error(err: CherryPickSingleError, commit_label: &str) -> CherryPic
         CherryPickSingleError::SaveFailed(r) => CherryPickError::SaveFailed(r),
         CherryPickSingleError::InvalidConflictStyle(v) => CherryPickError::InvalidConflictStyle(v),
         CherryPickSingleError::ConflictStyleRead(r) => CherryPickError::ConflictStyleRead(r),
+        CherryPickSingleError::MergeDriverConfigRead(r) => {
+            CherryPickError::MergeDriverConfigRead(r)
+        }
         CherryPickSingleError::GitlinkUnsupported(detail) => {
             CherryPickError::GitlinkUnsupported(detail)
         }
@@ -731,6 +942,18 @@ async fn load_state_or_err() -> Result<CherryPickState, CherryPickError> {
         .ok_or(CherryPickError::NoCherryPickInProgress)
 }
 
+/// Fail closed on a row whose external-conclusion marker contradicts its todo
+/// (#477 HF-01): no writer marks a sequence that has nothing left to pick, so
+/// the row is corrupt. `--abort`/`--quit` stay available to clean it up.
+fn reject_inconsistent_conclusion(state: &CherryPickState) -> Result<(), CherryPickError> {
+    if state.stop_concluded && state.todo.is_empty() {
+        return Err(CherryPickError::CorruptState(
+            "the stopped commit is marked concluded but no commits remain".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reject continuing on a different branch than the one the sequence began on.
 async fn ensure_on_state_branch(state: &CherryPickState) -> Result<(), CherryPickError> {
     let current = current_branch_name().await?;
@@ -753,7 +976,7 @@ fn silent_child_output(output: &OutputConfig) -> OutputConfig {
 /// the stdout/JSON envelope.
 async fn reset_hard(target: &str, output: &OutputConfig) -> Result<(), CherryPickError> {
     let child = silent_child_output(output);
-    crate::command::reset::execute_safe(
+    crate::command::reset::execute_safe_internal(
         crate::command::reset::ResetArgs {
             target: Some(target.to_string()),
             soft: false,
@@ -766,6 +989,9 @@ async fn reset_hard(target: &str, output: &OutputConfig) -> Result<(), CherryPic
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &child,
     )
@@ -829,6 +1055,15 @@ async fn run_cherry_pick(
         return Err(CherryPickError::InProgress);
     }
 
+    // ADR-HF-04: refuse before resolving targets or writing anything while the
+    // index still has unmerged entries (Git: "Cherry-picking is not possible
+    // because you have unmerged files."). Sequencer controls returned above.
+    let unmerged = unmerged_index_paths()
+        .map_err(|e| CherryPickError::LoadObject(format!("failed to load index: {e}")))?;
+    if !unmerged.is_empty() {
+        return Err(CherryPickError::UnmergedIndex(unmerged));
+    }
+
     let mut commit_ids = Vec::new();
     for commit_ref in &args.commits {
         let id = resolve_commit(commit_ref)
@@ -848,21 +1083,63 @@ async fn run_cherry_pick(
     preflight_pick_gitlinks(&commit_ids, &args).await?;
 
     let mut acc = PickAccumulator::default();
+    // #477 HF-31 X1/X7: a commit-per-pick run of several commits claims its
+    // sequence row before the first pick writes anything (Git creates its
+    // sequencer directory before the first pick, too) and moves the row with
+    // every landing, so an interruption between two picks still leaves
+    // `--continue`/`--skip`/`--abort` a sequence to act on.
+    let sequence_anchor = match head_orig {
+        Some(orig) if commit_ids.len() > 1 && !args.no_commit => Some(orig),
+        _ => None,
+    };
+    let (opts_json, claim_needle) = if sequence_anchor.is_some() {
+        opts_json_with_claim_token(&opts_json)
+    } else {
+        (opts_json, None)
+    };
+    if let Some(orig) = sequence_anchor {
+        claim_sequence_start(&CherryPickState {
+            head_name: head_name.clone(),
+            head_orig: orig,
+            current_oid: commit_ids[0],
+            stop_concluded: false,
+            todo: commit_ids[1..].iter().copied().collect(),
+            opts_json: opts_json_with_conflict_flag(&opts_json, false),
+        })
+        .await?;
+    }
+    let row_exists = sequence_anchor.is_some();
     for (i, commit_id) in commit_ids.iter().enumerate() {
-        match cherry_pick_single_commit(commit_id, &args, output).await {
-            Ok(outcome) => record_outcome(outcome, commit_id, &mut acc),
-            Err(CherryPickSingleError::Conflicted(paths)) => {
+        let advance = match sequence_anchor {
+            Some(orig) => {
+                let rest: VecDeque<ObjectHash> = commit_ids[i + 1..].iter().copied().collect();
+                SequenceAdvance::after(&head_name, orig, commit_id, &rest, &opts_json)
+            }
+            None => SequenceAdvance::NoRow,
+        };
+        match cherry_pick_single_commit(commit_id, &args, output, &advance).await {
+            Ok(outcome) => {
+                if matches!(outcome, PickOutcome::Dropped(_)) {
+                    // HF-31 X6: a dropped pick moves no HEAD, so no transaction
+                    // carried the advance; apply it here.
+                    advance
+                        .apply_without_head_move()
+                        .await
+                        .map_err(CherryPickError::SaveFailed)?;
+                    after_drop_failpoint()?;
+                }
+                record_outcome(outcome, commit_id, &mut acc)
+            }
+            Err(CherryPickSingleError::UntrackedOverwrite(path)) if i > 0 => {
+                // Earlier picks already landed (ADR-HF-04 U14). A commit-per-pick
+                // run stops at this commit with its state saved, so `--continue`
+                // re-attempts it once the file is moved.
                 let label = args.commits[i].clone();
                 if args.no_commit {
-                    // `--no-commit` sequences have no per-step snapshot, so a
-                    // conflict is terminal: no resumable state is written.
-                    return Err(CherryPickError::Conflict {
+                    return Err(CherryPickError::UntrackedOverwrite {
                         commit: label,
-                        reason: format!(
-                            "conflicts in {} path(s); '--no-commit' multi-commit picks cannot be \
-                             continued — clean up with 'libra reset --hard'/'libra restore'",
-                            paths.len()
-                        ),
+                        path,
+                        stop: UntrackedStop::NoCommitPartial,
                     });
                 }
                 let head_orig = head_orig.ok_or_else(|| {
@@ -872,25 +1149,74 @@ async fn run_cherry_pick(
                     head_name: head_name.clone(),
                     head_orig,
                     current_oid: *commit_id,
+                    stop_concluded: false,
+                    todo: commit_ids[i + 1..].iter().copied().collect(),
+                    opts_json: opts_json_with_conflict_flag(&opts_json, false),
+                };
+                let persisted = if row_exists {
+                    state.save().await
+                } else {
+                    state.claim_start().await
+                };
+                persisted.map_err(CherryPickError::SaveFailed)?;
+                return Err(CherryPickError::UntrackedOverwrite {
+                    commit: label,
+                    path,
+                    stop: UntrackedStop::SequenceStopped,
+                });
+            }
+            Err(CherryPickSingleError::Conflicted(paths)) => {
+                let label = args.commits[i].clone();
+                if args.no_commit {
+                    // `--no-commit` sequences have no per-step snapshot, so a
+                    // conflict is terminal: no resumable state is written.
+                    return Err(CherryPickError::NoCommitConflict {
+                        commit: label,
+                        paths: paths.len(),
+                    });
+                }
+                let head_orig = head_orig.ok_or_else(|| {
+                    CherryPickError::LoadObject("failed to resolve original HEAD".to_string())
+                })?;
+                let state = CherryPickState {
+                    head_name: head_name.clone(),
+                    head_orig,
+                    current_oid: *commit_id,
+                    stop_concluded: false,
                     todo: commit_ids[i + 1..].iter().copied().collect(),
                     // This claim only happens on a conflict stop — say so
                     // durably (§C.5 conflict-phase discriminator).
                     opts_json: opts_json_with_conflict_flag(&opts_json, true),
                 };
-                // The FIRST persistence of a fresh sequence: an atomic claim,
-                // not a replace (§C.4.4). `resume_picks` keeps the upsert —
-                // by then the caller owns the row and advancing it is the
-                // point.
-                state
-                    .claim_start()
-                    .await
-                    .map_err(CherryPickError::SaveFailed)?;
+                // A multi-commit run already claimed its row before the first
+                // pick (§C.4.4, HF-31), so the stop replaces the row it owns; a
+                // single-commit stop makes the first, atomic claim here.
+                let persisted = if row_exists {
+                    state.save().await
+                } else {
+                    state.claim_start().await
+                };
+                persisted.map_err(CherryPickError::SaveFailed)?;
                 return Err(CherryPickError::Conflict {
                     commit: label,
                     reason: format!("conflicts in {} path(s)", paths.len()),
                 });
             }
-            Err(other) => return Err(map_single_error(other, &args.commits[i])),
+            Err(other) => {
+                // Nothing landed yet (HEAD unmoved): release this run's claim so
+                // the refusal leaves no sequence, as before HF-31. Once HEAD has
+                // moved, the row stays for `--continue`/`--skip`/`--abort`.
+                if row_exists && Head::current_commit().await == head_orig {
+                    release_sequence_claim(claim_needle.as_deref())
+                        .await
+                        .map_err(|error| {
+                        CherryPickError::SaveFailed(format!(
+                            "{error}; the refused pick left its sequence claim in place (run 'libra cherry-pick --quit')"
+                        ))
+                    })?;
+                }
+                return Err(map_single_error(other, &args.commits[i]));
+            }
         }
     }
 
@@ -911,14 +1237,184 @@ async fn run_cherry_pick(
 /// `opts_json` with the §C.5 conflict-phase flag set or cleared. Falls back
 /// to the input on a parse failure — the option payload is validated where
 /// it is USED; the flag must never turn a working sequence into an error.
+/// Whether a persisted options blob carries the `stopped_on_conflict` key at
+/// all. Rows from binaries that predate the flag omit it and must keep the old
+/// finalize-on-continue behavior.
+fn opts_json_has_conflict_flag(opts_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(opts_json)
+        .ok()
+        .is_some_and(|value| value.get("stopped_on_conflict").is_some())
+}
+
 fn opts_json_with_conflict_flag(opts_json: &str, stopped_on_conflict: bool) -> String {
     match serde_json::from_str::<CherryPickOpts>(opts_json) {
         Ok(mut opts) => {
             opts.stopped_on_conflict = stopped_on_conflict;
+            // A position write means no `--skip`/`--abort` is still pending,
+            // no fast-forward is between its row write and its reset, and the
+            // sequence is no longer sitting on an externally concluded stop.
+            opts.control_phase = None;
+            opts.ff_landing = None;
+            opts.stop_concluded = false;
             serde_json::to_string(&opts).unwrap_or_else(|_| opts_json.to_string())
         }
         Err(_) => opts_json.to_string(),
     }
+}
+
+/// `opts_json` marked as externally concluded (#477 HF-01). Options this
+/// binary cannot read are an error rather than a silent no-op: the row is left
+/// byte-identical and the caller (`reset`) warns about the state it could not
+/// update, naming `libra cherry-pick --quit`.
+fn opts_json_with_stop_concluded(opts_json: &str) -> Result<String, String> {
+    let mut opts: CherryPickOpts = serde_json::from_str(opts_json)
+        .map_err(|e| format!("failed to read the stopped sequence's saved options: {e}"))?;
+    opts.stop_concluded = true;
+    serde_json::to_string(&opts).map_err(|e| format!("failed to record the concluded stop: {e}"))
+}
+
+/// End the cherry-pick item a stopped sequence is sitting on, because a later
+/// `reset` concluded it (ADR-HF-03 items 1 and 4, #477 HF-01). Reused by HF-29
+/// for the `commit` entry point.
+pub(crate) async fn snapshot_stopped_cherry_pick()
+-> Result<Option<crate::internal::sequencer::SequenceState>, String> {
+    sequencer::snapshot_stopped_sequence(SequenceKind::CherryPick).await
+}
+
+/// Conclude exactly the row `snapshot` describes (see
+/// [`sequencer::conclude_stopped_sequence`] for why the caller snapshots first).
+pub(crate) async fn conclude_stopped_cherry_pick(
+    snapshot: crate::internal::sequencer::SequenceState,
+) -> Result<crate::internal::sequencer::ExternalConclusion, String> {
+    sequencer::conclude_stopped_sequence(snapshot, opts_json_with_stop_concluded).await
+}
+
+/// The `--skip`/`--abort` still pending in a row's options (#477 HF-31); `None`
+/// for unmarked rows, rows from older binaries and unreadable options.
+fn opts_json_control_phase(opts_json: &str) -> Option<ControlPhase> {
+    serde_json::from_str::<CherryPickOpts>(opts_json)
+        .ok()
+        .and_then(|opts| opts.control_phase)
+}
+
+/// `opts_json` marked with a pending control phase, or `None` when the options
+/// cannot be read (the control verb then proceeds unmarked, as before).
+fn opts_json_with_control_phase(opts_json: &str, phase: ControlPhase) -> Option<String> {
+    let mut opts = serde_json::from_str::<CherryPickOpts>(opts_json).ok()?;
+    opts.control_phase = Some(phase);
+    serde_json::to_string(&opts).ok()
+}
+
+/// `opts_json` naming `landing` as the fast-forward about to move HEAD (HF-31
+/// X2); unreadable options are returned unchanged (no marker, so `--continue`
+/// re-attempts instead of skipping).
+fn opts_json_with_ff_landing(opts_json: &str, landing: &ObjectHash) -> String {
+    match serde_json::from_str::<CherryPickOpts>(opts_json) {
+        Ok(mut opts) => {
+            opts.ff_landing = Some(landing.to_string());
+            serde_json::to_string(&opts).unwrap_or_else(|_| opts_json.to_string())
+        }
+        Err(_) => opts_json.to_string(),
+    }
+}
+
+/// `opts_json` stamped with a fresh claim token, plus the payload fragment a
+/// fenced release matches (HF-31). Unreadable options stay unstamped, and the
+/// release then falls back to the scoped clear.
+fn opts_json_with_claim_token(opts_json: &str) -> (String, Option<String>) {
+    let Ok(mut opts) = serde_json::from_str::<CherryPickOpts>(opts_json) else {
+        return (opts_json.to_string(), None);
+    };
+    let token = uuid::Uuid::new_v4().to_string();
+    opts.claim_token = Some(token.clone());
+    match serde_json::to_string(&opts) {
+        Ok(stamped) => (stamped, Some(format!("\"claim_token\":\"{token}\""))),
+        Err(_) => (opts_json.to_string(), None),
+    }
+}
+
+/// Test-only stand-in for a concurrent `--quit` followed by a new start that
+/// claims this worktree's sequence before a refused run releases its own
+/// claim (HF-31 X7; gated on `LIBRA_TEST`).
+async fn reclaim_before_release_failpoint() {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_RECLAIM_BEFORE_RELEASE").is_some()
+        && let Ok(Some(mut row)) = CherryPickState::load().await
+    {
+        let _ = CherryPickState::clear().await;
+        row.opts_json = opts_json_with_claim_token(&row.opts_json).0;
+        let _ = row.claim_start().await;
+    }
+}
+
+/// Test-only stand-in for a concurrent start that claims this worktree's
+/// sequence between the in-progress check and this run's claim (HF-31 X7;
+/// gated on `LIBRA_TEST`).
+async fn race_before_claim_failpoint(state: &CherryPickState) {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_RACE_BEFORE_CLAIM").is_some()
+    {
+        let _ = state.claim_start().await;
+    }
+}
+
+/// Claim a multi-commit sequence before its first pick writes anything
+/// (HF-31 X1/X7). Losing the claim to a concurrent start is the ordinary
+/// in-progress refusal, and nothing has been written yet.
+async fn claim_sequence_start(state: &CherryPickState) -> Result<(), CherryPickError> {
+    race_before_claim_failpoint(state).await;
+    state.claim_start().await.map_err(|error| {
+        if error.contains("already in progress") {
+            CherryPickError::InProgress
+        } else {
+            CherryPickError::SaveFailed(error)
+        }
+    })
+}
+
+/// Test-only interruption right after a dropped pick advanced the sequence row
+/// (HF-31 X6; gated on `LIBRA_TEST`).
+fn after_drop_failpoint() -> Result<(), CherryPickError> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_DROP").is_some()
+    {
+        return Err(CherryPickError::SaveFailed(
+            "test-injected cherry-pick interruption after a dropped pick".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Release this run's sequence claim after a refusal before anything landed
+/// (HF-31 X7). `LIBRA_TEST_CHERRY_PICK_FAIL_RELEASE_CLAIM` (gated on
+/// `LIBRA_TEST`) injects a failure so the caller's error path is testable.
+async fn release_sequence_claim(claim_needle: Option<&str>) -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_FAIL_RELEASE_CLAIM").is_some()
+    {
+        return Err("test-injected failure releasing the sequence claim".to_string());
+    }
+    reclaim_before_release_failpoint().await;
+    match claim_needle {
+        // Fenced by this run's token: a row claimed by a later start stays.
+        Some(needle) => sequencer::clear_if_payload_contains(SequenceKind::CherryPick, needle)
+            .await
+            .map(|_| ()),
+        None => CherryPickState::clear().await,
+    }
+}
+
+/// Test-only interruption right after `--skip`/`--abort` reset the index and
+/// worktree, before the sequence row changes (gated on `LIBRA_TEST`).
+fn after_control_reset_failpoint() -> Result<(), CherryPickError> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_CONTROL_RESET").is_some()
+    {
+        return Err(CherryPickError::SaveFailed(
+            "test-injected cherry-pick interruption after the control reset".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// ADR-MG-01 gate for a WHOLE cherry-pick sequence, ahead of its first write.
@@ -1056,13 +1552,17 @@ async fn resume_picks(
     while let Some(commit_id) = todo.pop_front() {
         // Persist the position BEFORE attempting each commit so that whatever
         // happens — clean success, conflict, or a non-conflict hard error — the
-        // `cherry_pick_state` row already reflects `current_oid = commit_id` and
+        // `sequence_state` row already reflects `current_oid = commit_id` and
         // the remaining `todo`. This keeps state accurate even when the pick
         // fails with a non-conflict error after earlier resumed commits landed.
+        // A pick that lands moves the row past `commit_id` in the same
+        // transaction as HEAD (`SequenceAdvance`), so no crash can leave the row
+        // naming a commit that already landed.
         let pending = CherryPickState {
             head_name: head_name.to_string(),
             head_orig,
             current_oid: commit_id,
+            stop_concluded: false,
             todo: todo.clone(),
             // STRIPPED flag: this save happens before the attempt, so if the
             // pick stops on a NON-conflict error the row must not carry a
@@ -1070,9 +1570,29 @@ async fn resume_picks(
             opts_json: opts_json_with_conflict_flag(opts_json, false),
         };
         pending.save().await.map_err(CherryPickError::SaveFailed)?;
+        let advance = SequenceAdvance::after(head_name, head_orig, &commit_id, &todo, opts_json);
 
-        match cherry_pick_single_commit(&commit_id, opts_args, output).await {
-            Ok(outcome) => record_outcome(outcome, &commit_id, acc),
+        match cherry_pick_single_commit(&commit_id, opts_args, output, &advance).await {
+            Ok(outcome) => {
+                if matches!(outcome, PickOutcome::Dropped(_)) {
+                    // HF-31 X6: a dropped pick moves no HEAD; advance the row here.
+                    advance
+                        .apply_without_head_move()
+                        .await
+                        .map_err(CherryPickError::SaveFailed)?;
+                    after_drop_failpoint()?;
+                }
+                record_outcome(outcome, &commit_id, acc)
+            }
+            Err(CherryPickSingleError::UntrackedOverwrite(path)) => {
+                // `pending` (conflict flag stripped) already records this commit
+                // as the stop, so `--continue` re-attempts it (ADR-HF-04 U12/U13).
+                return Err(CherryPickError::UntrackedOverwrite {
+                    commit: commit_id.to_string(),
+                    path,
+                    stop: UntrackedStop::SequenceStopped,
+                });
+            }
             Err(CherryPickSingleError::Conflicted(paths)) => {
                 // Re-persist WITH the conflict flag: `CHERRY_PICK_HEAD` is
                 // defined only for a conflict stop (§C.5), and this is the
@@ -1099,11 +1619,58 @@ async fn resume_picks(
     Ok(())
 }
 
+/// #477 HF-02 / M-CONT C4: after an external conclusion the next pick applies
+/// onto the current index. Staged changes would be overwritten, so refuse
+/// before touching the sequence.
+async fn refuse_staged_changes_on_concluded_continue() -> Result<(), CherryPickError> {
+    let staged = crate::command::status::changes_to_be_committed_safe()
+        .await
+        .map_err(|e| CherryPickError::LoadObject(e.to_string()))?;
+    if staged.is_empty() {
+        Ok(())
+    } else {
+        Err(CherryPickError::LocalChangesWouldBeOverwritten)
+    }
+}
+
 async fn run_cherry_pick_continue(
     output: &OutputConfig,
 ) -> Result<CherryPickOutput, CherryPickError> {
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
+    // The corrupt-row check runs before the control-phase one: a row that is
+    // both marked concluded with nothing left and mid-`--skip` is corrupt, and
+    // must fail closed (LBR-REPO-002) rather than look like a resumable phase.
+    reject_inconsistent_conclusion(&state)?;
+    if let Some(phase) = opts_json_control_phase(&state.opts_json) {
+        return Err(CherryPickError::ControlPending(phase));
+    }
+    if state.stop_concluded {
+        // #477 HF-02: a later reset/commit already concluded this stop. Do not
+        // record the current index as that commit; apply the remaining todo.
+        refuse_staged_changes_on_concluded_continue().await?;
+        let opts: CherryPickOpts = serde_json::from_str(&state.opts_json).map_err(|e| {
+            CherryPickError::LoadObject(format!("failed to read saved options: {e}"))
+        })?;
+        let opts_args = opts.into_args();
+        let mut acc = PickAccumulator::default();
+        resume_picks(
+            &state.head_name,
+            state.head_orig,
+            state.todo,
+            &opts_args,
+            &state.opts_json,
+            output,
+            &mut acc,
+        )
+        .await?;
+        return Ok(CherryPickOutput {
+            picked: acc.picked,
+            dropped: acc.dropped,
+            action: Some("continue".to_string()),
+            ..Default::default()
+        });
+    }
 
     // The conflicted index must be fully resolved (no stage 1/2/3 left).
     let index = Index::load(path::index())
@@ -1121,11 +1688,51 @@ async fn run_cherry_pick_continue(
 
     let opts: CherryPickOpts = serde_json::from_str(&state.opts_json)
         .map_err(|e| CherryPickError::LoadObject(format!("failed to read saved options: {e}")))?;
+    // A stop that was not a conflict (for example an untracked-overwrite
+    // refusal, ADR-HF-04 U12-U14) never applied `current_oid`: re-attempt it
+    // instead of recording the untouched index as that commit. Rows written
+    // before the flag existed keep finalizing from the index.
+    let reattempt_current =
+        !opts.stopped_on_conflict && opts_json_has_conflict_flag(&state.opts_json);
+    let ff_landed = opts.ff_landing.as_deref() == Some(state.current_oid.to_string().as_str());
     let opts_args = opts.into_args();
+
+    if reattempt_current {
+        let mut todo = state.todo;
+        let mut acc = PickAccumulator::default();
+        if ff_landed && Head::current_commit().await == Some(state.current_oid) {
+            // HF-31 X2: a fast-forward pick marks its commit in the row, then
+            // moves HEAD through `reset --hard` outside that write. A marked
+            // commit that HEAD already points at landed before an interruption;
+            // anything else (HF-31 X8: HEAD moved by hand) is re-attempted.
+            acc.picked
+                .push(make_entry(&state.current_oid, Some(state.current_oid)));
+        } else {
+            todo.push_front(state.current_oid);
+        }
+        resume_picks(
+            &state.head_name,
+            state.head_orig,
+            todo,
+            &opts_args,
+            &state.opts_json,
+            output,
+            &mut acc,
+        )
+        .await?;
+        return Ok(CherryPickOutput {
+            picked: acc.picked,
+            dropped: acc.dropped,
+            action: Some("continue".to_string()),
+            ..Default::default()
+        });
+    }
 
     // rerere: the conflict is resolved — record its postimage so an identical
     // conflict is auto-resolved next time. A no-op unless `rerere.enabled`.
-    if let Err(error) = crate::command::rerere::auto_update(opts_args.rerere_autoupdate).await {
+    if let Err(error) =
+        crate::command::rerere::auto_update(rerere_autoupdate_override(&opts_args)).await
+    {
         tracing::warn!("rerere auto-update on cherry-pick --continue failed: {error}");
     }
 
@@ -1137,9 +1744,18 @@ async fn run_cherry_pick_continue(
         .await
         .ok_or_else(|| CherryPickError::LoadObject("failed to resolve current HEAD".to_string()))?;
     let tree_id = create_tree_from_index(&index).map_err(|e| map_single_error(e, ""))?;
-    let new_commit = create_cherry_pick_commit(&original, &parent, tree_id, &opts_args, output)
-        .await
-        .map_err(|e| map_single_error(e, &state.current_oid.to_string()))?;
+    // The resolved commit lands and the row moves past it in one transaction.
+    let advance = SequenceAdvance::after(
+        &state.head_name,
+        state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.opts_json,
+    );
+    let new_commit =
+        create_cherry_pick_commit(&original, &parent, tree_id, &opts_args, output, &advance)
+            .await
+            .map_err(|e| map_single_error(e, &state.current_oid.to_string()))?;
 
     let mut acc = PickAccumulator {
         picked: vec![make_entry(&state.current_oid, Some(new_commit))],
@@ -1167,10 +1783,25 @@ async fn run_cherry_pick_continue(
 async fn run_cherry_pick_skip(output: &OutputConfig) -> Result<CherryPickOutput, CherryPickError> {
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
+    reject_inconsistent_conclusion(&state)?;
+    if opts_json_control_phase(&state.opts_json) == Some(ControlPhase::Abort) {
+        return Err(CherryPickError::ControlPending(ControlPhase::Abort));
+    }
+
+    // HF-31 X3: record the skip before resetting, so an interruption after the
+    // reset leaves a row that `--skip` finishes and `--continue` refuses.
+    if let Some(opts_json) = opts_json_with_control_phase(&state.opts_json, ControlPhase::Skip) {
+        let marked = CherryPickState {
+            opts_json,
+            ..state.clone()
+        };
+        marked.save().await.map_err(CherryPickError::SaveFailed)?;
+    }
 
     // Drop the current conflicted commit: restore index+worktree to the last
     // successful tip (current HEAD), discarding the conflict markers/stages.
     reset_hard("HEAD", output).await?;
+    after_control_reset_failpoint()?;
 
     let opts: CherryPickOpts = serde_json::from_str(&state.opts_json)
         .map_err(|e| CherryPickError::LoadObject(format!("failed to read saved options: {e}")))?;
@@ -1200,8 +1831,18 @@ async fn run_cherry_pick_abort(output: &OutputConfig) -> Result<CherryPickOutput
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
 
+    // HF-31 X4: record the abort before resetting; re-running `--abort` after an
+    // interruption resets to the same commit again and then clears the row.
+    if let Some(opts_json) = opts_json_with_control_phase(&state.opts_json, ControlPhase::Abort) {
+        let marked = CherryPickState {
+            opts_json,
+            ..state.clone()
+        };
+        marked.save().await.map_err(CherryPickError::SaveFailed)?;
+    }
     let restored = state.head_orig.to_string();
     reset_hard(&restored, output).await?;
+    after_control_reset_failpoint()?;
     CherryPickState::clear()
         .await
         .map_err(CherryPickError::SaveFailed)?;
@@ -1283,6 +1924,7 @@ async fn cherry_pick_single_commit(
     commit_id: &ObjectHash,
     args: &CherryPickArgs,
     output: &OutputConfig,
+    advance: &SequenceAdvance,
 ) -> Result<PickOutcome, CherryPickSingleError> {
     let commit_to_pick: Commit =
         load_object(commit_id).map_err(|e| CherryPickSingleError::LoadObject(e.to_string()))?;
@@ -1303,9 +1945,40 @@ async fn cherry_pick_single_commit(
         && let Some(head) = Head::current_commit().await
         && commit_to_pick.parent_commit_ids[0] == head
     {
+        // ADR-HF-04 U11: the fast-forward goes through `reset --hard`, so refuse
+        // an untracked overwrite before that reset rewrites anything.
+        let target_tree: Tree = load_object(&commit_to_pick.tree_id).map_err(|e| {
+            CherryPickSingleError::LoadObject(format!("failed to load fast-forward tree: {e}"))
+        })?;
+        let mut target_index = Index::new();
+        crate::command::reset::rebuild_index_from_tree(&target_tree, &mut target_index, "")
+            .map_err(CherryPickSingleError::LoadObject)?;
+        let index_file = path::index();
+        let current_index = if index_file.exists() {
+            Index::load(&index_file).map_err(|e| {
+                CherryPickSingleError::LoadObject(format!("failed to load index: {e}"))
+            })?
+        } else {
+            Index::new()
+        };
+        ensure_no_untracked_overwrite(&current_index, &target_index)?;
+        // HF-31 X2: `reset --hard` moves HEAD outside the sequence row's
+        // transaction, so first write a row naming this commit with the
+        // `ff_landing` marker; an interruption before the advance below leaves
+        // HEAD at the marked commit, which `--continue` resumes after.
+        if let Some(row) = advance.landing_row(commit_id) {
+            sequencer::save(&row)
+                .await
+                .map_err(CherryPickSingleError::SaveFailed)?;
+        }
         reset_hard(&commit_id.to_string(), output)
             .await
             .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))?;
+        after_head_move_failpoint()?;
+        advance
+            .apply_without_head_move()
+            .await
+            .map_err(CherryPickSingleError::SaveFailed)?;
         return Ok(PickOutcome::Committed(*commit_id));
     }
 
@@ -1372,7 +2045,6 @@ async fn cherry_pick_single_commit(
     let mut index = Index::load(&index_file).map_err(|e| {
         CherryPickSingleError::LoadObject(format!("failed to load current index: {e}"))
     })?;
-
     // ── Three-way apply: base = parent tree, ours = current index stage 0,
     // theirs = picked commit tree. A path whose ours-side still matches base
     // fast-forwards to theirs; a path where both sides agree is a no-op; a path
@@ -1399,79 +2071,259 @@ async fn cherry_pick_single_commit(
     )
     .map_err(|refusal| CherryPickSingleError::GitlinkUnsupported(refusal.to_string()))?;
 
+    let their_index_modes = tree_index_modes(&their_tree);
+    let base_index_modes = tree_index_modes(&parent_tree);
+    let changes = diff_trees(&their_tree, &parent_tree);
+    let needs_content_driver = changes.iter().any(|(path, their_hash, base_hash)| {
+        let ours_hash = ours_items.get(path).copied();
+        ours_hash != *base_hash
+            && ours_hash != *their_hash
+            && (ours_hash.is_some() || their_hash.is_some())
+    });
+    let default_driver = if needs_content_driver {
+        merge::read_merge_default_driver()
+            .await
+            .map_err(CherryPickSingleError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
+    let (preflighted_conflict_style, mut deferred_conflict_style_error) = if needs_content_driver {
+        match merge::conflict_style_from_config().await {
+            Ok(style) => (Some(style), None),
+            Err(error) => (Some(merge::ConflictStyle::Merge), Some(error)),
+        }
+    } else {
+        (None, None)
+    };
+
     let mut conflicts: Vec<ConflictEntry> = Vec::new();
-    for (path, their_hash, base_hash) in diff_trees(&their_tree, &parent_tree) {
+    for (path, their_hash, base_hash) in changes {
         let ours_hash = ours_items.get(&path).cloned();
         if ours_hash == base_hash {
             match their_hash {
-                Some(th) => update_index_entry(&mut index, &path, th)?,
+                Some(th) => update_index_entry(
+                    &mut index,
+                    &path,
+                    th,
+                    their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                )?,
                 None => {
                     index.remove(path_to_utf8(&path)?, 0);
                 }
             }
         } else if ours_hash == their_hash {
             // Both sides already converged on the same content — nothing to do.
+        } else if let (Some(ours_hash), Some(their_hash)) = (ours_hash, their_hash) {
+            let driver = merge::builtin_merge_driver_for_path(&path, default_driver.as_deref());
+            // Preserve the pre-driver add/add behavior for the implicit text
+            // fallback (MG-08 G15). An explicitly selected binary/union driver
+            // still owns the base-less content merge below.
+            if base_hash.is_none() && driver == merge::BuiltinMergeDriver::Text {
+                if let Some(favor) = args.strategy_option.last().copied() {
+                    apply_favored_pick_resolution(
+                        &mut index,
+                        &path,
+                        base_hash,
+                        Some(ours_hash),
+                        Some(their_hash),
+                        favor,
+                        (
+                            current_index_mode(&current_index, &path),
+                            their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                        ),
+                    )?;
+                } else {
+                    index.remove(path_to_utf8(&path)?, 0);
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        ours_hash,
+                        2,
+                        current_index_mode(&current_index, &path),
+                    )?;
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        their_hash,
+                        3,
+                        their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                    )?;
+                    conflicts.push((path, Some(ours_hash), Some(their_hash), None, driver));
+                }
+                continue;
+            }
+            let base_data = match base_hash {
+                Some(base_hash) => {
+                    let base: Blob = load_object(&base_hash)
+                        .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+                    base.data
+                }
+                None => Vec::new(),
+            };
+            let ours: Blob = load_object(&ours_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            let theirs: Blob = load_object(&their_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            match merge::merge_bytes_with_refined_driver(
+                driver,
+                &base_data,
+                &ours.data,
+                &theirs.data,
+                args.strategy_option.last().copied(),
+                preflighted_conflict_style.unwrap_or(merge::ConflictStyle::Merge),
+                0,
+            )
+            .map_err(CherryPickSingleError::SaveFailed)?
+            {
+                merge::BuiltinMergeOutcome::Clean(bytes) => {
+                    let blob = Blob::from_content_bytes(bytes);
+                    save_object(&blob, &blob.id).map_err(|error| {
+                        CherryPickSingleError::SaveFailed(format!(
+                            "failed to save merged cherry-pick result for '{}': {error}",
+                            path.display()
+                        ))
+                    })?;
+                    let mode = merged_entry_mode(
+                        current_index_mode(&current_index, &path),
+                        base_index_modes.get(&path).copied(),
+                        their_index_modes.get(&path).copied(),
+                    );
+                    update_index_entry(&mut index, &path, blob.id, mode)?;
+                }
+                merge::BuiltinMergeOutcome::Conflict(_) => {
+                    index.remove(path_to_utf8(&path)?, 0);
+                    if let Some(base_hash) = base_hash {
+                        add_stage_entry(
+                            &mut index,
+                            &path,
+                            base_hash,
+                            1,
+                            base_index_modes.get(&path).copied().unwrap_or(0o100644),
+                        )?;
+                    }
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        ours_hash,
+                        2,
+                        current_index_mode(&current_index, &path),
+                    )?;
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        their_hash,
+                        3,
+                        their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                    )?;
+                    conflicts.push((path, Some(ours_hash), Some(their_hash), base_hash, driver));
+                }
+            }
         } else if let Some(favor) = args.strategy_option.last().copied() {
             apply_favored_pick_resolution(
-                &mut index, &path, base_hash, ours_hash, their_hash, favor,
+                &mut index,
+                &path,
+                base_hash,
+                ours_hash,
+                their_hash,
+                favor,
+                (
+                    current_index_mode(&current_index, &path),
+                    their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                ),
             )?;
         } else {
+            let driver = merge::builtin_merge_driver_for_path(&path, default_driver.as_deref());
             index.remove(path_to_utf8(&path)?, 0);
             if let Some(b) = base_hash {
-                add_stage_entry(&mut index, &path, b, 1)?;
+                add_stage_entry(
+                    &mut index,
+                    &path,
+                    b,
+                    1,
+                    base_index_modes.get(&path).copied().unwrap_or(0o100644),
+                )?;
             }
             if let Some(o) = ours_hash {
-                add_stage_entry(&mut index, &path, o, 2)?;
+                add_stage_entry(
+                    &mut index,
+                    &path,
+                    o,
+                    2,
+                    current_index_mode(&current_index, &path),
+                )?;
             }
             if let Some(t) = their_hash {
-                add_stage_entry(&mut index, &path, t, 3)?;
+                add_stage_entry(
+                    &mut index,
+                    &path,
+                    t,
+                    3,
+                    their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                )?;
             }
-            conflicts.push((path, ours_hash, their_hash, base_hash));
+            conflicts.push((path, ours_hash, their_hash, base_hash, driver));
         }
     }
 
     if !conflicts.is_empty() {
-        // Honor the Git-compatible `merge.conflictStyle` config (merge/diff3)
-        // for the line-level markers, same as `libra merge` (lore.md §1.3).
-        // Resolved FIRST — before the conflicted index is saved or the worktree
-        // is touched — so an invalid config errors with nothing mutated.
+        // Honor the shared merge/diff3/zdiff3 renderer. A bad setting was
+        // deferred while deciding whether a real conflict existed; surface it
+        // now, before the conflicted index or worktree is written.
+        if let Some(error) = deferred_conflict_style_error.take() {
+            return Err(match error {
+                super::merge::ConflictStyleError::Invalid(value) => {
+                    CherryPickSingleError::InvalidConflictStyle(value)
+                }
+                super::merge::ConflictStyleError::Read(detail) => {
+                    CherryPickSingleError::ConflictStyleRead(detail)
+                }
+            });
+        }
         let conflict_style =
-            super::merge::conflict_style_from_config()
-                .await
-                .map_err(|e| match e {
-                    super::merge::ConflictStyleError::Invalid(value) => {
-                        CherryPickSingleError::InvalidConflictStyle(value)
-                    }
-                    super::merge::ConflictStyleError::Read(detail) => {
-                        CherryPickSingleError::ConflictStyleRead(detail)
-                    }
-                })?;
+            match preflighted_conflict_style {
+                Some(style) => style,
+                None => super::merge::conflict_style_from_config()
+                    .await
+                    .map_err(|error| match error {
+                        super::merge::ConflictStyleError::Invalid(value) => {
+                            CherryPickSingleError::InvalidConflictStyle(value)
+                        }
+                        super::merge::ConflictStyleError::Read(detail) => {
+                            CherryPickSingleError::ConflictStyleRead(detail)
+                        }
+                    })?,
+            };
+        ensure_no_untracked_overwrite(&current_index, &index)?;
         index
             .save(&index_file)
             .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save index: {e}")))?;
         // Sync the cleanly-applied stage-0 paths, then overlay conflict markers
         // onto each divergent path so the user can resolve them in the worktree.
         reset_workdir_tracked_only(&current_index, &index)?;
-        let short_src = short_display_hash(&commit_id.to_string()).to_string();
-        for (path, ours_hash, their_hash, base_hash) in &conflicts {
+        let labels =
+            super::merge::GitConflictLabels::for_cherry_pick(commit_id, &commit_to_pick.message);
+        for (path, ours_hash, their_hash, base_hash, driver) in &conflicts {
             write_conflict_markers_file(
                 path,
                 ours_hash,
                 their_hash,
                 base_hash,
-                &short_src,
+                &labels,
                 conflict_style,
+                *driver,
             )?;
         }
         // rerere: record the preimage of each just-written conflict and replay a
         // previously recorded resolution if one matches. A no-op unless
         // `rerere.enabled` is set, so default cherry-pick behaviour is unchanged.
-        if let Err(error) = crate::command::rerere::auto_update(args.rerere_autoupdate).await {
+        if let Err(error) =
+            crate::command::rerere::auto_update(rerere_autoupdate_override(args)).await
+        {
             tracing::warn!("rerere auto-update after cherry-pick conflict failed: {error}");
         }
         let mut paths: Vec<String> = conflicts
             .iter()
-            .map(|(path, _, _, _)| path.display().to_string())
+            .map(|(path, _, _, _, _)| path.display().to_string())
             .collect();
         paths.sort();
         return Err(CherryPickSingleError::Conflicted(paths));
@@ -1483,6 +2335,7 @@ async fn cherry_pick_single_commit(
     let tree_id = create_tree_from_index(&index)?;
 
     if args.no_commit {
+        ensure_no_untracked_overwrite(&current_index, &index)?;
         index
             .save(&index_file)
             .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save index: {e}")))?;
@@ -1522,13 +2375,21 @@ async fn cherry_pick_single_commit(
         }
     }
 
+    ensure_no_untracked_overwrite(&current_index, &index)?;
     index
         .save(&index_file)
         .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save index: {e}")))?;
     reset_workdir_tracked_only(&current_index, &index)?;
 
-    let cherry_pick_commit_id =
-        create_cherry_pick_commit(&commit_to_pick, &current_head, tree_id, args, output).await?;
+    let cherry_pick_commit_id = create_cherry_pick_commit(
+        &commit_to_pick,
+        &current_head,
+        tree_id,
+        args,
+        output,
+        advance,
+    )
+    .await?;
     Ok(PickOutcome::Committed(cherry_pick_commit_id))
 }
 
@@ -1672,6 +2533,7 @@ async fn create_cherry_pick_commit(
     tree_id: ObjectHash,
     args: &CherryPickArgs,
     output: &OutputConfig,
+    advance: &SequenceAdvance,
 ) -> Result<ObjectHash, CherryPickSingleError> {
     let message = build_cherry_pick_message(original_commit, args, output).await?;
 
@@ -1721,6 +2583,12 @@ async fn create_cherry_pick_commit(
 
     save_object(&commit, &commit.id)
         .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save commit: {e}")))?;
+    record_current_repo_commit_revision_for_active_operation(
+        commit.id.to_string(),
+        Some((original_commit.id.to_string(), RelationKind::CherryPick)),
+    )
+    .await
+    .map_err(|error| CherryPickSingleError::SaveFailed(error.to_string()))?;
 
     let action = ReflogAction::CherryPick {
         source_message: original_commit.message.clone(),
@@ -1731,11 +2599,19 @@ async fn create_cherry_pick_commit(
         action,
     };
 
+    let advance = advance.clone();
     with_reflog(
         context,
         move |txn| {
             Box::pin(async move {
                 update_head(txn, &commit.id.to_string()).await?;
+                match &advance {
+                    SequenceAdvance::NoRow => {}
+                    SequenceAdvance::Save(next) => sequencer::save_with_conn(txn, next).await?,
+                    SequenceAdvance::Clear(_) => {
+                        sequencer::clear_with_conn(txn, SequenceKind::CherryPick).await?
+                    }
+                }
                 Ok(())
             })
         },
@@ -1745,6 +2621,7 @@ async fn create_cherry_pick_commit(
     .map_err(|e| {
         CherryPickSingleError::SaveFailed(format!("failed to update branch and reflog: {e}"))
     })?;
+    after_head_move_failpoint()?;
     Ok(commit.id)
 }
 
@@ -1785,6 +2662,43 @@ fn mergeable_tree_items(tree: &Tree) -> HashMap<PathBuf, ObjectHash> {
         .collect()
 }
 
+/// Index-mode map for a tree's non-gitlink entries.
+fn tree_index_modes(tree: &Tree) -> HashMap<PathBuf, u32> {
+    tree.get_plain_items_with_mode()
+        .into_iter()
+        .filter(|(_, _, mode)| *mode != TreeItemMode::Commit)
+        .map(|(path, _, mode)| (path, tree_mode_to_index_mode(mode)))
+        .collect()
+}
+
+fn tree_mode_to_index_mode(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
+}
+
+/// Stage-0 mode currently recorded in the index, defaulting to a plain file.
+fn current_index_mode(index: &Index, path: &Path) -> u32 {
+    path.to_str()
+        .and_then(|name| index.get(name, 0))
+        .map(|entry| entry.mode)
+        .unwrap_or(0o100644)
+}
+
+/// Git's `merge_mode` behaviour: a side that matches the base yields to the
+/// other side's mode; otherwise ours wins.
+fn merged_entry_mode(ours: u32, base: Option<u32>, theirs: Option<u32>) -> u32 {
+    match (base, theirs) {
+        (Some(base), Some(theirs)) if ours == base => theirs,
+        (Some(base), Some(theirs)) if theirs == base => ours,
+        _ => ours,
+    }
+}
+
 /// Resolve a divergent cherry-pick path using the same hunk-level side
 /// preference as merge. A true three-sided content conflict preserves clean
 /// ranges; add/add and modify/delete conflicts select the requested whole side.
@@ -1795,6 +2709,7 @@ fn apply_favored_pick_resolution(
     ours_hash: Option<ObjectHash>,
     theirs_hash: Option<ObjectHash>,
     favor: MergeFavor,
+    modes: (u32, u32),
 ) -> Result<(), CherryPickSingleError> {
     let selected_hash = match (base_hash, ours_hash, theirs_hash) {
         (Some(base_hash), Some(ours_hash), Some(theirs_hash)) => {
@@ -1821,10 +2736,14 @@ fn apply_favored_pick_resolution(
         },
     };
 
+    let selected_mode = match favor {
+        MergeFavor::Ours => modes.0,
+        MergeFavor::Theirs => modes.1,
+    };
     let path_str = path_to_utf8(path)?;
     index.remove(path_str, 0);
     if let Some(hash) = selected_hash {
-        update_index_entry(index, path, hash)?;
+        update_index_entry(index, path, hash, selected_mode)?;
     }
     Ok(())
 }
@@ -1833,13 +2752,15 @@ fn update_index_entry(
     index: &mut Index,
     path: &Path,
     hash: ObjectHash,
+    mode: u32,
 ) -> Result<(), CherryPickSingleError> {
     let blob = git_internal::internal::object::blob::Blob::load(&hash);
-    let entry = IndexEntry::new_from_blob(
+    let mut entry = IndexEntry::new_from_blob(
         path_to_utf8(path)?.to_string(),
         hash,
         blob.data.len() as u32,
     );
+    entry.mode = mode;
     index.add(entry);
     Ok(())
 }
@@ -1850,6 +2771,7 @@ fn add_stage_entry(
     path: &Path,
     hash: ObjectHash,
     stage: u8,
+    mode: u32,
 ) -> Result<(), CherryPickSingleError> {
     let blob = git_internal::internal::object::blob::Blob::load(&hash);
     let mut entry = IndexEntry::new_from_blob(
@@ -1857,6 +2779,7 @@ fn add_stage_entry(
         hash,
         blob.data.len() as u32,
     );
+    entry.mode = mode;
     entry.flags.stage = stage;
     index.add(entry);
     Ok(())
@@ -1875,8 +2798,9 @@ fn write_conflict_markers_file(
     ours_hash: &Option<ObjectHash>,
     their_hash: &Option<ObjectHash>,
     base_hash: &Option<ObjectHash>,
-    short_src: &str,
-    conflict_style: diffy::ConflictStyle,
+    labels: &merge::GitConflictLabels,
+    conflict_style: merge::ConflictStyle,
+    driver: merge::BuiltinMergeDriver,
 ) -> Result<(), CherryPickSingleError> {
     fn side_bytes(hash: &Option<ObjectHash>) -> Option<Vec<u8>> {
         hash.as_ref()
@@ -1888,62 +2812,84 @@ fn write_conflict_markers_file(
 
     // Line-level merge applies only when both sides are present and text; the
     // shared helper returns None otherwise so we fall back to whole-file markers.
-    let content: Vec<u8> = match (&ours_bytes, &theirs_bytes) {
-        (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict(
-            base_bytes.as_deref(),
-            ours,
-            theirs,
-            short_src,
-            conflict_style,
-        )
-        .unwrap_or_else(|| whole_file_conflict(ours, theirs, short_src)),
-        _ => whole_file_conflict(
-            ours_bytes.as_deref().unwrap_or(&[]),
-            theirs_bytes.as_deref().unwrap_or(&[]),
-            short_src,
-        ),
+    let binary_conflict = driver == merge::BuiltinMergeDriver::Binary
+        || (driver == merge::BuiltinMergeDriver::Union
+            && ours_bytes.is_some()
+            && theirs_bytes.is_some()
+            && [
+                base_bytes.as_deref(),
+                ours_bytes.as_deref(),
+                theirs_bytes.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(merge::merge_input_is_binary));
+    let content: Vec<u8> = if binary_conflict {
+        // A binary modify/delete conflict keeps whichever complete side still
+        // exists. Choosing only ours would turn an ours-deleted/theirs-modified
+        // path into an empty worktree file even though stage 3 retained data.
+        ours_bytes
+            .clone()
+            .or_else(|| theirs_bytes.clone())
+            .unwrap_or_default()
+    } else {
+        match (&ours_bytes, &theirs_bytes) {
+            (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict_labeled(
+                base_bytes.as_deref(),
+                ours,
+                theirs,
+                labels,
+                conflict_style,
+            )
+            .map_err(CherryPickSingleError::SaveFailed)?
+            .unwrap_or_else(|| whole_file_conflict(ours, theirs, &labels.theirs)),
+            _ => whole_file_conflict(
+                ours_bytes.as_deref().unwrap_or(&[]),
+                theirs_bytes.as_deref().unwrap_or(&[]),
+                &labels.theirs,
+            ),
+        }
     };
 
     let target = util::working_dir().join(path);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
+    let executable = index_entry_executable(path);
+    crate::utils::worktree_blob::write_worktree_blob(&target, &content, executable).map_err(
+        |e| {
             CherryPickSingleError::SaveFailed(format!(
-                "failed to create parent directory '{}': {e}",
-                parent.display()
+                "failed to write conflict markers to '{}': {e}",
+                target.display()
             ))
-        })?;
-    }
-    fs::write(&target, &content).map_err(|e| {
-        CherryPickSingleError::SaveFailed(format!(
-            "failed to write conflict markers to '{}': {e}",
-            target.display()
-        ))
-    })?;
+        },
+    )?;
     Ok(())
+}
+
+/// Executable bit of the index entry for `path` (stage 2, else 3/0), used by
+/// conflict-marker materialization (ADR-FM-02/03).
+fn index_entry_executable(path: &Path) -> bool {
+    let Some(name) = path.to_str() else {
+        return false;
+    };
+    Index::load(crate::utils::path::index())
+        .ok()
+        .and_then(|index| {
+            [2u8, 3, 0]
+                .iter()
+                .find_map(|stage| index.get(name, *stage))
+                .map(|entry| entry.mode & 0o111 != 0)
+        })
+        .unwrap_or(false)
 }
 
 /// Whole-file conflict presentation, used when a line-level merge does not apply
 /// (a delete/modify conflict, or binary content): ours between `<<<<<<< HEAD`
 /// and `=======`, theirs up to `>>>>>>> <short-source>`.
 fn whole_file_conflict(ours: &[u8], theirs: &[u8], short_src: &str) -> Vec<u8> {
-    fn side_text(bytes: &[u8]) -> String {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-    let ours = side_text(ours);
-    let theirs = side_text(theirs);
-
-    let mut content = String::from("<<<<<<< HEAD\n");
-    content.push_str(&ours);
-    if !ours.is_empty() && !ours.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str("=======\n");
-    content.push_str(&theirs);
-    if !theirs.is_empty() && !theirs.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(&format!(">>>>>>> {short_src}\n"));
-    content.into_bytes()
+    // Preserve cherry-pick's established lossy binary/delete-modify fallback;
+    // the shared renderer only owns marker framing and line endings here.
+    let ours = String::from_utf8_lossy(ours);
+    let theirs = String::from_utf8_lossy(theirs);
+    merge::render_whole_file_conflict(ours.as_bytes(), theirs.as_bytes(), "HEAD", short_src)
 }
 
 /// Build (and persist) the nested tree for the current index, delegating to the
@@ -1956,20 +2902,32 @@ fn create_tree_from_index(index: &Index) -> Result<ObjectHash, CherryPickSingleE
         .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))
 }
 
+/// Refuse a pick that would overwrite an untracked working tree file. Callers
+/// run this before saving the new index, so the refusal writes nothing
+/// (ADR-HF-04 U8-U10; Git: "The following untracked working tree files would be
+/// overwritten by merge").
+fn ensure_no_untracked_overwrite(
+    current_index: &Index,
+    new_index: &Index,
+) -> Result<(), CherryPickSingleError> {
+    let untracked_paths = worktree::untracked_workdir_paths(current_index).map_err(|e| {
+        CherryPickSingleError::LoadObject(format!("failed to inspect untracked files: {e}"))
+    })?;
+    match worktree::untracked_overwrite_path(&untracked_paths, new_index) {
+        Some(path) => Err(CherryPickSingleError::UntrackedOverwrite(
+            path.display().to_string(),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Sync the worktree to `new_index`. Callers have already run
+/// [`ensure_no_untracked_overwrite`] before saving `new_index`.
 fn reset_workdir_tracked_only(
     current_index: &Index,
     new_index: &Index,
 ) -> Result<(), CherryPickSingleError> {
     let workdir = util::working_dir();
-    let untracked_paths = worktree::untracked_workdir_paths(current_index).map_err(|e| {
-        CherryPickSingleError::LoadObject(format!("failed to inspect untracked files: {e}"))
-    })?;
-    if let Some(conflict) = worktree::untracked_overwrite_path(&untracked_paths, new_index) {
-        return Err(CherryPickSingleError::Conflict(format!(
-            "untracked working tree file would be overwritten: {}",
-            conflict.display()
-        )));
-    }
     let new_tracked_paths: HashSet<_> = new_index.tracked_files().into_iter().collect();
 
     for path_buf in current_index.tracked_files() {
@@ -2004,20 +2962,27 @@ fn reset_workdir_tracked_only(
             }
             let blob = git_internal::internal::object::blob::Blob::load(&entry.hash);
             let target_path = workdir.join(path_str);
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
+            if entry.mode & 0o170000 == 0o120000 {
+                crate::utils::worktree_blob::write_worktree_symlink(&target_path, &blob.data)
+                    .map_err(|e| {
+                        CherryPickSingleError::SaveFailed(format!(
+                            "failed to write symlink '{}': {e}",
+                            target_path.display()
+                        ))
+                    })?;
+            } else {
+                crate::utils::worktree_blob::write_worktree_blob(
+                    &target_path,
+                    &blob.data,
+                    entry.mode & 0o111 != 0,
+                )
+                .map_err(|e| {
                     CherryPickSingleError::SaveFailed(format!(
-                        "failed to create parent directory '{}': {e}",
-                        parent.display()
+                        "failed to write file '{}': {e}",
+                        target_path.display()
                     ))
                 })?;
             }
-            fs::write(&target_path, &blob.data).map_err(|e| {
-                CherryPickSingleError::SaveFailed(format!(
-                    "failed to write file '{}': {e}",
-                    target_path.display()
-                ))
-            })?;
         }
     }
     Ok(())
@@ -2054,6 +3019,91 @@ async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), 
 
 // ── Cherry-pick sequencer state (unified `sequence_state`, lore.md 2.6) ──
 
+/// Test-only interruption right after a pick moved HEAD, before any later
+/// sequencer write (gated on the `LIBRA_TEST` sentinel like every failpoint).
+fn after_head_move_failpoint() -> Result<(), CherryPickSingleError> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_HEAD").is_some()
+    {
+        return Err(CherryPickSingleError::SaveFailed(
+            "test-injected cherry-pick interruption after moving HEAD".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Sequencer row write committed in the same transaction as a pick's HEAD
+/// move, so an interruption between the two can never leave `current_oid`
+/// naming a commit that already landed (which `--continue` would replay).
+#[derive(Debug, Clone)]
+enum SequenceAdvance {
+    /// No sequence row is involved (a single-commit or `--no-commit` pick).
+    NoRow,
+    /// Point the existing row at the next commit to attempt.
+    Save(SequenceState),
+    /// The landed commit was the last one: remove the row. Carries the row that
+    /// names the landing commit, written first by a fast-forward pick.
+    Clear(SequenceState),
+}
+
+impl SequenceAdvance {
+    /// The row once `landing` (the commit ahead of `todo`) lands: the next
+    /// commit with the conflict flag cleared (a later `--continue` re-attempts
+    /// it), or no row.
+    fn after(
+        head_name: &str,
+        head_orig: ObjectHash,
+        landing: &ObjectHash,
+        todo: &VecDeque<ObjectHash>,
+        opts_json: &str,
+    ) -> Self {
+        let row = |current_oid: ObjectHash, todo: VecDeque<ObjectHash>| {
+            CherryPickState {
+                head_name: head_name.to_string(),
+                head_orig,
+                current_oid,
+                stop_concluded: false,
+                todo,
+                opts_json: opts_json_with_conflict_flag(opts_json, false),
+            }
+            .to_sequence()
+        };
+        let mut rest = todo.clone();
+        match rest.pop_front() {
+            Some(next) => SequenceAdvance::Save(row(next, rest)),
+            None => SequenceAdvance::Clear(row(*landing, VecDeque::new())),
+        }
+    }
+
+    /// The row naming `landing` itself, written before a fast-forward pick
+    /// moves HEAD outside the transaction (HF-31 X2).
+    fn landing_row(&self, landing: &ObjectHash) -> Option<SequenceState> {
+        let mut row = match self {
+            SequenceAdvance::NoRow => return None,
+            SequenceAdvance::Save(next) => {
+                let mut row = next.clone();
+                row.todo.insert(0, row.current_oid.clone());
+                row.current_oid = landing.to_string();
+                row
+            }
+            SequenceAdvance::Clear(landed) => landed.clone(),
+        };
+        row.payload = opts_json_with_ff_landing(&row.payload, landing);
+        Some(row)
+    }
+
+    /// Apply the transition when no HEAD transaction carries it: after a
+    /// fast-forward's `reset --hard`, or for a pick dropped by `--empty=drop`
+    /// (HF-31 X6).
+    async fn apply_without_head_move(&self) -> Result<(), String> {
+        match self {
+            SequenceAdvance::NoRow => Ok(()),
+            SequenceAdvance::Save(next) => sequencer::save(next).await,
+            SequenceAdvance::Clear(_) => sequencer::clear(SequenceKind::CherryPick).await,
+        }
+    }
+}
+
 /// Upper bound on `todo` OIDs read back from a persisted state row. Guards
 /// against an externally-corrupted `todo` column ballooning memory on load.
 const CHERRY_PICK_TODO_CAP: usize = 10_000;
@@ -2074,6 +3124,13 @@ pub struct CherryPickState {
     pub head_orig: ObjectHash,
     /// The commit whose application is currently conflicted.
     pub current_oid: ObjectHash,
+    /// #477 HF-01: the stopped item was concluded from outside (a later
+    /// `reset`), recorded as `stop_concluded` in the row's serialized options.
+    /// The remaining `todo` is kept; `current_oid` still names the stopped
+    /// commit, which `--continue` must no longer record.
+    /// Derived from `opts_json` when loading; `save()` persists `opts_json`,
+    /// not changes made directly to this derived field.
+    pub stop_concluded: bool,
     /// Remaining commits to pick, in order.
     pub todo: VecDeque<ObjectHash>,
     /// Serialized commit-modifier options (`-x`/`-s`/…) for the sequence.
@@ -2100,11 +3157,17 @@ impl CherryPickState {
             .map_err(|e| format!("invalid head_orig hash: {e}"))?;
         let current_oid = ObjectHash::from_str(state.current_oid.trim())
             .map_err(|e| format!("invalid current_oid hash: {e}"))?;
+        // #477 HF-01: the external-conclusion marker rides in the options, so
+        // the row itself stays valid for binaries that predate it.
+        let stop_concluded = serde_json::from_str::<CherryPickOpts>(&state.payload)
+            .map(|opts| opts.stop_concluded)
+            .unwrap_or(false);
         let todo = VecDeque::from(Self::parse_todo(&state.todo.join("\n"))?);
         Ok(CherryPickState {
             head_name: state.head_name,
             head_orig,
             current_oid,
+            stop_concluded,
             todo,
             opts_json: state.payload,
         })
@@ -2234,8 +3297,45 @@ mod tests {
             "failed to cherry-pick abc123: untracked file would be overwritten",
         );
         assert_eq!(
+            CherryPickError::UntrackedOverwrite {
+                commit: "abc123".to_string(),
+                path: "new.txt".to_string(),
+                stop: UntrackedStop::BeforeAnyWrite,
+            }
+            .to_string(),
+            "failed to cherry-pick abc123: untracked working tree file would be overwritten: new.txt",
+        );
+        assert_eq!(
+            CherryPickError::UnmergedIndex(vec!["a.txt".to_string()]).to_string(),
+            "cherry-pick is not possible because the index has unmerged entries",
+        );
+        assert_eq!(
+            CherryPickError::NoCommitConflict {
+                commit: "abc123".to_string(),
+                paths: 2,
+            }
+            .to_string(),
+            "failed to cherry-pick abc123: conflicts in 2 path(s); a '--no-commit' pick leaves no sequence to continue",
+        );
+        assert_eq!(
             CherryPickError::InProgress.to_string(),
             "a cherry-pick is already in progress",
+        );
+        assert_eq!(
+            CherryPickError::CorruptState("bad".to_string()).to_string(),
+            "cherry-pick state is inconsistent: bad",
+        );
+        assert_eq!(
+            CherryPickError::LocalChangesWouldBeOverwritten.to_string(),
+            "your local changes would be overwritten by cherry-pick",
+        );
+        assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Skip).to_string(),
+            "an interrupted 'libra cherry-pick --skip' has not finished",
+        );
+        assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Abort).to_string(),
+            "an interrupted 'libra cherry-pick --abort' has not finished",
         );
         assert_eq!(
             CherryPickError::NoCherryPickInProgress.to_string(),
@@ -2323,8 +3423,45 @@ mod tests {
             StableErrorCode::ConflictUnresolved,
         );
         assert_eq!(
+            CherryPickError::UntrackedOverwrite {
+                commit: "abc123".to_string(),
+                path: "new.txt".to_string(),
+                stop: UntrackedStop::BeforeAnyWrite,
+            }
+            .stable_code(),
+            StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
+            CherryPickError::UnmergedIndex(vec!["a.txt".to_string()]).stable_code(),
+            StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
+            CherryPickError::NoCommitConflict {
+                commit: "abc123".to_string(),
+                paths: 1,
+            }
+            .stable_code(),
+            StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
             CherryPickError::InProgress.stable_code(),
             StableErrorCode::ConflictOperationBlocked,
+        );
+        assert_eq!(
+            CherryPickError::CorruptState("bad".to_string()).stable_code(),
+            StableErrorCode::RepoCorrupt,
+        );
+        assert_eq!(
+            CherryPickError::LocalChangesWouldBeOverwritten.stable_code(),
+            StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Skip).stable_code(),
+            StableErrorCode::RepoStateInvalid,
+        );
+        assert_eq!(
+            CherryPickError::ControlPending(ControlPhase::Abort).stable_code(),
+            StableErrorCode::RepoStateInvalid,
         );
         assert_eq!(
             CherryPickError::NoCherryPickInProgress.stable_code(),
@@ -2348,6 +3485,206 @@ mod tests {
         );
     }
 
+    /// ADR-HF-04: the refusal names at most ten unmerged paths and counts the rest.
+    #[test]
+    fn unmerged_paths_hint_lists_at_most_ten_paths() {
+        let paths: Vec<String> = (1..=12).map(|i| format!("p{i}.txt")).collect();
+        assert_eq!(
+            unmerged_paths_hint(&paths[..2]),
+            "unmerged paths: p1.txt, p2.txt"
+        );
+        let hint = unmerged_paths_hint(&paths);
+        assert!(
+            hint.contains("p10.txt") && !hint.contains("p11.txt"),
+            "{hint}"
+        );
+        assert!(hint.ends_with("(and 2 more)"), "{hint}");
+    }
+
+    /// ADR-HF-04: the unmerged-index refusal exits 128 with `LBR-CONFLICT-001`
+    /// and lists the paths in a hint.
+    #[test]
+    fn unmerged_index_refusal_is_fatal_conflict_with_paths() {
+        let error = CliError::from(CherryPickError::UnmergedIndex(vec!["a.txt".to_string()]));
+        assert_eq!(error.exit_code(), 128);
+        let rendered = error.render_json();
+        assert!(rendered.contains("LBR-CONFLICT-001"), "{rendered}");
+        assert!(rendered.contains("unmerged paths: a.txt"), "{rendered}");
+    }
+
+    /// M-UNMERGED U8-U10: the untracked-overwrite refusal says nothing was
+    /// written and points at moving the file, never at `--continue`.
+    #[test]
+    fn untracked_overwrite_refusal_guides_to_move_the_file() {
+        let error = CliError::from(CherryPickError::UntrackedOverwrite {
+            commit: "abc123".to_string(),
+            path: "new.txt".to_string(),
+            stop: UntrackedStop::BeforeAnyWrite,
+        });
+        assert_eq!(error.exit_code(), 128);
+        let rendered = error.render_json();
+        assert!(rendered.contains("move or remove 'new.txt'"), "{rendered}");
+        assert!(rendered.contains("nothing was written"), "{rendered}");
+        assert!(!rendered.contains("--continue"), "{rendered}");
+    }
+
+    /// ADR-HF-04 U12-U14: an untracked stop inside a sequence points at
+    /// `--continue`, and a partial `--no-commit` run says earlier picks stay staged.
+    #[test]
+    fn untracked_overwrite_hint_follows_the_stop() {
+        let hint = |stop| {
+            CliError::from(CherryPickError::UntrackedOverwrite {
+                commit: "abc123".to_string(),
+                path: "new.txt".to_string(),
+                stop,
+            })
+            .render_json()
+        };
+        let sequence = hint(UntrackedStop::SequenceStopped);
+        assert!(
+            sequence.contains("libra cherry-pick --continue"),
+            "{sequence}"
+        );
+        assert!(
+            !sequence.contains("run the same command again"),
+            "{sequence}"
+        );
+        let partial = hint(UntrackedStop::NoCommitPartial);
+        assert!(partial.contains("stay staged"), "{partial}");
+        assert!(!partial.contains("--continue"), "{partial}");
+    }
+
+    /// `--continue` re-attempts a non-conflict stop only when the persisted row
+    /// carries the conflict flag; rows from older binaries keep finalizing.
+    #[test]
+    fn opts_json_conflict_flag_presence_distinguishes_legacy_rows() {
+        let args = CherryPickArgs::try_parse_from(["cherry-pick", "abc"]).unwrap();
+        let current = serde_json::to_string(&CherryPickOpts::from_args(&args)).unwrap();
+        assert!(opts_json_has_conflict_flag(&current));
+        assert!(!opts_json_has_conflict_flag(r#"{"signoff":false}"#));
+        assert!(!opts_json_has_conflict_flag("not json"));
+    }
+
+    /// The row written with a landed pick names the next commit with the
+    /// conflict flag cleared, or clears the sequence after the last commit; a
+    /// fast-forward first writes the row naming the landing commit itself with
+    /// the `ff_landing` marker (#477 HF-31).
+    #[test]
+    fn sequence_advance_points_at_next_commit_or_clears() {
+        let oid = |c: char| ObjectHash::from_str(&c.to_string().repeat(40)).unwrap();
+        let args = CherryPickArgs::try_parse_from(["cherry-pick", "abc"]).unwrap();
+        let mut opts = CherryPickOpts::from_args(&args);
+        opts.stopped_on_conflict = true;
+        opts.control_phase = Some(ControlPhase::Skip);
+        let opts_json = serde_json::to_string(&opts).unwrap();
+        let todo = VecDeque::from([oid('b'), oid('c')]);
+        let advance = SequenceAdvance::after("main", oid('a'), &oid('d'), &todo, &opts_json);
+        match &advance {
+            SequenceAdvance::Save(row) => {
+                assert_eq!(row.current_oid, oid('b').to_string());
+                assert_eq!(row.todo, vec![oid('c').to_string()]);
+                let saved: CherryPickOpts = serde_json::from_str(&row.payload).unwrap();
+                assert!(!saved.stopped_on_conflict);
+                assert_eq!(saved.control_phase, None);
+                assert!(opts_json_has_conflict_flag(&row.payload));
+            }
+            other => panic!("expected Save, got {other:?}"),
+        }
+        let landing = advance
+            .landing_row(&oid('d'))
+            .expect("a row names the landing commit");
+        assert_eq!(landing.current_oid, oid('d').to_string());
+        assert_eq!(
+            landing.todo,
+            vec![oid('b').to_string(), oid('c').to_string()]
+        );
+        let marked: CherryPickOpts = serde_json::from_str(&landing.payload).unwrap();
+        assert_eq!(marked.ff_landing, Some(oid('d').to_string()));
+        let cleared: CherryPickOpts =
+            serde_json::from_str(&opts_json_with_conflict_flag(&landing.payload, false)).unwrap();
+        assert_eq!(cleared.ff_landing, None);
+
+        let last =
+            SequenceAdvance::after("main", oid('a'), &oid('d'), &VecDeque::new(), &opts_json);
+        match &last {
+            SequenceAdvance::Clear(row) => {
+                assert_eq!(row.current_oid, oid('d').to_string());
+                assert!(row.todo.is_empty());
+            }
+            other => panic!("expected Clear, got {other:?}"),
+        }
+        assert!(SequenceAdvance::NoRow.landing_row(&oid('d')).is_none());
+    }
+
+    /// M-CRASH X5 (#477 HF-31): rows without a control phase (older binaries)
+    /// report none, a marked row reports its verb, and a position write clears it.
+    #[test]
+    #[serial_test::serial(env)]
+    fn control_phase_round_trips_and_legacy_rows_have_none() {
+        let args = CherryPickArgs::try_parse_from(["cherry-pick", "abc"]).unwrap();
+        let current = serde_json::to_string(&CherryPickOpts::from_args(&args)).unwrap();
+        assert!(!current.contains("control_phase"), "{current}");
+        assert_eq!(opts_json_control_phase(&current), None);
+        assert_eq!(
+            opts_json_control_phase(r#"{"stopped_on_conflict":true,"signoff":false}"#),
+            None
+        );
+        let skipping = opts_json_with_control_phase(&current, ControlPhase::Skip).unwrap();
+        assert_eq!(opts_json_control_phase(&skipping), Some(ControlPhase::Skip));
+        assert_eq!(
+            opts_json_control_phase(&opts_json_with_conflict_flag(&skipping, false)),
+            None
+        );
+        assert!(opts_json_with_control_phase("not json", ControlPhase::Abort).is_none());
+        let ff_args = CherryPickArgs::try_parse_from(["cherry-pick", "--ff", "abc"]).unwrap();
+        let ff_opts = CherryPickOpts::from_args(&ff_args);
+        assert!(ff_opts.ff, "--ff is persisted with the sequence");
+        assert!(ff_opts.into_args().ff, "--ff is restored for resumed picks");
+        let (stamped, needle) = opts_json_with_claim_token(&current);
+        let needle = needle.expect("readable options get a claim token");
+        assert!(stamped.contains(&needle), "{stamped}");
+        assert!(
+            opts_json_with_conflict_flag(&stamped, true).contains(&needle),
+            "position writes keep the claim token"
+        );
+        assert_eq!(opts_json_with_claim_token("not json").1, None);
+        let legacy: CherryPickOpts = serde_json::from_str(r#"{"signoff":false}"#).unwrap();
+        assert!(!legacy.ff && legacy.ff_landing.is_none());
+        assert_eq!(opts_json_control_phase("not json"), None);
+    }
+
+    /// HF-31: the refusal names the control verb to re-run.
+    #[test]
+    fn control_pending_names_the_verb_to_rerun() {
+        for (phase, verb) in [
+            (ControlPhase::Skip, "--skip"),
+            (ControlPhase::Abort, "--abort"),
+        ] {
+            let rendered = CliError::from(CherryPickError::ControlPending(phase)).render_json();
+            assert!(
+                rendered.contains(&format!("libra cherry-pick {verb}")),
+                "{rendered}"
+            );
+            assert!(rendered.contains("LBR-REPO-003"), "{rendered}");
+        }
+    }
+
+    /// M-UNMERGED U5: a `--no-commit` conflict mentions neither a multi-commit
+    /// sequence nor `--continue`; it points at `libra add` and `reset --hard`.
+    #[test]
+    fn no_commit_conflict_guides_to_add_instead_of_continue() {
+        let error = CliError::from(CherryPickError::NoCommitConflict {
+            commit: "abc123".to_string(),
+            paths: 1,
+        });
+        let rendered = error.render_json();
+        assert!(!rendered.contains("multi-commit"), "{rendered}");
+        assert!(!rendered.contains("--continue"), "{rendered}");
+        assert!(rendered.contains("libra add"), "{rendered}");
+        assert!(rendered.contains("libra reset --hard"), "{rendered}");
+        assert!(rendered.contains("LBR-CONFLICT-001"), "{rendered}");
+    }
+
     /// Every commit-shaping modifier must round-trip through `CherryPickOpts`
     /// serde (the `cherry_pick_state.opts_json` blob), so a conflict + resume
     /// replays the rest of the sequence with the same options. Guards against
@@ -2363,6 +3700,7 @@ mod tests {
             allow_empty_message: true,
             keep_redundant_commits: true,
             gpg_sign: true,
+            rerere_autoupdate: true,
             mainline: Some(2),
             cleanup: Some("strip".to_string()),
             empty: Some("drop".to_string()),
@@ -2380,10 +3718,16 @@ mod tests {
         assert!(rebuilt.allow_empty_message);
         assert!(rebuilt.keep_redundant_commits);
         assert!(rebuilt.gpg_sign);
+        assert!(rebuilt.rerere_autoupdate);
+        assert!(!rebuilt.no_rerere_autoupdate);
         assert_eq!(rebuilt.mainline, Some(2));
         assert_eq!(rebuilt.cleanup.as_deref(), Some("strip"));
         assert_eq!(rebuilt.empty.as_deref(), Some("drop"));
         assert_eq!(rebuilt.strategy_option, vec![MergeFavor::Ours]);
+
+        let old: CherryPickOpts = serde_json::from_str("{}")
+            .expect("options written before rerere override remain readable");
+        assert_eq!(old.rerere_autoupdate, None);
     }
 
     #[test]
@@ -2392,5 +3736,21 @@ mod tests {
             .expect("valid cherry-pick arguments should parse");
         assert!(args.gpg_sign);
         assert!(!args.no_gpg_sign);
+    }
+
+    #[test]
+    fn rerere_autoupdate_flags_are_last_wins_and_round_trip() {
+        let args = CherryPickArgs::try_parse_from([
+            "cherry-pick",
+            "--rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            "deadbeef",
+        ])
+        .expect("the last rerere toggle must win");
+        assert_eq!(rerere_autoupdate_override(&args), Some(false));
+
+        let rebuilt = CherryPickOpts::from_args(&args).into_args();
+        assert!(!rebuilt.rerere_autoupdate);
+        assert!(rebuilt.no_rerere_autoupdate);
     }
 }

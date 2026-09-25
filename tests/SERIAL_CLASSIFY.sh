@@ -28,6 +28,11 @@
 # is NOT exclusive with named lanes, so `global` rows must expand to the full
 # resource key set at conversion time — see plan-20260729 S2/DEFER-09.
 #
+# Tree face (plan-20260917 ADR-SH-03): SERIAL_CLASSIFY_TREE=tests|src
+# (default tests). The tests face must stay byte-identical to the pre-SH-01
+# baseline. src/ rows never enter SERIAL_REGISTRY.tsv / NEXTEST_GROUPS.sh.
+# An unrecognized TREE value exits 2 without writing files.
+#
 # Scanning is string/comment-aware: comments and string literals (normal, raw,
 # byte/C strings, char literals) are blanked before matching, so a `#[serial]`
 # inside text never produces a row, and `#[test] #[serial]` on one line is read.
@@ -71,13 +76,20 @@
 set -eu
 ROOT="${SERIAL_CLASSIFY_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$ROOT" || { echo "FAIL: cannot reach the repository root" >&2; exit 2; }
-# Source-only Docker/CI exports intentionally omit repository metadata.
-[ -f COMPATIBILITY.md ] && { [ -d .libra ] || [ -e .git ] || { [ -f Cargo.toml ] && [ -f src/lib.rs ]; }; } || { echo "FAIL: not at the repository root" >&2; exit 2; }
+[ -f COMPATIBILITY.md ] && { [ -d .libra ] || [ -e .git ]; } || { echo "FAIL: not at the repository root" >&2; exit 2; }
 
 python3 - <<'CLASSIFY_PY'
 import os, re, sys, time
 _T0 = time.time()
 _TM = {}
+
+# plan-20260917 ADR-SH-03: optional src/ face. Default remains tests/ so
+# existing guards and NEXTEST_GROUPS stay byte-stable.
+TREE = os.environ.get('SERIAL_CLASSIFY_TREE', 'tests').strip() or 'tests'
+if TREE not in ('tests', 'src'):
+    print('FAIL: SERIAL_CLASSIFY_TREE must be tests or src, got %r' % TREE,
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def _tmark(tag):
@@ -580,12 +592,17 @@ def _load_rs(p):
     return lines, blanked
 
 
-for root, dirs, files in os.walk('tests'):
+for root, dirs, files in os.walk(TREE):
     dirs[:] = sorted(d for d in dirs if d not in ('data', 'fixtures'))
     for name in sorted(files):
         if not name.endswith('.rs'):
             continue
         path = os.path.join(root, name)
+        if TREE == 'src' and path != 'src/utils/test.rs' and not path.startswith(
+                'src/utils/test' + os.sep):
+            probe = open(path, encoding='utf-8', errors='replace').read()
+            if '#[serial' not in probe and 'serial_test::serial' not in probe:
+                continue
         lines, blanked = _load_rs(path)
         # Codex TA-01 R26 P0: item-position `include!` splices ANOTHER file's
         # items into this one — even from the pruned fixtures/ and data/
@@ -610,7 +627,7 @@ for root, dirs, files in os.walk('tests'):
                         cand = os.path.normpath(
                             os.path.join(os.path.dirname(ipath), tgt))
                     if not (cand and cand.endswith('.rs')
-                            and cand.startswith('tests' + os.sep)
+                            and cand.startswith(TREE + os.sep)
                             and os.path.isfile(cand)):
                         UNRESOLVED_INCLUDES.add(path)
                         continue
@@ -892,6 +909,8 @@ for path, code in FILES:
 
 _tmark('pass1-done')
 SHARED_PREFIXES = ('tests/command/mod.rs', 'tests/harness/', 'tests/helpers/')
+if TREE == 'src':
+    SHARED_PREFIXES = SHARED_PREFIXES + ('src/utils/test.rs',)
 shared_bodies = {}   # fn name -> [(body, defining path)] under the shared prefixes
 shared_macros = {}   # macro name -> [(body, defining path)] under the shared prefixes
 shared_types = {}    # type name -> defining shared path | AMBIGUOUS
@@ -2809,7 +2828,7 @@ if BENIGN_DISABLED:
     BENIGN_READ_KEYS = frozenset()
 
 bad_benign = sorted(BENIGN_READ_KEYS & MUTATED_ENV_KEYS)
-if bad_benign:
+if bad_benign and TREE == 'tests':
     print('FAIL: benign env-read key(s) %s are mutated somewhere in tests/ — '
           'remove them from BENIGN_READ_KEYS' % ','.join(bad_benign),
           file=sys.stderr)
@@ -2817,14 +2836,16 @@ if bad_benign:
 
 # Self-check: an allowlisted name redefined in shared scope with a polluted
 # body would launder pollution through the allowlist — refuse to run. Every
-# same-named shared body is scanned, ambiguous or not.
-for nm in sorted(CALL_ALLOW):
-    for body, _bp in shared_bodies.get(nm, ()):
-        if isinstance(body, str) and any(c in body for c in GLOBAL_CALLS + HASH_CALLS + CWD_CALLS):
-            print('FAIL: allowlisted helper %s is defined in shared scope with '
-                  'process-wide pollution — remove it from CALL_ALLOW' % nm,
-                  file=sys.stderr)
-            sys.exit(3)
+# same-named shared body is scanned, ambiguous or not. TREE=src loads
+# production helpers that share names with the tests allowlist; skip.
+if TREE == 'tests':
+    for nm in sorted(CALL_ALLOW):
+        for body, _bp in shared_bodies.get(nm, ()):
+            if isinstance(body, str) and any(c in body for c in GLOBAL_CALLS + HASH_CALLS + CWD_CALLS):
+                print('FAIL: allowlisted helper %s is defined in shared scope with '
+                      'process-wide pollution — remove it from CALL_ALLOW' % nm,
+                      file=sys.stderr)
+                sys.exit(3)
 
 # ---------- call surface extraction ----------------------------------------
 ATTR_IN_BODY = re.compile(r'#!?\[[^\]\n]*\]')
@@ -3745,9 +3766,12 @@ for path, code in FILES:
                     # composite lane the source attribute cannot provide.
                     uncovered = [p for p in parts if p in LANE_ORDER and p not in keys]
                     if keys and uncovered:
-                        print("FAIL: %s (%s): named key(s) %s do not cover process-wide pollution lane(s) %s — make the attribute unkeyed or remove the pollution" % (
-                            fn, path, '+'.join(keys), '+'.join(uncovered)), file=sys.stderr)
-                        sys.exit(3)
+                        if TREE == 'tests':
+                            print("FAIL: %s (%s): named key(s) %s do not cover process-wide pollution lane(s) %s — make the attribute unkeyed or remove the pollution" % (
+                                fn, path, '+'.join(keys), '+'.join(uncovered)), file=sys.stderr)
+                            sys.exit(3)
+                        # src/ is the conversion input: emit the proven lanes
+                        # instead of aborting the whole face (plan-20260917 SH-01).
                     if parts:
                         verdict = 'lane:' + '+'.join(parts)
                     else:

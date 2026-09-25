@@ -10,8 +10,11 @@ use libra::{
     },
     utils::{client_storage::ClientStorage, path, test::ChangeDirGuard},
 };
+use tempfile::tempdir;
 
 use super::*;
+
+mod gitlink_preflight;
 
 #[test]
 fn test_switch_cli_missing_branch_returns_cli_exit_code() {
@@ -1100,5 +1103,144 @@ fn switch_no_progress_flag_is_accepted_noop() {
     assert!(
         String::from_utf8_lossy(&current.stdout).contains("feature"),
         "switched to feature"
+    );
+}
+
+/// M-DETACH D2, D3, D4 (switch), D6, D7: bare `--detach` detaches at HEAD;
+/// `HEAD~1` still works; unborn HEAD is refused with Git wording.
+#[test]
+fn test_switch_bare_detach_detaches_at_head() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("second.txt"), "two\n").expect("second.txt");
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add second");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], p),
+        "commit second",
+    );
+    let parent = {
+        let out = run_libra_command(&["rev-parse", "HEAD~1"], p);
+        assert_cli_success(&out, "rev-parse HEAD~1");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let d2 = run_libra_command(&["switch", "--detach"], p);
+    assert_cli_success(&d2, "D2 switch --detach");
+    let symbolic = run_libra_command(&["symbolic-ref", "HEAD"], p);
+    assert!(!symbolic.status.success(), "D2 symbolic-ref HEAD must fail");
+    let d2_json = run_libra_command(&["--json", "switch", "--detach"], p);
+    assert_cli_success(&d2_json, "D6 switch --json --detach");
+    let parsed = parse_json_stdout(&d2_json);
+    assert_eq!(parsed["data"]["detached"], true);
+    let status = run_libra_command(&["status"], p);
+    assert_cli_success(&status, "D7 status after D2");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("HEAD detached at"),
+        "D7: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    let d3 = run_libra_command(&["switch", "--detach", "HEAD~1"], p);
+    assert_cli_success(&d3, "D3 switch --detach HEAD~1");
+    let detached = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], p);
+        assert_cli_success(&out, "rev-parse after D3");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(detached, parent, "D3 detaches at HEAD~1");
+    let status = run_libra_command(&["status"], p);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("HEAD detached at"),
+        "D7 after D3"
+    );
+
+    let unborn = tempdir().expect("unborn");
+    init_repo_via_cli(unborn.path());
+    let before = run_libra_command(&["symbolic-ref", "HEAD"], unborn.path());
+    assert_cli_success(&before, "unborn symbolic-ref");
+    let before_out = String::from_utf8_lossy(&before.stdout).into_owned();
+    let d4 = run_libra_command(&["switch", "--detach"], unborn.path());
+    let (stderr, report) = parse_cli_error_stderr(&d4.stderr);
+    assert_eq!(d4.status.code(), Some(128), "D4: {stderr}");
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert!(
+        stderr.contains("You are on a branch yet to be born"),
+        "D4 wording: {stderr}"
+    );
+    let after = run_libra_command(&["symbolic-ref", "HEAD"], unborn.path());
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        before_out.trim(),
+        "D4 zero-write"
+    );
+}
+
+/// FM-01 (M-MAT T5): switching to a branch whose entry is 100644 clears the
+/// execute bit, and switching back to the 100755 entry sets it again.
+#[cfg(unix)]
+#[test]
+fn test_switch_sets_and_clears_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("failed to create repository root");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    std::fs::write(repo_path.join("tool"), "v1\n").expect("write tool");
+    assert_cli_success(
+        &run_libra_command(&["add", "tool"], repo_path),
+        "stage plain tool",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "plain tool", "--no-verify"], repo_path),
+        "commit plain tool",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], repo_path),
+        "create feature branch",
+    );
+    let tool = repo_path.join("tool");
+    std::fs::write(&tool, "v2\n").expect("rewrite tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    assert_cli_success(
+        &run_libra_command(&["add", "tool"], repo_path),
+        "stage executable tool",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "executable tool", "--no-verify"],
+            repo_path,
+        ),
+        "commit executable tool",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo_path),
+        "switch to main",
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&tool)
+            .expect("tool metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "switching to a 100644 entry must clear the execute bit"
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], repo_path),
+        "switch to feature",
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&tool)
+            .expect("tool metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "switching to a 100755 entry must set the execute bit"
     );
 }

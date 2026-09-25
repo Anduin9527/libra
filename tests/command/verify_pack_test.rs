@@ -212,7 +212,7 @@ fn verify_pack_accepts_sha256_index_path_outside_repository() {
 }
 
 #[test]
-#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+#[serial(cwd, env, hash_kind)]
 fn verify_pack_rejects_duplicate_object_ids_even_with_valid_index_checksum() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());

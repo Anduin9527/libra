@@ -1,27 +1,25 @@
 //! Operation (op) command group for viewing and restoring command-level operation history.
 
-use std::{collections::HashSet, str::FromStr};
+use std::collections::HashSet;
 
 use clap::{Parser, Subcommand};
-use git_internal::hash::ObjectHash;
-use sea_orm::DbErr;
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde::Serialize;
 
 use crate::{
     command::status,
     internal::{
-        ai::linear_ref::OwnedRefSpec,
-        branch::{Branch, is_locked_branch},
         config::ConfigKv,
         db::get_db_conn_instance,
-        head::Head,
         operation::{
-            OperationGraphRecord, OperationLogListItem, OperationPage, OperationQueryPage,
-            OperationService, OperationStatus,
+            DoctorEngine, DoctorReport, OperationKind, OperationStoreV2, ReconcileEngine,
+            ReconcileError, ReconcileOutcome, RestoreEngine, RestoreError, RestoreReceipt,
+            RestoreWhat, UndoEngine, UndoError,
         },
-        operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
+        worktree_scope::RequestScope,
     },
     utils::{
+        client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         util,
@@ -83,6 +81,64 @@ pub enum OpCommand {
         /// Only show what would be done
         #[clap(long)]
         dry_run: bool,
+
+        /// Facet selection for an operation-log v2 restore.
+        #[clap(long, value_enum, default_value_t = RestoreWhat::All)]
+        what: RestoreWhat,
+
+        /// Explicitly acknowledge a repository-wide/multi-worktree target.
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Append an operation that moves the current state back to a prior operation's parent.
+    Undo {
+        op_ref: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Re-apply the operation that was undone by the selected undo operation.
+    Redo {
+        op_ref: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Apply the inverse of an operation relative to an explicit parent.
+    Revert {
+        op_ref: String,
+        #[arg(long)]
+        parent: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Converge concurrent operation heads when their states are provably unambiguous.
+    Reconcile {
+        /// Only report what would happen
+        #[clap(long)]
+        dry_run: bool,
+    },
+
+    /// Diagnose operation state; repair is opt-in with --fix.
+    Doctor {
+        #[clap(long)]
+        fix: bool,
+        #[clap(long)]
+        dry_run: bool,
     },
 }
 
@@ -128,23 +184,26 @@ pub enum OpOutput {
         new_op_id: String,
         /// Human-readable restore confirmation.
         message: String,
-        /// Canonical local-only refs omitted from an old operation snapshot.
-        skipped_owned_refs: Vec<String>,
     },
-    #[serde(rename = "restore-preview")]
-    RestorePreview {
-        target_op_id: String,
-        head_kind: String,
-        head_target: String,
-        restored_refs: Vec<String>,
-        pruned_refs: Vec<String>,
-        skipped_owned_refs: Vec<String>,
-    },
+    #[serde(rename = "restore_v2")]
+    RestoreV2 { receipt: RestoreReceipt },
+    #[serde(rename = "undo")]
+    Undo { receipt: RestoreReceipt },
+    #[serde(rename = "redo")]
+    Redo { receipt: RestoreReceipt },
+    #[serde(rename = "revert")]
+    Revert { receipt: RestoreReceipt },
+    #[serde(rename = "reconcile")]
+    Reconcile { outcome: ReconcileOutcome },
+    #[serde(rename = "doctor")]
+    Doctor { report: DoctorReport },
 }
 
 #[derive(Debug, Clone, Serialize)]
 /// One entry rendered by `op log`.
 pub struct OpLogEntry {
+    /// Zero-based index in the complete, unfiltered operation history.
+    pub index: usize,
     /// Operation identifier.
     pub op_id: String,
     /// Recorded command name.
@@ -157,6 +216,55 @@ pub struct OpLogEntry {
     pub status: String,
     /// Completion timestamp in unix seconds, if the operation finished.
     pub end_ts: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct OperationHistoryEntry {
+    index: usize,
+    op_id: String,
+    command_name: String,
+    description: String,
+    actor: String,
+    status: String,
+    start_ts: i64,
+    end_ts: Option<i64>,
+    view_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperationQueryPage {
+    page: u64,
+    per_page: u64,
+}
+
+impl OperationQueryPage {
+    const DEFAULT_PER_PAGE: u64 = 50;
+    const MAX_PER_PAGE: u64 = 200;
+
+    fn normalized(self) -> Self {
+        let per_page = if self.per_page == 0 {
+            Self::DEFAULT_PER_PAGE
+        } else {
+            self.per_page.clamp(1, Self::MAX_PER_PAGE)
+        };
+        Self {
+            page: self.page.max(1),
+            per_page,
+        }
+    }
+
+    fn offset(self) -> u64 {
+        let normalized = self.normalized();
+        (normalized.page - 1).saturating_mul(normalized.per_page)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperationPage<T> {
+    items: Vec<T>,
+    page: u64,
+    per_page: u64,
+    total: u64,
 }
 
 /// Execute `libra op` using default CLI output settings.
@@ -182,8 +290,286 @@ pub async fn execute_safe(args: OpArgs, output: &OutputConfig) -> CliResult<()> 
             op_ref,
             force,
             dry_run,
-        } => handle_op_restore(op_ref, force, dry_run, output).await,
+            what,
+            confirm_repo_wide,
+        } => handle_op_restore(op_ref, force, dry_run, what, confirm_repo_wide, output).await,
+        OpCommand::Undo {
+            op_ref,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_undo(op_ref, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Redo {
+            op_ref,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_redo(op_ref, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Revert {
+            op_ref,
+            parent,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_revert(op_ref, parent, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Reconcile { dry_run } => handle_op_reconcile(dry_run, output).await,
+        OpCommand::Doctor { fix, dry_run } => handle_op_doctor(fix, dry_run, output).await,
     }
+}
+
+async fn v2_engine_for_repo(repo_id: &str) -> CliResult<RestoreEngine> {
+    let Some(scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "v2 operation state is unavailable in this repository",
+        ));
+    };
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let db = get_db_conn_instance().await;
+    Ok(RestoreEngine::new(scope, repo_id, db, storage))
+}
+
+async fn v2_engine_and_ref(repo_id: &str, op_ref: &str) -> CliResult<(RestoreEngine, String)> {
+    let engine = v2_engine_for_repo(repo_id).await?;
+    let entry = resolve_v2_history_ref(engine.store().db(), repo_id, op_ref).await?;
+    Ok((engine, entry.op_id))
+}
+
+async fn handle_op_undo(
+    op_ref: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let receipt = UndoEngine::new(restore)
+        .undo(op_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("undo", receipt, output)
+}
+
+async fn handle_op_redo(
+    op_ref: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let receipt = UndoEngine::new(restore)
+        .redo(op_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("redo", receipt, output)
+}
+
+async fn handle_op_revert(
+    op_ref: String,
+    parent: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let parent_id = resolve_v2_history_ref(restore.store().db(), &repo_id, &parent)
+        .await?
+        .op_id;
+    let receipt = UndoEngine::new(restore)
+        .revert(op_id, parent_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("revert", receipt, output)
+}
+
+async fn handle_op_reconcile(dry_run: bool, output: &OutputConfig) -> CliResult<()> {
+    let repo_id = current_repo_id().await?;
+    let scope = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+        .ok_or_else(|| CliError::fatal("v2 operation state is unavailable in this repository"))?;
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let database = get_db_conn_instance().await;
+    let store = OperationStoreV2::new_for_repo(&repo_id, database, storage);
+    let engine = ReconcileEngine::new(scope, &repo_id, store);
+    let outcome = engine
+        .reconcile(dry_run)
+        .await
+        .map_err(|error| match &error {
+            ReconcileError::Cas(message) => CliError::fatal(format!(
+                "reconcile failed because the head set changed concurrently: {message}"
+            ))
+            .with_hint("re-run 'libra op reconcile' to converge the new head set"),
+            other => CliError::fatal(other.to_string()),
+        })?;
+    let payload = OpOutput::Reconcile { outcome };
+    let conflicted = matches!(
+        &payload,
+        OpOutput::Reconcile {
+            outcome: ReconcileOutcome::Conflicted { .. }
+        }
+    );
+    if output.is_json() {
+        emit_json_data("op", &payload, output)?;
+    } else if !output.quiet {
+        let OpOutput::Reconcile { outcome } = &payload else {
+            return Err(CliError::fatal(
+                "internal error: reconcile produced an unexpected output payload",
+            ));
+        };
+        match outcome {
+            ReconcileOutcome::NothingToReconcile => {
+                println!("Nothing to reconcile: the operation log has a single head.");
+            }
+            ReconcileOutcome::DryRunConverged { parents } => {
+                println!(
+                    "Would converge {} concurrent operation heads:\n  {}",
+                    parents.len(),
+                    parents.join("\n  ")
+                );
+            }
+            ReconcileOutcome::Converged {
+                reconcile_op_id,
+                parents,
+                generation,
+            } => {
+                println!(
+                    "Converged {} concurrent operation heads into reconcile operation {reconcile_op_id} (generation {generation}).",
+                    parents.len()
+                );
+            }
+            ReconcileOutcome::Conflicted { conflicts } => {
+                eprintln!(
+                    "Cannot reconcile: concurrent heads disagree on {} reference(s). The head set is preserved; resolve the conflicts and retry.",
+                    conflicts.len()
+                );
+                for conflict in conflicts {
+                    eprintln!("  {} {}:", conflict.kind, conflict.name);
+                    for (head, target) in &conflict.targets {
+                        eprintln!("    {head} -> {target}");
+                    }
+                }
+            }
+        }
+    }
+    if conflicted {
+        return Err(CliError::fatal(
+            "reconcile conflicts must be resolved before the head set can converge",
+        )
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "inspect the conflict targets above, resolve the reference disagreement, then retry",
+        ));
+    }
+    Ok(())
+}
+
+async fn handle_op_doctor(fix: bool, dry_run: bool, output: &OutputConfig) -> CliResult<()> {
+    let repo_id = current_repo_id().await?;
+    let restore = v2_engine_for_repo(&repo_id).await?;
+    let report = DoctorEngine::new(
+        RequestScope::try_resolve(util::cur_dir())
+            .map_err(|error| {
+                CliError::fatal(format!("failed to resolve repository scope: {error}"))
+            })?
+            .ok_or_else(|| {
+                CliError::fatal("v2 operation state is unavailable in this repository")
+            })?,
+        repo_id,
+        restore.store().clone(),
+    )
+    .inspect(dry_run, fix)
+    .await
+    .map_err(|error| CliError::fatal(error.to_string()))?;
+    if output.is_json() {
+        return emit_json_data("op", &OpOutput::Doctor { report }, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    println!("Operation doctor: {} issue(s)", report.issues.len());
+    for issue in &report.issues {
+        println!("{}: {}", issue.code, issue.message);
+    }
+    for fixed in &report.fixed {
+        println!("fixed: {fixed}");
+    }
+    Ok(())
+}
+
+fn emit_transition_output(
+    action: &str,
+    receipt: RestoreReceipt,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let print = |receipt: &RestoreReceipt| {
+        println!(
+            "{} {} facet(s), {} path(s)",
+            action,
+            receipt.restored_facets.len(),
+            receipt.changed_paths
+        );
+        if let Some(op_id) = &receipt.new_op_id {
+            println!("New operation recorded: {}", &op_id[..8.min(op_id.len())]);
+        } else {
+            println!("Dry run: no operation was published.");
+        }
+    };
+    if output.is_json() {
+        let payload = match action {
+            "undo" => OpOutput::Undo { receipt },
+            "redo" => OpOutput::Redo { receipt },
+            "revert" => OpOutput::Revert { receipt },
+            _ => return Err(CliError::fatal("unknown operation transition")),
+        };
+        return emit_json_data("op", &payload, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    print(&receipt);
+    Ok(())
+}
+
+fn undo_cli_error(error: UndoError) -> CliError {
+    match error {
+        UndoError::NotUndo(_) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
+        UndoError::Restore(RestoreError::HeadConfirmationRequired)
+        | UndoError::Restore(RestoreError::WrongWorkspace(_))
+        | UndoError::Restore(RestoreError::WrongScope { .. })
+        | UndoError::Restore(RestoreError::Cas(_)) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+        UndoError::Restore(RestoreError::NonRestorableOperation) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
+        UndoError::Restore(RestoreError::Storage(message))
+            if message.contains("not found") || message.contains("not a completed") =>
+        {
+            CliError::fatal(message).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
+        UndoError::Restore(_) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
+        }
+    }
+}
+
+async fn ensure_transition_clean(force: bool) -> CliResult<()> {
+    if !force && !status::is_clean().await {
+        return Err(CliError::fatal("working tree has uncommitted changes")
+            .with_stable_code(StableErrorCode::ConflictUnresolved)
+            .with_hint("use --force to transition anyway, or commit/stash changes first"));
+    }
+    Ok(())
 }
 
 /// Render one `op log` request, including optional command filtering and paging.
@@ -227,12 +613,7 @@ async fn handle_op_log(
     );
     println!();
 
-    let page_start = result
-        .page
-        .saturating_sub(1)
-        .saturating_mul(result.per_page) as usize;
-    for (page_offset, op) in entries.iter().enumerate() {
-        let idx = page_start + page_offset;
+    for op in &entries {
         let short_id = &op.op_id[..8.min(op.op_id.len())];
         let timestamp = op
             .end_ts
@@ -240,7 +621,7 @@ async fn handle_op_log(
             .unwrap_or_else(|| "running".to_string());
 
         if verbose {
-            println!("{short_id}@{{{idx}}}");
+            println!("{short_id}@{{{}}}", op.index);
             println!("  command: {}", op.command_name);
             println!("  description: {}", op.description);
             println!("  actor: {}", op.actor);
@@ -249,8 +630,8 @@ async fn handle_op_log(
             println!();
         } else {
             println!(
-                "{short_id}@{{{idx}}} {} {} - {} [{}]",
-                op.command_name, op.description, timestamp, op.status
+                "{short_id}@{{{}}} {} {} - {} [{}]",
+                op.index, op.command_name, op.description, timestamp, op.status
             );
         }
     }
@@ -258,168 +639,254 @@ async fn handle_op_log(
     Ok(())
 }
 
-/// Query one operation-log page, applying the optional command filter before pagination.
-async fn query_operation_log_page<C: sea_orm::ConnectionTrait>(
+const OPERATION_HISTORY_CTE: &str = r#"
+WITH ranked AS (
+    SELECT op_id,
+           COALESCE(command_name, kind) AS command_name,
+           COALESCE(description, kind) AS description,
+           COALESCE(actor, '') AS actor,
+           start_ts, end_ts, status,
+           post_view_oid AS view_id,
+           ROW_NUMBER() OVER (
+               ORDER BY end_ts DESC, start_ts DESC, op_id DESC
+           ) - 1 AS history_index
+      FROM operation
+     WHERE repo_id = ?
+)
+"#;
+
+const OPERATION_HISTORY_FIELDS: &str =
+    "op_id, command_name, description, actor, start_ts, end_ts, status, view_id, history_index";
+
+/// Query the Operation v2 history in its canonical newest-first order.
+async fn query_operation_log_page<C: ConnectionTrait>(
     db: &C,
     repo_id: &str,
     query_page: OperationQueryPage,
     command_filter: Option<&str>,
-) -> CliResult<OperationPage<OperationLogListItem>> {
+) -> CliResult<OperationPage<OperationHistoryEntry>> {
+    let query_page = query_page.normalized();
     let command_filter = command_filter
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    OperationService::list_operations_by_repo_and_command_paginated_with_conn(
-        db,
-        repo_id,
-        command_filter,
-        query_page,
-    )
-    .await
-    .map_err(|e| CliError::fatal(format!("failed to query operations: {e}")))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let count_sql = format!(
+        "{OPERATION_HISTORY_CTE} SELECT COUNT(*) AS total FROM ranked \
+         WHERE (? IS NULL OR command_name = ?)"
+    );
+    let count_row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            count_sql,
+            [
+                repo_id.to_string().into(),
+                command_filter.clone().into(),
+                command_filter.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to count operations: {error}")))?
+        .ok_or_else(|| CliError::fatal("operation history count returned no row"))?;
+    let total = count_row
+        .try_get::<i64>("", "total")
+        .map_err(|error| CliError::fatal(format!("failed to read operation count: {error}")))?;
+    let offset = i64::try_from(query_page.offset()).unwrap_or(i64::MAX);
+    let list_sql = format!(
+        "{OPERATION_HISTORY_CTE} SELECT {OPERATION_HISTORY_FIELDS} FROM ranked \
+         WHERE (? IS NULL OR command_name = ?) ORDER BY history_index LIMIT ? OFFSET ?"
+    );
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            list_sql,
+            [
+                repo_id.to_string().into(),
+                command_filter.clone().into(),
+                command_filter.into(),
+                i64::try_from(query_page.per_page)
+                    .unwrap_or(i64::MAX)
+                    .into(),
+                offset.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to query operations: {error}")))?;
+    let items = rows
+        .iter()
+        .map(operation_history_entry_from_row)
+        .collect::<CliResult<Vec<_>>>()?;
+
+    Ok(OperationPage {
+        items,
+        page: query_page.page,
+        per_page: query_page.per_page,
+        total: u64::try_from(total).unwrap_or(0),
+    })
+}
+
+fn operation_history_entry_from_row(
+    row: &sea_orm::QueryResult,
+) -> CliResult<OperationHistoryEntry> {
+    macro_rules! field {
+        ($name:literal, $ty:ty) => {
+            row.try_get::<$ty>("", $name).map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to read operation history field '{}': {error}",
+                    $name
+                ))
+            })?
+        };
+    }
+
+    let raw_start_ts = field!("start_ts", i64);
+    let raw_end_ts = field!("end_ts", Option<i64>);
+    let (start_ts, end_ts) = (
+        raw_start_ts.div_euclid(1000),
+        raw_end_ts.map(|timestamp| timestamp.div_euclid(1000)),
+    );
+    let stored_status = field!("status", String);
+    let status = match stored_status.as_str() {
+        "success" => "succeeded".to_string(),
+        "aborted" => "canceled".to_string(),
+        status => status.to_string(),
+    };
+    let history_index = field!("history_index", i64);
+    let index = usize::try_from(history_index)
+        .map_err(|_| CliError::fatal("operation history index is out of range"))?;
+
+    Ok(OperationHistoryEntry {
+        index,
+        op_id: field!("op_id", String),
+        command_name: field!("command_name", String),
+        description: field!("description", String),
+        actor: field!("actor", String),
+        status,
+        start_ts,
+        end_ts,
+        view_id: field!("view_id", String),
+    })
 }
 
 /// Render one `op show` request after resolving the supplied operation reference.
 async fn handle_op_show(op_ref: String, show_view: bool, output: &OutputConfig) -> CliResult<()> {
     let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
-    let op_id = resolve_op_ref(&db, &repo_id, &op_ref).await?;
-
-    let graph = load_operation_graph(&db, &op_id).await?;
-    let op_record = &graph.operation;
+    let entry = resolve_op_ref(&db, &repo_id, &op_ref).await?;
     let op_output = OpOutput::Show {
-        op_id: op_record.op_id.clone(),
-        command_name: op_record.command_name.clone(),
-        description: op_record.description.clone(),
-        actor: op_record.actor.clone(),
-        status: status_label(op_record.status).to_string(),
-        start_ts: op_record.start_ts,
-        end_ts: op_record.end_ts,
-        view_id: op_record.view_id.clone(),
+        op_id: entry.op_id.clone(),
+        command_name: entry.command_name.clone(),
+        description: entry.description.clone(),
+        actor: entry.actor.clone(),
+        status: entry.status.clone(),
+        start_ts: entry.start_ts,
+        end_ts: entry.end_ts,
+        view_id: entry.view_id.clone(),
     };
 
     if output.is_json() {
         return emit_json_data("op", &op_output, output);
     }
 
-    let short_id = &op_record.op_id[..8.min(op_record.op_id.len())];
+    let short_id = &entry.op_id[..8.min(entry.op_id.len())];
     println!("Operation: {short_id}");
-    println!("Command: {}", op_record.command_name);
-    println!("Description: {}", op_record.description);
-    println!("Actor: {}", op_record.actor);
-    println!("Status: {}", status_label(op_record.status));
-    println!("Started: {}", format_timestamp(op_record.start_ts));
-    if let Some(end_ts) = op_record.end_ts {
+    println!("Command: {}", entry.command_name);
+    println!("Description: {}", entry.description);
+    println!("Actor: {}", entry.actor);
+    println!("Status: {}", entry.status);
+    println!("Started: {}", format_timestamp(entry.start_ts));
+    if let Some(end_ts) = entry.end_ts {
         println!("Completed: {}", format_timestamp(end_ts));
         println!(
             "Duration: {}ms",
-            end_ts.saturating_sub(op_record.start_ts) * 1000
+            end_ts.saturating_sub(entry.start_ts) * 1000
         );
     }
-    println!("View ID: {}", op_record.view_id);
+    println!("View ID: {}", entry.view_id);
 
     if show_view {
-        println!();
-        println!("View Snapshot:");
-        println!(
-            "  HEAD: {} ({})",
-            graph.view.head_target, graph.view.head_kind
-        );
-        println!("  Refs:");
-        for ref_rec in &graph.refs {
-            let ref_name = if let Some(remote) = &ref_rec.ref_remote {
-                format!("{}/{}/{}", ref_rec.ref_kind, remote, ref_rec.ref_name)
-            } else {
-                format!("{} {}", ref_rec.ref_kind, ref_rec.ref_name)
-            };
-            println!(
-                "    {}: {}",
-                ref_name,
-                &ref_rec.target_oid[..7.min(ref_rec.target_oid.len())]
-            );
-        }
+        print_v2_view_snapshot(&repo_id, &entry.op_id).await?;
     }
 
     Ok(())
 }
 
-/// The set of local branch names that an `op restore` to `graph` must KEEP: the
-/// local branches captured in the target view plus the restored HEAD branch.
-/// Any other (non-locked) local branch is pruned so the restore reproduces the
-/// operation's exact local-branch set.
-fn restore_keep_set(graph: &OperationGraphRecord) -> HashSet<String> {
-    let mut keep: HashSet<String> = graph
-        .refs
-        .iter()
-        .filter(|r| {
-            r.ref_kind == "branch"
-                && r.ref_remote.is_none()
-                && !operation_restore_excludes_ref(&r.ref_name)
-        })
-        .map(|r| r.ref_name.clone())
-        .collect();
-    if graph.view.head_kind == "branch" {
-        keep.insert(graph.view.head_target.clone());
-    }
-    keep
-}
-
-fn operation_restore_excludes_ref(name: &str) -> bool {
-    OwnedRefSpec::for_storage_name(name).is_some_and(|spec| !spec.policy().operation_snapshot)
-}
-
-fn skipped_owned_refs(graph: &OperationGraphRecord) -> Vec<String> {
-    let mut skipped: Vec<String> = graph
-        .refs
-        .iter()
-        .filter(|record| {
-            record.ref_kind == "branch"
-                && record.ref_remote.is_none()
-                && operation_restore_excludes_ref(&record.ref_name)
-        })
-        .map(|record| record.ref_name.clone())
-        .collect();
-    if graph.view.head_kind == "branch" && operation_restore_excludes_ref(&graph.view.head_target) {
-        skipped.push(graph.view.head_target.clone());
-    }
-    skipped.sort();
-    skipped.dedup();
-    skipped
-}
-
-/// List the local branches that an `op restore` would prune for the given
-/// `keep` set: present now, absent from the target view, and not a Libra-owned
-/// locked branch (`main`/`intent`/`traces`/`agent-traces`), which are never
-/// pruned so AI/session history and the trunk are preserved. Remote-tracking
-/// refs are excluded (the listing is local-only).
-async fn local_branches_to_prune<C: sea_orm::ConnectionTrait>(
-    db: &C,
-    keep: &HashSet<String>,
-) -> Result<Vec<String>, DbErr> {
-    let current = Branch::list_branches_result_with_conn(db, None)
+async fn print_v2_view_snapshot(repo_id: &str, op_id: &str) -> CliResult<()> {
+    let Some(scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "v2 operation state is unavailable in this repository",
+        ));
+    };
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let db = get_db_conn_instance().await;
+    let store = OperationStoreV2::new_for_repo(repo_id, db, storage);
+    let operation = store
+        .load_operation(op_id)
         .await
-        .map_err(|e| DbErr::Custom(e.to_string()))?;
-    Ok(prune_candidates(current.into_iter().map(|b| b.name), keep))
-}
+        .map_err(|error| {
+            CliError::fatal(format!("failed to load v2 operation '{op_id}': {error}"))
+        })?
+        .ok_or_else(|| CliError::fatal(format!("v2 operation '{op_id}' not found")))?;
+    let view = store.load_view(&operation.post_view_oid).map_err(|error| {
+        CliError::fatal(format!("failed to load v2 view for '{op_id}': {error}"))
+    })?;
 
-/// Pure prune predicate over local branch names. A name is a prune candidate
-/// unless it is in `keep`, is a Libra-owned locked branch
-/// (`main`/`intent`/`traces`/`agent-traces`), or lives in the reserved `libra/`
-/// namespace. The namespace guard protects AI-owned refs such as the history
-/// branch `libra/intent` and the orchestrator's `libra/src`/`libra/target`,
-/// which are stored as local `Branch` rows but must never be deleted by an
-/// `op restore`. Split out so the protection can be unit-tested without a
-/// database (the CLI refuses to create these refs, so an integration fixture
-/// cannot reproduce one).
-fn prune_candidates<I: IntoIterator<Item = String>>(
-    current: I,
-    keep: &HashSet<String>,
-) -> Vec<String> {
-    current
-        .into_iter()
-        .filter(|name| {
-            !keep.contains(name) && !is_locked_branch(name) && !name.starts_with("libra/")
-        })
-        .collect()
+    println!();
+    println!("View Snapshot:");
+    if let Some(snapshot_oid) = view.workspaces.values().next() {
+        let snapshot = store.load_snapshot(snapshot_oid).map_err(|error| {
+            CliError::fatal(format!(
+                "failed to load v2 workspace snapshot for '{op_id}': {error}"
+            ))
+        })?;
+        use crate::internal::operation::HeadState;
+        match snapshot.head {
+            HeadState::Symbolic { reference } => {
+                if let Some(branch) = reference.strip_prefix("refs/heads/") {
+                    println!("  HEAD: {branch} (branch)");
+                } else {
+                    println!("  HEAD: {reference} (symbolic)");
+                }
+            }
+            HeadState::Detached { oid } => {
+                let oid = oid.to_string();
+                println!("  HEAD: {} (detached)", &oid[..7.min(oid.len())]);
+            }
+        }
+    } else {
+        println!("  HEAD: (not captured)");
+    }
+
+    println!("  Refs:");
+    let refs_bytes = store.load_object(&view.refs_facet_oid).map_err(|error| {
+        CliError::fatal(format!("failed to load v2 refs for '{op_id}': {error}"))
+    })?;
+    let refs_value: serde_json::Value = serde_json::from_slice(&refs_bytes).map_err(|error| {
+        CliError::fatal(format!("failed to decode v2 refs for '{op_id}': {error}"))
+    })?;
+    if let Some(references) = refs_value
+        .get("references")
+        .and_then(serde_json::Value::as_array)
+    {
+        for reference in references {
+            let Some(kind) = reference.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(name) = reference.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let ref_name = reference
+                .get("remote")
+                .and_then(serde_json::Value::as_str)
+                .map(|remote| format!("{kind}/{remote}/{name}"))
+                .unwrap_or_else(|| format!("{kind} {name}"));
+            if let Some(target) = reference.get("commit").and_then(serde_json::Value::as_str) {
+                println!("    {ref_name}: {}", &target[..7.min(target.len())]);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Restore the repository view referenced by one prior operation.
@@ -427,335 +894,287 @@ async fn handle_op_restore(
     op_ref: String,
     force: bool,
     dry_run: bool,
+    what: RestoreWhat,
+    confirm_repo_wide: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
     let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
-    let target_op_id = resolve_op_ref(&db, &repo_id, &op_ref).await?;
-    let target_graph = load_operation_graph(&db, &target_op_id).await?;
-    let target_op = target_graph.operation.clone();
-    let skipped_owned_refs = skipped_owned_refs(&target_graph);
+    let target_entry = resolve_op_ref(&db, &repo_id, &op_ref).await?;
+    handle_v2_restore(
+        &db,
+        &repo_id,
+        &target_entry.op_id,
+        force,
+        what,
+        dry_run,
+        confirm_repo_wide,
+        output,
+    )
+    .await
+}
 
-    // plan-20260714 W0 (§C.11, ADR-0714-08): restoring rewrites THIS
-    // worktree's HEAD, index and working tree from a snapshot. Doing that
-    // from an operation that ran in a DIFFERENT worktree grafts that
-    // worktree's state onto this one; doing it from an operation whose scope
-    // was never recorded is the same act performed blind. Both are refused
-    // before the dry-run report, so the preview cannot describe a restore
-    // that is not permitted. Restoring the current worktree's own operations
-    // is unaffected.
-    // W1 §C.9: the snapshot is HEAD and refs. An operation that also moved an
-    // index, a working tree or sequencer state declared itself non-restorable
-    // when it was recorded — replaying it would move HEAD while leaving
-    // `sequence_state` pointing at a todo that no longer matches. Checked
-    // FIRST, before the dry-run report, so the preview cannot describe a
-    // restore that will not happen. A stored property, not a guess from the
-    // command name.
-    if !target_op.restorable {
-        return Err(CliError::fatal(format!(
-            "cannot restore operation {}: '{}' changed state this snapshot does not \
-             capture (the index, the working tree, or an in-progress sequence)",
-            &target_op_id[..8.min(target_op_id.len())],
-            target_op.command_name
-        ))
-        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-        .with_hint(
-            "inspect it with `libra op show`, and undo a sequencer control with that \
-             command's own `--abort`",
+/// Restore through the Operation v2 engine and never synthesize a v2 view from
+/// historical storage.
+#[allow(clippy::too_many_arguments)]
+async fn handle_v2_restore(
+    db: &sea_orm::DatabaseConnection,
+    repo_id: &str,
+    op_id: &str,
+    force: bool,
+    what: RestoreWhat,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let Some(operation_scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "v2 operation state is unavailable in this repository",
         ));
-    }
-    // §C.9: a repository-scope operation acts on state every worktree shares,
-    // and an `unknown` one was never attributed at all. Replaying either into
-    // ONE worktree is what the plan says must fail closed until LR-02, and the
-    // kind is what distinguishes them from a main-scope operation — their
-    // `worktree_id` is the same empty string.
-    // §C.9 fail-closed: `repository` (no worktree scope at all) and `unknown`
-    // (never recorded) are both refused. A `branch` operation is NOT
-    // repository-scoped — it is recorded with the worktree it ran in, so branch
-    // restore keeps working, and the shared refs it would move are protected by
-    // the checked-out-elsewhere guard further down (Codex R24).
-    if !matches!(target_op.scope_kind.as_str(), "main" | "linked") {
-        return Err(CliError::fatal(format!(
-            "cannot restore operation {}: it is recorded with scope kind '{}', which this \
-             snapshot cannot be replayed into a single worktree",
-            &target_op_id[..8.min(target_op_id.len())],
-            target_op.scope_kind
-        ))
-        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-        .with_hint(
-            "inspect it with `libra op show`; repository-wide restore is deferred to the \
-             operation-recovery work",
-        ));
-    }
-    // A claim that was never closed: the command crashed, or is still running.
-    // Either way its recorded view is not the state it will end in.
-    if target_op.status != crate::internal::operation::OperationStatus::Succeeded {
-        return Err(CliError::fatal(format!(
-            "cannot restore operation {}: it is recorded as {}, not a completed success",
-            &target_op_id[..8.min(target_op_id.len())],
-            target_op.status.as_str()
-        ))
-        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-        .with_hint("wait for it to finish, then restore from a completed operation"));
-    }
-    let current_scope = crate::utils::util::current_worktree_id().unwrap_or_default();
-    // Accept ONLY the positive value. Testing for the literal "unknown"
-    // instead would let any corrupted or mistyped provenance ("declraed")
-    // through as trusted — failing open on precisely the rows whose
-    // trustworthiness is the question.
-    if target_op.scope_provenance != "declared" {
-        let detail = if target_op.scope_provenance == "unknown" {
-            "which worktree it ran in was never recorded (it predates worktree-scoped \
-             operation records in a repository that has linked worktrees)"
-                .to_string()
-        } else {
-            format!(
-                "its recorded scope provenance '{}' is not a value this version understands",
-                target_op.scope_provenance
-            )
-        };
-        return Err(CliError::fatal(format!(
-            "cannot restore operation {}: {detail}",
-            &target_op_id[..8.min(target_op_id.len())]
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-        .with_hint(
-            "restore from an operation recorded after the upgrade, or inspect it with \
-             `libra op log` and reproduce the change directly",
-        ));
-    }
-    if target_op.worktree_id != current_scope {
-        let describe = |scope: &str| {
-            if scope.is_empty() {
-                "the main worktree".to_string()
-            } else {
-                format!("worktree '{scope}'")
-            }
-        };
-        return Err(CliError::fatal(format!(
-            "operation {} ran in {}, but this is {}",
-            &target_op_id[..8.min(target_op_id.len())],
-            describe(&target_op.worktree_id),
-            describe(&current_scope)
-        ))
-        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-        .with_hint("run `libra op restore` from the worktree the operation ran in"));
-    }
-
+    };
+    let object_storage = ClientStorage::init_local(operation_scope.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(repo_id, db.clone(), object_storage.clone());
+    let operation = store
+        .load_operation(op_id)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to load v2 operation: {error}")))?
+        .ok_or_else(|| CliError::fatal(format!("v2 operation '{op_id}' not found")))?;
+    let engine = RestoreEngine::new(operation_scope, repo_id, db.clone(), object_storage);
+    engine
+        .validate_target(
+            op_id.to_string(),
+            operation.post_view_oid,
+            OperationKind::Restore,
+            confirm_repo_wide,
+        )
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("v2 restore failed: {error}"))
+                .with_stable_code(restore_error_code(&error))
+        })?;
     if !force && !status::is_clean().await {
         return Err(CliError::fatal("working tree has uncommitted changes")
             .with_stable_code(StableErrorCode::ConflictUnresolved)
             .with_hint("use --force to restore anyway, or commit/stash changes first"));
     }
-
-    if dry_run {
-        let restored_refs: Vec<String> = target_graph
-            .refs
-            .iter()
-            .filter(|record| {
-                !(record.ref_kind == "branch"
-                    && record.ref_remote.is_none()
-                    && operation_restore_excludes_ref(&record.ref_name))
-            })
-            .map(|record| record.ref_name.clone())
-            .collect();
-        let keep = restore_keep_set(&target_graph);
-        let pruned = local_branches_to_prune(&db, &keep)
-            .await
-            .map_err(|e| CliError::fatal(format!("failed to inspect branches: {e}")))?;
-        if output.is_json() {
-            return emit_json_data(
+    let receipt = engine
+        .restore(
+            op_id.to_string(),
+            operation.post_view_oid,
+            what,
+            dry_run,
+            confirm_repo_wide,
+        )
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("v2 restore failed: {error}"))
+                .with_stable_code(restore_error_code(&error))
+        })?;
+    if output.is_json() {
+        if receipt.dry_run {
+            emit_json_data("op", &OpOutput::RestoreV2 { receipt }, output)?;
+        } else {
+            let new_op_id = receipt.new_op_id.clone().unwrap_or_default();
+            let target_short =
+                receipt.target_op_id[..8.min(receipt.target_op_id.len())].to_string();
+            emit_json_data(
                 "op",
-                &OpOutput::RestorePreview {
-                    target_op_id,
-                    head_kind: target_graph.view.head_kind.clone(),
-                    head_target: target_graph.view.head_target.clone(),
-                    restored_refs,
-                    pruned_refs: pruned,
-                    skipped_owned_refs,
+                &OpOutput::Restore {
+                    target_op_id: receipt.target_op_id,
+                    new_op_id,
+                    message: format!("Restored to operation {target_short}"),
                 },
                 output,
-            );
+            )?;
         }
-        let short_id = &target_op_id[..8.min(target_op_id.len())];
-        println!(
-            "Would restore to operation {} ({})",
-            short_id, target_op.description
-        );
-        println!(
-            "  HEAD would become: {} ({})",
-            target_graph.view.head_target, target_graph.view.head_kind
-        );
-        println!("Refs that would be restored:");
-        for ref_rec in target_graph
-            .refs
-            .iter()
-            .filter(|record| restored_refs.contains(&record.ref_name))
-        {
-            println!(
-                "  {}: {}",
-                ref_rec.ref_name,
-                &ref_rec.target_oid[..7.min(ref_rec.target_oid.len())]
-            );
-        }
-        for name in &skipped_owned_refs {
-            println!("  Skipping Libra-owned local ref: {name}");
-        }
-        if pruned.is_empty() {
-            println!("No branches would be pruned.");
+    } else if !output.quiet {
+        let target_short = &receipt.target_op_id[..8.min(receipt.target_op_id.len())];
+        let description = operation
+            .metadata
+            .description
+            .as_deref()
+            .unwrap_or("operation view");
+        if receipt.dry_run {
+            render_restore_preview(&store, &operation, db).await?;
         } else {
-            println!("Branches that would be pruned (absent from the target view):");
-            for name in &pruned {
-                println!("  {name}");
-            }
-        }
-        return Ok(());
-    }
-
-    // Part C W0 (§C.11): op restore rewrites and prunes SHARED branch refs.
-    // Refuse if any affected branch is checked out in ANOTHER worktree — moving
-    // its tip or deleting it would corrupt that worktree's HEAD/working tree.
-    // `branch_checked_out_elsewhere` excludes the current worktree, so restoring
-    // this worktree's own branch stays allowed.
-    {
-        let keep = restore_keep_set(&target_graph);
-        let pruned = local_branches_to_prune(&db, &keep)
-            .await
-            .map_err(|e| CliError::fatal(format!("failed to inspect branches: {e}")))?;
-        let mut affected: Vec<String> = target_graph
-            .refs
-            .iter()
-            .filter(|r| {
-                r.ref_kind == "branch"
-                    && !(r.ref_remote.is_none() && operation_restore_excludes_ref(&r.ref_name))
-            })
-            .map(|r| r.ref_name.clone())
-            .collect();
-        affected.extend(pruned);
-        for branch in &affected {
-            let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
-            // §C.4.4: fail CLOSED. The infallible probe folded a database
-            // error into "nobody has it checked out", so a transient DB
-            // failure let a restore move a branch another worktree was on.
-            let checked_out = Head::branch_checked_out_elsewhere_result(short)
-                .await
-                .map_err(|error| {
-                    CliError::fatal(format!(
-                        "cannot determine whether branch '{short}' is checked out in another \
-                         worktree: {error}"
-                    ))
-                    .with_stable_code(StableErrorCode::RepoCorrupt)
-                })?;
-            if let Some(other) = checked_out {
-                return Err(CliError::fatal(format!(
-                    "cannot restore: branch '{short}' is checked out at worktree '{other}'"
-                ))
-                // §C.13: branch checked out in another worktree →
-                // LBR-CONFLICT-002.
-                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-                .with_hint("switch that worktree to another branch first, or run restore there"));
+            println!("Restored to operation {target_short} ({description})");
+            if let Some(new_op_id) = &receipt.new_op_id {
+                println!(
+                    "New operation recorded: {}",
+                    &new_op_id[..8.min(new_op_id.len())]
+                );
             }
         }
     }
-
-    let restore_meta = OperationMeta {
-        command_name: "op restore".to_string(),
-        description: format!("restore to {}", &target_op_id[..8.min(target_op_id.len())]),
-        actor: operation_actor().await,
-        repo_id,
-        args_digest: Some(target_op_id.clone()),
-    };
-    let restore_graph = target_graph.clone();
-
-    let result = with_operation_log(restore_meta, OperationScope::default(), move |txn| {
-        Box::pin(async move {
-            let new_head = if restore_graph.view.head_kind == "branch"
-                && operation_restore_excludes_ref(&restore_graph.view.head_target)
-            {
-                Head::current_result_with_conn(txn)
-                    .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))?
-            } else if restore_graph.view.head_kind == "branch" {
-                Head::Branch(restore_graph.view.head_target.clone())
-            } else {
-                Head::Detached(
-                    ObjectHash::from_str(&restore_graph.view.head_target)
-                        .map_err(|e| DbErr::Custom(e.to_string()))?,
-                )
-            };
-            Head::update_result_with_conn(txn, new_head, None)
-                .await
-                .map_err(|e| DbErr::Custom(e.to_string()))?;
-
-            for ref_rec in &restore_graph.refs {
-                if ref_rec.ref_kind == "branch"
-                    && !(ref_rec.ref_remote.is_none()
-                        && operation_restore_excludes_ref(&ref_rec.ref_name))
-                {
-                    Branch::update_branch_with_conn(
-                        txn,
-                        &ref_rec.ref_name,
-                        &ref_rec.target_oid,
-                        None,
-                    )
-                    .await?;
-                }
-            }
-
-            // Prune local branches that are absent from the target view, so
-            // `op restore` reproduces that operation's exact local-branch set
-            // rather than only updating the branches it names. Libra-owned locked
-            // branches (`main`/`intent`/`traces`/`agent-traces`) and the restored
-            // HEAD branch are always kept; remote-tracking refs are left untouched
-            // (the listing below is local-only).
-            let keep = restore_keep_set(&restore_graph);
-            let to_prune = local_branches_to_prune(txn, &keep).await?;
-            for name in &to_prune {
-                Branch::delete_branch_result_with_conn(txn, name, None)
-                    .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))?;
-            }
-
-            Ok::<(), DbErr>(())
-        })
-    })
-    .await
-    .map_err(|e| CliError::fatal(format!("restore failed: {e}")))?;
-
-    let op_output = OpOutput::Restore {
-        target_op_id: target_op_id.clone(),
-        new_op_id: result.op_id.clone(),
-        message: format!(
-            "Restored to operation {} ({})",
-            &target_op_id[..8.min(target_op_id.len())],
-            target_op.description
-        ),
-        skipped_owned_refs: skipped_owned_refs.clone(),
-    };
-
-    if output.is_json() {
-        return emit_json_data("op", &op_output, output);
-    }
-
-    println!(
-        "{}",
-        match op_output {
-            OpOutput::Restore { message, .. } => message,
-            _ => unreachable!(),
-        }
-    );
-    for name in &skipped_owned_refs {
-        println!("Skipped Libra-owned local ref: {name}");
-    }
-    println!(
-        "New operation recorded: {}",
-        &result.op_id[..8.min(result.op_id.len())]
-    );
-
     Ok(())
 }
 
-/// Read the current repository id from config and validate that it is non-empty.
+/// Render the stable human restore preview used by the legacy command
+/// surface. The v2 receipt remains the machine-facing source of counts; this
+/// preview adds the target HEAD/ref names and the local branches that an
+/// all-facets restore would prune.
+async fn render_restore_preview(
+    store: &OperationStoreV2,
+    operation: &crate::internal::operation::OperationV2,
+    db: &sea_orm::DatabaseConnection,
+) -> CliResult<()> {
+    let target_short = &operation.op_id[..8.min(operation.op_id.len())];
+    let description = operation
+        .metadata
+        .description
+        .as_deref()
+        .unwrap_or("operation view");
+    let view = store.load_view(&operation.post_view_oid).map_err(|error| {
+        CliError::fatal(format!(
+            "failed to load restore preview view for '{}': {error}",
+            operation.op_id
+        ))
+    })?;
+    let workspace_id =
+        match crate::internal::worktree_scope::RequestScope::try_resolve(util::cur_dir()).map_err(
+            |error| CliError::fatal(format!("failed to resolve repository scope: {error}")),
+        )? {
+            Some(scope) => scope
+                .scope
+                .worktree_id()
+                .map(str::to_string)
+                .unwrap_or_else(|| "main".to_string()),
+            None => "main".to_string(),
+        };
+    let snapshot_oid = view.workspaces.get(&workspace_id).ok_or_else(|| {
+        CliError::fatal(format!(
+            "restore preview has no workspace snapshot for '{workspace_id}'"
+        ))
+    })?;
+    let snapshot = store.load_snapshot(snapshot_oid).map_err(|error| {
+        CliError::fatal(format!("failed to load restore preview snapshot: {error}"))
+    })?;
+
+    println!("Would restore to operation {target_short} ({description})");
+    match snapshot.head {
+        crate::internal::operation::HeadState::Symbolic { reference } => {
+            let branch = reference
+                .strip_prefix("refs/heads/")
+                .unwrap_or(reference.as_str());
+            println!("  HEAD would become: {branch} (branch)");
+        }
+        crate::internal::operation::HeadState::Detached { oid } => {
+            println!("  HEAD would become: {oid} (detached)");
+        }
+    }
+
+    let refs_bytes = store.load_object(&view.refs_facet_oid).map_err(|error| {
+        CliError::fatal(format!("failed to load restore preview refs: {error}"))
+    })?;
+    let refs_value: serde_json::Value = serde_json::from_slice(&refs_bytes).map_err(|error| {
+        CliError::fatal(format!("failed to decode restore preview refs: {error}"))
+    })?;
+    let references = refs_value
+        .get("references")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| CliError::fatal("restore preview refs have no references array"))?;
+    println!("Refs that would be restored:");
+    for reference in references {
+        let Some(kind) = reference.get("kind").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let name = reference
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("HEAD");
+        let ref_name = reference
+            .get("remote")
+            .and_then(serde_json::Value::as_str)
+            .map(|remote| format!("{kind}/{remote}/{name}"))
+            .unwrap_or_else(|| format!("{kind} {name}"));
+        if let Some(target) = reference.get("commit").and_then(serde_json::Value::as_str) {
+            println!("  {ref_name}: {}", &target[..7.min(target.len())]);
+        } else {
+            println!("  {ref_name}");
+        }
+    }
+
+    let keep = references
+        .iter()
+        .filter(|reference| {
+            reference.get("kind").and_then(serde_json::Value::as_str) == Some("Branch")
+                && reference
+                    .get("remote")
+                    .is_none_or(serde_json::Value::is_null)
+        })
+        .filter_map(|reference| {
+            reference
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+    let pruned = local_branches_to_prune(db, &keep).await?;
+    if pruned.is_empty() {
+        println!("No branches would be pruned.");
+    } else {
+        println!("Branches that would be pruned (absent from the target view):");
+        for name in pruned {
+            println!("  {name}");
+        }
+    }
+    Ok(())
+}
+
+async fn local_branches_to_prune(
+    db: &sea_orm::DatabaseConnection,
+    keep: &HashSet<String>,
+) -> CliResult<Vec<String>> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT name FROM reference WHERE kind = 'Branch' AND remote IS NULL ORDER BY name",
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to inspect local branches: {error}")))?;
+    let mut branches = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name = row
+            .try_get_by_index::<String>(0)
+            .map_err(|error| CliError::fatal(format!("failed to decode local branch: {error}")))?;
+        if !keep.contains(&name)
+            && !crate::internal::branch::is_locked_branch(&name)
+            && !name.starts_with("libra/")
+        {
+            branches.push(name);
+        }
+    }
+    Ok(branches)
+}
+
+fn restore_error_code(error: &RestoreError) -> StableErrorCode {
+    match error {
+        RestoreError::WorkspaceMissing(_)
+        | RestoreError::WrongWorkspace(_)
+        | RestoreError::WrongScope { .. }
+        | RestoreError::NonRestorableOperation
+        | RestoreError::IncompleteSnapshot
+        | RestoreError::HeadConfirmationRequired => StableErrorCode::CliInvalidTarget,
+        RestoreError::Cas(_) => StableErrorCode::ConflictUnresolved,
+        RestoreError::Object { .. } | RestoreError::IncompleteView => StableErrorCode::RepoCorrupt,
+        RestoreError::Io(_) => StableErrorCode::IoWriteFailed,
+        RestoreError::Facet(_) | RestoreError::Storage(_) => {
+            StableErrorCode::ConflictOperationBlocked
+        }
+    }
+}
+
+/// Resolve an operation reference against the v2 history.
+async fn resolve_v2_history_ref<C: ConnectionTrait>(
+    db: &C,
+    repo_id: &str,
+    op_ref: &str,
+) -> CliResult<OperationHistoryEntry> {
+    resolve_op_ref(db, repo_id, op_ref).await
+}
+
 async fn current_repo_id() -> CliResult<String> {
     ConfigKv::get("libra.repoid")
         .await
@@ -769,59 +1188,43 @@ async fn current_repo_id() -> CliResult<String> {
         })
 }
 
-/// Resolve the actor name recorded for newly created operation entries.
-async fn operation_actor() -> String {
-    ConfigKv::get("user.name")
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.value)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "libra-user".to_string())
-}
-
-/// Load the full restore graph for a resolved operation id.
-async fn load_operation_graph<C: sea_orm::ConnectionTrait>(
-    db: &C,
-    op_id: &str,
-) -> CliResult<OperationGraphRecord> {
-    OperationService::load_restore_view_by_operation_with_conn(db, op_id)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to load operation '{op_id}': {e}")))?
-        .ok_or_else(|| {
-            CliError::fatal(format!("operation '{op_id}' not found"))
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-                .with_hint("use 'libra op log' to list available operations")
-        })
-}
-
-/// Resolve an operation reference that may be either a raw id or an indexed `@{n}` entry.
-async fn resolve_op_ref<C: sea_orm::ConnectionTrait>(
+/// Resolve an operation reference against the v2 order used by `op log`.
+async fn resolve_op_ref<C: ConnectionTrait>(
     db: &C,
     repo_id: &str,
     op_ref: &str,
-) -> CliResult<String> {
-    if let Some(index_str) = op_ref.strip_prefix("@{")
-        && let Some(index_end) = index_str.find('}')
+) -> CliResult<OperationHistoryEntry> {
+    if let Some(index_text) = op_ref
+        .strip_prefix("@{")
+        .and_then(|value| value.strip_suffix('}'))
     {
-        let index: usize = index_str[..index_end].parse().map_err(|_| {
+        let index = index_text.parse::<usize>().map_err(|_| {
             CliError::fatal(format!("invalid operation index: {op_ref}"))
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
         })?;
-        let page = OperationQueryPage {
-            page: 1,
-            per_page: (index + 1) as u64,
-        };
-        let result =
-            OperationService::list_operations_by_repo_paginated_with_conn(db, repo_id, page)
-                .await
-                .map_err(|e| CliError::fatal(format!("failed to query operations: {e}")))?;
-
-        return result
-            .items
-            .into_iter()
-            .nth(index)
-            .map(|op| op.op_id)
+        let index_value = i64::try_from(index).map_err(|_| {
+            CliError::fatal(format!("operation index {index} out of range"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra op log' to see available operations")
+        })?;
+        let sql = format!(
+            "{OPERATION_HISTORY_CTE} SELECT {OPERATION_HISTORY_FIELDS} FROM ranked \
+             WHERE history_index = ?"
+        );
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [repo_id.to_string().into(), index_value.into()],
+            ))
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("failed to resolve operation index: {error}"))
+            })?;
+        return row
+            .as_ref()
+            .map(operation_history_entry_from_row)
+            .transpose()?
             .ok_or_else(|| {
                 CliError::fatal(format!("operation index {index} out of range"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -829,28 +1232,40 @@ async fn resolve_op_ref<C: sea_orm::ConnectionTrait>(
             });
     }
 
-    Ok(op_ref.to_string())
+    let sql = format!(
+        "{OPERATION_HISTORY_CTE} SELECT {OPERATION_HISTORY_FIELDS} FROM ranked \
+         WHERE op_id = ?"
+    );
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [repo_id.to_string().into(), op_ref.to_string().into()],
+        ))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to resolve operation '{op_ref}': {error}"))
+        })?;
+    row.as_ref()
+        .map(operation_history_entry_from_row)
+        .transpose()?
+        .ok_or_else(|| {
+            CliError::fatal(format!("operation '{op_ref}' not found"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra op log' to list available operations")
+        })
 }
 
-/// Convert one service log item into the command-layer output shape.
-fn log_entry_from_item(op: &OperationLogListItem) -> OpLogEntry {
+/// Convert one canonical history row into the command-layer log output shape.
+fn log_entry_from_item(op: &OperationHistoryEntry) -> OpLogEntry {
     OpLogEntry {
+        index: op.index,
         op_id: op.op_id.clone(),
         command_name: op.command_name.clone(),
         description: op.description.clone(),
         actor: op.actor.clone(),
-        status: status_label(op.status).to_string(),
+        status: op.status.clone(),
         end_ts: op.end_ts,
-    }
-}
-
-/// Convert an operation status enum into its stable CLI label.
-fn status_label(status: OperationStatus) -> &'static str {
-    match status {
-        OperationStatus::Running => "running",
-        OperationStatus::Succeeded => "succeeded",
-        OperationStatus::Failed => "failed",
-        OperationStatus::Canceled => "canceled",
     }
 }
 
@@ -861,58 +1276,4 @@ fn format_timestamp(ts: i64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| ts.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `prune_candidates` never proposes a Libra-owned locked branch
-    /// (`main`/`intent`/`traces`/`agent-traces`) for pruning, even when it is
-    /// absent from the target view's keep set — so `op restore` cannot orphan
-    /// AI/session history or delete the trunk. Ordinary branches absent from the
-    /// keep set are pruned; branches in the keep set are retained.
-    #[test]
-    fn prune_candidates_protects_locked_branches() {
-        let keep: HashSet<String> = ["keep".to_string()].into_iter().collect();
-        let current = [
-            "main".to_string(),
-            "intent".to_string(),
-            "traces".to_string(),
-            "agent-traces".to_string(),
-            // AI history + orchestrator refs live in the reserved `libra/` namespace.
-            "libra/intent".to_string(),
-            "libra/src".to_string(),
-            "libra/target".to_string(),
-            "libra/memory/repo".to_string(),
-            "keep".to_string(),
-            "ephemeral".to_string(),
-        ];
-        let pruned = prune_candidates(current, &keep);
-        // Only the ordinary, view-absent branch is a prune candidate; every
-        // locked branch and every `libra/`-namespaced internal ref is protected.
-        assert_eq!(pruned, vec!["ephemeral".to_string()]);
-    }
-
-    #[test]
-    fn restore_skips_only_exact_memory_ref_from_legacy_views() {
-        assert!(operation_restore_excludes_ref("libra/memory/repo"));
-        assert!(!operation_restore_excludes_ref("libra/memory/repo-user"));
-        assert!(!operation_restore_excludes_ref("feature/memory"));
-    }
-
-    /// A branch in the keep set is never a prune candidate even if it shares a
-    /// name shape with user branches; an empty keep set still protects locked
-    /// branches.
-    #[test]
-    fn prune_candidates_respects_keep_and_locks_with_empty_keep() {
-        let empty: HashSet<String> = HashSet::new();
-        let current = ["main".to_string(), "feature".to_string()];
-        let pruned = prune_candidates(current, &empty);
-        assert_eq!(
-            pruned,
-            vec!["feature".to_string()],
-            "locked `main` is protected; `feature` is pruned"
-        );
-    }
 }

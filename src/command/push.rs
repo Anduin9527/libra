@@ -26,12 +26,17 @@ use git_internal::{
 };
 use sea_orm::TransactionError;
 use serde::Serialize;
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::{Digest as Sha256Digest, Sha256};
 use tokio::sync::mpsc;
 use url::Url;
 
 use crate::{
     command::{branch, fetch::RemoteClient, lfs_schema::LfsUploadSummary},
-    git_protocol::{ServiceType::ReceivePack, add_pkt_line_string, read_pkt_line},
+    git_protocol::{
+        PKT_LINE_PROTOCOL_ERROR_PREFIX, PktLineError, ServiceType::ReceivePack,
+        add_pkt_line_string, read_pkt_line,
+    },
     info_println,
     internal::{
         ai::{
@@ -254,6 +259,12 @@ pub enum PushError {
         suggestion: Option<String>,
     },
 
+    #[error(
+        "cannot push: branch '{branch}' tracks a local upstream; \
+         network commands do not operate on local upstreams (issues/480 HP-16)"
+    )]
+    LocalUpstream { branch: String },
+
     #[error("invalid refspec '{0}'")]
     InvalidRefspec(String),
 
@@ -316,6 +327,10 @@ pub enum PushError {
     #[error("remote rejected ref update for '{refname}': {reason}")]
     RemoteRefUpdateFailed { refname: String, reason: String },
 
+    /// A pkt-line failure whose detail starts with the shared protocol marker.
+    #[error("{detail}")]
+    Protocol { detail: String },
+
     #[error("network error: {0}")]
     Network(String),
 
@@ -348,6 +363,43 @@ pub enum PushError {
     PushSignFailed(String),
 }
 
+impl From<PktLineError> for PushError {
+    fn from(error: PktLineError) -> Self {
+        Self::Protocol {
+            detail: error.to_string(),
+        }
+    }
+}
+
+fn map_push_discovery_error(repo_url: &str, error: GitError) -> PushError {
+    match error {
+        GitError::UnAuthorized(_) => PushError::AuthenticationFailed {
+            url: repo_url.to_string(),
+        },
+        GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+            PushError::Protocol { detail }
+        }
+        GitError::NetworkError(detail) => {
+            let lower = detail.to_lowercase();
+            if lower.contains("timeout") || lower.contains("timed out") {
+                PushError::Timeout {
+                    phase: "discovery".to_string(),
+                    seconds: PUSH_CONNECT_TIMEOUT.as_secs(),
+                }
+            } else {
+                PushError::DiscoveryFailed {
+                    url: repo_url.to_string(),
+                    detail,
+                }
+            }
+        }
+        other => PushError::DiscoveryFailed {
+            url: repo_url.to_string(),
+            detail: other.to_string(),
+        },
+    }
+}
+
 impl From<PushError> for CliError {
     fn from(error: PushError) -> Self {
         match &error {
@@ -368,6 +420,12 @@ impl From<PushError> for CliError {
                 }
                 err
             }
+            PushError::LocalUpstream { .. } => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_detail("remote", ".")
+                .with_detail("upstream_kind", "local")
+                .with_hint("use 'libra branch --unset-upstream' to clear the local upstream")
+                .with_hint("local-upstream network operations are tracked as issues/480 HP-16"),
             PushError::InvalidRefspec(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("use '<name>' or '<src>:<dst>'"),
@@ -427,6 +485,9 @@ impl From<PushError> for CliError {
             PushError::RemoteRefUpdateFailed { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("the remote rejected the update; check branch protection rules"),
+            PushError::Protocol { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check the remote Git service or proxy response and retry"),
             PushError::Network(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
                 .with_hint("check network connectivity and retry"),
@@ -548,6 +609,25 @@ fn build_push_certificate(
         cert.push_str(&format!("{old} {new} {refname}\n"));
     }
     cert
+}
+
+/// GPG-sign a push certificate body with the repository's active signing key.
+///
+/// Split out of the send-pack path so the payload/signature contract can be
+/// exercised without a remote that advertises `push-cert`.
+async fn sign_push_certificate(certificate: &str) -> Result<String, PushError> {
+    let unseal_key = crate::internal::vault::load_unseal_key()
+        .await
+        .ok_or(PushError::PushSignNoKey)?;
+    let sig_hex = crate::internal::vault::pgp_sign(
+        &crate::utils::util::storage_path(),
+        &unseal_key,
+        certificate.as_bytes(),
+    )
+    .await
+    .map_err(|e| PushError::PushSignFailed(e.to_string()))?;
+    crate::internal::vault::signature_to_armored(&sig_hex)
+        .map_err(|e| PushError::PushSignFailed(e.to_string()))
 }
 
 /// Frame a signed push certificate into the send-pack stream: the `push-cert`
@@ -873,6 +953,11 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         None => {
             let remote = ConfigKv::get_remote(&current_branch).await.ok().flatten();
             match remote {
+                Some(remote) if remote == "." => {
+                    return Err(PushError::LocalUpstream {
+                        branch: current_branch,
+                    });
+                }
                 Some(remote) => remote,
                 None => return Err(PushError::NoRemoteConfigured),
             }
@@ -901,12 +986,11 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     // Determine transport: SSH or HTTPS
     let is_ssh = is_ssh_spec(&repo_url);
 
-    let remote_client =
-        RemoteClient::from_spec_with_remote(&repo_url, Some(&repository)).map_err(|e| {
-            PushError::InvalidRemoteUrl {
-                url: repo_url.clone(),
-                detail: e.to_string(),
-            }
+    let remote_client = RemoteClient::from_spec_with_remote(&repo_url, Some(&repository))
+        .await
+        .map_err(|e| PushError::InvalidRemoteUrl {
+            url: repo_url.clone(),
+            detail: e.to_string(),
         })?;
     let remote_client = remote_client
         .with_network_timeouts(PUSH_CONNECT_TIMEOUT, PUSH_IDLE_TIMEOUT)
@@ -921,29 +1005,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         phase: "discovery".to_string(),
         seconds: PUSH_CONNECT_TIMEOUT.as_secs(),
     })?
-    .map_err(|e| match e {
-        GitError::UnAuthorized(_) => PushError::AuthenticationFailed {
-            url: repo_url.clone(),
-        },
-        GitError::NetworkError(detail) => {
-            let lower = detail.to_lowercase();
-            if lower.contains("timeout") || lower.contains("timed out") {
-                PushError::Timeout {
-                    phase: "discovery".to_string(),
-                    seconds: PUSH_CONNECT_TIMEOUT.as_secs(),
-                }
-            } else {
-                PushError::DiscoveryFailed {
-                    url: repo_url.clone(),
-                    detail,
-                }
-            }
-        }
-        other => PushError::DiscoveryFailed {
-            url: repo_url.clone(),
-            detail: other.to_string(),
-        },
-    })?;
+    .map_err(|error| map_push_discovery_error(&repo_url, error))?;
 
     let local_kind = get_hash_kind();
     if discovery.hash_kind != local_kind {
@@ -1095,7 +1157,8 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         }
     }
 
-    let obj_result = collect_push_objects(&plans).await?;
+    let advertised_haves = collect_advertised_haves(&discovery.refs).await;
+    let obj_result = collect_push_objects(&plans, &advertised_haves).await?;
     let objs = obj_result.objs;
     warnings.extend(obj_result.warnings);
     let obj_count = objs.len();
@@ -1171,18 +1234,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             chrono::Utc::now().timestamp()
         );
         let certificate = build_push_certificate(&pusher, &repo_url, &nonce, &commands);
-        let unseal_key = crate::internal::vault::load_unseal_key()
-            .await
-            .ok_or(PushError::PushSignNoKey)?;
-        let sig_hex = crate::internal::vault::pgp_sign(
-            &crate::utils::util::storage_path(),
-            &unseal_key,
-            certificate.as_bytes(),
-        )
-        .await
-        .map_err(|e| PushError::PushSignFailed(e.to_string()))?;
-        let armored = crate::internal::vault::signature_to_armored(&sig_hex)
-            .map_err(|e| PushError::PushSignFailed(e.to_string()))?;
+        let armored = sign_push_certificate(&certificate).await?;
         encode_push_cert_section(&capability, &certificate, &armored, &mut data);
     } else {
         for (index, (old_oid, new_oid, remote_ref)) in commands.iter().enumerate() {
@@ -1224,6 +1276,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     }
 
     let mut pack_data = Vec::new();
+    let needs_pack = plans.iter().any(|plan| plan.new_oid.is_some());
     if !objs.is_empty() && args.thin {
         // `--thin` (lore.md 2.10): REF_DELTA entries against SERVER-KNOWN
         // bases. Base harvesting is deliberately conservative: only blobs
@@ -1279,7 +1332,11 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
                 "thin pack: {delta_count} delta object(s) against server-known bases"
             );
         }
-    } else if !objs.is_empty() {
+    } else if objs.is_empty() && needs_pack {
+        // receive-pack expects a valid pack stream for every non-delete
+        // update, even when all wanted objects are already advertised.
+        pack_data = encode_empty_pack(discovery.hash_kind);
+    } else if needs_pack {
         let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1_000_000);
         let (stream_tx, mut stream_rx) = mpsc::channel(1_000_000);
 
@@ -2184,7 +2241,42 @@ fn tag_object_hash(object: &tag::TagObject) -> ObjectHash {
     }
 }
 
-async fn collect_push_objects(plans: &[RefUpdatePlan]) -> Result<IncrementalObjsResult, PushError> {
+#[derive(Debug, Default)]
+struct AdvertisedHaves {
+    objects: HashSet<ObjectHash>,
+    commits: HashSet<ObjectHash>,
+}
+
+/// Build the pack exclusion boundary from every object the server advertised
+/// and the local repository can load. Git send-pack follows the same
+/// conservative rule: an advertised OID missing locally cannot be used as a
+/// negative have because its type and reachable graph are unknown.
+async fn collect_advertised_haves(refs: &[crate::internal::protocol::DiscRef]) -> AdvertisedHaves {
+    let mut haves = AdvertisedHaves::default();
+    let mut commit_tips = HashSet::new();
+
+    for reference in refs {
+        let Ok(oid) = ObjectHash::from_str(reference.hash()) else {
+            continue;
+        };
+        let Ok(object) = tag::load_object_trait(&oid).await else {
+            continue;
+        };
+
+        haves.objects.insert(oid);
+        if let tag::TagObject::Commit(commit) = object {
+            commit_tips.insert(commit.id);
+        }
+    }
+
+    haves.commits = collect_history_commits_from_tips(commit_tips.iter());
+    haves
+}
+
+async fn collect_push_objects(
+    plans: &[RefUpdatePlan],
+    advertised_haves: &AdvertisedHaves,
+) -> Result<IncrementalObjsResult, PushError> {
     let mut combined = IncrementalObjsResult {
         objs: HashSet::new(),
         warnings: Vec::new(),
@@ -2193,7 +2285,7 @@ async fn collect_push_objects(plans: &[RefUpdatePlan]) -> Result<IncrementalObjs
         let Some(new_oid) = plan.new_oid else {
             continue;
         };
-        let result = collect_objects_for_ref(new_oid, plan.old_oid, plan.local_kind).await?;
+        let result = collect_objects_for_ref(new_oid, advertised_haves).await?;
         combined.objs.extend(result.objs);
         combined.warnings.extend(result.warnings);
     }
@@ -2202,38 +2294,43 @@ async fn collect_push_objects(plans: &[RefUpdatePlan]) -> Result<IncrementalObjs
 
 async fn collect_objects_for_ref(
     new_oid: ObjectHash,
-    old_oid: ObjectHash,
-    kind: Option<LocalRefKind>,
+    advertised_haves: &AdvertisedHaves,
 ) -> Result<IncrementalObjsResult, PushError> {
-    match tag::load_object_trait(&new_oid)
+    if advertised_haves.objects.contains(&new_oid) {
+        return Ok(IncrementalObjsResult::default());
+    }
+
+    let mut result = match tag::load_object_trait(&new_oid)
         .await
         .map_err(|error| PushError::ObjectCollection(error.to_string()))?
     {
         tag::TagObject::Commit(commit) => {
-            let remote_base = if kind == Some(LocalRefKind::Tag) {
-                zero_object_hash()
-            } else {
-                old_oid
-            };
-            Ok(incremental_objs(commit.id, remote_base))
+            incremental_objs_from_haves(commit.id, &advertised_haves.commits)
         }
-        tag::TagObject::Tag(tag_object) => collect_tag_object_chain(tag_object).await,
+        tag::TagObject::Tag(tag_object) => {
+            collect_tag_object_chain(tag_object, advertised_haves).await?
+        }
         tag::TagObject::Tree(tree) => {
             let mut warnings = Vec::new();
-            Ok(IncrementalObjsResult {
+            IncrementalObjsResult {
                 objs: diff_tree_objs(None, &tree.id, &mut warnings),
                 warnings,
-            })
+            }
         }
-        tag::TagObject::Blob(blob) => Ok(IncrementalObjsResult {
+        tag::TagObject::Blob(blob) => IncrementalObjsResult {
             objs: HashSet::from([blob.into()]),
             warnings: Vec::new(),
-        }),
-    }
+        },
+    };
+    result
+        .objs
+        .retain(|entry| !advertised_haves.objects.contains(&entry.hash));
+    Ok(result)
 }
 
 async fn collect_tag_object_chain(
     mut tag_object: GitTagObject,
+    advertised_haves: &AdvertisedHaves,
 ) -> Result<IncrementalObjsResult, PushError> {
     let mut result = IncrementalObjsResult {
         objs: HashSet::new(),
@@ -2251,13 +2348,17 @@ async fn collect_tag_object_chain(
 
         let target_oid = tag_object.object_hash;
         result.objs.insert(tag_object.into());
+        if advertised_haves.objects.contains(&target_oid) {
+            return Ok(result);
+        }
 
         match tag::load_object_trait(&target_oid)
             .await
             .map_err(|error| PushError::ObjectCollection(error.to_string()))?
         {
             tag::TagObject::Commit(commit) => {
-                let commit_result = incremental_objs(commit.id, zero_object_hash());
+                let commit_result =
+                    incremental_objs_from_haves(commit.id, &advertised_haves.commits);
                 result.objs.extend(commit_result.objs);
                 result.warnings.extend(commit_result.warnings);
                 return Ok(result);
@@ -2279,11 +2380,51 @@ async fn collect_tag_object_chain(
     }
 }
 
+/// Escape terminal controls before limiting each displayed remote field to
+/// 200 Unicode characters, plus an ellipsis when truncated. Never split an
+/// escape sequence or UTF-8 character; processing stops at the display limit.
+fn sanitize_remote_ref_rejection(value: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut result = String::new();
+    let mut retained = 0;
+    for ch in value.chars() {
+        let escaped = if ch.is_control() {
+            ch.escape_default().to_string()
+        } else {
+            ch.to_string()
+        };
+        let width = escaped.chars().count();
+        if retained + width > LIMIT {
+            result.push('…');
+            break;
+        }
+        result.push_str(&escaped);
+        retained += width;
+    }
+    result
+}
+
 fn validate_receive_pack_response(
     mut response_data: Bytes,
     plans: &[RefUpdatePlan],
 ) -> Result<(), PushError> {
-    let (_, pkt_line) = read_pkt_line(&mut response_data);
+    // Validate framing through an actual flush before an unpack/ng rejection
+    // can return early. Bytes clones and slices share the response allocation.
+    let mut frames = response_data.clone();
+    loop {
+        if frames.is_empty() {
+            return Err(PushError::Protocol {
+                detail: format!(
+                    "{PKT_LINE_PROTOCOL_ERROR_PREFIX}missing receive-pack status flush"
+                ),
+            });
+        }
+        let (len, _) = read_pkt_line(&mut frames)?;
+        if len == 0 {
+            break;
+        }
+    }
+    let (_, pkt_line) = read_pkt_line(&mut response_data)?;
     if pkt_line != "unpack ok\n" {
         return Err(PushError::RemoteUnpackFailed);
     }
@@ -2294,7 +2435,7 @@ fn validate_receive_pack_response(
         .collect();
     let mut seen_refs = HashSet::new();
     loop {
-        let (len, pkt_line) = read_pkt_line(&mut response_data);
+        let (len, pkt_line) = read_pkt_line(&mut response_data)?;
         if len == 0 {
             break;
         }
@@ -2307,14 +2448,21 @@ fn validate_receive_pack_response(
             let (refname, reason) = rest
                 .split_once(' ')
                 .unwrap_or((rest, "remote rejected update"));
+            if !expected_refs.contains(refname) {
+                return Err(PushError::Protocol {
+                    detail: format!(
+                        "{PKT_LINE_PROTOCOL_ERROR_PREFIX}receive-pack rejected an unexpected ref"
+                    ),
+                });
+            }
             return Err(PushError::RemoteRefUpdateFailed {
-                refname: refname.to_string(),
-                reason: reason.to_string(),
+                refname: sanitize_remote_ref_rejection(refname),
+                reason: sanitize_remote_ref_rejection(reason),
             });
         }
-        return Err(PushError::Network(format!(
-            "unexpected receive-pack status line: {line}"
-        )));
+        return Err(PushError::Protocol {
+            detail: format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}unexpected receive-pack status line"),
+        });
     }
 
     for expected in expected_refs {
@@ -2573,10 +2721,16 @@ fn porcelain_ref_fields(update: &PushRefUpdate) -> (char, String) {
 
 /// Classify a transport-layer I/O error into a typed `PushError`.
 ///
-/// Transport errors that mention "timed out" (from SSH idle timeout or reqwest
-/// read_timeout) are mapped to `PushError::Timeout` with the originating phase.
-/// All other errors become `PushError::Network`.
+/// A pkt-line protocol carrier takes precedence over timeout text and keeps its
+/// fixed protocol diagnostic. Other transport errors mentioning "timed out"
+/// (from SSH idle timeout or reqwest read_timeout) become `PushError::Timeout`;
+/// remaining errors become `PushError::Network`.
 fn classify_transport_error(phase: &str, e: std::io::Error) -> PushError {
+    if crate::command::fetch::is_pkt_line_io_error(&e) {
+        return PushError::Protocol {
+            detail: e.to_string(),
+        };
+    }
     let detail = e.to_string();
     let lower = detail.to_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
@@ -2772,16 +2926,24 @@ fn is_local_file_remote(spec: &str) -> bool {
 }
 
 /// collect all commits from `commit_id` to root commit
+#[cfg(test)]
 fn collect_history_commits(commit_id: &ObjectHash) -> HashSet<ObjectHash> {
-    let zero_oid = zero_object_hash();
-    if commit_id == &zero_oid {
-        return HashSet::new();
-    }
+    collect_history_commits_from_tips(std::iter::once(commit_id))
+}
 
+fn collect_history_commits_from_tips<'a>(
+    commit_ids: impl IntoIterator<Item = &'a ObjectHash>,
+) -> HashSet<ObjectHash> {
     let mut commits = HashSet::new();
     let mut queue = VecDeque::new();
-    commits.insert(*commit_id);
-    queue.push_back(*commit_id);
+    for commit_id in commit_ids {
+        if commit_id.as_ref().iter().any(|byte| *byte != 0)
+            && Commit::try_load(commit_id).is_some()
+            && commits.insert(*commit_id)
+        {
+            queue.push_back(*commit_id);
+        }
+    }
     while let Some(commit) = queue.pop_front() {
         let commit = match Commit::try_load(&commit) {
             Some(c) => c,
@@ -2857,11 +3019,32 @@ fn load_object_data(hash: &ObjectHash) -> Result<Vec<u8>, GitError> {
     storage.get(hash)
 }
 
+fn encode_empty_pack(hash_kind: HashKind) -> Vec<u8> {
+    let mut pack = Vec::with_capacity(12 + hash_kind.size());
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    pack.extend_from_slice(&0_u32.to_be_bytes());
+
+    let checksum = match hash_kind {
+        HashKind::Sha1 => <Sha1 as Sha1Digest>::digest(&pack).to_vec(),
+        HashKind::Sha256 => <Sha256 as Sha256Digest>::digest(&pack).to_vec(),
+        HashKind::Blake3 => {
+            let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+            hasher.update(&pack);
+            hasher.finalize_object_hash().as_ref().to_vec()
+        }
+    };
+    pack.extend_from_slice(&checksum);
+    pack
+}
+
+#[derive(Default)]
 struct IncrementalObjsResult {
     objs: HashSet<Entry>,
     warnings: Vec<String>,
 }
 
+#[cfg(test)]
 fn incremental_objs(local_ref: ObjectHash, remote_ref: ObjectHash) -> IncrementalObjsResult {
     tracing::debug!("local_ref: {}, remote_ref: {}", local_ref, remote_ref);
 
@@ -2932,9 +3115,17 @@ fn incremental_objs(local_ref: ObjectHash, remote_ref: ObjectHash) -> Incrementa
         }
     }
 
-    let mut objs = HashSet::new();
-    let mut visit = HashSet::new();
     let exist_commits = collect_history_commits(&remote_ref);
+    incremental_objs_from_haves(local_ref, &exist_commits)
+}
+
+fn incremental_objs_from_haves(
+    local_ref: ObjectHash,
+    exist_commits: &HashSet<ObjectHash>,
+) -> IncrementalObjsResult {
+    let mut objs = HashSet::new();
+    let mut warnings = Vec::new();
+    let mut visit = HashSet::new();
     let mut queue = VecDeque::new();
     if !exist_commits.contains(&local_ref) {
         queue.push_back(local_ref);
@@ -2987,8 +3178,11 @@ fn incremental_objs(local_ref: ObjectHash, remote_ref: ObjectHash) -> Incrementa
 }
 
 fn zero_object_hash() -> ObjectHash {
-    ObjectHash::from_bytes(&vec![0u8; get_hash_kind().size()])
-        .expect("zero hash should match hash kind size")
+    match get_hash_kind() {
+        HashKind::Sha1 => ObjectHash::Sha1([0; 20]),
+        HashKind::Sha256 => ObjectHash::Sha256([0; 32]),
+        HashKind::Blake3 => ObjectHash::Blake3([0; 32]),
+    }
 }
 
 /// Check if `ancestor` is an ancestor of `descendant` using breadth-first search.
@@ -3095,7 +3289,10 @@ mod test {
         internal::object::{
             blob::Blob,
             commit::Commit,
+            signature::{Signature, SignatureType},
+            tag::Tag as GitTag,
             tree::{Tree, TreeItem, TreeItemMode},
+            types::ObjectType,
         },
     };
     use serial_test::serial;
@@ -3103,6 +3300,776 @@ mod test {
 
     use super::*;
     use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+    #[test]
+    #[serial_test::serial(hash_kind)]
+    fn pkt_line_push_ng_reason_escaped_and_capped() {
+        assert_eq!(
+            sanitize_remote_ref_rejection("protected branch hook declined"),
+            "protected branch hook declined"
+        );
+        assert_eq!(
+            sanitize_remote_ref_rejection("a\n\r\t\0\x1b[31m\x7f\u{9b}31mz"),
+            r"a\n\r\t\u{0}\u{1b}[31m\u{7f}\u{9b}31mz"
+        );
+        for ch in (0u8..=31).chain([127, 155]).map(char::from) {
+            let actual = sanitize_remote_ref_rejection(&format!("a{ch}z"));
+            assert!(!actual.chars().any(char::is_control));
+            assert!(actual.starts_with('a') && actual.ends_with('z'));
+            assert!(actual.contains('\\'));
+        }
+        for ch in ['x', '保', '🙂'] {
+            let exact = ch.to_string().repeat(200);
+            assert_eq!(sanitize_remote_ref_rejection(&exact), exact);
+            assert_eq!(
+                sanitize_remote_ref_rejection(&format!("{exact}{ch}")),
+                format!("{exact}…")
+            );
+        }
+        // Escaping is included in the displayed character budget. A final
+        // escape sequence which cannot fit is omitted whole, then ellipsis.
+        assert_eq!(
+            sanitize_remote_ref_rejection(&format!("{}\x1bTAIL", "x".repeat(198))),
+            format!("{}…", "x".repeat(198))
+        );
+        assert_eq!(
+            sanitize_remote_ref_rejection(&format!("{}\n", "x".repeat(198))),
+            format!("{}\\n", "x".repeat(198))
+        );
+        assert_eq!(
+            sanitize_remote_ref_rejection(&format!("{}\nZ", "x".repeat(198))),
+            format!("{}\\n…", "x".repeat(198))
+        );
+        assert_eq!(sanitize_remote_ref_rejection(""), "");
+        // The direct enum construction covers both algorithms without a
+        // fallible conversion, allocation, or a production expect.
+        let previous = get_hash_kind();
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            git_internal::hash::set_hash_kind(kind);
+            let oid = zero_object_hash();
+            assert_eq!(oid.as_ref(), vec![0u8; kind.size()]);
+            assert_eq!(oid.to_string(), "0".repeat(kind.size() * 2));
+            assert!(matches!(
+                (kind, oid),
+                (HashKind::Sha1, ObjectHash::Sha1(_)) | (HashKind::Sha256, ObjectHash::Sha256(_))
+            ));
+        }
+        git_internal::hash::set_hash_kind(previous);
+    }
+
+    #[test]
+    fn pkt_line_push_refname_validated_or_protocol() {
+        let plans = [test_ref_update_plan("refs/heads/main")];
+        for unexpected in [
+            "refs/heads/main-extra",
+            "refs/heads/other",
+            "refs/heads/REMOTE_STATUS_SECRET_7c41\x1b[31m",
+            "refs/heads/main\u{9b}",
+        ] {
+            let line = format!("ng {unexpected} {STATUS_SENTINEL}\n");
+            assert_status_protocol(
+                validate_receive_pack_response(
+                    receive_pack_response(&["unpack ok\n", &line]),
+                    &plans,
+                )
+                .unwrap_err(),
+                "receive-pack rejected an unexpected ref",
+            );
+        }
+        assert_status_protocol(
+            validate_receive_pack_response(
+                receive_pack_response(&["unpack ok\n", "ng refs/heads/main rejected\n"]),
+                &[],
+            )
+            .unwrap_err(),
+            "receive-pack rejected an unexpected ref",
+        );
+        // Synthetic local plans prove refname sanitation uses the same rule as
+        // reason sanitation even if an earlier local ref validator is bypassed.
+        for (name, rendered) in [
+            (
+                "refs/heads/a\x1b[31m\u{9b}31mb".to_string(),
+                r"refs/heads/a\u{1b}[31m\u{9b}31mb".to_string(),
+            ),
+            (
+                format!("refs/heads/{}", "保".repeat(205)),
+                format!("refs/heads/{}…", "保".repeat(189)),
+            ),
+        ] {
+            let plans = [test_ref_update_plan(&name)];
+            let line = format!("ng {name} denied\rspoof\n");
+            let error = validate_receive_pack_response(
+                receive_pack_response(&["unpack ok\n", &line]),
+                &plans,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, PushError::RemoteRefUpdateFailed { refname, reason } if refname == &rendered && reason == r"denied\rspoof")
+            );
+            let cli = CliError::from(error);
+            let expected = format!("remote rejected ref update for '{rendered}': denied\\rspoof");
+            assert_eq!(cli.message(), expected);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&cli.render_json()).unwrap()["message"]
+                    .as_str(),
+                Some(expected.as_str())
+            );
+            assert!(!cli.message().chars().any(char::is_control));
+            for text in [
+                cli.render(),
+                cli.render_report(),
+                cli.render_json().to_string(),
+            ] {
+                assert!(!text.contains('\x1b') && !text.contains('\u{9b}') && !text.contains('\r'));
+            }
+        }
+        let error = validate_receive_pack_response(
+            receive_pack_response(&["unpack ok\n", "ng refs/heads/main\n"]),
+            &plans,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PushError::RemoteRefUpdateFailed { reason, .. } if reason == "remote rejected update")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(cwd, env)]
+    async fn pkt_line_push_ng_sentinel_human_and_json() {
+        use crate::utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in};
+        let _storage = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let tracking = "refs/remotes/origin/main";
+        let oid = "1111111111111111111111111111111111111111";
+        Branch::update_branch(tracking, oid, Some("origin"))
+            .await
+            .unwrap();
+        let mut server = ReceivePackTestServer::start().await;
+        ConfigKv::set("remote.origin.url", &server.url, false)
+            .await
+            .unwrap();
+        let ordinary_hint = "the remote rejected the update; check branch protection rules";
+        let cases = [
+            ("ng refs/heads/main blocked\x1b[31m\rspoof\u{9b}31m\x7fEND\n".to_string(), r"remote rejected ref update for 'refs/heads/main': blocked\u{1b}[31m\rspoof\u{9b}31m\u{7f}END".to_string(), ordinary_hint),
+            (format!("ng refs/heads/main {}\n", "保".repeat(205)), format!("remote rejected ref update for 'refs/heads/main': {}…", "保".repeat(200)), ordinary_hint),
+            (format!("ng refs/heads/{}\x1b[31m {}\rspoof\n", STATUS_SENTINEL, STATUS_SENTINEL), format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}receive-pack rejected an unexpected ref"), STATUS_PROTOCOL_HINT),
+            ("ng refs/heads/main protected branch hook declined\n".to_string(), "remote rejected ref update for 'refs/heads/main': protected branch hook declined".to_string(), ordinary_hint),
+        ];
+        for (line, expected, hint) in cases {
+            *server.state.response.lock().unwrap() = receive_pack_response(&["unpack ok\n", &line]);
+            let before = server.state.transcript.lock().unwrap().len();
+            let args = PushArgs::try_parse_from(["push", "origin", ":refs/heads/main"]).unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_secs(45),
+                execute_safe(args, &OutputConfig::default()),
+            )
+            .await
+            .expect("bounded push command")
+            .expect_err("remote rejection must fail");
+            assert_eq!(error.message(), expected);
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(error.exit_code(), 128);
+            assert_eq!(
+                error.hints().iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+                [hint]
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&error.render_json()).unwrap()["message"]
+                    .as_str(),
+                Some(expected.as_str())
+            );
+            assert!(!expected.chars().any(char::is_control));
+            for output in [
+                error.render(),
+                error.render_report(),
+                error.render_json().to_string(),
+            ] {
+                assert!(
+                    !output.contains('\x1b')
+                        && !output.contains('\r')
+                        && !output.contains('\u{9b}')
+                        && !output.contains('\x7f')
+                );
+                assert!(!output.contains(STATUS_SENTINEL));
+            }
+            let requests = server.state.transcript.lock().unwrap()[before..].to_vec();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                (&requests[0].0[..], &requests[0].1[..]),
+                ("GET", "/repo/info/refs?service=git-receive-pack")
+            );
+            assert_eq!(
+                (&requests[1].0[..], &requests[1].1[..]),
+                ("POST", "/repo/git-receive-pack")
+            );
+            let mut post = Bytes::copy_from_slice(&requests[1].2);
+            let (_, command) = read_pkt_line(&mut post).unwrap();
+            assert_eq!(
+                command.as_ref(),
+                format!("{oid} {} refs/heads/main\0report-status\n", "0".repeat(40)).as_bytes()
+            );
+            assert_eq!(post, "0000");
+            let branch = Branch::find_branch_result(tracking, Some("origin"))
+                .await
+                .unwrap()
+                .expect("rejection preserves tracking ref");
+            assert_eq!(branch.commit.to_string(), oid);
+        }
+        server.stop().await;
+    }
+
+    const STATUS_SENTINEL: &str = "REMOTE_STATUS_SECRET_7c41";
+    const STATUS_PROTOCOL_HINT: &str = "check the remote Git service or proxy response and retry";
+
+    fn assert_status_protocol(error: PushError, reason: &str) {
+        let expected = format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}{reason}");
+        assert!(matches!(&error, PushError::Protocol { detail } if detail == &expected));
+        assert_eq!(error.to_string(), expected);
+        let error = CliError::from(error);
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+        assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+        assert_eq!(
+            error
+                .hints()
+                .iter()
+                .map(|hint| hint.as_str())
+                .collect::<Vec<_>>(),
+            [STATUS_PROTOCOL_HINT]
+        );
+        for rendered in [
+            error.render(),
+            error.render_report(),
+            error.render_json().to_string(),
+        ] {
+            assert!(!rendered.contains(STATUS_SENTINEL), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn pkt_line_push_status_line_is_protocol_variant() {
+        let plans = vec![test_ref_update_plan("refs/heads/main")];
+        for line in ["ready refs/heads/main\n", "ok\n", "ng\n", "\n"] {
+            let response = receive_pack_response(&["unpack ok\n", line]);
+            assert_status_protocol(
+                validate_receive_pack_response(response, &plans).unwrap_err(),
+                "unexpected receive-pack status line",
+            );
+        }
+        for statuses in [
+            &["unpack ok\n"][..],
+            &["unpack ok\n", "ok refs/heads/main\n"][..],
+            &["unpack failed\n"][..],
+            &["unpack ok\n", "ng refs/heads/main rejected\n"][..],
+        ] {
+            let response = receive_pack_response(statuses);
+            let truncated = response.slice(..response.len() - 4);
+            assert_status_protocol(
+                validate_receive_pack_response(truncated, &plans).unwrap_err(),
+                "missing receive-pack status flush",
+            );
+        }
+        assert_status_protocol(
+            validate_receive_pack_response(Bytes::new(), &plans).unwrap_err(),
+            "missing receive-pack status flush",
+        );
+        let response = receive_pack_response(&["unpack ok\n"]);
+        assert_status_protocol(
+            validate_receive_pack_response(response.slice(..response.len() - 4), &[]).unwrap_err(),
+            "missing receive-pack status flush",
+        );
+        validate_receive_pack_response(response, &[]).expect("an actual flush is accepted");
+        validate_receive_pack_response(
+            receive_pack_response(&["unpack ok\n", "ok refs/heads/main\n"]),
+            &plans,
+        )
+        .expect("complete status report remains valid");
+    }
+
+    #[test]
+    fn pkt_line_push_status_line_locked_test_updated() {
+        let plans = vec![test_ref_update_plan("refs/heads/main")];
+        let status = validate_receive_pack_response(
+            receive_pack_response(&["unpack ok\n", "ready refs/heads/main\n"]),
+            &plans,
+        )
+        .unwrap_err();
+        assert!(matches!(&status, PushError::Protocol { .. }));
+        let unpack =
+            validate_receive_pack_response(receive_pack_response(&["unpack failed\n"]), &plans)
+                .unwrap_err();
+        assert!(matches!(&unpack, PushError::RemoteUnpackFailed));
+        let rejected = validate_receive_pack_response(
+            receive_pack_response(&[
+                "unpack ok\n",
+                "ng refs/heads/main protected branch hook declined\n",
+            ]),
+            &plans,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&rejected, PushError::RemoteRefUpdateFailed { refname, reason } if refname == "refs/heads/main" && reason == "protected branch hook declined")
+        );
+        for (error, hint) in [
+            (status, STATUS_PROTOCOL_HINT),
+            (
+                unpack,
+                "the remote server failed to process the pack; retry or check server logs",
+            ),
+            (
+                rejected,
+                "the remote rejected the update; check branch protection rules",
+            ),
+        ] {
+            let error = CliError::from(error);
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [hint]
+            );
+        }
+        assert!(
+            matches!(validate_receive_pack_response(receive_pack_response(&["unpack ok\n"]), &plans), Err(PushError::RemoteRefUpdateFailed { reason, .. }) if reason == "missing status from remote")
+        );
+    }
+
+    #[test]
+    fn pkt_line_push_status_line_zero_echo_sentinel() {
+        let plans = vec![test_ref_update_plan("refs/heads/main")];
+        for line in [
+            format!("ready {STATUS_SENTINEL}\n"),
+            format!("timeout host key verification failed {STATUS_SENTINEL}\n"),
+            format!("\u{1b}[31m{STATUS_SENTINEL}\u{1b}[0m\n"),
+        ] {
+            let response = receive_pack_response(&["unpack ok\n", &line]);
+            assert_status_protocol(
+                validate_receive_pack_response(response, &plans).unwrap_err(),
+                "unexpected receive-pack status line",
+            );
+        }
+    }
+
+    type ReceivePackTranscript = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>;
+
+    #[derive(Clone)]
+    struct ReceivePackServerState {
+        response: std::sync::Arc<std::sync::Mutex<Bytes>>,
+        transcript: ReceivePackTranscript,
+    }
+
+    struct ReceivePackTestServer {
+        url: String,
+        state: ReceivePackServerState,
+        task: tokio::task::JoinHandle<()>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for ReceivePackTestServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            self.task.abort();
+        }
+    }
+
+    async fn receive_pack_mock_response(
+        axum::extract::State(state): axum::extract::State<ReceivePackServerState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use axum::{
+            body::{Body, to_bytes},
+            http::StatusCode,
+            response::Response,
+        };
+        let method = request.method().to_string();
+        let path = request.uri().path_and_query().unwrap().to_string();
+        let body = to_bytes(request.into_body(), 64 * 1024)
+            .await
+            .expect("bounded mock push body");
+        state
+            .transcript
+            .lock()
+            .unwrap()
+            .push((method.clone(), path.clone(), body.to_vec()));
+        let (content_type, response) = if method == "GET"
+            && path == "/repo/info/refs?service=git-receive-pack"
+        {
+            let mut advertisement = BytesMut::new();
+            add_pkt_line_string(
+                &mut advertisement,
+                "# service=git-receive-pack\n".to_string(),
+            );
+            advertisement.extend_from_slice(b"0000");
+            add_pkt_line_string(&mut advertisement, "1111111111111111111111111111111111111111 refs/heads/main\0report-status delete-refs object-format=sha1\n".to_string());
+            advertisement.extend_from_slice(b"0000");
+            (
+                "application/x-git-receive-pack-advertisement",
+                advertisement.freeze(),
+            )
+        } else if method == "POST" && path == "/repo/git-receive-pack" {
+            (
+                "application/x-git-receive-pack-result",
+                state.response.lock().unwrap().clone(),
+            )
+        } else {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .body(Body::from(response))
+            .unwrap()
+    }
+
+    impl ReceivePackTestServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = ReceivePackServerState {
+                response: Default::default(),
+                transcript: Default::default(),
+            };
+            let app = axum::Router::new()
+                .fallback(receive_pack_mock_response)
+                .with_state(state.clone());
+            let (shutdown, request) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = request.await;
+                    })
+                    .await
+                    .expect("mock push server healthy");
+            });
+            Self {
+                url: format!("http://{address}/repo/"),
+                state,
+                task,
+                shutdown: Some(shutdown),
+            }
+        }
+        async fn stop(&mut self) {
+            self.shutdown
+                .take()
+                .expect("stop once")
+                .send(())
+                .expect("mock running");
+            tokio::time::timeout(Duration::from_secs(5), &mut self.task)
+                .await
+                .expect("bounded shutdown")
+                .expect("mock shutdown succeeds");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(cwd, env)]
+    async fn pkt_line_push_malformed_receive_pack_end_to_end_lbr_net_002() {
+        use crate::utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in};
+        // The delete-only transaction may look up advertised haves. Select the
+        // existing local-only fallback even when live cloud env is loaded.
+        let _storage = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let tracking = "refs/remotes/origin/main";
+        let oid = "1111111111111111111111111111111111111111";
+        Branch::update_branch(tracking, oid, Some("origin"))
+            .await
+            .unwrap();
+        let mut server = ReceivePackTestServer::start().await;
+        ConfigKv::set("remote.origin.url", &server.url, false)
+            .await
+            .unwrap();
+        let plans = vec![test_ref_update_plan("refs/heads/main")];
+        let mut cases = Vec::new();
+        for malformed in [
+            b"0".as_slice(),
+            b"00",
+            b"000",
+            b"\xff000",
+            b"zzzz",
+            b"+004",
+            b"0001",
+            b"0002",
+            b"0003",
+            b"0008abc",
+        ] {
+            for later in [false, true] {
+                let mut response = BytesMut::new();
+                if later {
+                    add_pkt_line_string(&mut response, "unpack ok\n".to_string());
+                }
+                response.extend_from_slice(malformed);
+                cases.push(response.freeze());
+            }
+        }
+        let complete = receive_pack_response(&["unpack ok\n", "ok refs/heads/main\n"]);
+        cases.push(complete.slice(..complete.len() - 4));
+        for statuses in [
+            &["unpack failed\n"][..],
+            &["unpack ok\n", "ng refs/heads/main rejected\n"][..],
+        ] {
+            let complete = receive_pack_response(statuses);
+            cases.push(complete.slice(..complete.len() - 4));
+        }
+        cases.push(Bytes::new());
+        cases.push(receive_pack_response(&[
+            "unpack ok\n",
+            &format!("ready {STATUS_SENTINEL}\n"),
+        ]));
+        for (index, response) in cases.into_iter().enumerate() {
+            let expected = CliError::from(
+                validate_receive_pack_response(response.clone(), &plans)
+                    .expect_err("malformed fixture"),
+            );
+            assert_eq!(expected.stable_code(), StableErrorCode::NetworkProtocol);
+            *server.state.response.lock().unwrap() = response;
+            let before = server.state.transcript.lock().unwrap().len();
+            let args = PushArgs::try_parse_from(["push", "origin", ":refs/heads/main"]).unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_secs(45),
+                execute_safe(args, &OutputConfig::default()),
+            )
+            .await
+            .expect("push command bounded")
+            .expect_err("malformed receive-pack must fail");
+            assert_eq!(
+                error.stable_code(),
+                StableErrorCode::NetworkProtocol,
+                "case{index}: {error:?}"
+            );
+            assert_eq!(error.message(), expected.message(), "case{index}");
+            assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [STATUS_PROTOCOL_HINT]
+            );
+            for rendered in [
+                error.render(),
+                error.render_report(),
+                error.render_json().to_string(),
+            ] {
+                assert!(
+                    !rendered.contains(STATUS_SENTINEL),
+                    "case{index}: {rendered}"
+                );
+            }
+            let requests = server.state.transcript.lock().unwrap()[before..].to_vec();
+            assert_eq!(requests.len(), 2, "case{index}: {requests:?}");
+            assert_eq!(
+                (&requests[0].0[..], &requests[0].1[..]),
+                ("GET", "/repo/info/refs?service=git-receive-pack")
+            );
+            assert_eq!(
+                (&requests[1].0[..], &requests[1].1[..]),
+                ("POST", "/repo/git-receive-pack")
+            );
+            let mut post = Bytes::copy_from_slice(&requests[1].2);
+            let (_, command) = read_pkt_line(&mut post).unwrap();
+            let expected_command =
+                format!("{oid} {} refs/heads/main\0report-status\n", "0".repeat(40));
+            assert_eq!(command.as_ref(), expected_command.as_bytes());
+            assert_eq!(post, "0000");
+            let branch = Branch::find_branch_result(tracking, Some("origin"))
+                .await
+                .unwrap()
+                .expect("failed response must preserve tracking ref");
+            assert_eq!(branch.commit.to_string(), oid);
+        }
+        server.stop().await;
+    }
+
+    #[test]
+    fn pkt_line_push_protocol_variant_exists() {
+        let error = PushError::from(PktLineError::TruncatedHeader);
+        assert!(
+            matches!(&error, PushError::Protocol { detail } if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+        );
+        assert_eq!(
+            error.to_string(),
+            "pkt-line protocol error: incomplete four-byte header"
+        );
+    }
+
+    #[test]
+    fn pkt_line_push_discovery_marker_maps_to_protocol() {
+        // Feed the real discovery parser result through the production mapper.
+        for response in [b"".as_slice(), b"0001", b"0008abc"] {
+            let error = crate::internal::protocol::parse_discovered_references(
+                Bytes::copy_from_slice(response),
+                ReceivePack,
+            )
+            .expect_err("malformed discovery");
+            let error = map_push_discovery_error("https://example.invalid/repo", error);
+            assert!(
+                matches!(&error, PushError::Protocol { detail } if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+            );
+            assert_eq!(
+                CliError::from(error).stable_code(),
+                StableErrorCode::NetworkProtocol
+            );
+        }
+        let detail = format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}timeout in malformed frame");
+        assert!(matches!(
+            map_push_discovery_error("remote", GitError::NetworkError(detail)),
+            PushError::Protocol { .. }
+        ));
+    }
+
+    #[test]
+    fn pkt_line_empty_discovery_push_tail_maps_net_002() {
+        use crate::git_protocol::PktFrameError;
+
+        for (width, cap) in [(40, "object-format=sha1"), (64, "object-format=sha256")] {
+            for (tail, expected) in [
+                (
+                    b"zzzzREMOTE_EMPTY_TAIL_SECRET".as_slice(),
+                    PktLineError::InvalidHexHeader,
+                ),
+                (
+                    b"0001REMOTE_EMPTY_TAIL_SECRET",
+                    PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+                ),
+                (
+                    b"ffffREMOTE_EMPTY_TAIL_SECRET",
+                    PktLineError::TruncatedPayload,
+                ),
+            ] {
+                let mut bytes = BytesMut::new();
+                add_pkt_line_string(&mut bytes, "# service=git-receive-pack\n".to_string());
+                bytes.extend_from_slice(b"0000");
+                add_pkt_line_string(
+                    &mut bytes,
+                    format!(
+                        "{} capabilities^{{}}\0report-status {cap}\n",
+                        "0".repeat(width)
+                    ),
+                );
+                bytes.extend_from_slice(tail);
+                let source = crate::internal::protocol::parse_discovered_references(
+                    bytes.freeze(),
+                    ReceivePack,
+                )
+                .expect_err("empty receive-pack advertisement must reject malformed tail");
+                let error = map_push_discovery_error("https://example.invalid/repo", source);
+                assert!(
+                    matches!(&error, PushError::Protocol { detail } if detail == &expected.to_string())
+                );
+                let error = CliError::from(error);
+                assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+                assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+                assert_eq!(
+                    error
+                        .hints()
+                        .iter()
+                        .map(|hint| hint.as_str())
+                        .collect::<Vec<_>>(),
+                    ["check the remote Git service or proxy response and retry"]
+                );
+                for rendered in [error.render(), error.render_report(), error.render_json()] {
+                    assert!(!rendered.contains("REMOTE_EMPTY_TAIL_SECRET"));
+                    assert!(!rendered.contains("zzzz"));
+                }
+                let json: serde_json::Value = serde_json::from_str(&error.render_json()).unwrap();
+                assert_eq!(json["ok"], false);
+                assert_eq!(json["error_code"], "LBR-NET-002");
+                assert_eq!(json["exit_code"], 128);
+            }
+        }
+    }
+
+    #[test]
+    fn pkt_line_push_cli_maps_protocol_to_lbr_net_002() {
+        let error = CliError::from(PushError::from(PktLineError::TruncatedPayload));
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+    }
+
+    #[test]
+    fn pkt_line_push_malformed_response_unit() {
+        let plans = vec![test_ref_update_plan("refs/heads/main")];
+        for malformed in [
+            b"0".as_slice(),
+            b"00",
+            b"000",
+            b"\xff000",
+            b"zzzz",
+            b"+004",
+            b"0001",
+            b"0002",
+            b"0003",
+            b"0008abc",
+        ] {
+            for later_frame in [false, true] {
+                let mut response = BytesMut::new();
+                if later_frame {
+                    add_pkt_line_string(&mut response, "unpack ok\n".to_string());
+                }
+                response.extend_from_slice(malformed);
+                let error = validate_receive_pack_response(response.freeze(), &plans)
+                    .expect_err("malformed frame must fail");
+                assert!(
+                    matches!(&error, PushError::Protocol { detail } if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+                );
+                assert_eq!(
+                    CliError::from(error).stable_code(),
+                    StableErrorCode::NetworkProtocol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pkt_line_push_discovery_failed_regression_stays_net_001() {
+        for detail in [
+            "connection refused".to_string(),
+            format!("wrapper: {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+            format!(" {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+        ] {
+            let error = map_push_discovery_error("remote", GitError::NetworkError(detail));
+            assert!(matches!(&error, PushError::DiscoveryFailed { .. }));
+            assert_eq!(
+                CliError::from(error).stable_code(),
+                StableErrorCode::NetworkUnavailable
+            );
+        }
+        let timeout = map_push_discovery_error(
+            "remote",
+            GitError::NetworkError("operation timed out".to_string()),
+        );
+        assert!(matches!(&timeout, PushError::Timeout { .. }));
+        assert_eq!(
+            CliError::from(timeout).stable_code(),
+            StableErrorCode::NetworkUnavailable
+        );
+        assert!(matches!(
+            map_push_discovery_error("remote", GitError::UnAuthorized("denied".to_string())),
+            PushError::AuthenticationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn pkt_line_push_network_variant_regression_stays_net_001() {
+        let error = CliError::from(PushError::Network(
+            "failed to configure remote transport".to_string(),
+        ));
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+    }
 
     fn save_test_blob(content: &str) -> Blob {
         let blob = Blob::from_content(content);
@@ -3160,6 +4127,13 @@ mod test {
         let commit = Commit::from_tree_id(tree_id, parents, message);
         crate::command::save_object(&commit, &commit.id).expect("test commit should save");
         commit
+    }
+
+    fn advertised_ref(name: &str, oid: &str) -> crate::internal::protocol::DiscRef {
+        crate::internal::protocol::DiscRef {
+            _hash: oid.to_string(),
+            _ref: name.to_string(),
+        }
     }
 
     fn test_ref_update_plan(remote_ref: &str) -> RefUpdatePlan {
@@ -3345,7 +4319,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn incremental_objs_fast_forward_skips_unchanged_subtree_blobs() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -3398,6 +4372,217 @@ mod test {
         assert_eq!(hashes.len(), 4);
     }
 
+    #[tokio::test]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn advertised_haves_same_tip_commit_sends_nothing() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("already remote");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let commit = save_test_commit(tree.id, vec![], "already remote");
+        let refs = vec![advertised_ref("refs/heads/main", &commit.id.to_string())];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(commit.id, &haves)
+            .await
+            .expect("advertised commit should be reusable");
+
+        assert!(haves.objects.contains(&commit.id));
+        assert!(haves.commits.contains(&commit.id));
+        assert!(result.objs.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn advertised_haves_empty_pack_tracks_explicit_hash_kind() {
+        let header = b"PACK\0\0\0\x02\0\0\0\0";
+
+        let sha1_pack = encode_empty_pack(HashKind::Sha1);
+        assert_eq!(&sha1_pack[..12], header);
+        assert_eq!(sha1_pack.len(), 32);
+        assert_eq!(
+            sha1_pack[12..],
+            <Sha1 as Sha1Digest>::digest(&sha1_pack[..12])[..]
+        );
+
+        let sha256_pack = encode_empty_pack(HashKind::Sha256);
+        assert_eq!(&sha256_pack[..12], header);
+        assert_eq!(sha256_pack.len(), 44);
+        assert_eq!(
+            sha256_pack[12..],
+            <Sha256 as Sha256Digest>::digest(&sha256_pack[..12])[..]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn advertised_haves_direct_tree_and_blob_refs_send_nothing() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("already advertised");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let refs = vec![
+            advertised_ref("refs/tags/tree", &tree.id.to_string()),
+            advertised_ref("refs/tags/blob", &blob.id.to_string()),
+        ];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let tree_result = collect_objects_for_ref(tree.id, &haves)
+            .await
+            .expect("advertised tree should be reusable");
+        let blob_result = collect_objects_for_ref(blob.id, &haves)
+            .await
+            .expect("advertised blob should be reusable");
+
+        assert!(haves.objects.contains(&tree.id));
+        assert!(haves.objects.contains(&blob.id));
+        assert!(haves.commits.is_empty());
+        assert!(tree_result.objs.is_empty());
+        assert!(tree_result.warnings.is_empty());
+        assert!(blob_result.objs.is_empty());
+        assert!(blob_result.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn advertised_haves_descendant_sends_only_new_delta() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let old_blob = save_test_blob("old content");
+        let old_tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            old_blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let old_commit = save_test_commit(old_tree.id, vec![], "old");
+        let new_blob = save_test_blob("new content");
+        let new_tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            new_blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let new_commit = save_test_commit(new_tree.id, vec![old_commit.id], "new");
+        let refs = vec![advertised_ref(
+            "refs/heads/main",
+            &old_commit.id.to_string(),
+        )];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(new_commit.id, &haves)
+            .await
+            .expect("descendant objects should collect");
+        let hashes = result
+            .objs
+            .iter()
+            .map(|entry| entry.hash)
+            .collect::<HashSet<_>>();
+
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            hashes,
+            HashSet::from([new_commit.id, new_tree.id, new_blob.id])
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn advertised_haves_annotated_tag_sends_only_tag_object() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("release content");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let commit = save_test_commit(tree.id, vec![], "release");
+        let tag = GitTag::new(
+            commit.id,
+            ObjectType::Commit,
+            "v1.0".to_string(),
+            Signature {
+                signature_type: SignatureType::Tagger,
+                name: "Test User".to_string(),
+                email: "test@example.com".to_string(),
+                timestamp: 1,
+                timezone: "+0000".to_string(),
+            },
+            "release v1.0".to_string(),
+        );
+        crate::command::save_object(&tag, &tag.id).expect("test tag should save");
+        let refs = vec![
+            advertised_ref("refs/heads/main", &commit.id.to_string()),
+            advertised_ref("refs/tags/existing^{}", &commit.id.to_string()),
+        ];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(tag.id, &haves)
+            .await
+            .expect("annotated tag objects should collect");
+        let hashes = result
+            .objs
+            .iter()
+            .map(|entry| entry.hash)
+            .collect::<HashSet<_>>();
+
+        assert!(result.warnings.is_empty());
+        assert_eq!(hashes, HashSet::from([tag.id]));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn advertised_haves_invalid_or_unavailable_oids_are_ignored() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("must be sent");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let commit = save_test_commit(tree.id, vec![], "must be sent");
+        let refs = vec![
+            advertised_ref("refs/heads/invalid", "not-an-object-id"),
+            advertised_ref(
+                "refs/heads/unavailable",
+                "1111111111111111111111111111111111111111",
+            ),
+        ];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(commit.id, &haves)
+            .await
+            .expect("unknown advertised objects must not block collection");
+        let hashes = result
+            .objs
+            .iter()
+            .map(|entry| entry.hash)
+            .collect::<HashSet<_>>();
+
+        assert!(haves.objects.is_empty());
+        assert!(haves.commits.is_empty());
+        assert!(result.warnings.is_empty());
+        assert_eq!(hashes, HashSet::from([commit.id, tree.id, blob.id]));
+    }
+
     /// Regression (#464 follow-up): `collect_lease_tracking_oids` must prefer
     /// the fully-qualified `refs/remotes/<remote>/<branch>` row over a legacy
     /// short row. The lease expectation gating `--force-with-lease` is read
@@ -3405,7 +4590,7 @@ mod test {
     /// (== server tip) silently accept a push that the fresh full row (== the
     /// expected OID) must reject.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn collect_lease_tracking_oids_prefers_fully_qualified_row() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -3455,7 +4640,7 @@ mod test {
     /// merges are infeasible pre-fix (~2^40 queue operations) and
     /// instantaneous post-fix.
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env)]
     async fn collect_history_commits_dedupes_merge_heavy_history() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -3485,7 +4670,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(cwd, env, hash_kind)]
     async fn diff_tree_objs_recurses_by_path_for_changed_subtrees() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -3558,6 +4743,14 @@ mod test {
             }
             .to_string(),
             "remote 'upstream' not found",
+        );
+        assert_eq!(
+            PushError::LocalUpstream {
+                branch: "alpha".to_string(),
+            }
+            .to_string(),
+            "cannot push: branch 'alpha' tracks a local upstream; \
+             network commands do not operate on local upstreams (issues/480 HP-16)",
         );
         assert_eq!(
             PushError::InvalidRefspec("@invalid".to_string()).to_string(),
@@ -3701,8 +4894,8 @@ mod test {
 
         assert!(matches!(
             validate_receive_pack_response(response, &plans),
-            Err(PushError::Network(message))
-                if message == "unexpected receive-pack status line: ready refs/heads/main"
+            Err(PushError::Protocol { detail })
+                if detail == format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}unexpected receive-pack status line")
         ));
     }
 
@@ -4349,6 +5542,23 @@ old1 new1 refs/heads/main\n"
             PushError::Timeout { phase, seconds }
                 if phase == "send-pack" && seconds == PUSH_IDLE_TIMEOUT.as_secs()
         ));
+        let marker = crate::git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX;
+        let protocol_detail = format!("{marker}timed out fixture");
+        assert!(matches!(
+            classify_transport_error("send-pack", std::io::Error::other(protocol_detail.clone())),
+            PushError::Protocol { detail } if detail == protocol_detail
+        ));
+        assert!(matches!(
+            classify_transport_error(
+                "send-pack",
+                std::io::Error::other(format!("context: {marker}ordinary failure"))
+            ),
+            PushError::Network(_)
+        ));
+        assert!(matches!(
+            classify_transport_error("send-pack", std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")),
+            PushError::Network(detail) if detail == "send-pack failed: connection reset"
+        ));
     }
 
     #[test]
@@ -4439,5 +5649,71 @@ old1 new1 refs/heads/main\n"
         assert_eq!(levenshtein("origni", "origin"), 2);
         assert_eq!(levenshtein("", "abc"), 3);
         assert_eq!(levenshtein("abc", ""), 3);
+    }
+}
+
+#[cfg(test)]
+mod push_certificate_signing_tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    const FIXTURE_PASSPHRASE: &str = "libra-test-fixture-passphrase";
+
+    /// plan-20260921 (`push_certificate_payload_uses_imported_signing_key`):
+    /// the certificate that goes on the wire must verify against the imported
+    /// GPG key, not against a generated fallback.
+    #[tokio::test]
+    #[serial(env)]
+    #[serial(cwd)]
+    async fn push_certificate_payload_uses_imported_signing_key() {
+        // Owns a temp HOME/XDG so the global vault cannot reach the real one.
+        let _env = crate::utils::test::ConfigDbFixture::new().expect("env sandbox");
+        let repo = tempfile::tempdir().expect("temp repo");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/fake-gpg/protected-secret.asc");
+        let armor = std::fs::read_to_string(&fixture).expect("fixture armor");
+        let material = crate::internal::vault::prepare_imported_key(&armor, FIXTURE_PASSPHRASE)
+            .expect("fixture key must unlock");
+        let unseal_key = crate::internal::vault::lazy_init_vault_for_scope("local")
+            .await
+            .expect("local vault");
+        crate::internal::vault::persist_imported_gpg_key(&unseal_key, &material)
+            .await
+            .expect("persist imported key");
+        crate::internal::config::ConfigKv::set("vault.gpg.source", "imported", false)
+            .await
+            .expect("record imported source");
+
+        // Isolation guard: the imported key must live in the sandbox HOME.
+        let sandbox_scope = crate::internal::vault::gpg_source().await;
+        assert_eq!(sandbox_scope.as_deref(), Some("imported"));
+
+        let certificate = build_push_certificate(
+            "Fixture <fixture@example.invalid> 1 +0000",
+            "file:///remote",
+            "nonce-1",
+            &[(
+                "0".repeat(40),
+                "1".repeat(40),
+                "refs/heads/main".to_string(),
+            )],
+        );
+        let armored = sign_push_certificate(&certificate)
+            .await
+            .expect("sign the push certificate");
+        let sig_hex = crate::internal::vault::armored_to_signature_hex(&armored)
+            .expect("armored signature round-trips");
+        assert!(
+            crate::internal::vault::verify_signature_hex(
+                &sig_hex,
+                certificate.as_bytes(),
+                std::slice::from_ref(&material.pubkey_armor),
+            ),
+            "the push certificate must verify against the imported key"
+        );
     }
 }

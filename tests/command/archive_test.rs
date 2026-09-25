@@ -882,3 +882,33 @@ fn archive_mtime_rejects_invalid_value() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn test_archive_literal_pathspecs_global() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(p.join("x.txt"), "x\n").unwrap();
+    fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt", "*.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    let tar = p.join("out.tar");
+    let out = run_libra_command(
+        &[
+            "--literal-pathspecs",
+            "archive",
+            "--format=tar",
+            "-o",
+            tar.to_str().unwrap(),
+            "HEAD",
+            "*.txt",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "archive literal");
+    assert!(tar.exists(), "archive written");
+}

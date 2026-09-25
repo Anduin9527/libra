@@ -22,17 +22,31 @@ Restore can target a repository by UUID (`--repo-id`) or project name (`--name`)
 
 ## Global Config Schema Guard
 
-`libra cloud` reads the global storage configuration (`~/.libra/config.db`, or
-`LIBRA_CONFIG_GLOBAL_DB`) before trusting remote/tiered object storage settings. If that
-database has a schema version newer than this binary supports, cloud commands fail closed
-with `LBR-CONFIG-001` instead of silently ignoring global storage config and falling back
-to local objects. The diagnostic includes the binary path and version, config DB path,
-schema versions, and the update command:
-`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Configuration schema compatibility is role-scoped. Before `libra cloud` trusts
+configuration, it inspects GlobalConfig and SystemConfig metadata read-only. A
+future configuration schema or an unregistered/mismatched migration receipt
+fails closed with `LBR-CONFIG-001` when that scope is required. Known
+Repository-only receipts, including `2026090801` in the current manifest, do
+not make a configuration store future; its supported values remain readable.
+The configuration-owned legacy-reader barrier is recognized by this build;
+see [configuration compatibility](config.md#configuration-schema-compatibility).
 
-Use `libra --offline cloud ...` or `LIBRA_READ_POLICY=offline|local libra cloud ...` only when
-you intentionally want local-only object access. Libra will warn once and ignore the
-global storage config for that run.
+Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or the XDG configuration
+directory (`$XDG_CONFIG_HOME/libra/config.db`, defaulting to
+`<home>/.config/libra/config.db`), falling back to the legacy
+`<home>/.libra/config.db` until it is migrated;
+system configuration uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
+Complete process/repo-local storage settings can make GlobalConfig unnecessary
+(`cloud` must also satisfy its D1 settings). They do not prove that SystemConfig
+defaults are unnecessary. Diagnostics identify the affected scope, ledger and
+version without printing configuration values or untrusted receipt names.
+
+Unknown or unsupported state is upgrade-only here, not automatically repaired.
+Install a compatible newer Libra binary:
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Do not delete or edit SQLite receipts manually. Use `--offline` or
+`LIBRA_READ_POLICY=offline|local` only for intentional local-only object access;
+these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
@@ -539,4 +553,4 @@ Note: Neither Git nor jj have a built-in cloud backup command. They rely on push
 | `LBR-IO-002` | Hash mismatch on restored object |
 | `LBR-IO-002` | Failed to save restored object to local storage |
 | `LBR-IO-002` | Metadata sync/restore failure |
-| `LBR-IO-002` | Durable local object-index repair marker could not be replayed before a cloud operation |
+| `LBR-IO-002` | Durable local object-index repair marker could not be replayed before a cloud operation; when the cause is a lock timeout, the message names the lock holder (pid and purpose) or says the holder could not be determined — wait for that process and retry (lock waits use a Git-style quadratic backoff and give up after 10 seconds), and never delete lock files under `.libra/object-index-repair-locks`. Read-only commands skip the replay silently while the lock is busy and retry on the next command; `cloud sync` keeps the blocking wait and fails closed |

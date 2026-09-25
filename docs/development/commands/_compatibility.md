@@ -46,12 +46,13 @@ flowchart TD
 
 | 命令 | 当前 tier | 治理结论 | 说明 |
 |---|---|---|---|
-| merge | partial | partial | fast-forward, single-head three-way, `-s ours`, `-X ours/theirs`, unrelated-history opt-in, and CLI/config merge shortlogs supported; octopus and other strategies/options deferred |
+| merge | partial | partial | fast-forward, single-head three-way, and multi-head octopus merge supported; `-s ours`, `-X ours/theirs`, unrelated-history opt-in, and CLI/config merge shortlogs supported; other strategies/options deferred |
 | pull | partial | partial | fetch + fast-forward/three-way merge supported; `pull.rebase`/`branch.<name>.rebase`/`pull.ff` defaults are config-aware with local/global decryption, system-scope skip, and explicit unsupported diagnostics for interactive/rebase-merges modes; advanced strategy flags still partial |
 | push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |
 | checkout | partial | partial | visible branch compatibility surface including worktree-scoped `checkout -` previous-target toggling shared with `switch -`, `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
 | am | partial | partial | P2-01 exposes ordered plain-text patch files plus continue/skip/abort with the P2-02 shared bounded mail parser and rollback; multipart/binary/3-way/hooks and the wider Git option surface remain P2-03 follow-ups |
 | mailinfo | partial | partial | P2-02 exposes repo-independent `mailinfo <msg> <patch> < mail`, Git-shaped basic metadata, shared transfer/RFC 2047 cleanup, body/patch split, and JSON/quiet; wider flags, MIME, non-UTF-8, binary, and multi-message mbox remain deferred |
+| mega2 | intentionally-different | intentionally-different（Libra-only） | `libra mega2 browser` 是唯一的 Mega2 远端浏览入口，Git 无等价契约：只读、匿名的单层 `GET /api/v1/tree`；交互模式要求 TTY 且退出必还原终端，TUI 的 `+`/`d`/`m`/`R` 键各经一次 `create-entry`/`delete-entry`/`move-entry` POST 加一次重载 GET 建/删/移/改名（`d` 需确认行、文件惰性、敌意目标在 POST 前拒绝；token 优先序 `--token-file` → `LIBRA_MEGA2_TOKEN` → `--token`，不持久化、不回显）；`--json`/`--machine` 恰好一次 GET、不 POST，token flag 仅 TUI 可用；`t` 面板以匿名 `GET /api/v1/tags/list`（page/per_page/path，root-only）分页，`+`/`d` 经 `POST /api/v1/tags` / `DELETE /api/v1/tags/{name}` 建删 tag；不读写本地仓库/配置。命令保持 `CommandScope::ReadOnly` 但 `MutationClass::ExternalOrUnknown` |
 
 ## 子面兼容分级（CG-01）
 
@@ -175,19 +176,21 @@ unsupported 子面。
 - 状态：延后。Sparse checkout 依赖工作树配置和 skip-worktree 语义；Libra 已将 config/HEAD/refs 放入 SQLite，桥接成本高。
 - 重启条件：出现大型 monorepo 子树检出需求，并完成对象存储 + 部分检出的工程 RFC。
 
+- 进展（2026-09-20，issues/490 SW-01）：`git-internal` 已升级到 `=0.10.0`，索引 **v3 扩展标志字**（`CE_SKIP_WORKTREE` / `CE_INTENT_TO_ADD`）的读取、写入（按需输出 v3，否则保持 v2 字节不变）与未知扩展位 fail-closed 已落地；Libra 的 AI history 清理解析器接受 v3 并复用依赖的扩展位解码。设置/观察入口（`update-index --skip-worktree`、`ls-files` 的 `S` 标记）与 `status`/`add` 的尊重语义仍待 490 SW-03..SW-07，`clone --sparse` / 顶层 `sparse-checkout` 保持延后。
+
 - lore.md 2.2 landed the NON-declined complement: `libra sparse-view`, a strictly READ-ONLY view filter over `ls-files`/`diff` (working-tree) output that NEVER materializes or prunes the working tree, never writes skip-worktree bits, and never filters the to-be-committed set (status stays honest). The materializing `sparse-checkout` command and `clone --sparse` remain declined here.
 
 ### D15：跨命令 patch mode
 
-- 状态：拒绝。`add -p`、`commit -p`、`checkout -p`、`restore -p`、`reset -p`、`stash -p` 等交互式 patch mode 暂不进入当前兼容面。
-- 原因：patch mode 需要稳定的交互式 hunk 编辑、索引/工作树半应用语义和可恢复错误处理；当前 Libra 优先保证非交互式 Agent 可驱动路径。
-- 重启条件：先完成可测试的 hunk 编辑模型、JSON/机器输出边界和端到端回归测试，再逐命令开放。
+- 状态：部分重开。`add -p`/`reset -p` 已实现（`reset -p` 已实现（HF-20））；其余入口（`add -i`、`commit -p/--interactive`、`restore`/`checkout`/`stash -p`、`checkout`/`stash push --[no-]auto-advance`）仍延后，解析失败时映射为 `LBR-UNSUPPORTED-001`（128），并给出非交互替代写法；表外未知参数仍为 `LBR-CLI-002`。`add -p` 与 `--json`/`--machine`/`--dry-run` 组合为用法错误（129，`LBR-CLI-002`）。`reset -p` 与 `--json` 或 `--soft/--mixed/--hard/--merge/--keep` 组合同样为用法错误（129）。
+- 原因：#477 交付可测试的 hunk 编辑模型、JSON/机器输出边界和端到端回归；其余 patch 入口仍缺会话编排。
+- 重启条件：`restore`/`checkout`/`stash -p` 与 `add -i` 另立计划后再开放。
 
 ### D16：交互式 rebase 和 todo 编辑
 
-- 状态：拒绝。`rebase -i` 与 `rebase --edit-todo` 暂不支持。
-- 原因：交互式 rebase 需要 sequencer/todo 文件、编辑器生命周期、冲突恢复和历史重写保护；当前 rebase 兼容面优先覆盖可脚本化路径。
-- 重启条件：sequencer 状态模型、错误恢复和非 TTY/Agent 驱动协议完成后重新评估。（lore.md 2.6 已落地统一 `sequence_state` 状态模型的 v1——cherry-pick 迁移 + 对称跨序列互斥；交互式 rebase 的 todo 文件/编辑器生命周期仍待后续，此状态模型为其前置。）
+- 状态：`rebase -i`/`--edit-todo` 已实现；DEFER-02 项延后。`pick`/`reword`/`edit`/`squash`/`fixup [-C|-c]`/`exec`/`break`/`drop` 与 `--autosquash`（含 `rebase.autosquash`）、`--root`、`--exec`、`--autostash` 组合可用。`-i --update-refs` 为用法错误（129）。`rebase -r`/`--rebase-merges`、`label`/`reset`/`merge`/`update-ref` todo 行仍延后；解析失败时映射为 `LBR-UNSUPPORTED-001`（128，D16）。
+- 原因：#477 交付线性交互式 rebase；merge 拓扑与 `update-ref` 指令仍缺 sequencer 扩展。
+- 重启条件：`--rebase-merges` 与 `update-ref` todo 行另立计划后再开放。
 
 ### D-clean-pathspec：`clean <pathspec>`
 
@@ -197,9 +200,9 @@ unsupported 子面。
 
 ### D-empty-message：`commit --allow-empty-message`
 
-- 状态：拒绝。空提交说明不是当前 `commit` 默认可用面。
-- 原因：Libra 依赖提交信息作为人类和 Agent 的审计线索；允许空消息需要显式产品决策和钩子/签名路径测试。
-- 重启条件：存在明确自动化场景，并补齐 commit-msg hook、签名和日志渲染测试。
+- 状态：已实现（#477 HF-06 / ADR-HF-07）。`commit --allow-empty-message` 同时绕过空消息与模板未编辑检查，适用于 `-m`、`-F`、编辑器、`--amend` 与 `-t`。该参数不隐含 `--allow-empty`。commit-msg hook 仍可拒绝空消息文件；vault 签名与 `log`/`show` 对空主题正常渲染。
+- 原因（历史）：Libra 依赖提交信息作为人类和 Agent 的审计线索；允许空消息需要显式产品决策和钩子/签名路径测试。
+- 重启条件：已满足。
 
 ### D17：跨网 / foreign-Git / push 侧 `refs/notes/deps` travel
 
@@ -266,3 +269,9 @@ unsupported 子面。
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 修改 Git 兼容行为时，必须同步 `COMPATIBILITY.md`、本文件、对应 `docs/development/commands/<cmd>.md`、用户命令文档和测试。
 - 新增拒绝/延后项必须分配 D 编号，并在对应命令开发文档的未实现表中引用。
+
+## Issue #477 notes
+
+D15 拒绝诊断（HF-14）
+D16 拒绝诊断（HF-14）
+D-empty-message 已由 HF-06 实现

@@ -11,8 +11,8 @@
 
 **测试引用规范**（跨 agent 沟通统一使用）：
 
-- 文件级：`code_ui_remote_lease_matrix`（即 `cargo test --test` 后跟的名字）
-- 测试级：`code_ui_remote_lease_matrix::lease_expires_after_ttl`（三段式）
+- 文件级：`code_cli_dispatch_test`（即 `cargo test --test` 后跟的名字）
+- 测试级：`code_cli_dispatch_test::libra_code_is_unknown`（三段式）
 - 不要用文件相对路径或行号——rename / refactor 会失效；三段式稳定
 
 **4 条最常用命令**：
@@ -21,17 +21,17 @@
 # Wave 0：编译 + 格式 + lint + 文档一致性
 cargo +nightly fmt --all --check && \
   cargo clippy --all-targets --all-features -- -D warnings && \
-  cargo test --no-run --all-targets --features test-provider,test-network,test-live-ai,test-live-cloud && \
+  cargo test --no-run --all-targets --features test-network,test-live-ai,test-live-cloud && \
   cargo test --test compat_matrix_alignment -- --test-threads=1
 
 # Wave 1：命令层 + 兼容性
 cargo test --test command_test -- --test-threads=1
 
-# Wave 2：Code UI 矩阵（最小子集）
-cargo test --features test-provider --test code_ui_scenarios -- --test-threads=1
+# Wave 2：拆除后残留针（`libra code` 未知命令 + KEEP session/hardening）
+cargo test --test code_cli_dispatch_test -- --test-threads=1
 
-# Wave 4：Live AI（需 DEEPSEEK_API_KEY；务必先设成本闸门，见 §9.3）
-cargo test --test ai_agent_test -- --test-threads=1
+# Wave 4：Live agent capture gate（需 LIBRA_RUN_LIVE_AGENT_GATE=1）
+cargo test --features test-live-agent --test agent_live_gate_test -- --test-threads=1
 ```
 
 **3 个最常踩的坑**：
@@ -51,15 +51,11 @@ cargo test --test ai_agent_test -- --test-threads=1
 |---|---|---|
 | 命令层集成测试汇总入口 | 已存在 | `tests/command_test.rs` + `tests/command/*.rs` |
 | 兼容性专项测试 | 已存在 | `tests/compat/*.rs` + `Cargo.toml` `[[test]]` 注册 |
-| Code UI Web process harness | 已存在（non-TTY） | `tests/harness/code_session.rs` |
-| Code UI 事件流 harness | 已存在 | `tests/harness/event_stream.rs` |
-| Code UI 数据驱动矩阵 runner | 已存在 | `tests/code_ui_remote_{lease,sse,state,security,generation,approval,model_generation}_matrix.rs` |
-| Code UI 场景回归 | 已存在 | `tests/code_ui_scenarios.rs` |
-| MCP 双入口回归 | 已存在 | `tests/code_mcp_dual_entry_test.rs` |
-| resume 回归 | 已存在 | `tests/code_resume_test.rs` |
-| codex runtime 回归 | 已存在 | `tests/code_codex_runtime_test.rs` |
+| Code UI Web / 矩阵 / scenarios | 已删除（plan-20260920 RC-23） | 公开 `libra code` 针留在 `tests/code_cli_dispatch_test.rs` |
+| 本地 agent 采集 smoke | 已存在 | `tests/agent_local_capture_smoke_test.rs` + `tests/harness/agent_local_capture.rs` |
+| KEEP session / hardening | 已存在 | `tests/ai_session_jsonl_test.rs`、`tests/ai_hardening_contract_test.rs`、`tests/ai_command_safety_test.rs`、`tests/ai_file_undo_test.rs` |
 | 网络层集成测试 | 已存在 | `tests/network_remotes_test.rs`（`test-network`） |
-| Cloud live 集成测试 | 已存在 | `tests/cloud_storage_backup_test.rs`、`tests/publish_live_test.rs`（`test-live-cloud`） |
+| Cloud live 集成测试 | 已存在 | `tests/cloud_storage_backup_test.rs`（`test-live-cloud`；`publish_live_test` 随 RC-35 删除） |
 | 文档/兼容一致性 Rust 守卫 | 已存在 | `tests/compat/matrix_alignment.rs` |
 | 集成计划一致性 Rust 守卫 | 已存在 | `tests/compat/matrix_alignment.rs` |
 
@@ -86,9 +82,11 @@ cargo test --test ai_agent_test -- --test-threads=1
 | 覆盖域 | 主要命令/能力 | Wave | 当前状态 | Owner scenarios |
 |---|---|---:|---|---|
 | Config 基础读写 | `config set/get/list/unset`、默认 local scope、JSON envelope、global DB 隔离 | 1 | 已实现 | `cli.config-basic-kv`, `cli.config-scopes`, `cli.config-unset-compat-flags` |
+| Config 角色诊断与确认式恢复 | `config doctor --global-schema` 默认只读；`--repair --confirm` 的格式 attestation、私有 Unix 路径、SQLite 一致性备份、WAL/并发拒绝、事务回滚和旧 reader 拒写 | 1 / 1F | 已实现（Cargo-only，隔离 fixture；非 runner scenario） | Cargo: `compat_global_config_schema_future`（完整具名 target 包含 doctor 与 `global_schema_repair_`）；`db_migration_test`（`global_schema_repair_`）；故障门加 `--features test-upgrade` ， `old_reader_oracle_test` 另需 hash-pinned binary + `LIBRA_ENABLE_OLD_READER_ORACLE=1` + `--ignored`；具名命令与固定 hash 见 `plan-20260910.md` MIG-05 / MIG-06 |
 | Config 输入、密钥与兼容入口 | `--stdin`、`--encrypt`、`--plaintext`、`--import`、`path`、`edit`、Git 兼容隐藏 flag、SSH/GPG key 生成 | 1 | 已实现 | `cli.config-set-input-and-encryption`, `cli.config-get-default-and-patterns`, `cli.config-list-variants`, `cli.config-import-path-edit`, `cli.config-key-generation`, `cli.config-git-compat-mode` |
 | Init 参数矩阵 | 普通仓库、目标目录、quiet、初始分支、object/ref format、bare/shared、template、from-git、vault | 1 | 已实现 | `cli.init-basic`, `cli.init-directory-and-quiet`, `cli.init-branch-and-format-options`, `cli.init-bare-and-shared`, `cli.init-template`, `cli.init-from-git-repository`, `cli.init-vault` |
 | Core 写入闭环 | `status`、`add`、`commit`、`log`、message source、amend、dry-run、porcelain v2、rename/typechange；commit hook 顺序/消息修改/caller-env 隔离/逃逸阀/沙箱边界 | 1 | 已实现 | Runner: `cli.commit-status-log`; Cargo: `compat_libra_hooks_lifecycle` |
+| log 消息筛选 | `log --grep` 仅查询subject/body/trailer，排除committer后首个gpgsig/gpgsig-sha256的PGP/SSH签名头且保留真实消息前导空白；大小写/invert与human/JSON/machine一致 | 1 | Cargo-only，隔离真实CLI fixture；非runner场景新增覆盖 | Cargo: `command_test::command::log_test::log_grep_signed_commit_uses_message_only`；lib: `command::log::tests::log_grep_ignores_embedded_signature_headers` |
 | 分支与工作区切换 | `branch`、`switch`、`checkout`、detach、path checkout、远端分支可见性、`switch --guess`/`--no-guess` DWIM、worktree-scoped `switch -`/`checkout -` 分支与 detached previous-target 切换及 fail-closed 缺失/删除来源、未支持 switch flag 的负向路径、符号引用行为；`post-checkout` argv/show-current/already-on/逃逸阀 | 1 | 已实现 | Runner: `cli.branch-switch-checkout`; Cargo: `compat_previous_branch_shortcut`, `compat_libra_hooks_lifecycle` |
 | 工作区恢复与差异 | `diff`（含 P1-08a raw/compact/filter/full-index/prefix review metadata、P1-08b `-S`/`-G` pickaxe，以及 P1-08c bare/regex-valued `--color-words`、`--word-diff-regex`、Myers/MyersMinimal/Patience/Histogram/Anchored 与算法简写）、`restore`（含真实 `--overlay`/`--no-overlay` 切换）、`reset` 的五种模式（P1-07c `--merge`/`--keep` 的精确保留/拒绝/回滚矩阵在 Cargo compat），以及 restore/reset `--pathspec-from-file` 缺失文件、无效 algorithm/`-G` regex 和无效 word regex 的负向路径 | 1 | 已实现 | Runner: `cli.restore-reset-diff`; Cargo: `command_test::test_diff_algorithms`, `command_test::test_diff_word_diff_modes`, `compat_diff_review_options`, `ai_libra_vcs_safety_test`, `compat_noninteractive_history_controls` |
 | 工作流命令 | `stash`、`bisect`、`worktree` 当前参数面及未支持 Git 参数的负向路径 | 1 | 已实现 | `cli.stash-bisect-worktree` |
@@ -99,10 +97,45 @@ cargo test --test ai_agent_test -- --test-threads=1
 | 文件级命令与 LFS 本地能力 | `clean`、`rm`、`mv`、`lfs track/untrack/ls-files`、本地 lock 负向路径 | 1 | 已实现 | `cli.clean-rm-mv-lfs-basic` |
 | 其他 CLI 外壳能力 | `open`、root `--json/-J`、`--machine`、`--quiet`、颜色/progress/exit-code-on-warning | 1 | 已实现 | `cli.open-smoke`, `cli.cross-cutting-flags` |
 | 安装器短别名 | IX-01 默认相对 `lba -> libra`、same-version 缺失修复/幂等、`--no-alias`/`LIBRA_NO_ALIAS=1`、既有 regular/foreign symlink 保护、无 symlink 能力回退 | 1 | 已实现（Cargo 驱动 POSIX 完整 installer smoke） | Cargo: `compat_install_alias` |
+| pkt-line 命令错误边界 | fetch/clone/ls-remote/pull 的 marker 协议错误与普通 IO/网络错误归类；真实空 HTTP advertisement 四命令路径和 clone discovery→fetch POST | 1 | Cargo library 场景已实现；执行证据见 plan-20260901.md PKT-10 | Cargo library: `command::ls_remote::pkt_line_boundary_tests`（25 项；非 cli.* runner scenario） |
+| push receive-pack 状态报告 | 未识别状态行、畸形/截断帧、状态报告缺flush（含空响应及unpack/ng拒绝）、固定诊断及本地tracking引用保持 | 1 | Cargo library场景；实际验收见plan-20260901.md PKT-09 | Cargo library: `command::push::test` 中4个PKT-09具名门（非cli.* runner scenario） |
+| Git/SSH advertisement 读取边界 | 双客户端长度下界/flush/空payload/上限/标头与payload EOF及普通IO/超时分类；真实TCP Git取对象广告与fetch/clone/pull错误转换 | 1 | Cargo library场景；完整命令与SSH清理仍未验证 | Cargo library: `pkt_line_client_` 十个PKT-08具名门（非cli.* runner scenario） |
 | Schema 与本地协议 | schema 建链自动升级、local clone/remote/ls-remote/fetch/pull（含 refspec 精确映射、remotes.default、rename namespace、symref、pull-rebase hook/JSON child 隔离）、shallow fetch、拒绝 file remote push | 2 | 已实现 | Runner: `cli.schema-upgrade-observable`, `cli.clone-fetch-pull-local`, `cli.fetch-depth-local`, `cli.push-local-file-remote-rejected`; Cargo: `command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history` |
 | 对象读取与树遍历 | `rev-parse`、`show-ref` / `show-ref --branches` / `show-ref --no-branches` / `show-ref --no-tags` / `show-ref --hash[=<n>]` / `show-ref --no-hash` / `show-ref --abbrev[=<n>]` / `show-ref --no-abbrev` / `show-ref --dereference` / `show-ref --no-dereference` / `show-ref --verify` / `show-ref --no-verify` / `show-ref --exists` / `show-ref --no-exists` / `show-ref --head` / `show-ref --no-head` / `show-ref --exclude-existing[=<pattern>]`、`for-each-ref --points-at`、`cat-file`、`hash-object --stdin` / `--path` / `--no-filters`、`show`、`rev-list` / multi revision / `A..B` / `^A` / `A...B` / `rev-list --count` / `rev-list -n` / `rev-list --skip` / `rev-list --since` / `rev-list --after` / `rev-list --until` / `rev-list --before` / `rev-list --merges` / `rev-list --no-merges` / `rev-list --min-parents` / `rev-list --max-parents` / `rev-list --no-min-parents` / `rev-list --no-max-parents` / `rev-list --first-parent` / `rev-list --author` / `rev-list --committer` / `rev-list --grep` / `rev-list -- <path>` / `rev-list --left-right` / `rev-list --left-only` / `rev-list --right-only` / `rev-list --cherry-pick` / `rev-list --cherry-mark` / `rev-list --cherry` / `rev-list --parents` / `rev-list --children` / `rev-list --timestamp`、`fsck`、sha256 object format；`ls-tree` 默认/递归/子目录/`--full-name`/`--full-tree` 路径场景 | 2 | 已实现 | `cli.object-readback`, `cli.show-ref-exclude-existing`, `cli.ls-tree-smoke`, `cli.sha256-object-readback` |
 | 维护命令 | `gc`、`prune`、`archive`（tar/zip、`--prefix`、`--output`、`--list`、`TREEISH <path>...` pathspec）、`verify-pack <idx>...` / `verify-pack --pack` / `verify-pack -v` / `verify-pack -s`、内部 `index-pack --stdin` / `--keep` / `--progress` / `--no-progress` fixture | 2 | 已实现 | `cli.gc-smoke`, `cli.archive-smoke`, `cli.verify-pack-smoke` |
 | GitHub live remote | `gh` 创建/清理私有临时 repo、`push` refspec/tag/delete/force/mirror、真实 clone/fetch/pull | 3 | 已实现，需显式 live gate | `live.github-create-push-clone-fetch` |
+
+
+PKT-10 的 pkt-line 边界场景使用默认 Cargo library 测试：
+`cargo test --lib command::ls_remote::pkt_line_boundary_tests`。
+模块包含 25 个具名门；其中
+`pkt_line_discovery_empty_response_regression_fetch_clone_lsremote_pull`
+通过各命令实际 `execute_safe` 路径核对空 advertisement 的 GET、`LBR-NET-002`、
+exit 128、提示及 pull 的 fetch phase；
+`pkt_line_matrix_parametrized_https_marker_maps_net_002`
+核对 clone 两次 discovery GET 和带 wanted OID 的 fetch POST。
+本地 HTTP fixture 运行生产 HttpsClient，不宣称覆盖 TLS 握手或证书验证；
+git/ssh/https URL carrier 矩阵只验证 mapper。原始 Git/SSH framing 与严格异步
+header grammar 属于 PKT-08/13。fixture 使用临时仓库、env/cwd/hash_kind 锁、
+有界请求/等待与 server shutdown；无新增 feature gate 或 live remote。
+这些库测试不是 integration-runner 的新 cli.* 场景，完整运行及发布证据保存在
+`plan-20260901.md` 对应任务卡；文档映射检查为
+
+```bash
+cargo test --test compat_matrix_alignment
+```
+
+PKT-09 的状态报告回归使用既有 Cargo library 入口：
+
+```bash
+cargo test --lib pkt_line_push_
+cargo test --lib validate_receive_pack_response
+```
+
+其中4个新增具名门登记于 plan-20260901.md PKT-09；真实push fixture经本地HTTP
+完成receive-pack discovery和delete-only POST，核对畸形/截断响应返回LBR-NET-002
+及本地tracking ref不变。测试不宣称TLS、SSH或真实远端回滚覆盖；YAML notes同步
+Cargo-only范围，没有新增cli.* runner场景。
 
 **剩余覆盖缺口**：默认本地 wave 已覆盖当前 runner 注册的 `cli.*` 场景；需要真实 GitHub 远端的 `live.*` 场景不进入默认阻断门，只能在具备 `gh` 登录态和仓库创建/删除权限时运行。新增或修改 Git 兼容命令时，必须把对应场景加入本表、YAML、场景文档和 runner registry；如果当前 runner 尚未实现，必须在 YAML 和文档中保留明确的未实现状态，而不能只在本表声明覆盖。
 
@@ -122,7 +155,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # 编译基线（两条都必须 pass，feature 代码路径才被覆盖）
 cargo test --no-run --all-targets
-cargo test --no-run --all-targets --features test-provider,test-network,test-live-ai,test-live-cloud
+cargo test --no-run --all-targets --features test-network,test-live-ai,test-live-cloud
 
 # 文档/兼容性一致性
 cargo test --test compat_matrix_alignment -- --test-threads=1
@@ -158,7 +191,6 @@ set -a; source .env.test; set +a
 | `src/internal/ai/providers/**` | 2 | + 4 |
 | `src/internal/ai/tools/**` | 2 | — |
 | `src/internal/ai/intentspec/**`、`workflow_objects.rs` | 2 | + 4 |
-| `src/internal/ai/mcp/**` | 2 | — |
 | `src/internal/protocol/**`、`src/git_protocol.rs` | 1 | + 3 |
 | `src/utils/client_storage.rs`、`src/utils/d1_client.rs` | 1 | + 5 |
 | `src/internal/model/**`、`sql/*.sql` | 1, 2 | — |
@@ -195,32 +227,17 @@ cargo test --test compat_branch_lossy_wrapper_guard -- --test-threads=1
 
 通过标准：全部 green，无 skip/fail。
 
-## 4.2 Wave 2：Code UI 与本地自动化控制（必跑）
+## 4.2 Wave 2：拆除后残留针与本地采集（必跑）
+
+Code UI / `test-provider` 矩阵已随 plan-20260920 RC-23 删除。留下未知命令针与 KEEP session/hardening。
 
 ```bash
-# test-provider 矩阵与场景
-cargo test --features test-provider \
-  --test harness_self_test \
-  --test code_ui_scenarios \
-  --test code_ui_remote_lease_matrix \
-  --test code_ui_remote_sse_matrix \
-  --test code_ui_remote_state_matrix \
-  --test code_ui_remote_security_matrix \
-  --test code_ui_remote_generation_matrix \
-  --test code_ui_remote_approval_matrix \
-  -- --test-threads=1
-
-# Code 路径专项
-cargo test --features test-provider \
-  --test code_cli_dispatch_test \
-  --test code_provider_boot_test \
-  --test code_tool_acl_test \
-  --test code_mcp_dual_entry_test \
-  --test code_resume_test \
-  --test code_codex_default_web_test \
-  --test ai_code_ui_headless_test \
-  --test code_codex_runtime_test \
-  -- --test-threads=1
+cargo test --test code_cli_dispatch_test -- --test-threads=1
+cargo test --test code_provider_resolution_test -- --test-threads=1
+cargo test --test ai_session_jsonl_test -- --test-threads=1
+cargo test --test ai_hardening_contract_test -- --test-threads=1
+cargo test --test ai_command_safety_test -- --test-threads=1
+cargo test --test ai_file_undo_test -- --test-threads=1
 ```
 
 通过标准：全部 green。
@@ -239,14 +256,9 @@ cargo test --features test-network --test network_remotes_test -- --test-threads
 > 闸门 env 当前**未实现**自动 fail-fast，靠人工监控；详见 `BASELINE_GAP-INTEG-005`。
 
 ```bash
-# DeepSeek live（ai_agent_test / ai_chat_agent_test 内部按 DEEPSEEK_API_KEY gate）
-cargo test --test ai_agent_test -- --test-threads=1
-cargo test --test ai_chat_agent_test -- --test-threads=1
-
-# Code UI live model generation（ignored + 明确开关）
-LIBRA_RUN_LIVE=1 cargo test --features test-provider \
-  --test code_ui_remote_model_generation_matrix \
-  -- --ignored --test-threads=1
+# 外部 agent 本地 store live gate（内部执行器 live 目标已随 RC-23 删除）
+LIBRA_RUN_LIVE_AGENT_GATE=1 cargo test --features test-live-agent \
+  --test agent_live_gate_test -- --test-threads=1
 ```
 
 通过标准：
@@ -260,9 +272,7 @@ LIBRA_RUN_LIVE=1 cargo test --features test-provider \
 # D1/R2 live gate（依赖 LIBRA_D1_* + LIBRA_STORAGE_*）
 cargo test --features test-live-cloud --test cloud_storage_backup_test -- --test-threads=1
 
-# publish live gate（额外要求 LIBRA_ENABLE_TEST_LIVE_CLOUD=1）
-LIBRA_ENABLE_TEST_LIVE_CLOUD=1 cargo test --features test-live-cloud \
-  --test publish_live_test publish_live -- --test-threads=1
+# publish live gate 已随 RC-35 删除；不要再调用已删除的 publish live target
 ```
 
 通过标准：
@@ -271,13 +281,9 @@ LIBRA_ENABLE_TEST_LIVE_CLOUD=1 cargo test --features test-live-cloud \
 
 ## 4.6 Wave 6：性能 smoke（可选）
 
-```bash
-LIBRA_RUN_PERF=1 cargo test --features test-provider \
-  --test code_ui_perf_smoke_test \
-  -- --ignored --test-threads=1
-```
+Code UI SSE/perf smoke（`code_ui_perf_smoke_test`）已随 RC-23 删除。本 wave 不再有默认 `--test` 入口；趋势观察改走 agent 捕获 span 测试或另立计划。
 
-通过标准：全部 green；用于趋势观察，不作为默认阻断门。
+通过标准：N/A（无现行 target）。
 
 ---
 
@@ -358,7 +364,7 @@ nodes:
       shell: "bash -lc"
       workdir: "/data/ci/libra"
       concurrency: 1
-    features: ["test-provider", "test-network", "test-live-ai", "test-live-cloud"]
+    features: ["test-network", "test-live-ai", "test-live-cloud"]
     waves: [1, 2, 3]
     providers:
       - provider_id: "deepseek"
@@ -382,7 +388,7 @@ nodes:
       workdir: "/home/ci/libra"
       ssh_key_ref: "CI_AGENT_KEY"
       concurrency: 1
-    features: ["test-provider", "test-live-ai"]
+    features: ["test-live-ai"]
     waves: [4]
     providers:
       - provider_id: "deepseek"
@@ -516,7 +522,7 @@ runtime:
 
 ```
 ## Test Plan
-- New:      <target>::<fn>  // e.g. code_ui_remote_lease_matrix::lease_expires_after_ttl
+- New:      <target>::<fn>  // e.g. code_cli_dispatch_test::libra_code_is_unknown
 - Modified: <target>::<fn>
 - Deleted:  <target>::<fn>
 - Waves run locally: 0, 1, 2 (+ 4 if applicable)
@@ -588,3 +594,176 @@ CI 在 Wave 0 调用此脚本，失败即阻断 PR。
 3. 未实现能力必须用 `BASELINE_GAP-*` 标记，不允许写成默认可执行步骤。
 4. 若引入新的 live gate 环境变量，必须同步更新 `.env.test.example`、本计划 Wave 说明、`compat_matrix_alignment` 的 env 规则（如需）。
 5. 修改 §3.3 Path → Wave 映射，须同步更新 `tools/integration-runner/config/path-wave-map.toml`（如已落地）。
+
+### PKT-12 SSH advertisement error gates (Cargo-only)
+
+The eleven `pkt_line_client_` PKT-12 library gates cover shared inner/outer error
+formatting, native non-zero SSH exits with fixed status/guidance, successful/failed
+output collection, preservation of collected output when cleanup fails, and real
+ordinary-error child reaping. PKT-11 captures stderr for terminal and
+non-terminal callers, so the real-command gate no longer requires non-terminal
+stdin. The original PKT-12 prerequisite remains historical run evidence only.
+Unix child gates include fifty malformed-frame command cases and five native
+exit-255/empty-advertisement cases across ls-remote/fetch/clone/pull/push. The
+existing `transport_timeout_uses_push_idle_timeout` gate covers push classifier
+priority and ordinary errors. These are Cargo-only cases, not new cli.* runner
+scenarios. Actual run evidence belongs in plan-20260901.md; Unix process tests do
+not claim Windows execution coverage.
+
+### PKT-12 existing SSH host-key CLI cases
+
+`command_test::command::fetch_test::test_fetch_ssh_host_key_failure_is_reported`
+and `command_test::command::push_test::test_push_ssh_host_key_failure_is_reported`
+retain their names and serial lanes. Each runs the real CLI in human, JSON and
+machine modes. Under PKT-11 these cases pin exit 128 / `LBR-NET-001`, fixed
+host-verification guidance, and no raw host-key stderr in either output stream.
+Their complete network-hint vectors differ: fetch checks network connectivity;
+push checks the remote URL and network connectivity. Push also verifies no remote
+ref was created. The earlier PKT-12 NET002/incomplete-header/SSH255 and protocol
+hint expectations, including the rejected wrong-hint assertion and corrected
+rerun, remain historical evidence in plan-20260901.md. These are local fake-SSH
+CLI tests, with current source and execution acceptance recorded separately.
+
+## SSH capture validation scope
+
+The twelve named PKT-11 library gates retain the original plan names. They cover
+fixed diagnostics and metadata-only tracing, both service argument lists, three
+non-zero-exit paths, malformed-advertisement cleanup and all six capture paths
+under stderr floods. The flood gate also covers retained-prefix/full-stream
+digest accounting, collector cancellation, and oversized advertisement and push
+response rejection through actual clone/delete-only push commands, NET001, distinct
+network hints, decoded JSON and unchanged local tracking refs. The host-trust gate
+uses a current-thread runtime without a yield after setup; timeout precedence is
+also checked immediately after config writes. Both exercise asynchronous transport
+configuration without a blocking nested-runtime join. The host-trust gate covers native exit 255, typed primary
+error preservation through a secondary cleanup warning, the internal discovery
+carrier and an actual local fake-SSH clone command. Existing fetch/push CLI cases
+retain their names and test human, JSON and machine output plus remote-ref safety.
+The terminal gate uses a real local PTY. The passphrase gate creates an encrypted
+local key without an agent and exercises a simulated SSH failure; it does not
+claim live OpenSSH network authentication. Actual run IDs and results belong in
+plan-20260901.md after execution; the existence of these tests is not acceptance.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.
+
+## Task shell Rustup regression (FIX-PKT-04)
+
+The default lib suite covers `internal::ai::sandbox::runtime::tests::{task_shell_preserves_default_rustup_home,task_shell_preserves_explicit_rustup_environment,task_shell_rustup_home_derivation_is_conservative}` on Unix. They exercise original-home derivation, explicit precedence, missing/non-UTF-8 roots, non-task directories and continued task-local HOME/Cargo/XDG/log paths. The existing `internal::ai::orchestrator::executor::tests::execute_dag_syncs_cargo_project_without_treating_lockfile_or_target_as_scope_creep` runs the real Cargo fixture in a controlled subprocess without inherited RUSTUP_HOME/CARGO, preserves explicit toolchain selection, disables automatic installation with `RUSTUP_AUTO_INSTALL=0` on rustup 1.28+, and retains the lockfile/target/scope assertions. This exposes the installed-product environment even under a Cargo-launched suite. These are inline Cargo cases, not new integration-runner scenario IDs or proof of bwrap/macOS/Windows execution. Run the related sandbox/orchestrator/shell modules and compatibility guards, then the full default suite for the shared runtime change.
+
+## Header validation scope
+
+The ten named PKT-13 gates retain the plan's original names. The shared header
+decoder is used by the synchronous parser and all three asynchronous readers;
+the bounded IO marker classifier has one implementation in `git_protocol`, with
+a crate-visible fetch re-export for existing callers. Synchronous failure still
+leaves the input untouched. Four-byte validation does constant work without
+allocating or rendering peer bytes. Existing allocation and buffering behavior
+is unchanged: SSH advertisements retain their 16 MiB cap; Git TCP advertisements
+have no total-size cap.
+
+Direct reader fixtures cover strict UTF-8/ASCII-hex errors, valid case variants,
+flush/empty/maximum frames and typed CLI conversion. The Git discovery gate uses
+14 malformed byte sequences across five real `execute_safe` command paths (70
+cases), checking the service request, protocol reason, exact command hint, all
+three renderings and tracking-ref safety. The server tasks and listeners are
+bounded and cancelled on drop. Another gate exercises a real idle TCP peer to
+preserve the ordinary network wrapper. Fetch no-echo and empty-stream cases use
+`read_fetch_stream`; they are not fabricated marker-only errors. No new Cargo
+target or shared test helper is introduced. These are local fixtures, not live
+OpenSSH authentication;
+actual execution and release acceptance are recorded in plan-20260901.md.
+
+## Remote push rejection messages
+
+When receive-pack reports `ng <refname> <reason>`, Libra first checks that the
+refname is one of the local refs submitted for this push. A rejection for any
+other ref fails with `LBR-NET-002` (exit 128) and the fixed reason
+`receive-pack rejected an unexpected ref`; the unrecognized name and its reason
+are not echoed. Its hint asks you to check the remote Git service or proxy.
+
+For a recognized ref, the remote rejection remains readable. Both its name and
+reason use the same sanitizer: Unicode control characters, including C0, DEL,
+and C1/CSI, become literal escape text. Each displayed field is limited to 200
+Unicode characters after escaping, plus `…` when truncated. An escape sequence
+or UTF-8 character is never split, so the visible prefix can be shorter than 200
+characters. Ordinary short rejection text is unchanged. These rules apply before
+human, JSON, and machine rendering, including the decoded JSON message.
+
+Known-ref rejection still returns `LBR-NET-002` / exit 128 with the existing branch
+protection hint. JSON keeps the existing message/hints envelope; a separate
+structured reason field is not introduced. Readable remote text is not a trusted
+local assertion. A rejected response leaves local tracking refs unchanged; it
+does not prove that the server rolled back a partial remote update. Inspect the
+remote state before retrying when the server's result is uncertain.
+
+### Rejection validation scope
+
+The three original PKT-14 gates exercise exact expected-ref membership, both
+sanitized fields, all C0 plus DEL/CSI controls, Unicode/escape boundaries and
+ordinary rejection compatibility. The rendering gate drives a real local HTTP
+receive-pack discovery and delete-only POST through push `execute_safe`, then
+checks human/report/decoded-JSON messages, exact hints, wire request and unchanged
+tracking refs. The HTTP fixture is local; it does not claim TLS, SSH, or server
+rollback evidence. The two hash algorithms also cover direct zero-object-ID
+construction without a production `expect`. No test target or shared harness is
+added. Actual execution, failure history and release evidence belong in the plan.
+
+## Empty-repository advertisement tail regression (FIX-PKT-05)
+
+Four new library test names extend the existing pkt-line gates without replacing
+the original 113 plan gates or adding a Cargo target / cli.* scenario:
+
+- `internal::protocol::test::pkt_line_empty_discovery_rejects_malformed_tail`:
+  SHA-1/SHA-256 and both services, short/encoding/hex/sign/space/length/payload
+  errors after zero OID, exact typed Display reasons and no sentinel echo.
+- `internal::protocol::test::pkt_line_empty_discovery_preserves_valid_tail`:
+  empty refs/capabilities/hash kind and existing flush/0004/ffff framing behavior.
+- `command::ls_remote::pkt_line_boundary_tests::pkt_line_empty_discovery_http_tail_maps_net_002`:
+  real local HTTP through HttpsClient and fetch/clone/ls-remote/pull execute_safe,
+  fixed NET002/128/hints, three renderings and decoded JSON, GET-only transcript,
+  original repository refs/FETCH_HEAD and local sentinel unchanged. Valid empty
+  ls-remote retains empty entries and command success. No TLS or external server
+  coverage is claimed. Existing two-worker runtime, 45-second command bounds,
+  bounded server cleanup and env/cwd/hash_kind exclusion are retained.
+- `command::push::test::pkt_line_empty_discovery_push_tail_maps_net_002`:
+  real ReceivePack parser through the production discovery mapper and CLI
+  conversion; exact push hint, fixed reasons, JSON and sentinel assertions.
+  This is mapping coverage, not a remote push/rollback test.
+
+The inline serial test is outside SERIAL_CLASSIFY's tests/**/*.rs input; it
+uses the existing adjacent HTTP tests' keys. No registry or nextest configuration
+change is needed. Actual source/local/full/review/release acceptance must be
+recorded separately in plan-20260901.md.
