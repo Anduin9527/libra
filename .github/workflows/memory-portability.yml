@@ -18,15 +18,22 @@ jobs:
           - platform: linux-amd64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            rustflags: -D warnings
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rustflags: -D warnings
           - platform: macos-arm64
             runner: macos-latest
             target: aarch64-apple-darwin
+            rustflags: -D warnings
           - platform: windows-amd64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
+            # This probe validates release-linked SQLite/FTS5. Existing
+            # Windows-only cfg gaps leave unrelated Unix helpers dead there;
+            # the repository-wide clippy job remains the warning gate.
+            rustflags: -D warnings -A dead_code
     env:
       LIBRA_SKIP_WEB_BUILD: "1"
       EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -45,6 +52,7 @@ jobs:
         with:
           toolchain: stable
           target: ${{ matrix.target }}
+          rustflags: ${{ matrix.rustflags }}
 
       - name: Verify tested commit
         shell: bash
