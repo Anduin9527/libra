@@ -1,6 +1,6 @@
 //! Protocol abstraction for Git transport with shared advertisement parsing and traits implemented by HTTPS, local, and LFS clients.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeSet, io::Error as IoError};
 
 use bytes::{Bytes, BytesMut};
 use git_internal::{
@@ -53,6 +53,62 @@ pub type DiscRef = DiscoveredReference;
 
 pub type FetchStream = futures_util::stream::BoxStream<'static, Result<Bytes, std::io::Error>>;
 
+const MAX_ADVERTISED_SHALLOW_BOUNDARIES: usize = 4096;
+
+/// Protocol negotiation failed before a request could be sent because the
+/// remote cannot accept shallow boundaries or a depth request.
+#[derive(Debug)]
+pub(crate) struct MissingShallowCapability;
+
+impl std::fmt::Display for MissingShallowCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "remote did not advertise the Git 'shallow' capability; cannot request --depth or send existing shallow boundaries; use a server with shallow support",
+        )
+    }
+}
+
+impl std::error::Error for MissingShallowCapability {}
+
+/// The source changed its shallow boundary set after reference discovery.
+#[derive(Debug)]
+pub(crate) struct ChangedShallowAdvertisement;
+
+impl std::fmt::Display for ChangedShallowAdvertisement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "remote shallow boundaries changed between discovery and fetch; retry the operation",
+        )
+    }
+}
+
+impl std::error::Error for ChangedShallowAdvertisement {}
+
+/// Recognize typed protocol failures even when a transport preserves the
+/// original cause behind another I/O or contextual error.
+fn has_error_cause<T: std::error::Error + 'static>(error: &IoError) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if current.is::<T>() {
+            return true;
+        }
+        cause = current
+            .downcast_ref::<IoError>()
+            .and_then(IoError::get_ref)
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| current.source());
+    }
+    false
+}
+
+pub(crate) fn is_missing_shallow_capability(error: &IoError) -> bool {
+    has_error_cause::<MissingShallowCapability>(error)
+}
+
+pub(crate) fn is_shallow_advertisement_changed(error: &IoError) -> bool {
+    has_error_cause::<ChangedShallowAdvertisement>(error)
+}
+
 thread_local! {
     static WIRE_HASH_KIND: RefCell<HashKind> = RefCell::new(HashKind::default());
 }
@@ -72,6 +128,8 @@ pub fn get_wire_hash_kind() -> HashKind {
 pub struct DiscoveryResult {
     pub refs: Vec<DiscRef>,
     pub capabilities: Vec<String>,
+    /// Boundary commits advertised by a shallow upload-pack source.
+    pub shallow_boundaries: Vec<String>,
     pub hash_kind: HashKind,
 }
 
@@ -87,6 +145,7 @@ pub fn parse_discovered_references(
     }
     let mut ref_list = Vec::new(); // refs
     let mut capabilities = Vec::new(); // capabilities
+    let mut shallow_boundaries = BTreeSet::new();
     let mut saw_header = false; // header seen or not
     let mut processed_first_ref = false;
     let mut hash_kind = HashKind::Sha1;
@@ -123,6 +182,35 @@ pub fn parse_discovered_references(
 
         let pkt_line = String::from_utf8(pkt_line.to_vec())
             .map_err(|e| GitError::NetworkError(format!("Invalid UTF-8 in response: {}", e)))?;
+        if let Some(oid) = pkt_line.strip_prefix("shallow ") {
+            let oid = oid.trim_end_matches('\n');
+            if !processed_first_ref {
+                return Err(GitError::NetworkError(
+                    "Unexpected shallow boundary in reference advertisement".to_string(),
+                ));
+            }
+            if oid.len() != hash_kind.size() * 2
+                || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(GitError::NetworkError(format!(
+                    "Invalid shallow boundary object id '{oid}' in reference advertisement"
+                )));
+            }
+            let canonical_oid = ObjectHash::from_hex_for_kind(hash_kind, oid)
+                .map_err(|_| {
+                    GitError::NetworkError(format!(
+                        "Invalid shallow boundary object id '{oid}' in reference advertisement"
+                    ))
+                })?
+                .to_string();
+            shallow_boundaries.insert(canonical_oid);
+            if shallow_boundaries.len() > MAX_ADVERTISED_SHALLOW_BOUNDARIES {
+                return Err(GitError::NetworkError(format!(
+                    "remote advertised more than {MAX_ADVERTISED_SHALLOW_BOUNDARIES} distinct shallow boundaries; deepen the source repository before retrying"
+                )));
+            }
+            continue;
+        }
         let (hash, rest) = pkt_line.split_once(' ').ok_or_else(|| {
             GitError::NetworkError("Invalid reference format, missing object id".to_string())
         })?;
@@ -208,6 +296,7 @@ pub fn parse_discovered_references(
     Ok(DiscoveryResult {
         refs: ref_list,
         capabilities,
+        shallow_boundaries: shallow_boundaries.into_iter().collect(),
         hash_kind,
     })
 }
@@ -217,6 +306,50 @@ pub fn generate_upload_pack_content(
     want: &[String],
     shallow: &[String],
     depth: Option<usize>,
+) -> Bytes {
+    generate_upload_pack_content_inner(have, want, shallow, depth, false)
+}
+
+/// Build a v0/v1 request using the server's advertised shallow capability.
+pub fn generate_upload_pack_content_with_capabilities(
+    have: &[String],
+    want: &[String],
+    shallow: &[String],
+    depth: Option<usize>,
+    advertised_capabilities: &[String],
+) -> Result<Bytes, IoError> {
+    let supports_shallow = advertised_capabilities.iter().any(|cap| cap == "shallow");
+    if !supports_shallow && (depth.is_some() || !shallow.is_empty()) {
+        return Err(IoError::other(MissingShallowCapability));
+    }
+    Ok(generate_upload_pack_content_inner(
+        have,
+        want,
+        shallow,
+        depth,
+        supports_shallow,
+    ))
+}
+
+pub(crate) fn verify_shallow_advertisement_unchanged(
+    expected: &[String],
+    actual: &[String],
+) -> Result<(), IoError> {
+    let expected: BTreeSet<&str> = expected.iter().map(String::as_str).collect();
+    let actual: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(IoError::other(ChangedShallowAdvertisement))
+    }
+}
+
+fn generate_upload_pack_content_inner(
+    have: &[String],
+    want: &[String],
+    shallow: &[String],
+    depth: Option<usize>,
+    supports_shallow: bool,
 ) -> Bytes {
     let mut buf = BytesMut::new();
     let mut write_first_line = false;
@@ -236,6 +369,9 @@ pub fn generate_upload_pack_content(
         "ofs-delta",
         "include-tag",
     ];
+    if supports_shallow {
+        requested_caps.push("shallow");
+    }
     if get_wire_hash_kind() == HashKind::Sha256 {
         requested_caps.push("object-format=sha256");
     }
@@ -555,5 +691,89 @@ mod test {
             !text.contains("thin-pack"),
             "thin-pack must not be advertised: {text}"
         );
+    }
+
+    #[test]
+    fn missing_shallow_capability_is_typed_and_keeps_actionable_display() {
+        let want = vec!["1".repeat(40)];
+        for (boundaries, depth) in [(Vec::new(), Some(1)), (vec!["2".repeat(40)], None)] {
+            let error =
+                generate_upload_pack_content_with_capabilities(&[], &want, &boundaries, depth, &[])
+                    .expect_err("depth and existing boundaries require server shallow support");
+            assert!(is_missing_shallow_capability(&error));
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                "remote did not advertise the Git 'shallow' capability; cannot request --depth or send existing shallow boundaries; use a server with shallow support"
+            );
+
+            let contextual = IoError::other(error);
+            assert!(is_missing_shallow_capability(&contextual));
+        }
+
+        let request = generate_upload_pack_content_with_capabilities(&[], &want, &[], None, &[])
+            .expect("full fetch does not require shallow support");
+        assert!(!request.is_empty());
+        assert!(!is_missing_shallow_capability(&IoError::other(
+            "remote did not advertise the Git 'shallow' capability"
+        )));
+    }
+
+    #[test]
+    fn second_upload_pack_shallow_advertisement_must_match_first() {
+        let boundary = "1".repeat(40);
+        let other = "2".repeat(40);
+        assert!(
+            verify_shallow_advertisement_unchanged(
+                std::slice::from_ref(&boundary),
+                std::slice::from_ref(&boundary),
+            )
+            .is_ok()
+        );
+        let error = verify_shallow_advertisement_unchanged(&[other], &[])
+            .expect_err("changed boundary set must fail before want lines are sent");
+        assert!(is_shallow_advertisement_changed(&error));
+        assert!(!is_missing_shallow_capability(&error));
+        assert!(
+            error
+                .to_string()
+                .contains("changed between discovery and fetch")
+        );
+        assert!(is_shallow_advertisement_changed(&IoError::other(error)));
+        assert!(!is_shallow_advertisement_changed(&IoError::other(
+            "remote shallow boundaries changed between discovery and fetch"
+        )));
+    }
+
+    #[test]
+    fn upload_pack_discovery_bounds_distinct_shallow_advertisements() {
+        let oid = "1".repeat(40);
+        let mut wire = BytesMut::new();
+        add_pkt_line_string(&mut wire, format!("{oid} HEAD\0shallow\n"));
+        for number in 0..=MAX_ADVERTISED_SHALLOW_BOUNDARIES {
+            add_pkt_line_string(&mut wire, format!("shallow {number:040x}\n"));
+        }
+        wire.extend_from_slice(b"0000");
+        let error = parse_discovered_references(wire.freeze(), ServiceType::UploadPack)
+            .expect_err("unbounded source shallows must not trigger unbounded storage probes");
+        assert!(error.to_string().contains("more than 4096"), "{error}");
+    }
+
+    #[test]
+    fn upload_pack_discovery_canonicalizes_shallow_oid_case() {
+        let reference = "1".repeat(40);
+        let upper = "A".repeat(40);
+        let lower = "a".repeat(40);
+        let mut wire = BytesMut::new();
+        add_pkt_line_string(&mut wire, format!("{reference} HEAD\0shallow\n"));
+        add_pkt_line_string(&mut wire, format!("shallow {upper}\n"));
+        add_pkt_line_string(&mut wire, format!("shallow {lower}\n"));
+        wire.extend_from_slice(b"0000");
+
+        let discovery = parse_discovered_references(wire.freeze(), ServiceType::UploadPack)
+            .expect("mixed-case forms of one valid boundary must parse once");
+        assert_eq!(discovery.shallow_boundaries, vec![lower]);
+        verify_shallow_advertisement_unchanged(&discovery.shallow_boundaries, &["a".repeat(40)])
+            .expect("canonical boundary must compare equal across advertisements");
     }
 }

@@ -6,9 +6,10 @@ use std::{
 
 use git_internal::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
+        object::types::ObjectType,
         pack::{
             Pack,
             entry::Entry,
@@ -17,8 +18,11 @@ use git_internal::{
     },
 };
 
-use crate::command::index_pack_support::{
-    index_write_error, lock_state, record_first_pack_error, take_arc_mutex,
+use crate::{
+    command::index_pack_support::{
+        PackCommitEdges, index_write_error, lock_state, record_first_pack_error, take_arc_mutex,
+    },
+    utils::client_storage::parse_commit_header_refs,
 };
 
 async fn write_idx_v2_file(
@@ -77,8 +81,28 @@ impl Drop for TempDirGuard {
 }
 
 pub fn build_index_v2(pack_file: &str, index_file: &str) -> Result<(), GitError> {
+    build_index_v2_inner(pack_file, index_file, false).map(|_| ())
+}
+
+/// Build the index and spool commit parent edges from the same pack decode.
+pub(crate) fn build_index_v2_with_commit_edges(
+    pack_file: &str,
+    index_file: &str,
+) -> Result<PackCommitEdges, GitError> {
+    build_index_v2_inner(pack_file, index_file, true)?
+        .ok_or_else(|| GitError::PackEncodeError("commit edge spool was not created".to_string()))
+}
+
+fn build_index_v2_inner(
+    pack_file: &str,
+    index_file: &str,
+    collect_edges: bool,
+) -> Result<Option<PackCommitEdges>, GitError> {
     let pack_path = PathBuf::from(pack_file);
-    let parent = pack_path.parent().unwrap_or(std::path::Path::new("."));
+    let parent = pack_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -97,6 +121,11 @@ pub fn build_index_v2(pack_file: &str, index_file: &str) -> Result<(), GitError>
     let idx_entries_c = idx_entries.clone();
     let err = Arc::new(Mutex::new(None));
     let err_c = err.clone();
+    let commit_edges = collect_edges
+        .then(|| PackCommitEdges::new(parent, get_hash_kind()))
+        .transpose()?
+        .map(|spool| Arc::new(Mutex::new(spool)));
+    let commit_edges_c = commit_edges.clone();
 
     let mut pack = Pack::new(
         Some(8),
@@ -107,6 +136,30 @@ pub fn build_index_v2(pack_file: &str, index_file: &str) -> Result<(), GitError>
     pack.decode(
         &mut pack_reader,
         move |meta_entry: MetaAttached<Entry, EntryMeta>| {
+            let entry = &meta_entry.inner;
+            if let Some(spool) = commit_edges_c.as_ref()
+                && entry.obj_type == ObjectType::Commit
+            {
+                let (_, parents) = match parse_commit_header_refs(&entry.data, entry.hash) {
+                    Ok(refs) => refs,
+                    Err(error) => {
+                        record_first_pack_error(&err_c, error);
+                        return;
+                    }
+                };
+                match spool.lock() {
+                    Ok(mut guard) => {
+                        if let Err(error) = guard.record_parents(entry.hash, &parents) {
+                            record_first_pack_error(&err_c, error);
+                            return;
+                        }
+                    }
+                    Err(_) => record_first_pack_error(
+                        &err_c,
+                        GitError::PackEncodeError("commit edge spool mutex poisoned".to_string()),
+                    ),
+                }
+            }
             match IndexEntry::try_from(&meta_entry) {
                 Ok(entry) => match idx_entries_c.lock() {
                     Ok(mut guard) => guard.push(entry),
@@ -139,10 +192,18 @@ pub fn build_index_v2(pack_file: &str, index_file: &str) -> Result<(), GitError>
     if tokio::runtime::Handle::try_current().is_ok() {
         let handle =
             std::thread::spawn(move || write_idx_v2_sync(index_path, idx_entries, pack_hash));
-        return handle
+        handle
             .join()
-            .map_err(|_| GitError::PackEncodeError("idx writer thread panicked".to_string()))?;
+            .map_err(|_| GitError::PackEncodeError("idx writer thread panicked".to_string()))??;
+    } else {
+        write_idx_v2_sync(index_path, idx_entries, pack_hash)?;
     }
 
-    write_idx_v2_sync(index_path, idx_entries, pack_hash)
+    commit_edges
+        .map(|spool| {
+            let mut spool = take_arc_mutex(spool, "commit edge spool")?;
+            spool.finish()?;
+            Ok(spool)
+        })
+        .transpose()
 }

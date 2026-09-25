@@ -18,7 +18,7 @@
 //! Search supports Git's revision navigation suffixes (`HEAD`, `~`, `^`).
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -32,7 +32,7 @@ use std::{
 
 use async_trait::async_trait;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use futures::FutureExt; // Import for catch_unwind
+use futures::{FutureExt, StreamExt, TryStreamExt, stream}; // Import for catch_unwind
 use git_internal::{
     errors::GitError,
     hash::ObjectHash,
@@ -1045,6 +1045,82 @@ pub struct ClientStorage {
     base_path: PathBuf, // Keep base_path for legacy access if needed
 }
 
+/// Parse only the reference-bearing commit headers. Commit messages are byte
+/// strings in Git, so decoding the full object as UTF-8 would reject valid
+/// commits and must not use unchecked string conversion on remote data.
+pub(crate) fn parse_commit_header_refs(
+    data: &[u8],
+    commit_hash: ObjectHash,
+) -> Result<(ObjectHash, Vec<ObjectHash>), GitError> {
+    fn next_line<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], GitError> {
+        let remaining = data.get(*cursor..).ok_or_else(|| {
+            GitError::InvalidObjectInfo("commit header position is out of bounds".to_string())
+        })?;
+        let end = remaining
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| {
+                GitError::InvalidObjectInfo("commit header is not newline-terminated".to_string())
+            })?;
+        *cursor += end + 1;
+        Ok(&remaining[..end])
+    }
+
+    fn parse_ref(
+        line: &[u8],
+        prefix: &[u8],
+        commit_hash: ObjectHash,
+        label: &str,
+    ) -> Result<ObjectHash, GitError> {
+        let raw = line.strip_prefix(prefix).ok_or_else(|| {
+            GitError::InvalidObjectInfo(format!("commit {commit_hash} is missing its {label} ID"))
+        })?;
+        let hex = std::str::from_utf8(raw).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has a non-ASCII {label} ID: {error}"
+            ))
+        })?;
+        ObjectHash::from_hex_for_kind(commit_hash.kind(), hex).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has an invalid {label} ID: {error}"
+            ))
+        })
+    }
+
+    let mut cursor = 0;
+    let tree_line = next_line(data, &mut cursor)?;
+    let tree = parse_ref(tree_line, b"tree ", commit_hash, "tree")?;
+    if cursor == data.len() {
+        return Err(GitError::InvalidObjectInfo(format!(
+            "commit {commit_hash} ends immediately after its tree header"
+        )));
+    }
+    let mut parents = Vec::new();
+    while data[cursor..].starts_with(b"parent ") {
+        let line = next_line(data, &mut cursor)?;
+        if line.contains(&0) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has a NUL byte in its reference headers"
+            )));
+        }
+        if parents.len() >= 262_144 {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has more than 262144 parents"
+            )));
+        }
+        parents.push(parse_ref(line, b"parent ", commit_hash, "parent")?);
+        if cursor == data.len() {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} ends immediately after a parent header"
+            )));
+        }
+    }
+    // Git's graph parser stops at the first non-parent line after `tree`.
+    // Author, committer, extensions, and message bytes do not affect edges;
+    // legacy or historical commits can omit or reorder those later fields.
+    Ok((tree, parents))
+}
+
 /// Default tiered-storage small/large object threshold (1 MiB): objects at or
 /// above this size are LRU-cached rather than stored permanently locally.
 pub const DEFAULT_STORAGE_THRESHOLD_BYTES: usize = 1024 * 1024;
@@ -1903,6 +1979,128 @@ impl ClientStorage {
         self.block_on_storage(async move { storage.get(&hash).await.map(|(data, _)| data) })
     }
 
+    /// Read a typed object with a strict load bound, including the durable
+    /// tier when read policy allows it. This is for fetch protocol inspection;
+    /// preview's `get_with_limit` remains local-only.
+    pub fn get_typed_with_limit(
+        &self,
+        object_id: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let storage = self.storage.clone();
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.get_typed_bounded(&hash, limit).await })
+    }
+
+    /// Read raw commit objects concurrently and retain only their parent IDs.
+    /// The operation does not resolve replacement refs. Distinct IDs are read
+    /// once, and remote reads honor the configured connection limit.
+    pub fn commit_parents_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<ObjectHash>>, GitError> {
+        const MAX_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
+        const MAX_TOTAL_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
+        const MAX_TOTAL_PARENTS: usize = 262_144;
+        self.commit_parents_many_with_limits(
+            hashes,
+            MAX_COMMIT_BYTES,
+            MAX_TOTAL_COMMIT_BYTES,
+            MAX_TOTAL_PARENTS,
+        )
+    }
+
+    fn commit_parents_many_with_limits(
+        &self,
+        hashes: &[ObjectHash],
+        max_commit_bytes: u64,
+        max_total_commit_bytes: u64,
+        max_total_parents: usize,
+    ) -> Result<HashMap<ObjectHash, Vec<ObjectHash>>, GitError> {
+        let unique: HashSet<ObjectHash> = hashes.iter().copied().collect();
+        let storage = self.storage.clone();
+        let max_in_flight = crate::utils::resource_limits::max_connections().min(16);
+        self.block_on_storage(async move {
+            let mut remaining: VecDeque<_> = unique.into_iter().collect();
+            let mut commits = HashMap::new();
+            let mut total_parents = 0usize;
+            let mut total_bytes = 0u64;
+            while !remaining.is_empty() {
+                let available = max_total_commit_bytes - total_bytes;
+                if available == 0 {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "advertised shallow commits exceed {max_total_commit_bytes} bytes; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                    )));
+                }
+                let (slots, per_commit_limit) = crate::utils::storage::bounded_read_batch_shape(
+                    available,
+                    max_commit_bytes,
+                    max_in_flight,
+                );
+                let batch: Vec<_> = (0..slots).filter_map(|_| remaining.pop_front()).collect();
+                let reads: Vec<(ObjectHash, Vec<ObjectHash>, u64)> = stream::iter(batch)
+                    .map(|hash| {
+                        let storage = storage.clone();
+                        async move {
+                            let (data, object_type) = storage
+                                .get_commit_bounded(&hash, per_commit_limit)
+                                .await
+                                .map_err(|error| {
+                                    crate::utils::storage::checked_read_error(&hash, error)
+                                })?;
+                            if object_type != ObjectType::Commit {
+                                return Err(GitError::InvalidObjectInfo(format!(
+                                    "advertised shallow boundary {hash} is {object_type}, expected a commit"
+                                )));
+                            }
+                            let len = u64::try_from(data.len()).map_err(|error| {
+                                GitError::InvalidObjectInfo(format!(
+                                    "commit object {hash} is too large to inspect: {error}"
+                                ))
+                            })?;
+                            if len > per_commit_limit {
+                                return Err(GitError::InvalidObjectInfo(format!(
+                                    "commit object {hash} exceeds the remaining {per_commit_limit}-byte shallow boundary budget; fetch fewer refs"
+                                )));
+                            }
+                            let (_, parents) =
+                                parse_commit_header_refs(&data, hash).map_err(|error| {
+                                    crate::utils::storage::checked_read_error(&hash, error)
+                                })?;
+                            Ok((hash, parents, len))
+                        }
+                    })
+                    .buffer_unordered(slots)
+                    .try_collect()
+                    .await?;
+                for (hash, parents, bytes) in reads {
+                    total_parents = total_parents.checked_add(parents.len()).ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "shallow boundary parent count exceeds this platform".to_string(),
+                        )
+                    })?;
+                    if total_parents > max_total_parents {
+                        return Err(GitError::InvalidObjectInfo(format!(
+                            "advertised shallow commits have more than {max_total_parents} parents; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                        )));
+                    }
+                    total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "shallow boundary commit byte count exceeds u64".to_string(),
+                        )
+                    })?;
+                    if total_bytes > max_total_commit_bytes {
+                        return Err(GitError::InvalidObjectInfo(format!(
+                            "advertised shallow commits exceed {max_total_commit_bytes} bytes; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                        )));
+                    }
+                    commits.insert(hash, parents);
+                }
+            }
+            Ok(commits)
+        })
+    }
+
     /// Read an object only when the backend can enforce `limit` before
     /// materializing its payload.
     pub fn get_with_limit(&self, object_id: &ObjectHash, limit: u64) -> Result<Vec<u8>, GitError> {
@@ -2132,6 +2330,24 @@ impl ClientStorage {
         self.block_on_storage(async move { storage.exist(&hash).await })
     }
 
+    /// Probe presence without turning a storage or pack error into absence.
+    pub fn exist_checked(&self, obj_id: &ObjectHash) -> Result<bool, GitError> {
+        let storage = self.storage.clone();
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.exist_checked(&hash).await })
+    }
+
+    /// Probe many distinct objects with bounded concurrency while preserving
+    /// storage failures as errors. Duplicate IDs are checked only once.
+    pub fn exist_checked_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, bool>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move { storage.exist_checked_batch(&hashes).await })
+    }
+
     /// Read just the `ObjectType` for `obj_id`.
     ///
     /// Boundary conditions:
@@ -2142,6 +2358,43 @@ impl ClientStorage {
         let storage = self.storage.clone();
         let hash = *obj_id;
         self.block_on_storage(async move { storage.get(&hash).await.map(|(_, t)| t) })
+    }
+
+    /// Inspect an object's type without an unbounded body read. Local loose
+    /// and pack objects use header-only probes; a remote-only object is read
+    /// through the verified 4 MiB typed bound or rejected if larger.
+    pub fn get_object_type_bounded(&self, obj_id: &ObjectHash) -> Result<ObjectType, GitError> {
+        let storage = self.storage.clone();
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.object_type_bounded_probe(&hash).await })
+    }
+
+    /// Batch variant of [`Self::get_object_type_bounded`]. Missing IDs are
+    /// omitted; callers inspecting advertised refs must reject absent keys.
+    pub fn get_object_types_bounded_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move { storage.object_types_bounded_probe(&hashes).await })
+    }
+
+    /// Like [`Self::get_object_types_bounded_many`], reporting decoded bytes
+    /// fetched from the durable tier so a caller can enforce one response-wide
+    /// budget across annotated-tag peel rounds.
+    pub fn get_object_types_bounded_many_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move {
+            storage
+                .object_types_bounded_probe_with_budget(&hashes, remaining_remote_bytes)
+                .await
+        })
     }
 
     /// Convenience wrapper: returns whether `obj_id` resolves to an object of the
@@ -2595,6 +2848,47 @@ impl Storage for ClientStorage {
         // `block_on_storage` facade would park the caller thread in recv() and
         // make an outer timeout ineffective on a blocked local/pack read.
         self.storage.get_with_limit(hash, limit).await
+    }
+
+    async fn get_typed_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        self.storage
+            .get_typed_bounded(hash, max_payload_bytes)
+            .await
+    }
+
+    async fn get_commit_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        self.storage
+            .get_commit_bounded(hash, max_payload_bytes)
+            .await
+    }
+
+    async fn object_type_bounded_probe(&self, hash: &ObjectHash) -> Result<ObjectType, GitError> {
+        self.storage.object_type_bounded_probe(hash).await
+    }
+
+    async fn object_types_bounded_probe(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        self.storage.object_types_bounded_probe(hashes).await
+    }
+
+    async fn object_types_bounded_probe_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        self.storage
+            .object_types_bounded_probe_with_budget(hashes, remaining_remote_bytes)
+            .await
     }
 
     async fn put(
@@ -3553,15 +3847,19 @@ mod tests {
         ffi::OsString,
         fs,
         path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use git_internal::{
         errors::GitError,
-        hash::{HashKind, get_hash_kind, set_hash_kind, set_hash_kind_for_test},
+        hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind, set_hash_kind_for_test},
         internal::{
             metadata::{EntryMeta, MetaAttached},
-            object::{ObjectTrait, blob::Blob},
+            object::{ObjectTrait, blob::Blob, types::ObjectType},
             pack::{encode::PackEncoder, entry::Entry},
         },
     };
@@ -3571,9 +3869,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        ClientStorage, ObjectIndexRepairLock, ObjectReadFailure, acquire_index_repair_lock,
-        remove_object_index_rows_with_conn, resolve_env_sync, update_object_index,
-        update_object_index_once,
+        ClientStorage, Commit, ObjectIndexRepairLock, ObjectReadFailure, acquire_index_repair_lock,
+        parse_commit_header_refs, remove_object_index_rows_with_conn, resolve_env_sync,
+        update_object_index, update_object_index_once,
     };
     use crate::{
         internal::{
@@ -3583,9 +3881,408 @@ mod tests {
         },
         utils::{
             object_ext::BlobExt,
+            storage::Storage,
             test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
         },
     };
+
+    struct CheckedProbeStorage {
+        present: ObjectHash,
+        failed: Option<ObjectHash>,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl CheckedProbeStorage {
+        fn new(present: ObjectHash, failed: Option<ObjectHash>) -> Self {
+            Self {
+                present,
+                failed,
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CheckedProbeStorage {
+        async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
+            Err(GitError::ObjectNotFound(hash.to_string()))
+        }
+
+        async fn put(
+            &self,
+            _hash: &ObjectHash,
+            _data: &[u8],
+            _obj_type: ObjectType,
+        ) -> Result<String, GitError> {
+            unreachable!("checked-probe test never stores objects")
+        }
+
+        async fn exist(&self, _hash: &ObjectHash) -> bool {
+            unreachable!("checked-probe test must use error-aware existence")
+        }
+
+        async fn search(&self, _prefix: &str) -> Vec<ObjectHash> {
+            Vec::new()
+        }
+
+        async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.failed.as_ref() == Some(hash) {
+                return Err(GitError::IOError(std::io::Error::other(
+                    "simulated probe outage",
+                )));
+            }
+            Ok(*hash == self.present)
+        }
+    }
+
+    #[test]
+    fn checked_batch_deduplicates_and_bounds_concurrency() {
+        let hashes: Vec<ObjectHash> = (0..40).map(|byte| ObjectHash::new(&[byte; 20])).collect();
+        let backend = Arc::new(CheckedProbeStorage::new(hashes[3], None));
+        let client = ClientStorage::from_test_storage(backend.clone(), PathBuf::new());
+
+        let mut input = hashes.clone();
+        input.extend_from_slice(&[hashes[3], hashes[12]]);
+        let results = client.exist_checked_many(&input).expect("batch probe");
+
+        assert_eq!(results.len(), hashes.len());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), hashes.len());
+        assert!(results[&hashes[3]]);
+        assert!(!results[&hashes[12]]);
+        let peak = backend.peak.load(Ordering::SeqCst);
+        assert!(
+            (1..=16).contains(&peak),
+            "probe concurrency must be bounded: {peak}"
+        );
+    }
+
+    #[test]
+    fn checked_batch_reports_failing_oid() {
+        let failed = ObjectHash::new(&[9; 20]);
+        let backend = Arc::new(CheckedProbeStorage::new(
+            ObjectHash::new(&[1; 20]),
+            Some(failed),
+        ));
+        let client = ClientStorage::from_test_storage(backend, PathBuf::new());
+
+        let error = client
+            .exist_checked_many(&[failed])
+            .expect_err("storage failure must not become absence");
+        assert!(error.to_string().contains(&failed.to_string()));
+        assert!(error.to_string().contains("simulated probe outage"));
+    }
+
+    #[test]
+    fn commit_parent_batch_reads_raw_commits_and_reports_missing_oid() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[3; 20]);
+        let root = Commit::from_tree_id(tree, vec![], "root");
+        let tip = Commit::from_tree_id(tree, vec![root.id], "tip");
+        for commit in [&root, &tip] {
+            client
+                .put(
+                    &commit.id,
+                    &commit.to_data().expect("serialize fixture commit"),
+                    ObjectType::Commit,
+                )
+                .expect("store fixture commit");
+        }
+
+        let parents = client
+            .commit_parents_many(&[root.id, tip.id, tip.id])
+            .expect("batch read commits");
+        assert_eq!(parents.len(), 2);
+        assert!(parents[&root.id].is_empty());
+        assert_eq!(parents[&tip.id], vec![root.id]);
+
+        let absent = ObjectHash::new(&[4; 20]);
+        let error = client
+            .commit_parents_many(&[absent])
+            .expect_err("missing commit must be an error");
+        assert!(error.to_string().contains(&absent.to_string()));
+    }
+
+    #[test]
+    fn commit_parent_batch_rejects_wrong_type_and_oversized_payload() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[5; 20]);
+        let wrong_type = Commit::from_tree_id(tree, vec![], "content shaped like a commit");
+        let wrong_type_data = wrong_type.to_data().expect("serialize fixture");
+        let wrong_type_id = ObjectHash::from_type_and_data_for_kind(
+            wrong_type.id.kind(),
+            ObjectType::Blob,
+            &wrong_type_data,
+        )
+        .expect("hash blob fixture");
+        client
+            .put(&wrong_type_id, &wrong_type_data, ObjectType::Blob)
+            .expect("store wrong-type fixture");
+        let error = client
+            .commit_parents_many(&[wrong_type_id])
+            .expect_err("blob must not be accepted as a commit");
+        assert!(error.to_string().contains("expected a commit"), "{error}");
+
+        let oversized = Commit::from_tree_id(tree, vec![], &"x".repeat(4 * 1024 * 1024));
+        client
+            .put(
+                &oversized.id,
+                &oversized.to_data().expect("serialize large commit"),
+                ObjectType::Commit,
+            )
+            .expect("store oversized fixture");
+        let error = client
+            .commit_parents_many(&[oversized.id])
+            .expect_err("oversized commit must be refused");
+        assert!(error.to_string().contains(&oversized.id.to_string()));
+        assert!(error.to_string().contains("4194304"), "{error}");
+    }
+
+    #[test]
+    fn commit_parent_batch_rejects_mismatched_local_oid() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[5; 20]);
+        let actual = Commit::from_tree_id(tree, vec![], "actual contents");
+        let requested = Commit::from_tree_id(tree, vec![], "requested contents");
+        client
+            .put(
+                &requested.id,
+                &actual.to_data().expect("serialize actual commit"),
+                ObjectType::Commit,
+            )
+            .expect("seed mismatched commit under requested OID");
+
+        let error = client
+            .commit_parents_many(&[requested.id])
+            .expect_err("bounded commit read must verify the requested OID");
+        assert!(error.to_string().contains("integrity check"), "{error}");
+        assert!(error.to_string().contains(&requested.id.to_string()));
+    }
+
+    #[test]
+    fn commit_parent_batch_reserves_in_flight_byte_budget() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[6; 20]);
+        let mut hashes = Vec::new();
+        let mut commit_bytes = 0u64;
+        for message in *b"abc" {
+            let mut data =
+                format!("tree {tree}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n")
+                    .into_bytes();
+            data.push(message);
+            commit_bytes = data.len() as u64;
+            let hash =
+                ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Commit, &data)
+                    .expect("hash commit fixture");
+            client
+                .put(&hash, &data, ObjectType::Commit)
+                .expect("store commit fixture");
+            hashes.push(hash);
+        }
+        let last_read_limit = commit_bytes / 2;
+        let error = client
+            .commit_parents_many_with_limits(
+                &hashes,
+                commit_bytes,
+                2 * commit_bytes + last_read_limit,
+                10,
+            )
+            .expect_err("third commit must be bounded by the remaining response budget");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("limit of {last_read_limit} bytes")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn commit_parent_batch_caps_total_parents() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::init_local(dir.path().join("objects"));
+        let tree = ObjectHash::new(&[6; 20]);
+        let parent = ObjectHash::new(&[7; 20]);
+        let mut commits = Vec::new();
+        for index in 0..4 {
+            let commit =
+                Commit::from_tree_id(tree, vec![parent; 65_537], &format!("wide merge {index}"));
+            client
+                .put(
+                    &commit.id,
+                    &commit.to_data().expect("serialize wide commit"),
+                    ObjectType::Commit,
+                )
+                .expect("store wide commit");
+            commits.push(commit.id);
+        }
+
+        let error = client
+            .commit_parents_many(&commits)
+            .expect_err("aggregate parent cap must be enforced");
+        assert!(error.to_string().contains("262144 parents"), "{error}");
+    }
+
+    #[test]
+    fn commit_header_parser_accepts_binary_message_and_ignores_signature_continuation() {
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let commit = ObjectHash::new_for_kind(kind, b"commit");
+            let tree = ObjectHash::new_for_kind(kind, b"tree");
+            let parent = ObjectHash::new_for_kind(kind, b"parent");
+            let ignored_continuation = ObjectHash::new_for_kind(kind, b"ignored");
+            let mut bytes = format!(
+                "tree {tree}\nparent {parent}\nauthor Author <a@example.com> 0 +0000\ncommitter Committer <c@example.com> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n parent {ignored_continuation}\n\n"
+            )
+            .into_bytes();
+            bytes.extend_from_slice(&[0xff, 0x00, 0xfe]);
+
+            let (parsed_tree, parents) =
+                parse_commit_header_refs(&bytes, commit).expect("parse only commit headers");
+            assert_eq!(parsed_tree, tree);
+            assert_eq!(parents, vec![parent]);
+        }
+    }
+
+    #[test]
+    fn commit_header_parser_ignores_legacy_message_without_blank_separator() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        let message_oid = ObjectHash::new_for_kind(HashKind::Sha1, b"message text");
+        let body = format!(
+            "tree {tree}\nparent {parent}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\nparent {message_oid}\n"
+        );
+        let (parsed_tree, parents) =
+            parse_commit_header_refs(body.as_bytes(), commit).expect("legacy commit header");
+        assert_eq!(parsed_tree, tree);
+        assert_eq!(parents, vec![parent]);
+    }
+
+    #[test]
+    fn commit_header_parser_rejects_wrong_kind_and_malformed_parent() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha256, b"commit");
+        let wrong_kind = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let bad_tree =
+            format!("tree {wrong_kind}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n");
+        let error = parse_commit_header_refs(bad_tree.as_bytes(), commit)
+            .expect_err("tree kind mismatch must be rejected");
+        assert!(error.to_string().contains("invalid tree ID"));
+
+        let tree = ObjectHash::new_for_kind(HashKind::Sha256, b"tree");
+        let bad_parent = format!(
+            "tree {tree}\nparent {}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n",
+            "z".repeat(64)
+        );
+        let error = parse_commit_header_refs(bad_parent.as_bytes(), commit)
+            .expect_err("non-hex parent must be rejected");
+        assert!(error.to_string().contains("invalid parent ID"));
+    }
+
+    #[test]
+    fn commit_header_parser_stops_at_first_non_parent_line() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        let cases = [
+            format!(
+                "tree {tree}\nauthor A <a@b> 0 +0000\nparent {parent}\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!("tree {tree}\ncommitter C <c@d> 0 +0000\nauthor A <a@b> 0 +0000\n\n"),
+            format!(
+                "tree {tree}\nauthor A <a@b> 0 +0000\nauthor B <b@c> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!(
+                "tree {tree}\ntree {tree}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!("tree {tree}\n orphan\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"),
+        ];
+        for body in cases {
+            let (parsed_tree, parents) = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect("later noncanonical headers do not affect the parent graph");
+            assert_eq!(parsed_tree, tree);
+            assert!(parents.is_empty(), "later parent lines are not edges");
+        }
+    }
+
+    #[test]
+    fn commit_header_parser_accepts_missing_author_and_committer() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        for body in [
+            format!("tree {tree}\n\n"),
+            format!("tree {tree}\nparent {parent}\n\n"),
+            format!("tree {tree}\nparent {parent}\ncommitter before author\n"),
+        ] {
+            let (parsed_tree, parents) = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect("Git graph parser only requires tree and leading parents");
+            assert_eq!(parsed_tree, tree);
+            assert_eq!(
+                parents,
+                if body.contains("parent ") {
+                    vec![parent]
+                } else {
+                    vec![]
+                }
+            );
+        }
+
+        for body in [
+            format!("tree {tree}\n"),
+            format!("tree {tree}\nparent {parent}\n"),
+        ] {
+            let error = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect_err("a commit cannot end directly after a reference header");
+            assert!(error.to_string().contains("ends immediately"), "{error}");
+        }
+    }
+
+    #[test]
+    fn typed_bounded_read_preserves_type_and_enforces_limit() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("create object directory");
+        let storage = ClientStorage::init_local(dir.path().join("objects"));
+        let blob = Blob::from_content("bounded typed read");
+        storage
+            .put(&blob.id, &blob.data, ObjectType::Blob)
+            .expect("store local blob");
+
+        let (payload, object_type) = storage
+            .get_typed_with_limit(&blob.id, 1024)
+            .expect("read typed object within bound");
+        assert_eq!(payload, blob.data);
+        assert_eq!(object_type, ObjectType::Blob);
+        let error = storage
+            .get_typed_with_limit(&blob.id, 1)
+            .expect_err("small limit must reject the object");
+        assert!(error.to_string().contains("limit"), "{error}");
+
+        let mismatched = Blob::from_content("different object").id;
+        storage
+            .put(&mismatched, &blob.data, ObjectType::Blob)
+            .expect("seed payload under the wrong local OID");
+        let error = storage
+            .get_typed_with_limit(&mismatched, 1024)
+            .expect_err("bounded local tag/want reads must verify the requested OID");
+        assert!(error.to_string().contains("integrity check"), "{error}");
+        assert!(
+            error.to_string().contains(&mismatched.to_string()),
+            "{error}"
+        );
+    }
 
     /// Test helper that clears an env var on construction and restores it on drop.
     /// Combined with `#[serial]`, this lets tests assert behaviour when a specific

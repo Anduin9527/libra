@@ -409,6 +409,7 @@ impl LocalClient {
                 Ok(DiscoveryResult {
                     refs,
                     capabilities,
+                    shallow_boundaries: Vec::new(),
                     hash_kind,
                 })
             }
@@ -455,6 +456,7 @@ impl LocalClient {
                             }))
                             .collect::<Vec<_>>(),
                         capabilities: vec![],
+                        shallow_boundaries: Vec::new(),
                         hash_kind: repo_hash_kind,
                     })
                 })
@@ -624,7 +626,7 @@ impl LocalClient {
 
 /// Read `objectformat` from a foreign Git repository's `config`, defaulting to
 /// SHA-1 (the overwhelmingly common case for local Git remotes).
-fn git_repo_hash_kind(repo_path: &Path) -> HashKind {
+pub(crate) fn git_repo_hash_kind(repo_path: &Path) -> HashKind {
     if let Ok(text) = fs::read_to_string(repo_path.join("config")) {
         for line in text.lines() {
             let lower = line.to_ascii_lowercase();
@@ -895,9 +897,9 @@ type DepthWalkResult = (
 
 /// Shortest distance from any want, truncated at `depth`.
 fn load_git_repo_shallow(repo_path: &Path) -> Result<ShallowSet, GitError> {
-    ShallowSet::load_at(&repo_path.join("shallow")).map_err(|error| {
-        GitError::CustomError(format!("source shallow metadata is corrupt: {error}"))
-    })
+    ShallowSet::load_at_for_kind(&repo_path.join("shallow"), git_repo_hash_kind(repo_path)).map_err(
+        |error| GitError::CustomError(format!("source shallow metadata is corrupt: {error}")),
+    )
 }
 
 fn walk_git_commits_for_depth(
@@ -1786,6 +1788,35 @@ mod tests {
             .collect();
         commits.sort();
         (commits, shallow)
+    }
+
+    #[test]
+    fn load_git_repo_shallow_uses_source_hash_kind() {
+        let dir = tempdir().expect("tempdir");
+        let _ambient = HashKindRestoreGuard::switch_to(HashKind::Blake3);
+        for (config, kind, oid) in [
+            (
+                "[core]\nrepositoryformatversion = 0\n",
+                HashKind::Sha1,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "[extensions]\nobjectFormat = sha256\n",
+                HashKind::Sha256,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        ] {
+            fs::write(dir.path().join("config"), config).expect("write Git config");
+            fs::write(dir.path().join("shallow"), format!("{oid}\n"))
+                .expect("write Git shallow file");
+            let shallow = load_git_repo_shallow(dir.path()).expect("parse Git shallow file");
+            let hash = ObjectHash::from_hex_for_kind(kind, oid).expect("source hash");
+            assert!(shallow.is_boundary(&hash));
+            assert_eq!(
+                shallow.oids().iter().next().map(ObjectHash::kind),
+                Some(kind)
+            );
+        }
     }
 
     #[test]

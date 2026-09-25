@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased]
+
+### Git conversion and shallow-source fetch
+
+- `libra init --from-git-repository` now follows the source repository's advertised
+  `HEAD`, including when it points to a branch other than `main`.
+- Git, HTTPS, and SSH fetches request the `shallow` capability only when the
+  server advertises it. Fetches from an already shallow Git source retain its
+  advertised history boundaries. Reference advertisements allow at most 4,096
+  distinct shallow boundaries; upload-pack responses separately allow at most
+  4,096 distinct OIDs across `shallow` and `unshallow` lines. Larger sets fail
+  instead of processing boundaries without a limit.
+  Response boundary lines are also capped at 8,192 including duplicates; OIDs
+  are checked against the server's object format, with violations reported as
+  `LBR-NET-002`.
+- Inspecting advertised shallow-boundary commits is capped at 4 MiB of decoded
+  payload per commit, 64 MiB of decoded commit payload per fetch, and 262,144
+  parent IDs in total. Exceeding a limit aborts the fetch or clone;
+  aggregate-limit errors suggest fetching fewer refs or asking the remote owner
+  to reduce its shallow boundaries.
+- Network Git (`git://`), HTTP(S), and SSH fetches, including clone's internal
+  fetch, verify wanted objects and fetched commit-parent links against final
+  shallow boundaries before updating refs; unmarked missing parents are refused.
+  The temporary parent-edge file is capped at 1 GiB and the in-pack commit-ID
+  index at 64 MiB per fetch. Further depth-response shallow-marker checks cap
+  requested-object and tag-target inspections at 16,384. The response ancestry
+  walk separately caps distinct commits and parent edges at 262,144 each.
+  Remote type probes and inspected tags share a 256 MiB decoded object-payload
+  budget across each shallow response validation. Exceeding a limit fails
+  closed; fetch fewer refs or split the fetch. Smart HTTP additionally rechecks
+  the source's shallow advertisement after upload-pack POST.
+- Clone documentation now distinguishes local shallow-source rejection from
+  the network post-fetch `--reject-shallow` check when `--depth` is also set.
+- The unsupported `libra::internal::protocol::DiscoveryResult` embedding API
+  gains a `shallow_boundaries` field. External code constructing that struct
+  directly must initialize the new field.
+
 ## [0.23.65] — 2026-09-24
 
 ### GnuPG key import into the repository vault (plan-20260921)

@@ -125,9 +125,10 @@ pub struct CloneArgs {
     pub origin: Option<String>,
 
     /// Request local-clone semantics for a filesystem source (Git's `-l`/`--local`).
-    /// Libra still copies objects (it never hardlinks), but a plain local Git
-    /// path then ignores `--depth` / `--shallow-*` / `--filter` with Git's
-    /// warnings. Last one wins with `--no-local`.
+    /// Libra still copies objects (it never hardlinks). A complete plain local
+    /// Git source ignores `--depth` / `--shallow-*` / `--filter` with Git's
+    /// warnings; an already shallow Git source uses transport and honors
+    /// `--depth`. Last one wins with `--no-local`.
     #[clap(short = 'l', long, overrides_with = "no_local")]
     pub local: bool,
 
@@ -139,24 +140,26 @@ pub struct CloneArgs {
 
     /// Fail if the source repository is shallow (matching
     /// `git clone --reject-shallow`). A local Git shallow source is inspected
-    /// before the destination is created. Local Libra sources do not advertise
-    /// shallow boundaries (D20), so `--depth` fails closed before this check.
+    /// before the destination is created. A network source is checked after
+    /// fetch unless `--depth` is supplied, which skips that post-fetch check.
+    /// Local Libra sources do not advertise shallow boundaries (D20), so
+    /// `--depth` fails closed before this check.
     #[clap(long = "reject-shallow")]
     pub reject_shallow: bool,
 
     /// Borrow objects from an existing local repository to reduce transfer
     /// (Git's `--reference <repo>`, which sets up `objects/info/alternates`).
-    /// Accepted for compatibility but a no-op with a warning: Libra has no object
-    /// alternates — it always copies every object into the clone — so there is
-    /// nothing to borrow and the reference is ignored. May be given multiple
-    /// times.
+    /// Accepted for compatibility but the named reference is not used during
+    /// fetch; a warning explains that its copy avoidance is unavailable. This
+    /// does not affect `--shared`, which can register a local Libra source as
+    /// an alternate. May be given multiple times.
     #[clap(long = "reference", value_name = "repo")]
     pub reference: Vec<String>,
 
     /// Like `--reference`, but silently ignore a reference that cannot be used
-    /// (Git's `--reference-if-able`). Since Libra never uses alternates, the
-    /// reference is always "unusable" and is silently ignored — exactly Git's
-    /// graceful-degradation behavior. May be given multiple times.
+    /// (Git's `--reference-if-able`). Reference-based copy avoidance is not
+    /// implemented, so the named repository is silently ignored. May be given
+    /// multiple times.
     #[clap(long = "reference-if-able", value_name = "repo")]
     pub reference_if_able: Vec<String>,
 
@@ -175,10 +178,9 @@ pub struct CloneArgs {
     #[clap(long = "no-shared", overrides_with = "shared")]
     pub no_shared: bool,
 
-    /// Copy borrowed objects in so the clone does not depend on `--reference`
-    /// (Git's `--dissociate`). Accepted for compatibility and a no-op: Libra
-    /// never borrows objects (it always copies), so every clone is already
-    /// fully self-contained — there is nothing to dissociate.
+    /// Keep the clone independent of an alternate (Git's `--dissociate`).
+    /// Overrides `--shared` and `clone.shared=true`, so a local Libra clone
+    /// does not register its source as an alternate. Objects are still copied.
     #[clap(long = "dissociate")]
     pub dissociate: bool,
 
@@ -248,12 +250,10 @@ pub struct CloneArgs {
 /// cannot advertise shallow boundaries (accepted end state, D20). The common cases still match Git:
 /// `--reject-shallow` alone rejects a shallow result, and a full clone of a
 /// non-shallow source is allowed.
-/// Warn when `--reference`/`--shared` were given: those flags ask Git to share
-/// or borrow objects from another local store via alternates, but Libra always
-/// copies every object into the clone (it has no object alternates), so the
-/// clone is self-contained and the flags have no effect. `--reference-if-able`
-/// and `--dissociate` are intentionally silent (Git's `-if-able` silently
-/// ignores an unusable reference, and a copy-only clone is already dissociated).
+/// Warn when `--reference` was given: fetch does not yet use that repository's
+/// objects as alternates. `--shared` is handled by the local clone hook, which
+/// records an alternate when sharing is safe. `--reference-if-able` and
+/// `--dissociate` remain silent when they do not affect this fetch path.
 fn object_alternates_warning(args: &CloneArgs) -> Option<String> {
     // `--reference` is still a genuine no-op (copy-avoidance deferred).
     // `--shared` messaging is handled at the clone hook (took-effect vs
@@ -352,9 +352,12 @@ fn uses_local_clone_semantics(args: &CloneArgs, remote_client: &fetch::RemoteCli
 }
 
 fn git_source_is_shallow(repo_path: &Path) -> bool {
-    ShallowSet::load_at(&repo_path.join("shallow"))
-        .map(|set| !set.oids().is_empty())
-        .unwrap_or(true)
+    ShallowSet::load_at_for_kind(
+        &repo_path.join("shallow"),
+        crate::internal::protocol::local_client::git_repo_hash_kind(repo_path),
+    )
+    .map(|set| !set.oids().is_empty())
+    .unwrap_or(true)
 }
 
 fn inspect_local_git_shallow(
@@ -362,7 +365,10 @@ fn inspect_local_git_shallow(
 ) -> Result<ShallowSet, ShallowError> {
     match remote_client {
         fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
-            ShallowSet::load_at(&client.repo_path().join("shallow"))
+            ShallowSet::load_at_for_kind(
+                &client.repo_path().join("shallow"),
+                crate::internal::protocol::local_client::git_repo_hash_kind(client.repo_path()),
+            )
         }
         _ => Ok(ShallowSet::empty()),
     }
@@ -733,6 +739,20 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("the remote and local repository use different object formats"),
         fetch::FetchError::FetchObjects { source: error, .. }
+            if crate::internal::protocol::is_missing_shallow_capability(error) =>
+        {
+            CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("use a Git server that advertises shallow support")
+        }
+        fetch::FetchError::FetchObjects { source: error, .. }
+            if crate::internal::protocol::is_shallow_advertisement_changed(error) =>
+        {
+            CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("retry after the remote repository stops changing")
+        }
+        fetch::FetchError::FetchObjects { source: error, .. }
         | fetch::FetchError::PacketRead { source: error }
             if fetch::is_pkt_line_io_error(error) =>
         {
@@ -750,6 +770,19 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("the remote transfer failed or returned corrupted data; retry the clone")
         }
+        fetch::FetchError::ShallowAdvertisementChanged { .. } => CliError::fatal(source.to_string())
+            .with_stable_code(StableErrorCode::NetworkProtocol)
+            .with_hint("retry after the remote repository stops changing"),
+        fetch::FetchError::InvalidShallowResponse { .. } => CliError::fatal(source.to_string())
+            .with_stable_code(StableErrorCode::NetworkProtocol)
+            .with_hint("fix or deepen the remote shallow repository and retry"),
+        fetch::FetchError::InvalidAdvertisedShallowBoundary { .. } =>
+            CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("reduce advertised refs or fix and deepen the remote shallow repository"),
+        fetch::FetchError::IncompleteFetchedHistory { .. } => CliError::fatal(source.to_string())
+            .with_stable_code(StableErrorCode::NetworkProtocol)
+            .with_hint("retry the clone or use a Git server with consistent shallow history"),
         fetch::FetchError::UnsupportedShallowLocalLibra | fetch::FetchError::LocalState { .. } => {
             CliError::fatal(source.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
@@ -2128,6 +2161,49 @@ mod tests {
             cli.hints()[0].as_str(),
             "check filesystem permissions and repository integrity"
         );
+    }
+
+    #[test]
+    fn changed_http_shallow_boundary_maps_to_network_protocol() {
+        let cli = map_fetch_error(fetch::FetchError::ShallowAdvertisementChanged {
+            remote: "https://example.test/repo.git".to_string(),
+        });
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+        assert_eq!(
+            cli.hints()[0].as_str(),
+            "retry after the remote repository stops changing"
+        );
+    }
+
+    #[test]
+    fn shallow_fetch_protocol_errors_map_to_network_protocol() {
+        use crate::internal::protocol::{ChangedShallowAdvertisement, MissingShallowCapability};
+
+        for error in [
+            fetch::FetchError::InvalidShallowResponse {
+                reason: "invalid object ID".to_string(),
+            },
+            fetch::FetchError::InvalidAdvertisedShallowBoundary {
+                reason: "commit exceeds size limit".to_string(),
+            },
+            fetch::FetchError::IncompleteFetchedHistory {
+                message: "missing parent".to_string(),
+            },
+            fetch::FetchError::FetchObjects {
+                remote: "origin".to_string(),
+                source: std::io::Error::other(MissingShallowCapability),
+            },
+            fetch::FetchError::FetchObjects {
+                remote: "origin".to_string(),
+                source: std::io::Error::other(ChangedShallowAdvertisement),
+            },
+        ] {
+            let cli = map_fetch_error(error);
+            assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+            assert!(!cli.hints().is_empty());
+        }
     }
 
     #[test]

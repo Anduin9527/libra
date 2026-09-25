@@ -952,6 +952,35 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         fetch::FetchError::Discovery { source, .. } => {
             map_fetch_discovery_error(error.to_string(), source)
         }
+        fetch::FetchError::ShallowAdvertisementChanged { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("retry after the remote repository stops changing")
+        }
+        fetch::FetchError::InvalidShallowResponse { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::NetworkProtocol)
+            .with_hint("fix or deepen the remote shallow repository and retry"),
+        fetch::FetchError::InvalidAdvertisedShallowBoundary { .. } =>
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("reduce advertised refs or fix and deepen the remote shallow repository"),
+        fetch::FetchError::IncompleteFetchedHistory { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::NetworkProtocol)
+            .with_hint("retry the pull or use a Git server with consistent shallow history"),
+        fetch::FetchError::FetchObjects { source, .. }
+            if crate::internal::protocol::is_missing_shallow_capability(source) =>
+        {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("use a Git server that advertises shallow support")
+        }
+        fetch::FetchError::FetchObjects { source, .. }
+            if crate::internal::protocol::is_shallow_advertisement_changed(source) =>
+        {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("retry after the remote repository stops changing")
+        }
         fetch::FetchError::FetchObjects { source, .. } if fetch::is_pkt_line_io_error(source) => {
             CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkProtocol)
@@ -1302,6 +1331,46 @@ mod tests {
         );
 
         assert_eq!(cli.stable_code(), StableErrorCode::AuthPermissionDenied);
+    }
+
+    #[test]
+    fn changed_http_shallow_boundary_keeps_network_protocol_code() {
+        let error = fetch::FetchError::ShallowAdvertisementChanged {
+            remote: "https://example.test/repo.git".to_string(),
+        };
+        let cli = map_fetch_error_to_cli(&error);
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+    }
+
+    #[test]
+    fn shallow_fetch_protocol_errors_keep_network_protocol_code() {
+        use crate::internal::protocol::{ChangedShallowAdvertisement, MissingShallowCapability};
+
+        for error in [
+            fetch::FetchError::InvalidShallowResponse {
+                reason: "invalid object ID".to_string(),
+            },
+            fetch::FetchError::InvalidAdvertisedShallowBoundary {
+                reason: "commit exceeds size limit".to_string(),
+            },
+            fetch::FetchError::IncompleteFetchedHistory {
+                message: "missing parent".to_string(),
+            },
+            fetch::FetchError::FetchObjects {
+                remote: "origin".to_string(),
+                source: std::io::Error::other(MissingShallowCapability),
+            },
+            fetch::FetchError::FetchObjects {
+                remote: "origin".to_string(),
+                source: std::io::Error::other(ChangedShallowAdvertisement),
+            },
+        ] {
+            let cli = map_fetch_error_to_cli(&error);
+            assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+            assert!(!cli.hints().is_empty());
+        }
     }
 
     /// Pin the `Display` format for the static-message and direct-message

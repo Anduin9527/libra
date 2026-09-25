@@ -34,11 +34,12 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 
 ### `<REMOTE_REPO>`（必需）
 
-要克隆的远程仓库 URL。支持 SSH（`git@host:user/repo.git`）和 HTTPS（`https://host/user/repo.git`）协议，也支持本地文件系统路径。原 Cloudflare 发布站点恢复源已随 Publish 产品拆除；再使用该源会得到用法错误（退出码 129），并提示改用 git remote 或 `libra cloud` 做仓库备份。对应的 clone-domain 配置键已冷冻，不再读取。
+要克隆的远程仓库 URL。支持 Git（`git://host/user/repo.git`）、SSH（`git@host:user/repo.git`）和 HTTP(S)（`https://host/user/repo.git`）协议，也支持本地文件系统路径。原 Cloudflare 发布站点恢复源已随 Publish 产品拆除；再使用该源会得到用法错误（退出码 129），并提示改用 git remote 或 `libra cloud` 做仓库备份。对应的 clone-domain 配置键已冷冻，不再读取。
 
 ```bash
 libra clone git@github.com:user/repo.git
 libra clone https://github.com/user/repo.git
+libra clone git://host/user/repo.git
 libra clone /path/to/local/repo
 ```
 
@@ -93,7 +94,7 @@ libra clone --mirror git@github.com:user/repo.git repo-mirror.git
 
 ### `--filter <spec>` / `--shallow-since <date>` / `--shallow-exclude <rev>`
 
-Git 用于*减少*传输内容的 fetch 整形标志：`--filter`（如 `blob:none`）是部分克隆，`--shallow-since`/`--shallow-exclude` 按日期或排除 ref 限定浅历史。**Libra 没有 partial-clone/promisor 支持，其 fetch 也只支持 `--depth` 浅历史**，故这些标志被接受但**忽略并告警**——即不应用该优化（克隆仍会取回这些标志本会裁剪掉的内容，仅在同时给出 `--depth` 时按 `--depth` 限定）。不带 `--depth` 时即为**完整克隆**——是被过滤/按日期限定克隆结果的正确超集，故结果始终可用；这与 Git 自身在服务器无法处理 `--filter` 时告警并回退到完整克隆一致。`--shallow-exclude` 可多次给出。
+Git 用于*减少*传输内容的 fetch 整形标志：`--filter`（如 `blob:none`）是部分克隆，`--shallow-since`/`--shallow-exclude` 按日期或排除 ref 限定浅历史。**Libra 没有 partial-clone/promisor 支持，其 fetch 也只支持 `--depth` 主动限定浅历史**，故这些标志被接受但**忽略并告警**——不会按这些标志裁剪所选引用的历史（若同时给出 `--depth`，仍按深度限定）。不带 `--depth` 时会获取源中可用的历史；若源本身已浅，克隆仍为浅克隆，并保留源通告的边界。Git 在服务器无法处理 `--filter` 时也会告警并回退到未过滤的克隆。`--shallow-exclude` 可多次给出。
 
 ```bash
 libra clone --filter blob:none git@github.com:user/repo.git
@@ -102,7 +103,7 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 
 ### `-l, --local` / `--no-local`
 
-对齐 Git：对**普通本地 Git 路径**选择「本地克隆」还是传输。普通路径默认走本地克隆（`-l`/`--local` 也恢复该语义）：`--depth`、`--shallow-since`、`--shallow-exclude`、`--filter` 被忽略，并输出 Git 原文警告（`warning: --depth is ignored in local clones; use file:// instead.` 及其对应行）。`--no-local` 或 `file://` 走传输并尊重 `--depth`。Libra 仍从不硬链接，始终复制对象。两 flag 互相覆盖，最后出现者生效。本地 Libra 源不变：普通路径与 `file://` 上的 `--depth` 都以 `LBR-REPO-002` fail-closed。
+对齐 Git：对**普通本地 Git 路径**选择「本地克隆」还是传输。非浅源的普通路径默认走本地克隆（`-l`/`--local` 也恢复该语义）：`--depth`、`--shallow-since`、`--shallow-exclude`、`--filter` 被忽略，并输出 Git 原文警告（`warning: --depth is ignored in local clones; use file:// instead.` 及其对应行）。已有浅边界的 Git 源走传输，以保留边界。`--no-local` 或 `file://` 走传输并尊重 `--depth`。Libra 仍从不硬链接，始终复制对象。两 flag 互相覆盖，最后出现者生效。本地 Libra 源不变：普通路径与 `file://` 上的 `--depth` 都以 `LBR-REPO-002` fail-closed。
 
 ```bash
 libra clone -l /path/to/source /path/to/dest
@@ -111,9 +112,9 @@ libra clone -l /path/to/source /path/to/dest
 ### `--depth <N>`
 
 创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。除非给出 `--no-single-branch`，否则隐含 `--single-branch`（对齐 `git clone`）。
-只有 Git 远程支持浅传输。
+按传输语义访问的 Git 源支持浅传输，包括 `file://`、`--no-local` 的本地路径，以及已有浅边界的普通本地 Git 路径。
 本地 Libra 源会以 `LBR-REPO-002` 拒绝 `--depth`：该传输路径不能声明 shallow boundary，若接受会留下缺父提交的克隆。此 fail-closed 行为是已接受的终态（开发兼容登记 D20 决策），不是待补缺口。
-普通文件系统 Git 路径会忽略 `--depth` 并告警（issues/474 CL-06）。
+非浅源的普通文件系统 Git 路径会忽略 `--depth` 并告警（issues/474 CL-06）。
 通过 `file://` 或 `--no-local` 访问的本地 Git 源按各 want 的最短距离截断，再做一次边界计算：有父提交未被发送，或根提交恰好落在深度截止上时，该提交写入 `.libra/shallow`（issues/474 CL-04）。
 
 ```bash
@@ -123,23 +124,35 @@ libra clone --depth 50 git@github.com:user/repo.git
 
 ### `--reject-shallow`
 
-若**源**仓库是浅克隆则失败，对齐 `git clone --reject-shallow`（exit 128），且不留下目标目录。本地 Git 浅源在创建目标前检查；不带该标志克隆浅源时，会把源的 `.git/shallow` 边界并入 `.libra/shallow`，使 `log` / `fsck` 可遍历。本地 Libra 源带 `--depth` 仍在对象传输前以 `LBR-REPO-002` fail-closed。
+本地 Git 浅源在创建目标目录前即被拒绝，即使同时指定 `--depth` 也一样（exit 128，对齐 `git clone --reject-shallow`）。不带该标志克隆浅源时，会把源的 `.git/shallow` 边界并入 `.libra/shallow`，使 `log` / `fsck` 可遍历。本地 Libra 源带 `--depth` 仍在对象传输前以 `LBR-REPO-002` fail-closed。
 
-对能协商 shallow boundary 的网络远程，未请求 `--depth` 时仍会在 fetch 后拒绝意外的浅结果。
+对网络远程，`--reject-shallow` 目前仅在未请求 `--depth` 时，于 fetch 后拒绝浅结果。指定 `--depth` 后会跳过该网络后置检查，即使源本身已浅；这一点比 Git 的源检查范围更窄。
+
+Git、HTTPS 和 SSH 源可公布已有的浅边界；克隆时 Libra 会保留这些边界。若一次广告包含超过 4,096 个不同的浅边界，Libra 会拒绝，以限制对象存储检查的工作量。
+
+upload-pack 响应中的 `shallow` 与 `unshallow` 行合计去重后，最多接受 4,096 个不同的对象 ID。
+这些响应行（含重复）总数最多为 8,192，每个 ID 均按服务端对象格式校验；超限或格式错误返回 `LBR-NET-002`。
+
+检查这些边界提交时，每个提交的解码后对象 payload 最多 4 MiB，单次克隆累计读取的解码后提交 payload 最多 64 MiB，累计最多处理 262,144 个父提交 ID。超限会中止克隆；累计上限错误会建议减少获取的引用，或请远端所有者减少浅边界。
+
+网络 Git（`git://`）、HTTP(S) 和 SSH 克隆 fetch 会在更新引用前，对照最终浅边界校验目标对象与新获取提交的父边；未标记的缺失父提交会使克隆失败。校验使用的临时父边文件最多 1 GiB，本次 pack 的提交 ID 临时缓冲最多 64 MiB（目前最多约 2,097,152 个提交）。有效但很大的 pack 也可能触及这两项资源上限；克隆会在更新引用前报错，并不代表 pack 损坏。若深度响应的浅边界还需进一步校验，最多检查 16,384 个请求对象或标签目标。浅边界祖先遍历另分别最多访问 262,144 个不同提交和 262,144 条父边。远端对象类型探测与读取的标签数据共用每次浅响应校验 256 MiB 的解码后对象 payload 额度。任一项超限时，可减少选取的引用（例如使用 `--single-branch`），再分次 fetch 其余引用。
+
+智能 HTTP 还会在 upload-pack POST 后重新检查浅边界；若边界自发现阶段起发生变化，克隆会在写入 pack 或引用前报告 `NetworkProtocol` 错误并提示重试，然后尝试清理部分创建的目标目录。
 
 ```bash
 libra clone --reject-shallow git@github.com:user/repo.git
 ```
 
-### `--reference <repo>` / `--reference-if-able <repo>` / `--shared`（`-s`） / `--dissociate`
+### `--reference <repo>` / `--reference-if-able <repo>` / `--shared`（`-s`） / `--no-shared` / `--dissociate`
 
-Git 的对象共享标志，用于设置 `objects/info/alternates`，让克隆从另一个本地对象库借用或共享对象。**Libra 没有对象 alternates**——它总是把每个对象拷贝进克隆——因此 Libra 克隆始终完全自包含。故这些标志按**no-op**接受以兼容：
+Git 的对象共享标志用于设置 `objects/info/alternates`，让克隆从另一个本地对象库借用对象。Libra v1 会拷贝本次获取的所有对象，但也能为**本地 Libra 源**注册受保护的对象 alternate：
 
-- `--reference <repo>` 与 `--shared`（`-s`）会追加一条说明性 warning，指出它们没有生效（对象是拷贝而非借用/共享）。`--reference` 可多次给出。
+- `--shared`（`-s`）会将本地 Libra 源注册为 alternate，用于借用读取，并保护源对象不被 GC、驱逐或擦除。注册失败只告警，不使克隆失败；v1 已拷贝所有获取的对象，因此注册本身不节省磁盘空间。对本地 Git 或网络源显式使用 `--shared` 不生效并告警。`clone.shared=true` 可在源符合条件时默认启用。
+- `--no-shared` 覆盖 `--shared` 或配置默认值，禁止注册 alternate。`--dissociate` 也禁止注册；v1 没有需要再复制回来的借用克隆对象。
+- `--reference <repo>` 仍是 no-op 并告警：此标志尚无 fetch 侧 alternate 协商。可多次给出。
 - `--reference-if-able <repo>` 被静默忽略——这与 Git 一致：Git 对无法使用的引用静默丢弃（此处没有可用引用）。可多次给出。
-- `--dissociate` 是静默 no-op：从来没有需要 dissociate 的借用。
 
-克隆仍会成功，并产生完整、自包含的仓库。
+不带 `--depth` 时，克隆获取源中可用的历史；已浅源仍保留其浅边界。
 
 ```bash
 libra clone --reference /path/to/local/mirror git@github.com:user/repo.git
@@ -292,7 +305,7 @@ warning: You appear to have cloned an empty repository.
 - `remote_name` 是配置的远端名称（默认 `origin`，标准克隆下为 `-o`/`--origin` 的值）
 - `branch` 是实际检出的分支；远程没有 refs 时为 `null`
 - `gitignore_converted` 列出从 `.gitignore` 转换写出的 `.libraignore` 文件（工作区相对路径）；始终存在（裸克隆或源无 `.gitignore` 时为空）
-- 使用 `--depth` 时，`shallow` 为 `true`
+- `shallow` 表示本次是否实际使用 `--depth` 抓取；`false` 不代表源中继承的浅边界不存在
 - 普通 Git/本地克隆会省略 `source_kind` 和 `cloud_site`
 - init 中的 `ref_format` 和 `converted_from` 被有意排除
 - `objects_fetched` / `bytes_received` 给出 Git 源 fetch pack 的对象数与字节大小
@@ -313,7 +326,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 
 ### 用 `--depth` 进行浅克隆
 
-浅克隆对于 CI/CD 流水线和不需要完整历史的大型 monorepo 很重要。Libra 对能协商 shallow boundary 的 Git 远程支持 `--depth N`：历史会截断到指定提交数。depth 值在解析时校验（必须是正整数），并传递到 fetch 协议层。本地 Libra 源维持 fail-closed 返回 `LBR-REPO-002`（已决终态，见开发兼容登记 D20）。对于 `--shallow-since`/`--shallow-exclude`（以及 partial-clone 的 `--filter`）：Libra 的 fetch 只支持 `--depth`、无 partial-clone/promisor 支持，故这些 flag 按 no-op 接受——忽略并告警；**不应用该优化**，历史仅在同时给出 `--depth` 时按 `--depth` 限定，不带 `--depth` 时即为完整克隆（被过滤/浅克隆结果的正确超集）。每个给出的 flag 追加一条 warning（与 Git 在服务器不支持 `--filter` 时告警回退到完整克隆一致）。
+浅克隆对于 CI/CD 流水线和不需要完整历史的大型 monorepo 很重要。Libra 对能协商 shallow boundary 的 Git 远程支持 `--depth N`：历史会截断到指定提交数。depth 值在解析时校验（必须是正整数），并传递到 fetch 协议层。本地 Libra 源维持 fail-closed 返回 `LBR-REPO-002`（已决终态，见开发兼容登记 D20）。对于 `--shallow-since`/`--shallow-exclude`（以及 partial-clone 的 `--filter`）：Libra 的 fetch 只支持用 `--depth` 主动限定浅历史、无 partial-clone/promisor 支持，故这些 flag 按 no-op 接受——忽略并告警；**不应用该优化**。不带 `--depth` 时会获取源中可用的历史，但已有浅源的通告边界仍会保留。每个给出的 flag 追加一条 warning（与 Git 在服务器不支持 `--filter` 时告警回退到未过滤克隆一致）。
 
 ### `--sparse` 被有意不支持
 
@@ -338,12 +351,12 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 不限单分支 | `--no-single-branch` | N/A | `--no-single-branch`（撤销 `--single-branch`；默认即所有分支） |
 | 裸克隆 | `--bare` | N/A | `--bare` |
 | 浅克隆（depth） | `--depth <n>` | N/A | Git 远程支持；本地 Libra 源 fail-closed (`LBR-REPO-002`)；云端拒绝 |
-| 按日期浅克隆 | `--shallow-since=<date>` | N/A | Git 远程按 no-op 接受（忽略+告警；不应用、仅按 `--depth` 限定）；云端拒绝 |
-| 排除浅边界 | `--shallow-exclude=<rev>` | N/A | Git 远程按 no-op 接受（忽略+告警；不应用、仅按 `--depth` 限定）；云端拒绝 |
+| 按日期浅克隆 | `--shallow-since=<date>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界）；云端拒绝 |
+| 排除浅边界 | `--shallow-exclude=<rev>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界）；云端拒绝 |
 | 镜像克隆 | `--mirror` | N/A | `--mirror`（隐含 `--bare`；原样映射全部 `refs/*`，无 tracking ref，设 `remote.<name>.mirror` 与 `+refs/*:refs/*`） |
-| 引用仓库 | `--reference <repo>` / `--reference-if-able <repo>` | N/A | 接受式 no-op（Libra 总是拷贝对象、无 alternates）；`--reference` 告警，`--reference-if-able` 静默 |
-| 共享对象库 | `--shared` / `-s` | N/A | 接受式 no-op（总是拷贝）；告警 |
-| 从引用仓库脱离 | `--dissociate` | N/A | 接受式 no-op（已自包含）；静默 |
+| 引用仓库 | `--reference <repo>` / `--reference-if-able <repo>` | N/A | 接受式 no-op（无 fetch 侧 alternate 协商）；`--reference` 告警，`--reference-if-able` 静默 |
+| 共享对象库 | `--shared` / `-s` | N/A | 本地 Libra 源可注册受保护 alternate；v1 仍拷贝对象；其它源显式使用时告警 |
+| 从引用仓库脱离 | `--dissociate` | N/A | 禁止注册共享 alternate；获取的对象已拷贝 |
 | 禁用硬链接 | `--no-hardlinks` | N/A | N/A |
 | 递归 submodule | `--recurse-submodules` | N/A | N/A（无 submodule） |
 | 浅 submodule | `--shallow-submodules` | N/A | N/A |
@@ -353,7 +366,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | Verbose / 进度 | `--progress` / `--verbose` | N/A | 分阶段 stderr 进度（默认） |
 | 不检出 | `-n` / `--no-checkout` | N/A | `--no-checkout` |
 | 稀疏检出 | `--sparse` | N/A | N/A |
-| Filter（部分克隆） | `--filter=<spec>` | N/A | Git 远程按 no-op 接受（忽略+告警；不应用、仅按 `--depth` 限定）；云端拒绝 |
+| Filter（部分克隆） | `--filter=<spec>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界）；云端拒绝 |
 | Bundle URI | `--bundle-uri=<uri>` | N/A | N/A |
 | Vault 签名引导 | N/A | N/A | 始终启用（匹配 init） |
 | SSH key 检测 | N/A | N/A | 自动检测 + 提示 |
@@ -403,7 +416,7 @@ Init 错误会通过 `InitError -> CliError` 透明转发。
 ## 兼容性说明
 
 - 不支持 `--recurse-submodules`；Libra 不实现 submodule
-- `--reference`/`--reference-if-able`/`--shared`/`--dissociate` 按接受式 no-op 处理（Libra 无对象 alternates、总是拷贝对象，故克隆天然自包含；`--reference`/`--shared` 告警，其余静默）
+- `--reference`/`--reference-if-able` 仍为 no-op；`--shared` 可为本地 Libra 源注册受保护 alternate，`--no-shared`/`--dissociate` 禁止注册。v1 仍拷贝本次获取的所有对象。
 - Clone 始终引导 vault 签名；如有需要，可在克隆后使用 `libra config` 禁用
 - `--depth` 值必须是正整数；0 或负数会在解析时被拒绝
 - `--no-checkout` 会设置 objects/refs/HEAD 但跳过工作区检出；若想完全不要工作树（无 `.libra` 工作区布局），改用 `--bare`

@@ -2,12 +2,15 @@
 //! mapped local refs, and honor refspec configuration, `--depth`, tag policy,
 //! and transactional prune/update semantics.
 
+mod shallow_response_validation;
+
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
-    io::{self, Error as IoError, Write},
+    io::{self, Error as IoError, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -15,7 +18,7 @@ use clap::Parser;
 use futures_util::FutureExt;
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
     internal::object::commit::Commit,
 };
 use indicatif::ProgressBar;
@@ -29,7 +32,7 @@ use url::Url;
 
 use crate::{
     command::{
-        index_pack, load_object,
+        index_pack, index_pack_v1, index_pack_v2, load_object,
         remote::{
             RemotePruneEntry, classify_stale_tracking_branches, remote_advertised_branch_names,
         },
@@ -49,6 +52,7 @@ use crate::{
             bundle_client::BundleClient,
             git_client::GitClient,
             https_client::HttpsClient,
+            is_missing_shallow_capability, is_shallow_advertisement_changed,
             local_client::LocalClient,
             set_wire_hash_kind,
             ssh_client::{SshClient, is_ssh_spec},
@@ -241,12 +245,44 @@ impl RemoteClient {
         want: &[String],
         shallow: &[String],
         depth: Option<usize>,
+        advertised_capabilities: &[String],
+        expected_shallow_boundaries: &[String],
     ) -> Result<FetchStream, IoError> {
         match self {
-            RemoteClient::Http(client) => client.fetch_objects(have, want, shallow, depth).await,
+            RemoteClient::Http(client) => {
+                client
+                    .fetch_objects_with_capabilities(
+                        have,
+                        want,
+                        shallow,
+                        depth,
+                        advertised_capabilities,
+                    )
+                    .await
+            }
             RemoteClient::Local(client) => client.fetch_objects(have, want, shallow, depth).await,
-            RemoteClient::Git(client) => client.fetch_objects(have, want, shallow, depth).await,
-            RemoteClient::Ssh(client) => client.fetch_objects(have, want, shallow, depth).await,
+            RemoteClient::Git(client) => {
+                client
+                    .fetch_objects_with_expected_shallow_boundaries(
+                        have,
+                        want,
+                        shallow,
+                        depth,
+                        Some(expected_shallow_boundaries),
+                    )
+                    .await
+            }
+            RemoteClient::Ssh(client) => {
+                client
+                    .fetch_objects_with_expected_shallow_boundaries(
+                        have,
+                        want,
+                        shallow,
+                        depth,
+                        Some(expected_shallow_boundaries),
+                    )
+                    .await
+            }
             RemoteClient::Bundle(client) => client.fetch_objects(have, want, shallow, depth).await,
         }
     }
@@ -717,6 +753,11 @@ pub struct FetchRepositoryResult {
     /// record for this fetch has landed.
     #[serde(skip)]
     pub pack_keep_sentinel: Option<std::path::PathBuf>,
+    /// Clone-safe ownership of the pin lease. A second fetch of the same pack
+    /// cannot reuse and then lose our shared `.keep` sentinel before both
+    /// callers have recorded their roots.
+    #[serde(skip)]
+    pack_keep_lock: Option<Arc<Mutex<Option<PackKeepLease>>>>,
     pub refs_updated: Vec<FetchRefUpdate>,
     pub objects_fetched: usize,
     /// Bytes received in the fetch pack stream (the `.pack` payload size). Zero
@@ -739,8 +780,20 @@ impl FetchRepositoryResult {
     /// recorded every root for this fetch (refs/tags inside `run_fetch`,
     /// plus FETCH_HEAD where the surface writes one). Idempotent.
     pub fn release_pack_pin(&self) {
-        if let Some(keep) = &self.pack_keep_sentinel {
-            let _ = std::fs::remove_file(keep);
+        if let Some(lock) = &self.pack_keep_lock {
+            let mut held = match lock.lock() {
+                Ok(held) => held,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(lease) = held.take() {
+                if let Some(keep) = &lease.owned_sentinel
+                    && let Err(source) = fs::remove_file(keep)
+                    && source.kind() != io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %keep.display(), %source, "failed to release fetch pack pin");
+                }
+                drop(lease);
+            }
         }
     }
 }
@@ -815,6 +868,16 @@ pub enum FetchError {
     },
     #[error("failed to discover references from '{remote}': {source}")]
     Discovery { remote: String, source: GitError },
+    #[error(
+        "shallow boundaries advertised by '{remote}' changed during HTTP fetch; retry the fetch"
+    )]
+    ShallowAdvertisementChanged { remote: String },
+    #[error("remote sent invalid shallow response: {reason}")]
+    InvalidShallowResponse { reason: String },
+    #[error("remote advertised an invalid shallow commit: {reason}")]
+    InvalidAdvertisedShallowBoundary { reason: String },
+    #[error("remote returned incomplete commit history: {message}")]
+    IncompleteFetchedHistory { message: String },
     #[error("remote object format '{remote}' does not match local '{local}'")]
     ObjectFormatMismatch { remote: HashKind, local: HashKind },
     #[error("remote branch {branch} not found in upstream {remote}")]
@@ -873,6 +936,29 @@ impl From<FetchError> for CliError {
             FetchError::Discovery { source, .. } => {
                 map_fetch_discovery_error(error.to_string(), source)
             }
+            FetchError::ShallowAdvertisementChanged { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("retry after the remote repository stops changing"),
+            FetchError::InvalidShallowResponse { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("fix or deepen the remote shallow repository and retry"),
+            FetchError::InvalidAdvertisedShallowBoundary { .. } =>
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("reduce advertised refs or fix and deepen the remote shallow repository"),
+            FetchError::IncompleteFetchedHistory { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("retry the fetch or use a Git server with consistent shallow history"),
+            FetchError::FetchObjects { source, .. } if is_missing_shallow_capability(source) => {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("use a Git server that advertises shallow support")
+            }
+            FetchError::FetchObjects { source, .. } if is_shallow_advertisement_changed(source) => {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("retry after the remote repository stops changing")
+            }
             FetchError::FetchObjects { source, .. } if is_pkt_line_io_error(source) => {
                 CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::NetworkProtocol)
@@ -912,9 +998,11 @@ impl From<FetchError> for CliError {
                 .with_hint("the connection dropped mid-transfer — retry the fetch"),
             FetchError::InvalidPktHeader { .. }
             | FetchError::RemoteSideband { .. }
-            | FetchError::ChecksumMismatch
-            | FetchError::IndexPack { .. } => CliError::fatal(error.to_string())
+            | FetchError::ChecksumMismatch => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkProtocol),
+            FetchError::IndexPack { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("if this pack has no .idx, remove the orphan .pack file and retry"),
             FetchError::ObjectsDirNotFound { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -1201,13 +1289,12 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                     redact_url_credentials(&remote.url)
                 );
             }
-            results.push(
-                fetch_repository_with_result(
-                    remote, None, false, depth, dry_run, tag_cli, force, prune, notes, output,
-                )
-                .await
-                .map_err(CliError::from)?,
-            );
+            let fetched = fetch_repository_with_result_reusing(
+                remote, None, false, depth, dry_run, tag_cli, force, prune, notes, output, &results,
+            )
+            .await
+            .map_err(CliError::from)?;
+            results.push(fetched);
         }
 
         return Ok(FetchOutput {
@@ -1928,6 +2015,36 @@ pub(crate) async fn fetch_repository_with_result(
     notes: bool,
     output: &OutputConfig,
 ) -> Result<FetchRepositoryResult, FetchError> {
+    fetch_repository_with_result_reusing(
+        remote_config,
+        branch,
+        single_branch,
+        depth,
+        dry_run,
+        tag_cli,
+        force,
+        prune,
+        notes,
+        output,
+        &[],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_repository_with_result_reusing(
+    remote_config: RemoteConfig,
+    branch: Option<String>,
+    single_branch: bool,
+    depth: Option<usize>,
+    dry_run: bool,
+    tag_cli: Option<TagFetchMode>,
+    force: bool,
+    prune: bool,
+    notes: bool,
+    output: &OutputConfig,
+    prior_results: &[FetchRepositoryResult],
+) -> Result<FetchRepositoryResult, FetchError> {
     if single_branch {
         if let Some(requested) = branch.as_deref() {
             parse_fetch_refspec(requested, &remote_config.name)?;
@@ -1962,6 +2079,7 @@ pub(crate) async fn fetch_repository_with_result(
         // wipe every remote-tracking ref.
         return Ok(FetchRepositoryResult {
             pack_keep_sentinel: None,
+            pack_keep_lock: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated: Vec::new(),
@@ -2076,6 +2194,7 @@ pub(crate) async fn fetch_repository_with_result(
         };
         return Ok(FetchRepositoryResult {
             pack_keep_sentinel: None,
+            pack_keep_lock: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated,
@@ -2110,6 +2229,7 @@ pub(crate) async fn fetch_repository_with_result(
         };
         return Ok(FetchRepositoryResult {
             pack_keep_sentinel: None,
+            pack_keep_lock: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated,
@@ -2126,11 +2246,18 @@ pub(crate) async fn fetch_repository_with_result(
         .collect::<Vec<_>>();
     want.sort();
     want.dedup();
-    let have = current_have_safe().await?;
-    let shallow_boundaries = read_shallow_boundaries()?;
+    let have = current_have_safe(discovery.hash_kind).await?;
+    let shallow_boundaries = read_shallow_boundaries_for_kind(discovery.hash_kind)?;
     let shallow = shallow_boundaries.iter().cloned().collect::<Vec<_>>();
     let mut result_stream = remote_client
-        .fetch_objects(&have, &want, &shallow, depth)
+        .fetch_objects(
+            &have,
+            &want,
+            &shallow,
+            depth,
+            &discovery.capabilities,
+            &discovery.shallow_boundaries,
+        )
         .await
         .map_err(|source| FetchError::FetchObjects {
             remote: remote_config.url.clone(),
@@ -2138,37 +2265,170 @@ pub(crate) async fn fetch_repository_with_result(
         })?;
 
     let task = format!("fetch {}", remote_config.name);
-    let fetch_data = read_fetch_stream(&mut result_stream, output, &task).await?;
-    let objects_fetched = pack_object_count(&fetch_data.pack_data);
-    let bytes_received = fetch_data.pack_data.len();
-    let pack_file = write_pack_and_index(&fetch_data.pack_data)?;
-    // W2 §C.4.3: the `.keep` sentinel was created INSIDE
-    // `write_pack_and_index`, before the pack's final name became visible.
-    // It is carried out in the result and released by the caller only after
-    // FETCH_HEAD lands (the last root record of a fetch); a crash leaves it
-    // behind, which fails SAFE — repack retains the pack and reports it.
-    let keep_sentinel = pack_file
-        .as_ref()
-        .map(|pack| std::path::PathBuf::from(pack.replace(".pack", ".keep")));
-    if let Some(pack_file) = pack_file {
-        let index_version = match get_hash_kind() {
-            HashKind::Sha1 => None,
-            HashKind::Sha256 | HashKind::Blake3 => Some(2),
-        };
-        match index_version {
-            Some(2) => index_pack::build_index_v2(&pack_file, &pack_file.replace(".pack", ".idx"))
-                .map_err(|source| FetchError::IndexPack {
-                    path: pack_file.clone(),
-                    source,
-                })?,
-            _ => index_pack::build_index_v1(&pack_file, &pack_file.replace(".pack", ".idx"))
-                .map_err(|source| FetchError::IndexPack {
-                    path: pack_file.clone(),
-                    source,
-                })?,
+    let fetch_data =
+        read_fetch_stream_for_kind(&mut result_stream, output, &task, discovery.hash_kind).await?;
+    if matches!(&remote_client, RemoteClient::Http(_)) {
+        // Smart HTTP separates discovery (GET) and upload-pack (POST). A source
+        // can become shallower between them, and without `deepen` the POST need
+        // not repeat its new boundary. Recheck before persisting the pack or
+        // any refs, so the initial advertisement cannot hide a missing parent.
+        let latest = remote_client
+            .discovery_reference(UploadPack)
+            .await
+            .map_err(|source| FetchError::Discovery {
+                remote: normalized_url.clone(),
+                source,
+            })?;
+        if latest.shallow_boundaries != discovery.shallow_boundaries {
+            return Err(FetchError::ShallowAdvertisementChanged {
+                remote: normalized_url,
+            });
         }
     }
-    apply_shallow_updates(&fetch_data.shallow, &fetch_data.unshallow)?;
+    let objects_fetched = pack_object_count(&fetch_data.pack_data);
+    let bytes_received = fetch_data.pack_data.len();
+    let (keep_lock, install_lock, pack_file, pack_pin) =
+        write_pack_and_index(&fetch_data.pack_data, discovery.hash_kind, prior_results).await?;
+    // Pack::decode still consults git-internal's thread-local hash kind.
+    set_hash_kind(discovery.hash_kind);
+    // W2 §C.4.3: the `.keep` sentinel was created INSIDE
+    // `write_pack_and_index`, before the pack's final name became visible.
+    // The guard removes only a sentinel this fetch created on any error;
+    // success transfers it to the result until FETCH_HEAD is recorded.
+    let validate_network_history = matches!(
+        &remote_client,
+        RemoteClient::Http(_) | RemoteClient::Git(_) | RemoteClient::Ssh(_)
+    );
+    let mut commit_edges = pack_file
+        .as_deref()
+        .map(|pack_file| {
+            index_received_pack(pack_file, discovery.hash_kind, validate_network_history)
+        })
+        .transpose()?
+        .flatten();
+    // The pack and index are complete, so local readers can use them after the
+    // install lock is released. Keep the separate pin lease through the
+    // caller's FETCH_HEAD record, preventing same-pack fetches from sharing a
+    // `.keep` sentinel while either caller still needs it.
+    drop(install_lock);
+    // A shallow source advertises its boundaries during discovery. Without a
+    // deepen request Git does not repeat them in the pack response. Only record
+    // boundaries whose commits are present after indexing the fetched pack.
+    let mut shallow_updates = fetch_data.shallow;
+    let storage = util::objects_storage();
+    if validate_network_history {
+        shallow_response_validation::validate_response_shallow_updates(
+            &storage,
+            &want,
+            depth,
+            &shallow_boundaries,
+            &shallow_updates,
+            &fetch_data.unshallow,
+            discovery.hash_kind,
+        )?;
+    }
+    let advertised_boundaries = discovery
+        .shallow_boundaries
+        .iter()
+        .map(|boundary| {
+            ObjectHash::from_hex_for_kind(discovery.hash_kind, boundary)
+                .map(|oid| (boundary, oid))
+                .map_err(|source| FetchError::InvalidAdvertisedShallowBoundary {
+                    reason: format!("invalid object ID '{boundary}': {source}"),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let boundary_ids = advertised_boundaries
+        .iter()
+        .map(|(_, oid)| *oid)
+        .collect::<Vec<_>>();
+    let boundary_presence = storage
+        .exist_checked_many(&boundary_ids)
+        .map_err(|source| FetchError::LocalState {
+            message: format!("failed to probe advertised shallow commits: {source}"),
+        })?;
+    let mut present_boundaries = Vec::new();
+    for (boundary, oid) in advertised_boundaries {
+        let present =
+            boundary_presence
+                .get(&oid)
+                .copied()
+                .ok_or_else(|| FetchError::LocalState {
+                    message: format!(
+                        "missing presence result for advertised shallow commit '{boundary}'"
+                    ),
+                })?;
+        if !present {
+            continue;
+        }
+        present_boundaries.push((boundary, oid));
+    }
+    let present_ids = present_boundaries
+        .iter()
+        .map(|(_, oid)| *oid)
+        .collect::<Vec<_>>();
+    let mut loaded_parents = storage
+        .commit_parents_many(&present_ids)
+        .map_err(map_advertised_shallow_inspection_error)?;
+    let commit_parents = present_boundaries
+        .into_iter()
+        .map(|(boundary, oid)| {
+            let parents = loaded_parents
+                .remove(&oid)
+                .ok_or_else(|| FetchError::LocalState {
+                    message: format!(
+                        "missing parent result for advertised shallow commit '{boundary}'"
+                    ),
+                })?;
+            Ok((boundary, parents))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let parent_ids = commit_parents
+        .iter()
+        .flat_map(|(_, parents)| parents.iter().copied())
+        .collect::<Vec<_>>();
+    let parent_presence =
+        storage
+            .exist_checked_many(&parent_ids)
+            .map_err(|source| FetchError::LocalState {
+                message: format!("failed to probe parents of advertised shallow commits: {source}"),
+            })?;
+    for (boundary, parents) in commit_parents {
+        let mut missing_parent = false;
+        for parent in &parents {
+            let present = parent_presence
+                .get(parent)
+                .copied()
+                .ok_or_else(|| FetchError::LocalState {
+                    message: format!(
+                        "missing presence result for parent '{parent}' of advertised shallow commit '{boundary}'"
+                    ),
+                })?;
+            missing_parent |= !present;
+        }
+        if missing_parent {
+            shallow_updates.push(boundary.to_owned());
+        }
+    }
+    let final_boundaries = merged_shallow_boundaries(
+        shallow_boundaries,
+        &shallow_updates,
+        &fetch_data.unshallow,
+        discovery.hash_kind,
+    )?;
+    if validate_network_history {
+        validate_fetched_history(
+            &storage,
+            &want,
+            commit_edges.as_mut(),
+            &fetch_data.unshallow,
+            &final_boundaries,
+            discovery.hash_kind,
+        )?;
+    }
+    if !shallow_updates.is_empty() || !fetch_data.unshallow.is_empty() {
+        write_shallow_boundaries(&final_boundaries)?;
+    }
 
     let mut refs_updated = update_references(
         &remote_config,
@@ -2245,8 +2505,22 @@ pub(crate) async fn fetch_repository_with_result(
         Vec::new()
     };
 
+    let new_sentinel = pack_pin.into_path();
+    let (pack_keep_lock, keep_sentinel) = match keep_lock {
+        Some(PackKeepHold::Fresh { lock, keep_path }) => (
+            Some(Arc::new(Mutex::new(Some(PackKeepLease {
+                _lock: lock,
+                keep_path,
+                owned_sentinel: new_sentinel.clone(),
+            })))),
+            new_sentinel,
+        ),
+        Some(PackKeepHold::Shared { lease, sentinel }) => (Some(lease), sentinel),
+        None => (None, None),
+    };
     Ok(FetchRepositoryResult {
         pack_keep_sentinel: keep_sentinel,
+        pack_keep_lock,
         remote: remote_config.name,
         url: normalized_url,
         refs_updated,
@@ -2303,17 +2577,21 @@ async fn fetch_deps_notes(remote_client: &RemoteClient) -> Vec<String> {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct FetchStreamData {
     pack_data: Vec<u8>,
     shallow: Vec<String>,
     unshallow: Vec<String>,
 }
 
+const MAX_RESPONSE_SHALLOW_BOUNDARIES: usize = 4096;
+const MAX_RESPONSE_SHALLOW_PACKETS: usize = 8192;
+
 /// Tracks packfile boundaries so fetch can finish once the pack checksum is
 /// present, even if the SSH transport stays open after `git-upload-pack` is done.
 #[derive(Default)]
 struct PackCompletionTracker {
+    hash_kind: HashKind,
     object_count: Option<usize>,
     objects_seen: usize,
     offset: usize,
@@ -2327,6 +2605,13 @@ struct PackObjectInflate {
 }
 
 impl PackCompletionTracker {
+    fn new(hash_kind: HashKind) -> Self {
+        Self {
+            hash_kind,
+            ..Self::default()
+        }
+    }
+
     fn observe(&mut self, pack_data: &[u8]) -> bool {
         if self.complete {
             return true;
@@ -2371,7 +2656,7 @@ impl PackCompletionTracker {
     fn advance_object(&mut self, pack_data: &[u8]) -> bool {
         if self.current_object.is_none() {
             let Some(data_offset) =
-                parse_pack_entry_data_offset(pack_data, self.offset, get_hash_kind().size())
+                parse_pack_entry_data_offset(pack_data, self.offset, self.hash_kind.size())
             else {
                 return false;
             };
@@ -2431,15 +2716,16 @@ impl PackCompletionTracker {
     }
 
     fn has_valid_trailing_checksum(&self, pack_data: &[u8]) -> bool {
-        let hash_len = get_hash_kind().size();
+        let hash_len = self.hash_kind.size();
         let Some(end) = self.offset.checked_add(hash_len) else {
             return false;
         };
         if pack_data.len() != end {
             return false;
         }
-        let expected = ObjectHash::new(&pack_data[..self.offset]);
-        ObjectHash::from_bytes(&pack_data[self.offset..end]).is_ok_and(|actual| actual == expected)
+        let expected = ObjectHash::new_for_kind(self.hash_kind, &pack_data[..self.offset]);
+        ObjectHash::from_bytes_for_kind(self.hash_kind, &pack_data[self.offset..end])
+            .is_ok_and(|actual| actual == expected)
     }
 }
 
@@ -2480,17 +2766,22 @@ fn parse_pack_entry_data_offset(
     }
 }
 
-async fn read_fetch_stream(
+async fn read_fetch_stream_for_kind(
     result_stream: &mut FetchStream,
     output: &OutputConfig,
     task: &str,
+    hash_kind: HashKind,
 ) -> Result<FetchStreamData, FetchError> {
     let mut reader = StreamReader::new(result_stream);
     let mut data_out = FetchStreamData::default();
-    let mut pack_completion = PackCompletionTracker::default();
+    let mut pack_completion = PackCompletionTracker::new(hash_kind);
     let mut ready_tail_bytes = None;
     let mut reach_pack = false;
     let mut saw_shallow_response = false;
+    let mut shallow_seen = HashSet::new();
+    let mut unshallow_seen = HashSet::new();
+    let mut distinct_response_boundaries = HashSet::new();
+    let mut shallow_packet_count = 0usize;
     let render_progress = matches!(output.progress, ProgressMode::Text);
     let json_progress = matches!(output.progress, ProgressMode::Json);
     let bar = render_progress.then(ProgressBar::new_spinner);
@@ -2532,13 +2823,56 @@ async fn read_fetch_stream(
             continue;
         }
         if !reach_pack {
-            if let Some(oid) = parse_shallow_packet(&data, b"shallow ") {
-                data_out.shallow.push(oid);
+            if data.starts_with(b"ERR ") {
+                return Err(FetchError::RemoteSideband {
+                    message: clean_sideband_message(&data),
+                });
+            }
+            if data.starts_with(b"shallow ") {
+                shallow_packet_count += 1;
+                if shallow_packet_count > MAX_RESPONSE_SHALLOW_PACKETS {
+                    return Err(FetchError::InvalidShallowResponse {
+                        reason: format!(
+                            "more than {MAX_RESPONSE_SHALLOW_PACKETS} shallow response packets"
+                        ),
+                    });
+                }
+                let oid = parse_shallow_packet(&data, b"shallow ", hash_kind)?;
+                distinct_response_boundaries.insert(oid.clone());
+                if distinct_response_boundaries.len() > MAX_RESPONSE_SHALLOW_BOUNDARIES {
+                    return Err(FetchError::InvalidShallowResponse {
+                        reason: format!(
+                            "more than {MAX_RESPONSE_SHALLOW_BOUNDARIES} distinct shallow or unshallow boundaries"
+                        ),
+                    });
+                }
+                if shallow_seen.insert(oid.clone()) {
+                    data_out.shallow.push(oid);
+                }
                 saw_shallow_response = true;
                 continue;
             }
-            if let Some(oid) = parse_shallow_packet(&data, b"unshallow ") {
-                data_out.unshallow.push(oid);
+            if data.starts_with(b"unshallow ") {
+                shallow_packet_count += 1;
+                if shallow_packet_count > MAX_RESPONSE_SHALLOW_PACKETS {
+                    return Err(FetchError::InvalidShallowResponse {
+                        reason: format!(
+                            "more than {MAX_RESPONSE_SHALLOW_PACKETS} shallow response packets"
+                        ),
+                    });
+                }
+                let oid = parse_shallow_packet(&data, b"unshallow ", hash_kind)?;
+                distinct_response_boundaries.insert(oid.clone());
+                if distinct_response_boundaries.len() > MAX_RESPONSE_SHALLOW_BOUNDARIES {
+                    return Err(FetchError::InvalidShallowResponse {
+                        reason: format!(
+                            "more than {MAX_RESPONSE_SHALLOW_BOUNDARIES} distinct shallow or unshallow boundaries"
+                        ),
+                    });
+                }
+                if unshallow_seen.insert(oid.clone()) {
+                    data_out.unshallow.push(oid);
+                }
                 saw_shallow_response = true;
                 continue;
             }
@@ -2651,6 +2985,15 @@ async fn read_fetch_stream(
     Ok(data_out)
 }
 
+#[cfg(test)]
+async fn read_fetch_stream(
+    result_stream: &mut FetchStream,
+    output: &OutputConfig,
+    task: &str,
+) -> Result<FetchStreamData, FetchError> {
+    read_fetch_stream_for_kind(result_stream, output, task, get_hash_kind()).await
+}
+
 /// Strip a leading `ERR ` / `FATAL ` marker from a side-band channel-3 message so
 /// the surfaced fetch error reads as the remote's own text rather than repeating
 /// the wire marker (`remote reported an error: ERR access denied` → `… access
@@ -2666,10 +3009,26 @@ fn clean_sideband_message(payload: &[u8]) -> String {
     trimmed.to_string()
 }
 
-fn parse_shallow_packet(data: &[u8], prefix: &[u8]) -> Option<String> {
-    let raw = data.strip_prefix(prefix)?;
-    let text = std::str::from_utf8(raw).ok()?.trim();
-    (!text.is_empty()).then(|| text.to_string())
+fn parse_shallow_packet(
+    data: &[u8],
+    prefix: &[u8],
+    hash_kind: HashKind,
+) -> Result<String, FetchError> {
+    let raw = data
+        .strip_prefix(prefix)
+        .ok_or_else(|| FetchError::InvalidShallowResponse {
+            reason: "missing shallow packet prefix".to_string(),
+        })?;
+    let oid = std::str::from_utf8(raw).map(str::trim).map_err(|source| {
+        FetchError::InvalidShallowResponse {
+            reason: format!("object ID is not UTF-8: {source}"),
+        }
+    })?;
+    ObjectHash::from_hex_for_kind(hash_kind, oid)
+        .map(|hash| hash.to_string())
+        .map_err(|source| FetchError::InvalidShallowResponse {
+            reason: format!("invalid object ID '{oid}': {source}"),
+        })
 }
 
 /// Line-buffers raw sideband progress bytes so the indicatif spinner and the
@@ -2797,16 +3156,214 @@ fn pack_object_count(pack_data: &[u8]) -> usize {
     u32::from_be_bytes(count) as usize
 }
 
-fn write_pack_and_index(pack_data: &[u8]) -> Result<Option<String>, FetchError> {
-    let hash_len = get_hash_kind().size();
+/// Owns only a `.keep` file created by this fetch. A pre-existing sentinel
+/// belongs to another fetch or a crashed operation and must be preserved.
+struct PackPinGuard(Option<PathBuf>);
+
+impl PackPinGuard {
+    fn into_path(mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for PackPinGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Serialize installers of the same content-addressed pack across processes.
+/// The lock file is persistent, but the OS lock is released on process death.
+#[derive(Debug)]
+struct PackInstallLock {
+    _file: fs::File,
+}
+
+/// An early caller error may discard the result before FETCH_HEAD is written.
+/// In that case the pin remains as a safe recovery marker; only explicit
+/// `release_pack_pin` removes a sentinel after the roots are durable.
+#[derive(Debug)]
+struct PackKeepLease {
+    _lock: PackInstallLock,
+    keep_path: PathBuf,
+    owned_sentinel: Option<PathBuf>,
+}
+
+enum PackKeepHold {
+    Fresh {
+        lock: PackInstallLock,
+        keep_path: PathBuf,
+    },
+    Shared {
+        lease: Arc<Mutex<Option<PackKeepLease>>>,
+        sentinel: Option<PathBuf>,
+    },
+}
+
+impl PackInstallLock {
+    async fn acquire(path: &Path, timeout: Duration) -> Result<Self, FetchError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match try_lock_pack_install(path) {
+                Ok(Some(file)) => return Ok(Self { _file: file }),
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(None) => {
+                    return Err(FetchError::LocalState {
+                        message: format!(
+                            "timed out waiting for another fetch to install pack '{}'; retry after it finishes",
+                            path.display()
+                        ),
+                    });
+                }
+                Err(source) => {
+                    return Err(FetchError::LocalState {
+                        message: format!(
+                            "failed to lock pack installation '{}': {source}",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_pack_install(path: &Path) -> io::Result<Option<fs::File>> {
+    use std::os::fd::AsRawFd;
+
+    // Rust requires write access when creating a file. A later user in a
+    // shared repository may only have read access to the persistent lock file,
+    // which is sufficient for flock, so open existing files read-only.
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => fs::File::open(path)?,
+        Err(source) => return Err(source),
+    };
+    // SAFETY: flock operates on the owned descriptor, which outlives the lock.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(Some(file));
+    }
+    let source = io::Error::last_os_error();
+    match source.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+        _ => Err(source),
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_pack_install(path: &Path) -> io::Result<Option<fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let open = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            fs::OpenOptions::new().read(true).share_mode(0).open(path)
+        }
+        Err(source) => Err(source),
+    };
+    match open {
+        Ok(file) => Ok(Some(file)),
+        Err(source) if matches!(source.raw_os_error(), Some(32 | 33)) => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn try_lock_pack_install(_path: &Path) -> io::Result<Option<fs::File>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process pack installation locking is unsupported on this platform",
+    ))
+}
+
+fn files_are_identical(left: &Path, right: &Path) -> io::Result<bool> {
+    let mut left_file = fs::File::open(left)?;
+    let mut right_file = fs::File::open(right)?;
+    let length = left_file.metadata()?.len();
+    if length != right_file.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let size = remaining.min(left_buffer.len() as u64) as usize;
+        left_file.read_exact(&mut left_buffer[..size])?;
+        right_file.read_exact(&mut right_buffer[..size])?;
+        if left_buffer[..size] != right_buffer[..size] {
+            return Ok(false);
+        }
+        remaining -= size as u64;
+    }
+    Ok(true)
+}
+
+fn existing_sha1_index_is_v2(path: &Path) -> Result<bool, FetchError> {
+    let mut file = fs::File::open(path).map_err(|source| FetchError::LocalState {
+        message: format!(
+            "failed to inspect existing pack index '{}': {source}",
+            path.display()
+        ),
+    })?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)
+        .map_err(|source| FetchError::LocalState {
+            message: format!(
+                "failed to read existing pack index '{}': {source}",
+                path.display()
+            ),
+        })?;
+    if header[..4] != [0xff, b't', b'O', b'c'] {
+        return Ok(false);
+    }
+    if header[4..] != 2_u32.to_be_bytes() {
+        return Err(FetchError::LocalState {
+            message: format!(
+                "existing pack index '{}' uses an unsupported version; repair the object store before retrying",
+                path.display()
+            ),
+        });
+    }
+    Ok(true)
+}
+
+async fn write_pack_and_index(
+    pack_data: &[u8],
+    hash_kind: HashKind,
+    prior_results: &[FetchRepositoryResult],
+) -> Result<
+    (
+        Option<PackKeepHold>,
+        Option<PackInstallLock>,
+        Option<String>,
+        PackPinGuard,
+    ),
+    FetchError,
+> {
+    let hash_len = hash_kind.size();
     if pack_data.len() < hash_len {
         tracing::debug!("No pack data returned from remote");
-        return Ok(None);
+        return Ok((None, None, None, PackPinGuard(None)));
     }
 
     let payload_len = pack_data.len() - hash_len;
-    let hash = ObjectHash::new(&pack_data[..payload_len]);
-    let checksum = ObjectHash::from_bytes(&pack_data[payload_len..])
+    let hash = ObjectHash::new_for_kind(hash_kind, &pack_data[..payload_len]);
+    let checksum = ObjectHash::from_bytes_for_kind(hash_kind, &pack_data[payload_len..])
         .map_err(|_| FetchError::ChecksumMismatch)?;
     if hash != checksum {
         return Err(FetchError::ChecksumMismatch);
@@ -2814,7 +3371,7 @@ fn write_pack_and_index(pack_data: &[u8]) -> Result<Option<String>, FetchError> 
 
     if pack_data.len() <= 12 + hash_len {
         tracing::debug!("Empty pack file");
-        return Ok(None);
+        return Ok((None, None, None, PackPinGuard(None)));
     }
 
     let pack_dir = path::try_objects()
@@ -2827,28 +3384,251 @@ fn write_pack_and_index(pack_data: &[u8]) -> Result<Option<String>, FetchError> 
 
     let checksum = checksum.to_string();
     let pack_file = pack_dir.join(format!("pack-{checksum}.pack"));
+    // The keep lease always precedes the install lock. Only fetch takes the
+    // keep lease; pack writers and local readers coordinate on install.lock.
+    let keep_file = pack_dir.join(format!("pack-{checksum}.keep"));
+    let keep_lock_path = pack_dir.join(format!("pack-{checksum}.keep.lock"));
+    // `fetch --all` holds earlier results until FETCH_HEAD is durable. Reuse
+    // their lease for the same checksum to avoid waiting on our own lock.
+    let shared_lease = prior_results.iter().find_map(|prior| {
+        let lease = prior.pack_keep_lock.as_ref()?;
+        let held = match lease.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        held.as_ref()
+            .filter(|held| held.keep_path == keep_file)
+            .map(|_| (Arc::clone(lease), prior.pack_keep_sentinel.clone()))
+    });
+    let keep_lock = if let Some((lease, sentinel)) = shared_lease {
+        PackKeepHold::Shared { lease, sentinel }
+    } else {
+        PackKeepHold::Fresh {
+            lock: PackInstallLock::acquire(&keep_lock_path, Duration::from_secs(300)).await?,
+            keep_path: keep_file.clone(),
+        }
+    };
+    let install_lock_path = pack_dir.join(format!("pack-{checksum}.install.lock"));
+    let install_lock =
+        PackInstallLock::acquire(&install_lock_path, Duration::from_secs(30)).await?;
+    let index_file = pack_file.with_extension("idx");
+    if index_file.exists() && !pack_file.exists() {
+        return Err(FetchError::LocalState {
+            message: format!(
+                "pack index '{}' exists without its pack; repair the object store before retrying",
+                index_file.display()
+            ),
+        });
+    }
     // W2 §C.4.3: pin the pack BEFORE it becomes visible at its final name —
     // the `.keep` sentinel must exist for every instant a repack could list
     // this pack, so the pack-written→refs-recorded window has no gap at
     // either end (the caller releases the pin only after FETCH_HEAD lands).
-    let keep_file = pack_dir.join(format!("pack-{checksum}.keep"));
-    fs::write(&keep_file, b"libra fetch in progress\n").map_err(|source| {
-        FetchError::PackWrite {
-            path: keep_file.clone(),
-            source,
+    let pin = if matches!(&keep_lock, PackKeepHold::Shared { .. }) {
+        if !keep_file.is_file() {
+            return Err(FetchError::LocalState {
+                message: format!(
+                    "shared pack pin '{}' disappeared during fetch; repair the object store and retry",
+                    keep_file.display()
+                ),
+            });
         }
+        PackPinGuard(None)
+    } else {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&keep_file)
+        {
+            Ok(mut file) => {
+                let pin = PackPinGuard(Some(keep_file.clone()));
+                file.write_all(b"libra fetch in progress\n")
+                    .map_err(|source| FetchError::PackWrite {
+                        path: keep_file.clone(),
+                        source,
+                    })?;
+                pin
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => PackPinGuard(None),
+            Err(source) => {
+                return Err(FetchError::PackWrite {
+                    path: keep_file,
+                    source,
+                });
+            }
+        }
+    };
+    let pack_exists = match fs::metadata(&pack_file) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => {
+            return Err(FetchError::LocalState {
+                message: format!(
+                    "pack path '{}' is not a regular file; repair the object store before retrying",
+                    pack_file.display()
+                ),
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(FetchError::PackWrite {
+                path: pack_file,
+                source,
+            });
+        }
+    };
+    if !pack_exists {
+        // Publish only a complete, synced pack. A failed write leaves its
+        // private temporary file to RAII cleanup, never a partial final pack.
+        let mut temporary_pack =
+            tempfile::NamedTempFile::new_in(&pack_dir).map_err(|source| FetchError::PackWrite {
+                path: pack_file.clone(),
+                source,
+            })?;
+        temporary_pack
+            .write_all(pack_data)
+            .map_err(|source| FetchError::PackWrite {
+                path: pack_file.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        {
+            // tempfile defaults to 0600. The lock was created with the same
+            // 0666-and-umask policy as the old direct pack write.
+            let permissions = fs::metadata(&install_lock_path)
+                .map_err(|source| FetchError::PackWrite {
+                    path: pack_file.clone(),
+                    source,
+                })?
+                .permissions();
+            fs::set_permissions(temporary_pack.path(), permissions).map_err(|source| {
+                FetchError::PackWrite {
+                    path: pack_file.clone(),
+                    source,
+                }
+            })?;
+        }
+        // Sync after the permission change so a crash cannot publish a pack
+        // whose durable mode is still tempfile's private 0600.
+        temporary_pack
+            .as_file_mut()
+            .sync_all()
+            .map_err(|source| FetchError::PackWrite {
+                path: pack_file.clone(),
+                source,
+            })?;
+        match temporary_pack.persist_noclobber(&pack_file) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(FetchError::PackWrite {
+                    path: pack_file,
+                    source: error.error,
+                });
+            }
+        }
+    }
+    Ok((
+        Some(keep_lock),
+        Some(install_lock),
+        Some(pack_file.to_string_lossy().into_owned()),
+        pin,
+    ))
+}
+
+fn index_received_pack(
+    pack_file: &str,
+    hash_kind: HashKind,
+    collect_commit_edges: bool,
+) -> Result<Option<crate::command::index_pack_support::PackCommitEdges>, FetchError> {
+    let index_file = PathBuf::from(pack_file).with_extension("idx");
+    // A SHA-1 pack may already have a valid v2 index created by Git or by
+    // `libra index-pack --index-version 2`. Build the same format before the
+    // byte comparison, since v1 and v2 represent the same pack differently.
+    let use_v2_index = hash_kind != HashKind::Sha1
+        || (index_file.exists() && existing_sha1_index_is_v2(&index_file)?);
+    let index_dir = index_file.parent().ok_or_else(|| FetchError::LocalState {
+        message: format!(
+            "pack index '{}' has no parent directory",
+            index_file.display()
+        ),
     })?;
-    let mut file = fs::File::create(&pack_file).map_err(|source| FetchError::PackWrite {
-        path: pack_file.clone(),
-        source,
-    })?;
-    file.write_all(pack_data)
-        .map_err(|source| FetchError::PackWrite {
-            path: pack_file.clone(),
+    // Index builders create/truncate their output. Always build into a private
+    // path so an earlier referenced index survives decoder or write failures.
+    let temporary_index =
+        tempfile::NamedTempFile::new_in(index_dir).map_err(|source| FetchError::PackWrite {
+            path: index_file.clone(),
             source,
         })?;
-
-    Ok(Some(pack_file.to_string_lossy().into_owned()))
+    let temporary_path = temporary_index.path().to_string_lossy().into_owned();
+    let edges = match (use_v2_index, collect_commit_edges) {
+        (false, true) => {
+            index_pack_v1::build_index_v1_with_commit_edges(pack_file, &temporary_path).map(Some)
+        }
+        (false, false) => index_pack::build_index_v1(pack_file, &temporary_path).map(|_| None),
+        (true, true) => {
+            index_pack_v2::build_index_v2_with_commit_edges(pack_file, &temporary_path).map(Some)
+        }
+        (true, false) => index_pack::build_index_v2(pack_file, &temporary_path).map(|_| None),
+    }
+    .map_err(|source| FetchError::IndexPack {
+        path: pack_file.to_string(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        // tempfile uses 0600, while the pack was created with the repository's
+        // effective umask/shared permissions. Keep both files equally readable.
+        let permissions = fs::metadata(pack_file)
+            .map_err(|source| FetchError::PackWrite {
+                path: PathBuf::from(pack_file),
+                source,
+            })?
+            .permissions();
+        fs::set_permissions(temporary_index.path(), permissions).map_err(|source| {
+            FetchError::PackWrite {
+                path: index_file.clone(),
+                source,
+            }
+        })?;
+    }
+    // Index builders close their own write handle. Sync both their data and
+    // the adjusted shared-repository mode before exposing the final name.
+    temporary_index
+        .as_file()
+        .sync_all()
+        .map_err(|source| FetchError::PackWrite {
+            path: index_file.clone(),
+            source,
+        })?;
+    match temporary_index.persist_noclobber(&index_file) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            let identical =
+                files_are_identical(error.file.path(), &index_file).map_err(|source| {
+                    FetchError::LocalState {
+                        message: format!(
+                            "failed to compare existing pack index '{}': {source}",
+                            index_file.display()
+                        ),
+                    }
+                })?;
+            if !identical {
+                return Err(FetchError::LocalState {
+                    message: format!(
+                        "existing pack index '{}' differs from the received pack; repair the object store before retrying",
+                        index_file.display()
+                    ),
+                });
+            }
+        }
+        Err(error) => {
+            return Err(FetchError::PackWrite {
+                path: index_file,
+                source: error.error,
+            });
+        }
+    }
+    Ok(edges)
 }
 
 fn shallow_file_path() -> Result<PathBuf, FetchError> {
@@ -2866,6 +3646,13 @@ fn shallow_file_path() -> Result<PathBuf, FetchError> {
 /// disagreement that turns a shallow clone's GC into a corruption report.
 pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
     crate::internal::shallow::boundary_oids().map_err(shallow_read_error)
+}
+
+fn read_shallow_boundaries_for_kind(hash_kind: HashKind) -> Result<BTreeSet<String>, FetchError> {
+    let path = shallow_file_path()?;
+    crate::internal::shallow::ShallowSet::load_at_for_kind(&path, hash_kind)
+        .map(|boundaries| boundaries.oids_hex())
+        .map_err(shallow_read_error)
 }
 
 /// [`read_shallow_boundaries`] against an EXPLICIT shallow file (§C.4.2) —
@@ -2914,25 +3701,168 @@ fn write_shallow_boundaries(boundaries: &BTreeSet<String>) -> Result<(), FetchEr
     })
 }
 
-fn apply_shallow_updates(shallow: &[String], unshallow: &[String]) -> Result<(), FetchError> {
-    if shallow.is_empty() && unshallow.is_empty() {
-        return Ok(());
-    }
-
-    let mut boundaries = read_shallow_boundaries()?;
+fn merged_shallow_boundaries(
+    mut boundaries: BTreeSet<String>,
+    shallow: &[String],
+    unshallow: &[String],
+    hash_kind: HashKind,
+) -> Result<BTreeSet<String>, FetchError> {
     for oid in shallow {
-        ObjectHash::from_str(oid).map_err(|source| FetchError::LocalState {
-            message: format!("remote sent invalid shallow boundary '{oid}': {source}"),
+        ObjectHash::from_hex_for_kind(hash_kind, oid).map_err(|source| {
+            FetchError::InvalidShallowResponse {
+                reason: format!("invalid shallow boundary '{oid}': {source}"),
+            }
         })?;
         boundaries.insert(oid.clone());
     }
     for oid in unshallow {
-        ObjectHash::from_str(oid).map_err(|source| FetchError::LocalState {
-            message: format!("remote sent invalid unshallow boundary '{oid}': {source}"),
+        ObjectHash::from_hex_for_kind(hash_kind, oid).map_err(|source| {
+            FetchError::InvalidShallowResponse {
+                reason: format!("invalid unshallow boundary '{oid}': {source}"),
+            }
         })?;
         boundaries.remove(oid);
     }
-    write_shallow_boundaries(&boundaries)
+    Ok(boundaries)
+}
+
+fn map_advertised_shallow_inspection_error(source: GitError) -> FetchError {
+    match source {
+        GitError::InvalidObjectInfo(reason) => {
+            FetchError::InvalidAdvertisedShallowBoundary { reason }
+        }
+        source => FetchError::LocalState {
+            message: format!("failed to inspect advertised shallow commits: {source}"),
+        },
+    }
+}
+
+/// Check the commit edges decoded from this network pack against the shallow
+/// metadata that would be published with its refs. Existing repository objects
+/// are trusted; newly decoded commits and explicitly unshallowed old commits
+/// must not introduce a missing parent outside a final shallow boundary.
+fn validate_fetched_history(
+    storage: &crate::utils::client_storage::ClientStorage,
+    wanted: &[String],
+    mut commit_edges: Option<&mut crate::command::index_pack_support::PackCommitEdges>,
+    unshallow: &[String],
+    final_boundaries: &BTreeSet<String>,
+    hash_kind: HashKind,
+) -> Result<(), FetchError> {
+    let parse_remote_oid = |oid: &str| {
+        ObjectHash::from_hex_for_kind(hash_kind, oid).map_err(|source| {
+            FetchError::IncompleteFetchedHistory {
+                message: format!("invalid object id '{oid}': {source}"),
+            }
+        })
+    };
+    let wanted_ids = wanted
+        .iter()
+        .map(|oid| parse_remote_oid(oid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let wanted_presence =
+        storage
+            .exist_checked_many(&wanted_ids)
+            .map_err(|source| FetchError::LocalState {
+                message: format!("failed to probe fetched ref targets: {source}"),
+            })?;
+    for oid in &wanted_ids {
+        match wanted_presence.get(oid) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(FetchError::IncompleteFetchedHistory {
+                    message: format!("requested object '{oid}' is missing after pack indexing"),
+                });
+            }
+            None => {
+                return Err(FetchError::LocalState {
+                    message: format!("missing presence result for requested object '{oid}'"),
+                });
+            }
+        }
+    }
+
+    let boundary_ids = final_boundaries
+        .iter()
+        .map(|oid| parse_remote_oid(oid))
+        .collect::<Result<HashSet<_>, _>>()?;
+    let unshallowed_ids = unshallow
+        .iter()
+        .map(|oid| parse_remote_oid(oid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unshallowed_parents = storage
+        .commit_parents_many(&unshallowed_ids)
+        .map_err(|source| FetchError::LocalState {
+            message: format!("failed to inspect unshallowed commits: {source}"),
+        })?;
+    let unshallowed_edges = unshallowed_parents
+        .into_iter()
+        .flat_map(|(child, parents)| parents.into_iter().map(move |parent| (child, parent)))
+        .collect::<Vec<_>>();
+    validate_commit_parent_edges(
+        storage,
+        &boundary_ids,
+        commit_edges.as_deref(),
+        &unshallowed_edges,
+    )?;
+
+    if let Some(spool) = commit_edges.as_mut() {
+        loop {
+            let chunk = spool
+                .next_chunk()
+                .map_err(|source| FetchError::LocalState {
+                    message: format!("failed to read fetched commit edges: {source}"),
+                })?;
+            if chunk.is_empty() {
+                break;
+            }
+            validate_commit_parent_edges(storage, &boundary_ids, Some(spool), &chunk)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit_parent_edges(
+    storage: &crate::utils::client_storage::ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
+    pack_commits: Option<&crate::command::index_pack_support::PackCommitEdges>,
+    edges: &[(ObjectHash, ObjectHash)],
+) -> Result<(), FetchError> {
+    let relevant_edges = edges
+        .iter()
+        .filter(|(child, parent)| {
+            !boundaries.contains(child)
+                && !pack_commits.is_some_and(|commits| commits.contains_commit(parent))
+        })
+        .collect::<Vec<_>>();
+    let parents = relevant_edges
+        .iter()
+        .map(|(_, parent)| *parent)
+        .collect::<Vec<_>>();
+    let presence =
+        storage
+            .exist_checked_many(&parents)
+            .map_err(|source| FetchError::LocalState {
+                message: format!("failed to probe fetched commit parents: {source}"),
+            })?;
+    for (child, parent) in relevant_edges {
+        match presence.get(parent) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(FetchError::IncompleteFetchedHistory {
+                    message: format!(
+                        "commit '{child}' has missing parent '{parent}' without a shallow boundary"
+                    ),
+                });
+            }
+            None => {
+                return Err(FetchError::LocalState {
+                    message: format!("missing presence result for fetched parent '{parent}'"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read-only counterpart of [`update_references`] for `--dry-run`: report the
@@ -3777,7 +4707,7 @@ const HAVE_HISTORY_LIMIT: usize = 256;
 /// its target while building the `have` set. Bounds runaway/cyclic tag chains.
 const MAX_TAG_PEEL_DEPTH: usize = 32;
 
-async fn current_have_safe() -> Result<Vec<String>, FetchError> {
+async fn current_have_safe(hash_kind: HashKind) -> Result<Vec<String>, FetchError> {
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
     struct QueueItem {
         priority: usize,
@@ -3812,7 +4742,7 @@ async fn current_have_safe() -> Result<Vec<String>, FetchError> {
 
     let mut have = Vec::new();
     let mut have_set: HashSet<String> = HashSet::new();
-    let shallow_boundaries = read_shallow_boundaries()?;
+    let shallow_boundaries = read_shallow_boundaries_for_kind(hash_kind)?;
 
     // Phase 1: every local + remote-tracking branch tip becomes a `have`,
     // unconditionally. These are the commits the server is most likely to
@@ -3868,7 +4798,7 @@ async fn current_have_safe() -> Result<Vec<String>, FetchError> {
         }
         // Peel annotated tags best-effort: a missing object simply means this
         // tag contributes only its own oid. The bounded loop guards cycles.
-        let Ok(mut current) = ObjectHash::from_str(&ref_oid) else {
+        let Ok(mut current) = ObjectHash::from_hex_for_kind(hash_kind, &ref_oid) else {
             continue;
         };
         for _ in 0..MAX_TAG_PEEL_DEPTH {
@@ -4023,8 +4953,7 @@ mod tests {
         let mut empty: FetchStream = stream::empty().boxed();
         let error = read_fetch_stream(&mut empty, &OutputConfig::default(), "pkt13 empty stream")
             .await
-            .err()
-            .expect("empty transport must fail before a complete pack");
+            .expect_err("empty transport must fail before a complete pack");
         assert!(
             matches!(&error, FetchError::PacketRead { source } if source.kind() == std::io::ErrorKind::UnexpectedEof)
         );
@@ -4578,6 +5507,7 @@ mod tests {
             refspec: None,
             remotes: vec![FetchRepositoryResult {
                 pack_keep_sentinel: None,
+                pack_keep_lock: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 2,
@@ -4631,6 +5561,7 @@ mod tests {
             refspec: None,
             remotes: vec![FetchRepositoryResult {
                 pack_keep_sentinel: None,
+                pack_keep_lock: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 1,
@@ -4672,6 +5603,7 @@ mod tests {
             refspec: None,
             remotes: vec![FetchRepositoryResult {
                 pack_keep_sentinel: None,
+                pack_keep_lock: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 0,
@@ -4725,6 +5657,7 @@ mod tests {
             refspec: None,
             remotes: vec![FetchRepositoryResult {
                 pack_keep_sentinel: None,
+                pack_keep_lock: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 0,
@@ -4759,6 +5692,8 @@ mod tests {
     /// skipped — their `{source}` slot is owned by the wrapped type.
     #[test]
     fn fetch_error_display_pins_static_message_variants() {
+        use crate::utils::error::{CliError, StableErrorCode};
+
         // InvalidRemoteSpec echoes the `reason` field verbatim.
         assert_eq!(
             FetchError::InvalidRemoteSpec {
@@ -4801,6 +5736,49 @@ mod tests {
             .to_string(),
             "failed to read fetch configuration 'remote.origin.fetch': database is locked",
         );
+        let changed = FetchError::ShallowAdvertisementChanged {
+            remote: "https://example.test/repo.git".to_string(),
+        };
+        assert_eq!(
+            changed.to_string(),
+            "shallow boundaries advertised by 'https://example.test/repo.git' changed during HTTP fetch; retry the fetch",
+        );
+        assert_eq!(
+            CliError::from(changed).stable_code(),
+            StableErrorCode::NetworkProtocol,
+        );
+        let invalid_response = FetchError::InvalidShallowResponse {
+            reason: "invalid object ID 'xyz'".to_string(),
+        };
+        assert_eq!(
+            invalid_response.to_string(),
+            "remote sent invalid shallow response: invalid object ID 'xyz'",
+        );
+        assert_eq!(
+            CliError::from(invalid_response).stable_code(),
+            StableErrorCode::NetworkProtocol,
+        );
+        let invalid_boundary = FetchError::InvalidAdvertisedShallowBoundary {
+            reason: "commit exceeds size limit".to_string(),
+        };
+        assert_eq!(
+            invalid_boundary.to_string(),
+            "remote advertised an invalid shallow commit: commit exceeds size limit",
+        );
+        let cli = CliError::from(invalid_boundary);
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+        assert!(cli.hints()[0].as_str().contains("deepen"));
+        let incomplete = FetchError::IncompleteFetchedHistory {
+            message: "commit abc has missing parent def".to_string(),
+        };
+        assert_eq!(
+            incomplete.to_string(),
+            "remote returned incomplete commit history: commit abc has missing parent def",
+        );
+        assert_eq!(
+            CliError::from(incomplete).stable_code(),
+            StableErrorCode::NetworkProtocol,
+        );
         assert_eq!(
             FetchError::InvalidPktHeader {
                 header: "zzzz".to_string(),
@@ -4842,6 +5820,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn missing_shallow_capability_maps_to_network_protocol() {
+        use crate::{
+            internal::protocol::{ChangedShallowAdvertisement, MissingShallowCapability},
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        let error = FetchError::FetchObjects {
+            remote: "https://example.test/repo.git".to_string(),
+            source: std::io::Error::other(MissingShallowCapability),
+        };
+        let cli = CliError::from(error);
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+        assert!(cli.hints()[0].as_str().contains("shallow support"));
+
+        let changed = FetchError::FetchObjects {
+            remote: "git://example.test/repo.git".to_string(),
+            source: std::io::Error::other(ChangedShallowAdvertisement),
+        };
+        let cli = CliError::from(changed);
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+        assert!(
+            cli.hints()[0]
+                .as_str()
+                .contains("remote repository stops changing")
+        );
+    }
+
+    #[test]
+    fn invalid_advertised_boundary_classification_preserves_storage_errors() {
+        use git_internal::errors::GitError;
+
+        assert!(matches!(
+            super::map_advertised_shallow_inspection_error(GitError::InvalidObjectInfo(
+                "commit exceeds size limit".to_string()
+            )),
+            FetchError::InvalidAdvertisedShallowBoundary { .. }
+        ));
+        assert!(matches!(
+            super::map_advertised_shallow_inspection_error(GitError::IOError(
+                std::io::Error::other("disk unavailable")
+            )),
+            FetchError::LocalState { .. }
+        ));
+    }
+
     fn append_pkt_line(buf: &mut BytesMut, payload: &[u8]) {
         let len = payload.len() + 4;
         buf.extend_from_slice(format!("{len:04x}").as_bytes());
@@ -4856,6 +5882,544 @@ mod tests {
         let checksum = ObjectHash::new(&pack);
         pack.extend_from_slice(checksum.as_ref());
         pack
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_install_lock_creates_file_and_reuses_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temporary pack directory");
+        let path = dir.path().join("pack-test.install.lock");
+        let first = super::try_lock_pack_install(&path)
+            .expect("create and lock a new pack install file")
+            .expect("new lock is free");
+        assert!(path.is_file());
+        assert!(
+            super::try_lock_pack_install(&path)
+                .expect("probe a contended pack install lock")
+                .is_none(),
+            "a second installer must wait while this checksum is being installed"
+        );
+        drop(first);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            .expect("make existing lock read-only");
+        let second = super::try_lock_pack_install(&path)
+            .expect("flock an existing read-only lock file")
+            .expect("existing lock is free");
+        drop(second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pack_keep_lease_survives_result_clone_until_release() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("temporary pack directory");
+        let lock_path = dir.path().join("pack-test.keep.lock");
+        let keep_path = dir.path().join("pack-test.keep");
+        std::fs::write(&keep_path, b"first fetch").expect("first keep sentinel");
+        let lock = super::PackInstallLock::acquire(&lock_path, std::time::Duration::from_secs(1))
+            .await
+            .expect("first pin lease");
+        let result = super::FetchRepositoryResult {
+            remote: "origin".to_string(),
+            url: "test://origin".to_string(),
+            pack_keep_sentinel: Some(keep_path.clone()),
+            pack_keep_lock: Some(Arc::new(Mutex::new(Some(super::PackKeepLease {
+                _lock: lock,
+                keep_path: keep_path.clone(),
+                owned_sentinel: Some(keep_path.clone()),
+            })))),
+            refs_updated: Vec::new(),
+            objects_fetched: 1,
+            bytes_received: 1,
+            pruned: Vec::new(),
+            fetch_head_records: Vec::new(),
+        };
+        let cloned = result.clone();
+        assert!(
+            super::try_lock_pack_install(&lock_path)
+                .expect("probe a held pin lease")
+                .is_none(),
+            "another fetch must wait until the first caller records FETCH_HEAD"
+        );
+
+        result.release_pack_pin();
+        assert!(!keep_path.exists(), "the owned sentinel was released");
+        let second = super::try_lock_pack_install(&lock_path)
+            .expect("second pin lease")
+            .expect("pin lease is free after release");
+        std::fs::write(&keep_path, b"second fetch").expect("second keep sentinel");
+        cloned.release_pack_pin();
+        assert_eq!(
+            std::fs::read(&keep_path).expect("second sentinel remains"),
+            b"second fetch",
+            "a cloned result must not delete another fetch's sentinel"
+        );
+        drop(second);
+
+        let unattended_lock =
+            super::PackInstallLock::acquire(&lock_path, std::time::Duration::from_secs(1))
+                .await
+                .expect("lease for fetch whose caller exits early");
+        let unattended = super::FetchRepositoryResult {
+            pack_keep_sentinel: Some(keep_path.clone()),
+            pack_keep_lock: Some(Arc::new(Mutex::new(Some(super::PackKeepLease {
+                _lock: unattended_lock,
+                keep_path: keep_path.clone(),
+                owned_sentinel: Some(keep_path.clone()),
+            })))),
+            ..result.clone()
+        };
+        let unattended_clone = unattended.clone();
+        drop(unattended);
+        assert!(keep_path.exists(), "a live clone still owns its pin");
+        drop(unattended_clone);
+        assert!(
+            keep_path.exists(),
+            "an early caller error keeps the pin until recovery records roots"
+        );
+        assert!(
+            super::try_lock_pack_install(&lock_path)
+                .expect("probe released fallback lease")
+                .is_some()
+        );
+        std::fs::remove_file(&keep_path).expect("clean up retained pin in test repository");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn fetched_blake3_shallow_file_uses_discovery_kind_across_threads() {
+        use git_internal::hash::{HashKind, set_hash_kind};
+
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let repo = tempfile::tempdir().expect("temporary Libra repository");
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let oid = "c".repeat(64);
+        std::fs::write(
+            super::shallow_file_path().expect("repository shallow file path"),
+            format!("{oid}\n"),
+        )
+        .expect("write BLAKE3 shallow boundary");
+
+        let boundaries = tokio::task::spawn_blocking(|| {
+            // A fetch may resume on a different Tokio thread after discovery.
+            // The request's explicit kind must win over that thread's state.
+            set_hash_kind(HashKind::Sha1);
+            super::read_shallow_boundaries_for_kind(HashKind::Blake3)
+        })
+        .await
+        .expect("shallow reader task")
+        .expect("parse shallow boundary with discovery kind");
+        assert_eq!(boundaries, std::collections::BTreeSet::from([oid]));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn failed_pack_index_keeps_public_pack_until_explicit_repair() {
+        use std::path::PathBuf;
+
+        use git_internal::hash::{HashKind, ObjectHash, set_hash_kind};
+
+        use crate::utils::{
+            test::{ChangeDirGuard, setup_with_new_libra_in},
+            util,
+        };
+
+        let repo = tempfile::tempdir().expect("temporary Libra repository");
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        set_hash_kind(HashKind::Sha1);
+
+        let mut invalid_pack = b"PACK".to_vec();
+        invalid_pack.extend_from_slice(&99_u32.to_be_bytes());
+        invalid_pack.extend_from_slice(&1_u32.to_be_bytes());
+        invalid_pack.extend_from_slice(&[0_u8; 16]);
+        let checksum = ObjectHash::new_for_kind(HashKind::Sha1, &invalid_pack);
+        invalid_pack.extend_from_slice(checksum.as_ref());
+        let (keep_lock, install_lock, pack_file, pin) =
+            super::write_pack_and_index(&invalid_pack, HashKind::Sha1, &[])
+                .await
+                .expect("checksum-valid invalid pack reaches indexing");
+        let pack_file = pack_file.expect("nonempty pack is installed for indexing");
+        let pack_path = PathBuf::from(&pack_file);
+        let index_path = pack_path.with_extension("idx");
+        let keep_path = pack_path.with_extension("keep");
+        let error = super::index_received_pack(&pack_file, HashKind::Sha1, true)
+            .err()
+            .expect("invalid pack version must fail indexing");
+        assert!(matches!(error, FetchError::IndexPack { .. }));
+        drop(pin);
+        drop(install_lock);
+        drop(keep_lock);
+        assert!(
+            pack_path.exists(),
+            "a public pack must not be unlinked while another reader may hold it"
+        );
+        assert!(
+            !index_path.exists(),
+            "failed index removes its temporary output"
+        );
+        assert!(
+            !keep_path.exists(),
+            "failed index releases its keep sentinel"
+        );
+
+        let missing = ObjectHash::new_for_kind(HashKind::Sha1, b"missing after failed pack");
+        let error = util::objects_storage()
+            .exist_checked_many(&[missing])
+            .expect_err("orphan pack must fail closed until repaired");
+        assert!(
+            error.to_string().contains("index"),
+            "storage failure should explain the missing index: {error}"
+        );
+        std::fs::remove_file(&pack_path).expect("repair orphan pack in test repository");
+        let presence = util::objects_storage()
+            .exist_checked_many(&[missing])
+            .expect("storage probe works after explicit orphan repair");
+        assert_eq!(presence.get(&missing), Some(&false));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env, hash_kind)]
+    async fn existing_pack_index_is_never_overwritten_by_fetch() {
+        use std::{
+            io::Write,
+            path::PathBuf,
+            sync::{Arc, Mutex},
+        };
+
+        use flate2::{Compression, write::ZlibEncoder};
+        use git_internal::hash::{HashKind, ObjectHash, set_hash_kind};
+
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let repo = tempfile::tempdir().expect("temporary Libra repository");
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        set_hash_kind(HashKind::Sha1);
+
+        let mut compressed = ZlibEncoder::new(Vec::new(), Compression::default());
+        compressed.write_all(b"abc").expect("compress test blob");
+        let compressed = compressed.finish().expect("finish test blob");
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(&2_u32.to_be_bytes());
+        pack.extend_from_slice(&1_u32.to_be_bytes());
+        pack.push(0x33); // blob, three bytes
+        pack.extend_from_slice(&compressed);
+        let checksum = ObjectHash::new_for_kind(HashKind::Sha1, &pack);
+        pack.extend_from_slice(checksum.as_ref());
+
+        let (first_keep_lock, first_install_lock, pack_file, first_pin) =
+            super::write_pack_and_index(&pack, HashKind::Sha1, &[])
+                .await
+                .expect("first pack install");
+        let pack_file = pack_file.expect("nonempty pack");
+        super::index_received_pack(&pack_file, HashKind::Sha1, true).expect("first pack index");
+        drop(first_install_lock);
+        // A second fetch of the same pack waits asynchronously for the pin
+        // lease, while the indexed pack stays readable to local storage.
+        let competing_pack = pack.clone();
+        let competing = tokio::spawn(async move {
+            super::write_pack_and_index(&competing_pack, HashKind::Sha1, &[]).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !competing.is_finished(),
+            "the first fetch still owns its pin"
+        );
+        let pack_path = PathBuf::from(&pack_file);
+        assert!(pack_path.with_extension("keep").exists());
+        let blob_oid = ObjectHash::new_for_kind(HashKind::Sha1, b"blob 3\0abc");
+        assert_eq!(
+            crate::utils::util::objects_storage()
+                .exist_checked_many(&[blob_oid])
+                .expect("indexed pack is readable while keep lease is held")
+                .get(&blob_oid),
+            Some(&true)
+        );
+        drop(first_pin);
+        drop(first_keep_lock);
+        let (competing_keep_lock, competing_install_lock, competing_file, competing_pin) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), competing)
+                .await
+                .expect("same-pack fetch wakes after pin release")
+                .expect("same-pack fetch task")
+                .expect("same-pack fetch install");
+        assert_eq!(competing_file.as_deref(), Some(pack_file.as_str()));
+        assert!(
+            pack_path.with_extension("keep").exists(),
+            "second fetch creates its own sentinel after acquiring the lease"
+        );
+        drop(competing_pin);
+        drop(competing_install_lock);
+        drop(competing_keep_lock);
+
+        // `fetch --all` keeps earlier results until one FETCH_HEAD write. Its
+        // later remote must share the same-checksum lease, rather than wait on
+        // a lock held by this invocation itself.
+        let keep_path = pack_path.with_extension("keep");
+        let keep_lock_path = pack_path.with_extension("keep.lock");
+        std::fs::write(&keep_path, b"first remote").expect("first remote pin");
+        let scoped_lock =
+            super::PackInstallLock::acquire(&keep_lock_path, std::time::Duration::from_secs(1))
+                .await
+                .expect("first remote lease");
+        let scoped_lease = Arc::new(Mutex::new(Some(super::PackKeepLease {
+            _lock: scoped_lock,
+            keep_path: keep_path.clone(),
+            owned_sentinel: Some(keep_path.clone()),
+        })));
+        let prior = super::FetchRepositoryResult {
+            remote: "first".to_string(),
+            url: "test://first".to_string(),
+            pack_keep_sentinel: Some(keep_path.clone()),
+            pack_keep_lock: Some(scoped_lease.clone()),
+            refs_updated: Vec::new(),
+            objects_fetched: 1,
+            bytes_received: pack.len(),
+            pruned: Vec::new(),
+            fetch_head_records: Vec::new(),
+        };
+        let (shared_hold, shared_install_lock, _, shared_pin) =
+            super::write_pack_and_index(&pack, HashKind::Sha1, std::slice::from_ref(&prior))
+                .await
+                .expect("second remote reuses first remote's pin lease");
+        let Some(super::PackKeepHold::Shared { lease, .. }) = shared_hold else {
+            panic!("same-checksum remote must share the existing lease");
+        };
+        assert!(Arc::ptr_eq(&lease, &scoped_lease));
+        assert!(shared_pin.0.is_none(), "second remote owns no new pin");
+        drop(shared_install_lock);
+        drop(shared_pin);
+        drop(lease);
+        assert!(keep_path.exists(), "pin stays until FETCH_HEAD is durable");
+        prior.release_pack_pin();
+        assert!(!keep_path.exists(), "one release clears the shared pin");
+
+        let index_path = pack_path.with_extension("idx");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let pack_mode = std::fs::metadata(&pack_path)
+                .expect("pack metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let index_mode = std::fs::metadata(&index_path)
+                .expect("index metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(index_mode, pack_mode, "pack and index share read policy");
+        }
+        let v2_path = repo.path().join("same-pack-v2.idx");
+        super::index_pack_v2::build_index_v2(&pack_file, &v2_path.to_string_lossy())
+            .expect("build a valid v2 index for the same SHA-1 pack");
+        let v2_index = std::fs::read(&v2_path).expect("read v2 index");
+        std::fs::rename(&v2_path, &index_path).expect("install existing v2 index");
+
+        let (v2_keep_lock, v2_install_lock, v2_pack, v2_pin) =
+            super::write_pack_and_index(&pack, HashKind::Sha1, &[])
+                .await
+                .expect("same pack with v2 index");
+        super::index_received_pack(
+            v2_pack.as_deref().expect("nonempty pack"),
+            HashKind::Sha1,
+            true,
+        )
+        .expect("existing valid v2 index is compatible with the fetched pack");
+        drop(v2_pin);
+        drop(v2_install_lock);
+        drop(v2_keep_lock);
+        assert_eq!(
+            std::fs::read(&index_path).expect("existing v2 index"),
+            v2_index
+        );
+
+        let mut corrupt_index = std::fs::read(&index_path).expect("read first index");
+        corrupt_index[0] ^= 0x01;
+        std::fs::write(&index_path, &corrupt_index).expect("make existing index divergent");
+
+        let (second_keep_lock, second_install_lock, second_pack, second_pin) =
+            super::write_pack_and_index(&pack, HashKind::Sha1, &[])
+                .await
+                .expect("same checksum pack");
+        let error = super::index_received_pack(
+            second_pack.as_deref().expect("nonempty pack"),
+            HashKind::Sha1,
+            true,
+        )
+        .err()
+        .expect("divergent existing index must stop fetch");
+        assert!(matches!(error, FetchError::LocalState { .. }));
+        drop(second_pin);
+        drop(second_install_lock);
+        drop(second_keep_lock);
+        assert!(
+            pack_path.exists(),
+            "preexisting pack remains owned by its writer"
+        );
+        assert_eq!(
+            std::fs::read(&index_path).expect("existing index"),
+            corrupt_index
+        );
+    }
+
+    #[tokio::test]
+    async fn shallow_response_bounds_and_deduplicates_packets() {
+        use git_internal::hash::HashKind;
+
+        use crate::utils::error::{CliError, StableErrorCode};
+
+        let oid = "a".repeat(40);
+        let mut duplicate = BytesMut::new();
+        for _ in 0..=super::MAX_RESPONSE_SHALLOW_PACKETS {
+            append_pkt_line(&mut duplicate, format!("shallow {oid}\n").as_bytes());
+        }
+        let mut stream: FetchStream = stream::iter([Ok(duplicate.freeze())]).boxed();
+        let error = super::read_fetch_stream_for_kind(
+            &mut stream,
+            &OutputConfig::default(),
+            "fetch origin",
+            HashKind::Sha1,
+        )
+        .await
+        .expect_err("duplicate shallow packets must have a finite bound");
+        assert!(matches!(error, FetchError::InvalidShallowResponse { .. }));
+        assert_eq!(
+            CliError::from(error).stable_code(),
+            StableErrorCode::NetworkProtocol
+        );
+
+        let mut distinct = BytesMut::new();
+        for n in 0..=super::MAX_RESPONSE_SHALLOW_BOUNDARIES {
+            let kind = if n % 2 == 0 { "shallow" } else { "unshallow" };
+            append_pkt_line(&mut distinct, format!("{kind} {n:040x}\n").as_bytes());
+        }
+        let mut stream: FetchStream = stream::iter([Ok(distinct.freeze())]).boxed();
+        let error = super::read_fetch_stream_for_kind(
+            &mut stream,
+            &OutputConfig::default(),
+            "fetch origin",
+            HashKind::Sha1,
+        )
+        .await
+        .expect_err("combined shallow and unshallow IDs must be bounded");
+        assert!(error.to_string().contains("4096 distinct"));
+        assert_eq!(
+            CliError::from(error).stable_code(),
+            StableErrorCode::NetworkProtocol
+        );
+
+        let mut response = BytesMut::new();
+        for _ in 0..2 {
+            append_pkt_line(&mut response, format!("shallow {oid}\n").as_bytes());
+            append_pkt_line(&mut response, format!("unshallow {oid}\n").as_bytes());
+        }
+        append_pkt_line(&mut response, b"");
+        append_pkt_line(&mut response, b"NAK\n");
+        let mut pack = vec![1];
+        pack.extend_from_slice(&empty_pack_bytes());
+        append_pkt_line(&mut response, &pack);
+        let mut stream: FetchStream = stream::iter([Ok(response.freeze())]).boxed();
+        let result = super::read_fetch_stream_for_kind(
+            &mut stream,
+            &OutputConfig::default(),
+            "fetch origin",
+            HashKind::Sha1,
+        )
+        .await
+        .expect("repeated valid boundaries are accepted once per class");
+        assert_eq!(result.shallow.as_slice(), std::slice::from_ref(&oid));
+        assert_eq!(result.unshallow, [oid]);
+    }
+
+    #[tokio::test]
+    async fn shallow_response_rejects_wrong_kind_and_accepts_blake3() {
+        use git_internal::hash::HashKind;
+
+        use crate::utils::error::{CliError, StableErrorCode};
+
+        let oid = "b".repeat(64);
+        let mut invalid = BytesMut::new();
+        append_pkt_line(&mut invalid, format!("shallow {oid}\n").as_bytes());
+        let mut stream: FetchStream = stream::iter([Ok(invalid.freeze())]).boxed();
+        let error = super::read_fetch_stream_for_kind(
+            &mut stream,
+            &OutputConfig::default(),
+            "fetch origin",
+            HashKind::Sha1,
+        )
+        .await
+        .expect_err("SHA-1 response must reject a 64-digit boundary");
+        assert!(matches!(error, FetchError::InvalidShallowResponse { .. }));
+        assert_eq!(
+            CliError::from(error).stable_code(),
+            StableErrorCode::NetworkProtocol
+        );
+
+        let mut response = BytesMut::new();
+        append_pkt_line(&mut response, format!("shallow {oid}\n").as_bytes());
+        append_pkt_line(&mut response, b"");
+        append_pkt_line(&mut response, b"NAK\n");
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(&2_u32.to_be_bytes());
+        pack.extend_from_slice(&0_u32.to_be_bytes());
+        let checksum = ObjectHash::new_for_kind(HashKind::Blake3, &pack);
+        pack.extend_from_slice(checksum.as_ref());
+        let mut sideband = vec![1];
+        sideband.extend_from_slice(&pack);
+        append_pkt_line(&mut response, &sideband);
+        let mut stream: FetchStream = stream::iter([Ok(response.freeze())]).boxed();
+        let result = super::read_fetch_stream_for_kind(
+            &mut stream,
+            &OutputConfig::default(),
+            "fetch origin",
+            HashKind::Blake3,
+        )
+        .await
+        .expect("BLAKE3 response must retain the explicit hash kind");
+        assert_eq!(result.shallow.as_slice(), std::slice::from_ref(&oid));
+        let merged = super::merged_shallow_boundaries(
+            std::collections::BTreeSet::new(),
+            &result.shallow,
+            &[],
+            HashKind::Blake3,
+        )
+        .expect("BLAKE3 boundary must parse for its explicit kind");
+        assert_eq!(merged.into_iter().collect::<Vec<_>>(), [oid]);
+    }
+
+    #[tokio::test]
+    async fn pre_pack_err_is_not_ignored() {
+        use git_internal::hash::HashKind;
+
+        use crate::utils::error::{CliError, StableErrorCode};
+
+        let mut response = BytesMut::new();
+        append_pkt_line(&mut response, b"ERR upload-pack: not our ref\n");
+        let mut stream: FetchStream = stream::iter([Ok(response.freeze())]).boxed();
+        let error = super::read_fetch_stream_for_kind(
+            &mut stream,
+            &OutputConfig::default(),
+            "fetch origin",
+            HashKind::Sha1,
+        )
+        .await
+        .expect_err("remote rejection before pack must fail");
+        assert!(
+            matches!(&error, FetchError::RemoteSideband { message } if message == "upload-pack: not our ref")
+        );
+        assert_eq!(
+            CliError::from(error).stable_code(),
+            StableErrorCode::NetworkProtocol
+        );
     }
 
     fn assert_async_pkt_protocol_error(source: std::io::Error) {
@@ -5025,8 +6589,7 @@ mod tests {
                     let mut stream: FetchStream = stream::iter(chunks.into_iter().map(Ok)).boxed();
                     let error = read_fetch_stream(&mut stream, &output, "fetch origin")
                         .await
-                        .err()
-                        .expect("an observed truncated frame must fail after a complete pack");
+                        .expect_err("an observed truncated frame must fail after a complete pack");
                     let FetchError::PacketRead { source } = error else {
                         panic!("expected packet read failure")
                     };
@@ -5052,8 +6615,7 @@ mod tests {
                     stream::iter([Ok(incomplete_response.freeze())]).boxed();
                 let error = read_fetch_stream(&mut stream, &output, "fetch origin")
                     .await
-                    .err()
-                    .expect("truncated framing must take precedence over incomplete pack");
+                    .expect_err("truncated framing must take precedence over incomplete pack");
                 let FetchError::PacketRead { source } = error else {
                     panic!("expected packet read failure")
                 };
@@ -5265,8 +6827,7 @@ mod tests {
 
         let error = read_fetch_stream(&mut stream, &output, "fetch origin")
             .await
-            .err()
-            .expect("an incomplete pack must fail at a clean frame boundary");
+            .expect_err("an incomplete pack must fail at a clean frame boundary");
         assert!(
             matches!(&error, FetchError::IncompletePack { received } if *received == pack.len())
         );

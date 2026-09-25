@@ -3,11 +3,13 @@
 //! The `LocalStorage` struct provides methods to read and write Git objects, as well as to search for objects by prefix. It handles the Git object storage format, including zlib compression for loose objects
 //! and the pack file format for packed objects. The implementation also includes caching mechanisms for pack objects to improve performance when accessing packed data.
 use std::{
+    collections::{HashMap, HashSet},
     fs, io,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -33,12 +35,124 @@ static PACK_OBJ_CACHE: Lazy<Mutex<LruCache<String, CacheObject>>> =
 
 const IDX_MAGIC: [u8; 4] = [0xFF, 0x74, 0x4F, 0x63];
 const FANOUT: u64 = 256 * 4;
+const MAX_TYPE_PROBE_DELTA_DEPTH: usize = 128;
+const MAX_TYPE_PROBE_LOOSE_HEADER: usize = 64;
+const MAX_TYPE_PROBE_COMPRESSED_HEADER: u64 = 4096;
+const PACK_INSTALL_WAIT: Duration = Duration::from_secs(30);
+const PACK_INSTALL_POLL: Duration = Duration::from_millis(20);
+
+#[derive(Default)]
+struct TypeProbeState {
+    visiting_offsets: HashSet<(PathBuf, u64)>,
+    resolved_hashes: HashMap<ObjectHash, ObjectType>,
+}
+
+#[derive(Clone)]
+struct PackSnapshot {
+    ready_indexes: Vec<PathBuf>,
+    pending_packs: Vec<PathBuf>,
+    orphan_packs: Vec<PathBuf>,
+}
 
 /// Index version for pack files
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdxVersion {
     V1,
     V2,
+}
+
+/// Reuse one index fanout and file handle while checking a batch of objects.
+struct CheckedPackIndex {
+    index_path: PathBuf,
+    pack_path: PathBuf,
+    opened: Option<OpenedCheckedPackIndex>,
+}
+
+struct OpenedCheckedPackIndex {
+    index_file: fs::File,
+    pack_len: u64,
+    version: IdxVersion,
+    fanout: [u32; 256],
+}
+
+/// A type probe keeps one index open while resolving every remaining hash in a
+/// pack, then drops the handle before visiting the next pack.
+struct TypeProbePackIndex {
+    file: fs::File,
+    version: IdxVersion,
+    fanout: [u32; 256],
+}
+
+impl TypeProbePackIndex {
+    fn open(path: &Path) -> Result<Self, GitError> {
+        let mut file = fs::File::open(path).map_err(GitError::IOError)?;
+        let (version, fanout) =
+            LocalStorage::read_idx_fanout_from_open(&mut file).map_err(GitError::IOError)?;
+        Ok(Self {
+            file,
+            version,
+            fanout,
+        })
+    }
+
+    fn lookup(&mut self, hash: &ObjectHash) -> Result<Option<u64>, GitError> {
+        LocalStorage::read_idx_from_open_binary(&mut self.file, self.version, &self.fanout, hash)
+            .map_err(GitError::IOError)
+    }
+}
+
+impl CheckedPackIndex {
+    fn contains(&mut self, hash: &ObjectHash) -> Result<bool, GitError> {
+        if self.opened.is_none() {
+            let pack_metadata = fs::metadata(&self.pack_path).map_err(GitError::IOError)?;
+            if !pack_metadata.is_file() {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "pack '{}' is not a file",
+                    self.pack_path.display()
+                )));
+            }
+            let mut index_file = fs::File::open(&self.index_path).map_err(GitError::IOError)?;
+            let (version, fanout) = LocalStorage::read_idx_fanout_from_open(&mut index_file)
+                .map_err(GitError::IOError)?;
+            self.opened = Some(OpenedCheckedPackIndex {
+                index_file,
+                pack_len: pack_metadata.len(),
+                version,
+                fanout,
+            });
+        }
+        let Some(opened) = self.opened.as_mut() else {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "pack index '{}' could not be opened",
+                self.index_path.display()
+            )));
+        };
+        let offset = LocalStorage::read_idx_from_open_binary(
+            &mut opened.index_file,
+            opened.version,
+            &opened.fanout,
+            hash,
+        )
+        .map_err(GitError::IOError)?;
+        let Some(offset) = offset else {
+            return Ok(false);
+        };
+        if offset >= opened.pack_len {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "pack index '{}' points outside its pack",
+                self.index_path.display()
+            )));
+        }
+        let mut pack_file = fs::File::open(&self.pack_path).map_err(GitError::IOError)?;
+        pack_file
+            .seek(io::SeekFrom::Start(offset))
+            .map_err(GitError::IOError)?;
+        let mut first_byte = [0u8; 1];
+        pack_file
+            .read_exact(&mut first_byte)
+            .map_err(GitError::IOError)?;
+        Ok(true)
+    }
 }
 
 /// Local filesystem storage backend
@@ -54,6 +168,767 @@ pub struct LocalStorage {
 }
 
 impl LocalStorage {
+    /// Determine an object's type from its loose or pack header. This never
+    /// materializes the body of a large blob or tree while checking a commit
+    /// parent supplied by an untrusted remote.
+    pub(crate) async fn object_type_bounded_probe(
+        &self,
+        hash: &ObjectHash,
+    ) -> Result<ObjectType, GitError> {
+        self.object_types_bounded_probe(&[*hash])
+            .await?
+            .remove(hash)
+            .ok_or_else(|| GitError::ObjectNotFound(hash.to_string()))
+    }
+
+    pub(crate) async fn object_types_bounded_probe(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let storage = self.clone();
+        let hashes = hashes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            if let Some(kind) = storage.hash_kind {
+                set_hash_kind(kind);
+            }
+            let mut result = HashMap::new();
+            let mut state = TypeProbeState::default();
+            let mut processed = vec![HashSet::new(); storage.alternates.len() + 1];
+            let started = Instant::now();
+            loop {
+                let mut pending = None;
+                let mut orphan = None;
+                let issue = storage.object_types_batch_here(
+                    &hashes,
+                    &mut result,
+                    &mut state,
+                    &mut processed[0],
+                )?;
+                Self::remember_pack_issue(issue, &mut pending, &mut orphan);
+                let mut seen = HashSet::new();
+                let mut missing: Vec<_> = hashes
+                    .iter()
+                    .copied()
+                    .filter(|hash| seen.insert(*hash) && !result.contains_key(hash))
+                    .collect();
+                for (index, alternate) in storage.alternates.iter().enumerate() {
+                    if missing.is_empty() {
+                        break;
+                    }
+                    let issue = alternate.object_types_batch_here(
+                        &missing,
+                        &mut result,
+                        &mut state,
+                        &mut processed[index + 1],
+                    )?;
+                    Self::remember_pack_issue(issue, &mut pending, &mut orphan);
+                    missing.retain(|hash| !result.contains_key(hash));
+                }
+                if missing.is_empty() {
+                    return Ok(result);
+                }
+                if let Some(issue) = pending {
+                    if started.elapsed() < PACK_INSTALL_WAIT {
+                        std::thread::sleep(PACK_INSTALL_POLL);
+                        continue;
+                    }
+                    return Err(super::checked_read_error(
+                        &missing[0],
+                        Self::unresolved_pack_error(&issue, true),
+                    ));
+                }
+                if let Some(issue) = orphan {
+                    return Err(super::checked_read_error(
+                        &missing[0],
+                        Self::unresolved_pack_error(&issue, false),
+                    ));
+                }
+                return Ok(result);
+            }
+        })
+        .await
+        .map_err(|error| GitError::IOError(io::Error::other(error)))?
+    }
+
+    fn object_types_batch_here(
+        &self,
+        hashes: &[ObjectHash],
+        result: &mut HashMap<ObjectHash, ObjectType>,
+        state: &mut TypeProbeState,
+        processed: &mut HashSet<PathBuf>,
+    ) -> Result<Option<PackSnapshot>, GitError> {
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        for hash in hashes {
+            if !seen.insert(*hash) || result.contains_key(hash) {
+                continue;
+            }
+            let loose = self.get_obj_path(hash);
+            match fs::symlink_metadata(&loose) {
+                Ok(metadata) if metadata.is_file() => {
+                    let kind = Self::object_type_from_loose_header(&loose)
+                        .map_err(|error| super::checked_read_error(hash, error))?;
+                    result.insert(*hash, kind);
+                    state.resolved_hashes.insert(*hash, kind);
+                }
+                Ok(_) => {
+                    return Err(super::checked_read_error(
+                        hash,
+                        GitError::InvalidObjectInfo(format!(
+                            "object path '{}' is not a file",
+                            loose.display()
+                        )),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(*hash),
+                Err(error) => {
+                    return Err(super::checked_read_error(hash, GitError::IOError(error)));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(None);
+        }
+
+        let pack_dir = self.base_path.join("pack");
+        let snapshot = Self::pack_snapshot(&pack_dir)
+            .map_err(|error| super::checked_read_error(&missing[0], error))?;
+        for index_path in &snapshot.ready_indexes {
+            if missing.is_empty() {
+                break;
+            }
+            if !processed.insert(index_path.clone()) {
+                continue;
+            }
+            let pack = index_path.with_extension("pack");
+            let metadata = fs::metadata(&pack).map_err(|error| {
+                super::checked_read_error(&missing[0], GitError::IOError(error))
+            })?;
+            if !metadata.is_file() {
+                return Err(super::checked_read_error(
+                    &missing[0],
+                    GitError::InvalidObjectInfo(format!("pack '{}' is not a file", pack.display())),
+                ));
+            }
+            let pack_len = metadata.len();
+            let mut index = TypeProbePackIndex::open(index_path)
+                .map_err(|error| super::checked_read_error(&missing[0], error))?;
+            let mut unresolved = Vec::new();
+            for hash in missing {
+                let offset = index
+                    .lookup(&hash)
+                    .map_err(|error| super::checked_read_error(&hash, error))?;
+                let Some(offset) = offset else {
+                    unresolved.push(hash);
+                    continue;
+                };
+                if !(12..pack_len).contains(&offset) {
+                    return Err(super::checked_read_error(
+                        &hash,
+                        GitError::InvalidObjectInfo(format!(
+                            "pack index '{}' points outside its pack",
+                            index_path.display()
+                        )),
+                    ));
+                }
+                let kind = Self::object_type_at_pack_offset(
+                    &pack,
+                    offset,
+                    0,
+                    state,
+                    self,
+                    Some(&mut index),
+                )
+                .map_err(|error| super::checked_read_error(&hash, error))?;
+                result.insert(hash, kind);
+                state.resolved_hashes.insert(hash, kind);
+                state.visiting_offsets.clear();
+            }
+            missing = unresolved;
+        }
+        Ok((!missing.is_empty()).then_some(snapshot))
+    }
+
+    fn object_type_for_hash(
+        &self,
+        hash: &ObjectHash,
+        depth: usize,
+        state: &mut TypeProbeState,
+    ) -> Result<Option<ObjectType>, GitError> {
+        if let Some(kind) = state.resolved_hashes.get(hash) {
+            return Ok(Some(*kind));
+        }
+        let mut processed = vec![HashSet::new(); self.alternates.len() + 1];
+        let started = Instant::now();
+        loop {
+            let mut pending = None;
+            let mut orphan = None;
+            let (found, issue) = self.object_type_here(hash, depth, state, &mut processed[0])?;
+            Self::remember_pack_issue(issue, &mut pending, &mut orphan);
+            if let Some(kind) = found {
+                state.resolved_hashes.insert(*hash, kind);
+                return Ok(Some(kind));
+            }
+            for (index, alternate) in self.alternates.iter().enumerate() {
+                let (found, issue) =
+                    alternate.object_type_here(hash, depth, state, &mut processed[index + 1])?;
+                Self::remember_pack_issue(issue, &mut pending, &mut orphan);
+                if let Some(kind) = found {
+                    state.resolved_hashes.insert(*hash, kind);
+                    return Ok(Some(kind));
+                }
+            }
+            if let Some(issue) = pending {
+                if started.elapsed() < PACK_INSTALL_WAIT {
+                    std::thread::sleep(PACK_INSTALL_POLL);
+                    continue;
+                }
+                return Err(Self::unresolved_pack_error(&issue, true));
+            }
+            if let Some(issue) = orphan {
+                return Err(Self::unresolved_pack_error(&issue, false));
+            }
+            return Ok(None);
+        }
+    }
+
+    fn object_type_here(
+        &self,
+        hash: &ObjectHash,
+        depth: usize,
+        state: &mut TypeProbeState,
+        processed: &mut HashSet<PathBuf>,
+    ) -> Result<(Option<ObjectType>, Option<PackSnapshot>), GitError> {
+        let loose = self.get_obj_path(hash);
+        match fs::symlink_metadata(&loose) {
+            Ok(metadata) if metadata.is_file() => {
+                return Self::object_type_from_loose_header(&loose).map(|kind| (Some(kind), None));
+            }
+            Ok(_) => {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "object path '{}' is not a file",
+                    loose.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(GitError::IOError(error)),
+        }
+
+        let pack_dir = self.base_path.join("pack");
+        let snapshot = Self::pack_snapshot(&pack_dir)?;
+        for index in &snapshot.ready_indexes {
+            if !processed.insert(index.clone()) {
+                continue;
+            }
+            let pack = index.with_extension("pack");
+            let pack_len = fs::metadata(&pack).map_err(GitError::IOError)?.len();
+            let mut index_file = TypeProbePackIndex::open(index)?;
+            let offset = index_file.lookup(hash)?;
+            if let Some(offset) = offset {
+                if !(12..pack_len).contains(&offset) {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "pack index '{}' points outside its pack",
+                        index.display()
+                    )));
+                }
+                return Self::object_type_at_pack_offset(
+                    &pack,
+                    offset,
+                    depth,
+                    state,
+                    self,
+                    Some(&mut index_file),
+                )
+                .map(|kind| (Some(kind), None));
+            }
+        }
+        Ok((None, Some(snapshot)))
+    }
+
+    fn object_type_from_loose_header(path: &Path) -> Result<ObjectType, GitError> {
+        let file = fs::File::open(path).map_err(GitError::IOError)?;
+        let mut decoder =
+            flate2::read::ZlibDecoder::new(file.take(MAX_TYPE_PROBE_COMPRESSED_HEADER));
+        let mut header = Vec::with_capacity(MAX_TYPE_PROBE_LOOSE_HEADER);
+        loop {
+            if header.len() == MAX_TYPE_PROBE_LOOSE_HEADER {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "loose object header at '{}' exceeds {MAX_TYPE_PROBE_LOOSE_HEADER} bytes",
+                    path.display()
+                )));
+            }
+            let mut byte = [0u8; 1];
+            decoder.read_exact(&mut byte).map_err(|error| {
+                GitError::InvalidObjectInfo(format!(
+                    "cannot read loose object header at '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            if byte[0] == 0 {
+                break;
+            }
+            header.push(byte[0]);
+        }
+        let text = std::str::from_utf8(&header).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "loose object header at '{}' is not UTF-8: {error}",
+                path.display()
+            ))
+        })?;
+        let (kind, size) = text.split_once(' ').ok_or_else(|| {
+            GitError::InvalidObjectInfo(format!(
+                "loose object at '{}' has an invalid header",
+                path.display()
+            ))
+        })?;
+        if kind.is_empty() || size.is_empty() || size.contains(' ') || size.parse::<u64>().is_err()
+        {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "loose object at '{}' has an invalid header",
+                path.display()
+            )));
+        }
+        ObjectType::from_string(kind).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "loose object at '{}' has an invalid type: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    fn object_type_at_pack_offset(
+        pack: &Path,
+        offset: u64,
+        depth: usize,
+        state: &mut TypeProbeState,
+        storage: &Self,
+        index: Option<&mut TypeProbePackIndex>,
+    ) -> Result<ObjectType, GitError> {
+        if depth >= MAX_TYPE_PROBE_DELTA_DEPTH {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "delta chain at offset {offset} in '{}' exceeds depth {MAX_TYPE_PROBE_DELTA_DEPTH}",
+                pack.display()
+            )));
+        }
+        if !state.visiting_offsets.insert((pack.to_path_buf(), offset)) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "delta cycle at offset {offset} in '{}'",
+                pack.display()
+            )));
+        }
+        let mut file = fs::File::open(pack).map_err(GitError::IOError)?;
+        file.seek(io::SeekFrom::Start(offset))
+            .map_err(GitError::IOError)?;
+        let (kind, _) = Self::read_type_probe_pack_header(&mut file, pack, offset)?;
+        match kind {
+            1..=4 => ObjectType::from_pack_type_u8(kind),
+            5 | 6 => {
+                let distance = Self::read_type_probe_ofs_distance(&mut file, pack, offset)?;
+                let base = offset
+                    .checked_sub(distance)
+                    .filter(|base| *base >= 12)
+                    .ok_or_else(|| {
+                        GitError::InvalidObjectInfo(format!(
+                            "OFS_DELTA at offset {offset} in '{}' points before its pack",
+                            pack.display()
+                        ))
+                    })?;
+                Self::object_type_at_pack_offset(pack, base, depth + 1, state, storage, index)
+            }
+            7 => {
+                let base = ObjectHash::from_stream_for_kind(get_hash_kind(), &mut file).map_err(
+                    |error| {
+                        GitError::InvalidObjectInfo(format!(
+                            "cannot read REF_DELTA base at offset {offset} in '{}': {error}",
+                            pack.display()
+                        ))
+                    },
+                )?;
+                if let Some(kind) = state.resolved_hashes.get(&base) {
+                    return Ok(*kind);
+                }
+                if let Some(index) = index
+                    && let Some(base_offset) = index.lookup(&base)?
+                {
+                    let kind = Self::object_type_at_pack_offset(
+                        pack,
+                        base_offset,
+                        depth + 1,
+                        state,
+                        storage,
+                        Some(index),
+                    )?;
+                    state.resolved_hashes.insert(base, kind);
+                    return Ok(kind);
+                }
+                storage
+                    .object_type_for_hash(&base, depth + 1, state)?
+                    .ok_or_else(|| {
+                        GitError::ObjectNotFound(format!(
+                            "REF_DELTA base {base} for pack '{}'",
+                            pack.display()
+                        ))
+                    })
+            }
+            _ => Err(GitError::InvalidObjectInfo(format!(
+                "unsupported pack object type {kind} at offset {offset} in '{}'",
+                pack.display()
+            ))),
+        }
+    }
+
+    fn read_type_probe_pack_header(
+        file: &mut fs::File,
+        pack: &Path,
+        offset: u64,
+    ) -> Result<(u8, u64), GitError> {
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).map_err(GitError::IOError)?;
+        let mut current = byte[0];
+        let kind = (current >> 4) & 7;
+        let mut size = u64::from(current & 15);
+        let mut shift = 4u32;
+        while current & 0x80 != 0 {
+            file.read_exact(&mut byte).map_err(GitError::IOError)?;
+            current = byte[0];
+            let part = u64::from(current & 0x7f);
+            if shift >= 64 || part > (u64::MAX >> shift) {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "pack object size at offset {offset} in '{}' exceeds u64",
+                    pack.display()
+                )));
+            }
+            size |= part << shift;
+            shift += 7;
+        }
+        Ok((kind, size))
+    }
+
+    fn read_type_probe_ofs_distance(
+        file: &mut fs::File,
+        pack: &Path,
+        offset: u64,
+    ) -> Result<u64, GitError> {
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).map_err(GitError::IOError)?;
+        let mut current = byte[0];
+        let mut distance = u64::from(current & 0x7f);
+        let mut count = 1;
+        while current & 0x80 != 0 {
+            if count >= 10 {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "overlong OFS_DELTA distance at offset {offset} in '{}'",
+                    pack.display()
+                )));
+            }
+            file.read_exact(&mut byte).map_err(GitError::IOError)?;
+            current = byte[0];
+            distance = distance
+                .checked_add(1)
+                .and_then(|next| next.checked_mul(128))
+                .and_then(|next| next.checked_add(u64::from(current & 0x7f)))
+                .ok_or_else(|| {
+                    GitError::InvalidObjectInfo(format!(
+                        "OFS_DELTA distance at offset {offset} in '{}' exceeds u64",
+                        pack.display()
+                    ))
+                })?;
+            count += 1;
+        }
+        Ok(distance)
+    }
+
+    /// Snapshot usable indexes and packs whose index may still be publishing.
+    /// Callers inspect healthy stores first and defer orphan errors until they
+    /// know whether any requested object is still unresolved.
+    fn pack_snapshot(pack_dir: &Path) -> Result<PackSnapshot, GitError> {
+        let entries = match fs::read_dir(pack_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(PackSnapshot {
+                    ready_indexes: Vec::new(),
+                    pending_packs: Vec::new(),
+                    orphan_packs: Vec::new(),
+                });
+            }
+            Err(error) => return Err(GitError::IOError(error)),
+        };
+        let mut packs = HashSet::new();
+        let mut indexes = HashSet::new();
+        for entry in entries {
+            let path = entry.map_err(GitError::IOError)?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "pack")
+            {
+                packs.insert(path);
+            } else if path.extension().is_some_and(|extension| extension == "idx") {
+                indexes.insert(path);
+            }
+        }
+        let mut snapshot = PackSnapshot {
+            ready_indexes: Vec::new(),
+            pending_packs: Vec::new(),
+            orphan_packs: Vec::new(),
+        };
+        for pack in packs {
+            let index = pack.with_extension("idx");
+            let has_index = indexes.remove(&index);
+            if Self::pack_install_lock_held(&pack)? {
+                snapshot.pending_packs.push(pack);
+            } else if has_index {
+                snapshot.ready_indexes.push(index);
+            } else {
+                snapshot.orphan_packs.push(pack);
+            }
+        }
+        // An index without its pack is also an incomplete store. Defer the
+        // error if another healthy index already satisfies the whole query.
+        for index in indexes {
+            snapshot.orphan_packs.push(index.with_extension("pack"));
+        }
+        snapshot.ready_indexes.sort();
+        Ok(snapshot)
+    }
+
+    fn unresolved_pack_error(snapshot: &PackSnapshot, timed_out: bool) -> GitError {
+        if timed_out && let Some(pack) = snapshot.pending_packs.first() {
+            return GitError::InvalidObjectInfo(format!(
+                "timed out waiting for another fetch to finish installing pack '{}'; retry after it finishes",
+                pack.display()
+            ));
+        }
+        if let Some(pack) = snapshot.orphan_packs.first() {
+            return GitError::InvalidObjectInfo(format!(
+                "pack '{}' has no complete index; run 'libra index-pack <pack>' to rebuild it, then retry",
+                pack.display()
+            ));
+        }
+        GitError::InvalidObjectInfo(format!(
+            "{} for another fetch to finish installing pack '{}'; retry after it finishes",
+            if timed_out {
+                "timed out waiting"
+            } else {
+                "waiting"
+            },
+            snapshot.pending_packs.first().map_or_else(
+                || "<unknown>".to_string(),
+                |pack| pack.display().to_string()
+            )
+        ))
+    }
+
+    fn remember_pack_issue(
+        issue: Option<PackSnapshot>,
+        pending: &mut Option<PackSnapshot>,
+        orphan: &mut Option<PackSnapshot>,
+    ) {
+        if let Some(issue) = issue {
+            if pending.is_none() && !issue.pending_packs.is_empty() {
+                *pending = Some(issue.clone());
+            }
+            if orphan.is_none() && !issue.orphan_packs.is_empty() {
+                *orphan = Some(issue);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn pack_install_lock_held(pack: &Path) -> Result<bool, GitError> {
+        use std::os::fd::AsRawFd;
+
+        let lock_path = pack.with_extension("install.lock");
+        let file = match fs::File::open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(GitError::IOError(error)),
+        };
+        // SAFETY: flock uses the live descriptor owned by `file`; dropping it
+        // releases an uncontended probe lock immediately.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(true),
+            _ => Err(GitError::IOError(error)),
+        }
+    }
+
+    #[cfg(windows)]
+    fn pack_install_lock_held(pack: &Path) -> Result<bool, GitError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let lock_path = pack.with_extension("install.lock");
+        match fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(lock_path)
+        {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(true),
+            Err(error) => Err(GitError::IOError(error)),
+        }
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    fn pack_install_lock_held(_pack: &Path) -> Result<bool, GitError> {
+        Err(GitError::IOError(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cross-process pack installation locking is unsupported on this platform",
+        )))
+    }
+
+    fn checked_loose_present(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        let loose = self.get_obj_path(hash);
+        match fs::symlink_metadata(&loose) {
+            Ok(metadata) if metadata.is_file() => {
+                fs::File::open(&loose).map_err(GitError::IOError)?;
+                Ok(true)
+            }
+            Ok(_) => Err(GitError::InvalidObjectInfo(format!(
+                "object path '{}' is not a file",
+                loose.display()
+            ))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(GitError::IOError(error)),
+        }
+    }
+
+    /// Presence probe that preserves filesystem and pack-index failures.
+    fn exist_checked_here(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        if self.checked_loose_present(hash)? {
+            return Ok(true);
+        }
+
+        let pack_dir = self.base_path.join("pack");
+        let entries = match fs::read_dir(&pack_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(GitError::IOError(error)),
+        };
+        let mut packs = HashSet::new();
+        let mut indexes = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(GitError::IOError)?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "pack")
+            {
+                packs.insert(path);
+            } else if path.extension().is_some_and(|extension| extension == "idx") {
+                indexes.push(path);
+            }
+        }
+        let indexed_packs: HashSet<_> = indexes
+            .iter()
+            .map(|index| index.with_extension("pack"))
+            .collect();
+        for pack in &packs {
+            if !indexed_packs.contains(pack) {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "pack '{}' has no complete index; run 'libra index-pack <pack>' to rebuild it, then retry",
+                    pack.display()
+                )));
+            }
+        }
+        for index in indexes {
+            let pack = index.with_extension("pack");
+            let pack_metadata = fs::metadata(&pack).map_err(GitError::IOError)?;
+            if !pack_metadata.is_file() {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "pack '{}' is not a file",
+                    pack.display()
+                )));
+            }
+            let Some(offset) = Self::read_idx(&index, hash).map_err(GitError::IOError)? else {
+                continue;
+            };
+            if offset >= pack_metadata.len() {
+                return Err(GitError::InvalidObjectInfo(format!(
+                    "pack index '{}' points outside its pack",
+                    index.display()
+                )));
+            }
+            let mut file = fs::File::open(&pack).map_err(GitError::IOError)?;
+            file.seek(io::SeekFrom::Start(offset))
+                .map_err(GitError::IOError)?;
+            let mut first_byte = [0u8; 1];
+            file.read_exact(&mut first_byte)
+                .map_err(GitError::IOError)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Probe each store's loose files and pack directory once for a batch.
+    /// Visit each index once, keeping only that index's file open while checking
+    /// the unresolved hashes. This bounds file descriptors even with many packs.
+    fn exist_checked_batch_here(
+        &self,
+        hashes: &[ObjectHash],
+        processed: &mut HashSet<PathBuf>,
+    ) -> Result<(HashMap<ObjectHash, bool>, Option<PackSnapshot>), GitError> {
+        let mut results = HashMap::with_capacity(hashes.len());
+        let mut seen = HashSet::with_capacity(hashes.len());
+        let mut missing = Vec::new();
+        for hash in hashes {
+            if !seen.insert(*hash) {
+                continue;
+            }
+            if self
+                .checked_loose_present(hash)
+                .map_err(|error| super::checked_probe_error(hash, error))?
+            {
+                results.insert(*hash, true);
+            } else {
+                missing.push(*hash);
+            }
+        }
+        if missing.is_empty() {
+            return Ok((results, None));
+        }
+
+        let pack_dir = self.base_path.join("pack");
+        let snapshot = Self::pack_snapshot(&pack_dir)
+            .map_err(|error| super::checked_probe_error(&missing[0], error))?;
+        for index_path in &snapshot.ready_indexes {
+            if missing.is_empty() {
+                break;
+            }
+            if !processed.insert(index_path.clone()) {
+                continue;
+            }
+            let mut index = CheckedPackIndex {
+                pack_path: index_path.with_extension("pack"),
+                index_path: index_path.clone(),
+                opened: None,
+            };
+            let mut unresolved = Vec::new();
+            for hash in missing {
+                if index
+                    .contains(&hash)
+                    .map_err(|error| super::checked_probe_error(&hash, error))?
+                {
+                    results.insert(hash, true);
+                } else {
+                    unresolved.push(hash);
+                }
+            }
+            missing = unresolved;
+        }
+        let issue = (!missing.is_empty()).then_some(snapshot);
+        for hash in missing {
+            results.insert(hash, false);
+        }
+        Ok((results, issue))
+    }
+
     pub fn new(base_path: PathBuf) -> Self {
         fs::create_dir_all(&base_path).unwrap_or_else(|err| {
             panic!(
@@ -378,7 +1253,13 @@ impl LocalStorage {
 
     fn read_idx_fanout(idx_file: &Path) -> Result<(IdxVersion, [u32; 256]), io::Error> {
         let mut idx_file = fs::File::open(idx_file)?;
-        let version = Self::read_idx_version(&mut idx_file)?;
+        Self::read_idx_fanout_from_open(&mut idx_file)
+    }
+
+    fn read_idx_fanout_from_open(
+        idx_file: &mut fs::File,
+    ) -> Result<(IdxVersion, [u32; 256]), io::Error> {
+        let version = Self::read_idx_version(idx_file)?;
         let fanout_offset = match version {
             IdxVersion::V1 => 0,
             IdxVersion::V2 => 8,
@@ -394,9 +1275,17 @@ impl LocalStorage {
     }
 
     fn read_idx(idx_file: &Path, obj_id: &ObjectHash) -> Result<Option<u64>, io::Error> {
-        let (version, fanout) = Self::read_idx_fanout(idx_file)?;
         let mut idx_file = fs::File::open(idx_file)?;
+        let (version, fanout) = Self::read_idx_fanout_from_open(&mut idx_file)?;
+        Self::read_idx_from_open(&mut idx_file, version, &fanout, obj_id)
+    }
 
+    fn read_idx_from_open(
+        idx_file: &mut fs::File,
+        version: IdxVersion,
+        fanout: &[u32; 256],
+        obj_id: &ObjectHash,
+    ) -> Result<Option<u64>, io::Error> {
         let first_byte = obj_id.as_ref()[0];
         let start = if first_byte == 0 {
             0
@@ -418,7 +1307,7 @@ impl LocalStorage {
                 idx_file.seek(io::SeekFrom::Start(FANOUT + 24 * start as u64))?;
                 for _ in start..end {
                     let offset = idx_file.read_u32::<BigEndian>()?;
-                    let hash = read_sha(&mut idx_file)?;
+                    let hash = read_sha(idx_file)?;
 
                     if &hash == obj_id {
                         return Ok(Some(offset as u64));
@@ -431,7 +1320,7 @@ impl LocalStorage {
                 idx_file.seek(io::SeekFrom::Start(names_offset + hash_size * start as u64))?;
                 let mut found_index = None;
                 for i in start..end {
-                    let hash = read_sha(&mut idx_file)?;
+                    let hash = read_sha(idx_file)?;
                     if &hash == obj_id {
                         found_index = Some(i as u64);
                         break;
@@ -455,6 +1344,75 @@ impl LocalStorage {
                     Ok(Some(offset as u64))
                 }
             }
+        }
+    }
+
+    /// Batch-only lookup: pack index names are sorted within each fanout
+    /// bucket, so binary search avoids rescanning a large bucket for every
+    /// advertised shallow boundary. The single-object path above is unchanged.
+    fn read_idx_from_open_binary(
+        idx_file: &mut fs::File,
+        version: IdxVersion,
+        fanout: &[u32; 256],
+        obj_id: &ObjectHash,
+    ) -> Result<Option<u64>, io::Error> {
+        let first_byte = usize::from(obj_id.as_ref()[0]);
+        let mut low = if first_byte == 0 {
+            0
+        } else {
+            u64::from(fanout[first_byte - 1])
+        };
+        let mut high = u64::from(fanout[first_byte]);
+        let object_count = u64::from(fanout[255]);
+        let hash_size = get_hash_kind().size() as u64;
+        if version == IdxVersion::V1 && hash_size != 20 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pack index v1 only supports sha1",
+            ));
+        }
+
+        let names_offset = match version {
+            IdxVersion::V1 => FANOUT,
+            IdxVersion::V2 => FANOUT + 8,
+        };
+        let mut found_index = None;
+        while low < high {
+            let index = low + (high - low) / 2;
+            let name_position = match version {
+                IdxVersion::V1 => names_offset + index * 24 + 4,
+                IdxVersion::V2 => names_offset + index * hash_size,
+            };
+            idx_file.seek(io::SeekFrom::Start(name_position))?;
+            let candidate = read_sha(&mut *idx_file)?;
+            match candidate.as_ref().cmp(obj_id.as_ref()) {
+                std::cmp::Ordering::Less => low = index + 1,
+                std::cmp::Ordering::Greater => high = index,
+                std::cmp::Ordering::Equal => {
+                    found_index = Some(index);
+                    break;
+                }
+            }
+        }
+        let Some(index) = found_index else {
+            return Ok(None);
+        };
+
+        let offset_position = match version {
+            IdxVersion::V1 => names_offset + index * 24,
+            IdxVersion::V2 => {
+                names_offset + object_count * hash_size + object_count * 4 + index * 4
+            }
+        };
+        idx_file.seek(io::SeekFrom::Start(offset_position))?;
+        let offset = idx_file.read_u32::<BigEndian>()?;
+        if version == IdxVersion::V2 && offset & 0x8000_0000 != 0 {
+            let large_index = u64::from(offset & 0x7fff_ffff);
+            let large_offsets_offset = names_offset + object_count * hash_size + object_count * 8;
+            idx_file.seek(io::SeekFrom::Start(large_offsets_offset + large_index * 8))?;
+            Ok(Some(idx_file.read_u64::<BigEndian>()?))
+        } else {
+            Ok(Some(u64::from(offset)))
         }
     }
 
@@ -702,6 +1660,26 @@ impl LocalStorage {
 
 #[async_trait]
 impl Storage for LocalStorage {
+    async fn object_type_bounded_probe(&self, hash: &ObjectHash) -> Result<ObjectType, GitError> {
+        LocalStorage::object_type_bounded_probe(self, hash).await
+    }
+
+    async fn object_types_bounded_probe(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        LocalStorage::object_types_bounded_probe(self, hashes).await
+    }
+
+    async fn object_types_bounded_probe_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        _remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        let kinds = LocalStorage::object_types_bounded_probe(self, hashes).await?;
+        Ok((kinds, 0))
+    }
+
     async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
         let self_clone = self.clone();
         let hash = *hash;
@@ -838,6 +1816,130 @@ impl Storage for LocalStorage {
         })
         .await
         .unwrap_or(false)
+    }
+
+    async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        let self_clone = self.clone();
+        let hash = *hash;
+        tokio::task::spawn_blocking(move || {
+            if let Some(kind) = self_clone.hash_kind {
+                set_hash_kind(kind);
+            }
+            if self_clone.exist_checked_here(&hash)? {
+                return Ok(true);
+            }
+            for alternate in &self_clone.alternates {
+                if !alternate.exist_checked_here(&hash)? {
+                    continue;
+                }
+                // Borrowed hits must retain the existing full-byte OID check.
+                // The limit prevents an advertised commit parent from forcing
+                // an unbounded alternate object read.
+                const MAX_ALTERNATE_PROBE_BYTES: u64 = 64 * 1024 * 1024;
+                let (payload, object_type) = alternate
+                    .get_here_with_limit(&hash, Some(MAX_ALTERNATE_PROBE_BYTES))?
+                    .ok_or_else(|| {
+                        GitError::ObjectNotFound(format!(
+                            "alternate object {hash} disappeared during checked probe"
+                        ))
+                    })?;
+                super::tiered::verify_fetched_object(&hash, object_type, &payload)?;
+                return Ok(true);
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|error| GitError::IOError(io::Error::other(error)))?
+    }
+
+    async fn exist_checked_batch(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, bool>, GitError> {
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let self_clone = self.clone();
+        let hashes = hashes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            if let Some(kind) = self_clone.hash_kind {
+                set_hash_kind(kind);
+            }
+            let mut results = HashMap::new();
+            let mut processed = vec![HashSet::new(); self_clone.alternates.len() + 1];
+            let started = Instant::now();
+            loop {
+                let mut pending = None;
+                let mut orphan = None;
+                let mut seen = HashSet::with_capacity(hashes.len());
+                let mut unresolved: Vec<_> = hashes
+                    .iter()
+                    .copied()
+                    .filter(|hash| seen.insert(*hash) && results.get(hash) != Some(&true))
+                    .collect();
+                let (primary_hits, issue) =
+                    self_clone.exist_checked_batch_here(&unresolved, &mut processed[0])?;
+                Self::remember_pack_issue(issue, &mut pending, &mut orphan);
+                results.extend(primary_hits);
+                unresolved.retain(|hash| results.get(hash) != Some(&true));
+                for (index, alternate) in self_clone.alternates.iter().enumerate() {
+                    if unresolved.is_empty() {
+                        break;
+                    }
+                    let (alternate_hits, issue) = alternate
+                        .exist_checked_batch_here(&unresolved, &mut processed[index + 1])?;
+                    Self::remember_pack_issue(issue, &mut pending, &mut orphan);
+                    let mut still_missing = Vec::new();
+                    for hash in unresolved {
+                        let present = alternate_hits.get(&hash).copied().ok_or_else(|| {
+                            GitError::InvalidObjectInfo(format!(
+                                "alternate checked probe omitted object {hash}"
+                            ))
+                        })?;
+                        if !present {
+                            still_missing.push(hash);
+                            continue;
+                        }
+                        // Borrowed hits retain bounded, full-byte OID verification.
+                        const MAX_ALTERNATE_PROBE_BYTES: u64 = 64 * 1024 * 1024;
+                        let (payload, object_type) = alternate
+                            .get_here_with_limit(&hash, Some(MAX_ALTERNATE_PROBE_BYTES))
+                            .map_err(|error| super::checked_probe_error(&hash, error))?
+                            .ok_or_else(|| {
+                                GitError::ObjectNotFound(format!(
+                                    "alternate object {hash} disappeared during checked probe"
+                                ))
+                            })?;
+                        super::tiered::verify_fetched_object(&hash, object_type, &payload)
+                            .map_err(|error| super::checked_probe_error(&hash, error))?;
+                        results.insert(hash, true);
+                    }
+                    unresolved = still_missing;
+                }
+                if unresolved.is_empty() {
+                    return Ok(results);
+                }
+                if let Some(issue) = pending {
+                    if started.elapsed() < PACK_INSTALL_WAIT {
+                        std::thread::sleep(PACK_INSTALL_POLL);
+                        continue;
+                    }
+                    return Err(super::checked_probe_error(
+                        &unresolved[0],
+                        Self::unresolved_pack_error(&issue, true),
+                    ));
+                }
+                if let Some(issue) = orphan {
+                    return Err(super::checked_probe_error(
+                        &unresolved[0],
+                        Self::unresolved_pack_error(&issue, false),
+                    ));
+                }
+                return Ok(results);
+            }
+        })
+        .await
+        .map_err(|error| GitError::IOError(io::Error::other(error)))?
     }
 
     async fn object_size(&self, hash: &ObjectHash) -> Result<Option<u64>, GitError> {
@@ -1169,6 +2271,459 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial(hash_kind)]
+    async fn type_probe_reads_only_large_loose_blob_and_tree_headers() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary object store");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        for (byte, kind) in [(0x31, ObjectType::Blob), (0x32, ObjectType::Tree)] {
+            let hash = ObjectHash::Sha1([byte; 20]);
+            let path = storage.get_obj_path(&hash);
+            fs::create_dir_all(path.parent().expect("object shard")).expect("create shard");
+            let file = fs::File::create(&path).expect("create loose fixture");
+            let mut encoder = ZlibEncoder::new(file, Compression::default());
+            encoder
+                .write_all(format!("{kind} {}\0", 1u64 << 35).as_bytes())
+                .expect("write large declared header");
+            encoder.finish().expect("finish header-only fixture");
+
+            assert_eq!(
+                <LocalStorage as Storage>::object_type_bounded_probe(&storage, &hash)
+                    .await
+                    .expect("type probe reads only the header"),
+                kind
+            );
+            assert!(
+                storage.get_with_limit(&hash, 1024).await.is_err(),
+                "the full object is intentionally absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hash_kind)]
+    async fn type_probe_reads_only_large_packed_blob_and_tree_headers() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary pack directory");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        for (number, kind) in [(3u8, ObjectType::Blob), (2u8, ObjectType::Tree)] {
+            let pack = dir.path().join(format!("header-{number}.pack"));
+            let mut bytes = vec![0; 12];
+            let mut size = 1u64 << 35;
+            let mut first = (number << 4) | (size as u8 & 0x0f);
+            size >>= 4;
+            if size != 0 {
+                first |= 0x80;
+            }
+            bytes.push(first);
+            while size != 0 {
+                let mut byte = (size & 0x7f) as u8;
+                size >>= 7;
+                if size != 0 {
+                    byte |= 0x80;
+                }
+                bytes.push(byte);
+            }
+            fs::write(&pack, bytes).expect("write header-only pack fixture");
+            assert_eq!(
+                LocalStorage::object_type_at_pack_offset(
+                    &pack,
+                    12,
+                    0,
+                    &mut TypeProbeState::default(),
+                    &storage,
+                    None,
+                )
+                .expect("type probe reads only the pack header"),
+                kind
+            );
+        }
+
+        let zstd_delta_pack = dir.path().join("offset-zstdelta.pack");
+        let mut bytes = vec![0; 12];
+        bytes.extend_from_slice(&[0x30, 0x50, 0x01]);
+        fs::write(&zstd_delta_pack, bytes).expect("write zstd delta header fixture");
+        assert_eq!(
+            LocalStorage::object_type_at_pack_offset(
+                &zstd_delta_pack,
+                13,
+                0,
+                &mut TypeProbeState::default(),
+                &storage,
+                None,
+            )
+            .expect("resolve OffsetZstdelta base without decoding its body"),
+            ObjectType::Blob
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hash_kind)]
+    async fn type_probe_resolves_ofs_and_ref_delta_bases_without_decoding_payloads() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary object store");
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        let pack = pack_dir.join("ofs-delta-sha1.pack");
+        fs::copy(&fixture, &pack).expect("copy OFS delta fixture");
+        let index = pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            pack.to_str().expect("UTF-8 pack path"),
+            index.to_str().expect("UTF-8 index path"),
+        )
+        .expect("index OFS delta fixture");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let ofs_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse fixture delta hash");
+        assert_eq!(
+            storage
+                .object_type_bounded_probe(&ofs_delta)
+                .await
+                .expect("resolve OFS delta base type"),
+            ObjectType::Blob
+        );
+
+        let ref_base = ObjectHash::from_type_and_data(ObjectType::Tree, b"base tree");
+        storage
+            .put(&ref_base, b"base tree", ObjectType::Tree)
+            .await
+            .expect("store REF delta base");
+        let ref_pack = dir.path().join("ref-delta.pack");
+        let mut bytes = vec![0; 12];
+        bytes.push(0x70); // REF_DELTA, zero encoded bytes; payload is intentionally absent.
+        bytes.extend_from_slice(ref_base.as_ref());
+        fs::write(&ref_pack, bytes).expect("write REF delta header fixture");
+        assert_eq!(
+            LocalStorage::object_type_at_pack_offset(
+                &ref_pack,
+                12,
+                0,
+                &mut TypeProbeState::default(),
+                &storage,
+                None,
+            )
+            .expect("resolve REF delta base type"),
+            ObjectType::Tree
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(hash_kind)]
+    fn ref_delta_cross_pack_type_probe_ignores_unrelated_orphan_or_installer() {
+        use std::os::fd::AsRawFd;
+
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary object store");
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let healthy_pack = pack_dir.join("pack-base.pack");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack"),
+            &healthy_pack,
+        )
+        .expect("copy base pack");
+        let healthy_idx = healthy_pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            healthy_pack.to_str().expect("UTF-8 pack path"),
+            healthy_idx.to_str().expect("UTF-8 index path"),
+        )
+        .expect("index base pack");
+        let unrelated = pack_dir.join("pack-unrelated.pack");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/small-sha1.pack"),
+            &unrelated,
+        )
+        .expect("copy unindexed unrelated pack");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let base = ObjectHash::from_str("b1a36d7748643b07e2bd006211e9e6a492f6bb8b")
+            .expect("parse packed base OID");
+        let ref_pack = dir.path().join("reference.pack");
+        let mut bytes = vec![0; 12];
+        bytes.push(0x70);
+        bytes.extend_from_slice(base.as_ref());
+        fs::write(&ref_pack, bytes).expect("write REF delta header");
+        let probe = || {
+            LocalStorage::object_type_at_pack_offset(
+                &ref_pack,
+                12,
+                0,
+                &mut TypeProbeState::default(),
+                &storage,
+                None,
+            )
+        };
+        assert_eq!(
+            probe().expect("healthy cross-pack base ignores orphan"),
+            ObjectType::Blob
+        );
+
+        let lock = fs::File::create(unrelated.with_extension("install.lock"))
+            .expect("create unrelated install lock");
+        // SAFETY: this owned descriptor remains alive until after the probe.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert_eq!(
+            probe().expect("healthy cross-pack base ignores active unrelated installer"),
+            ObjectType::Blob
+        );
+        drop(lock);
+
+        let missing = ObjectHash::Sha1([0xc3; 20]);
+        let mut missing_bytes = vec![0; 12];
+        missing_bytes.push(0x70);
+        missing_bytes.extend_from_slice(missing.as_ref());
+        fs::write(&ref_pack, missing_bytes).expect("write missing REF delta base");
+        let error = probe().expect_err("unresolved base with orphan must fail closed");
+        assert!(error.to_string().contains("pack-unrelated.pack"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hash_kind)]
+    async fn type_probe_batch_checks_many_packs_with_one_result_per_oid() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary object store");
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        let seed_pack = pack_dir.join("fixture-00.pack");
+        fs::copy(&fixture, &seed_pack).expect("copy fixture pack");
+        let seed_index = seed_pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            seed_pack.to_str().expect("UTF-8 pack path"),
+            seed_index.to_str().expect("UTF-8 index path"),
+        )
+        .expect("index fixture pack");
+        for number in 1..27 {
+            let pack = pack_dir.join(format!("fixture-{number:02}.pack"));
+            fs::copy(&seed_pack, &pack).expect("copy another pack");
+            fs::copy(&seed_index, pack.with_extension("idx")).expect("copy another index");
+        }
+
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let loose = ObjectHash::from_type_and_data(ObjectType::Tree, b"small tree");
+        storage
+            .put(&loose, b"small tree", ObjectType::Tree)
+            .await
+            .expect("store loose tree");
+        let packed_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse packed delta hash");
+        let packed_base = ObjectHash::from_str("b1a36d7748643b07e2bd006211e9e6a492f6bb8b")
+            .expect("parse packed base hash");
+        let missing = ObjectHash::Sha1([0xf4; 20]);
+        let found = <LocalStorage as Storage>::object_types_bounded_probe(
+            &storage,
+            &[packed_delta, loose, missing, packed_base, packed_delta],
+        )
+        .await
+        .expect("probe OIDs across more than 24 packs");
+        assert_eq!(found.len(), 3);
+        assert_eq!(found.get(&packed_delta), Some(&ObjectType::Blob));
+        assert_eq!(found.get(&packed_base), Some(&ObjectType::Blob));
+        assert_eq!(found.get(&loose), Some(&ObjectType::Tree));
+        assert!(!found.contains_key(&missing));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hash_kind)]
+    async fn batch_probes_ignore_unrelated_orphan_but_reject_unresolved_oid() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary object store");
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let indexed_pack = pack_dir.join("pack-indexed.pack");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack"),
+            &indexed_pack,
+        )
+        .expect("copy indexed pack");
+        let indexed_idx = indexed_pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            indexed_pack.to_str().expect("UTF-8 pack path"),
+            indexed_idx.to_str().expect("UTF-8 index path"),
+        )
+        .expect("index healthy pack");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/small-sha1.pack"),
+            pack_dir.join("pack-orphan.pack"),
+        )
+        .expect("copy orphan pack");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let healthy = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse healthy OID");
+        assert_eq!(
+            storage
+                .exist_checked_batch(&[healthy])
+                .await
+                .expect("healthy indexed object ignores unrelated orphan")
+                .get(&healthy),
+            Some(&true)
+        );
+        assert_eq!(
+            storage
+                .object_types_bounded_probe(&[healthy])
+                .await
+                .expect("healthy typed object ignores unrelated orphan")
+                .get(&healthy),
+            Some(&ObjectType::Blob)
+        );
+
+        let missing = ObjectHash::Sha1([0xc7; 20]);
+        let presence_error = storage
+            .exist_checked_batch(&[healthy, missing])
+            .await
+            .expect_err("unresolved object must not become a confirmed miss");
+        assert!(presence_error.to_string().contains("pack-orphan.pack"));
+        let type_error = storage
+            .object_types_bounded_probe(&[healthy, missing])
+            .await
+            .expect_err("unresolved type must not bypass orphan pack");
+        assert!(type_error.to_string().contains("pack-orphan.pack"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(hash_kind)]
+    async fn batch_probes_wait_only_for_requested_oid_in_other_installing_pack() {
+        use std::os::fd::AsRawFd;
+
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary object store");
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let first_pack = pack_dir.join("pack-first.pack");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack"),
+            &first_pack,
+        )
+        .expect("copy first pack");
+        let first_idx = first_pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            first_pack.to_str().expect("UTF-8 pack path"),
+            first_idx.to_str().expect("UTF-8 index path"),
+        )
+        .expect("index first pack");
+        let second_pack = pack_dir.join("pack-second.pack");
+        let lock = fs::File::create(second_pack.with_extension("install.lock"))
+            .expect("create second pack install lock");
+        // SAFETY: the lock's descriptor stays alive until after the second
+        // index is fully published below.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/small-sha1.pack"),
+            &second_pack,
+        )
+        .expect("publish second pack before its index");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let first = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse first pack OID");
+        let second = ObjectHash::from_str("035f9b742ebf552ed87f003d4944480bfea6ba99")
+            .expect("parse second pack OID");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            storage.exist_checked_batch(&[first]),
+        )
+        .await
+        .expect("unrelated active install must not block presence")
+        .expect("probe healthy pack");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            storage.object_types_bounded_probe(&[first]),
+        )
+        .await
+        .expect("unrelated active install must not block type")
+        .expect("probe healthy type");
+
+        let presence_storage = storage.clone();
+        let presence =
+            tokio::spawn(async move { presence_storage.exist_checked_batch(&[second]).await });
+        let type_storage = storage.clone();
+        let types =
+            tokio::spawn(async move { type_storage.object_types_bounded_probe(&[second]).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !presence.is_finished(),
+            "presence must wait for the second index"
+        );
+        assert!(
+            !types.is_finished(),
+            "type probe must wait for the second index"
+        );
+        let second_idx = second_pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            second_pack.to_str().expect("UTF-8 pack path"),
+            second_idx.to_str().expect("UTF-8 index path"),
+        )
+        .expect("publish second index while install lock is held");
+        drop(lock);
+
+        let found = tokio::time::timeout(Duration::from_secs(3), presence)
+            .await
+            .expect("presence completes after install")
+            .expect("presence task")
+            .expect("presence succeeds");
+        assert_eq!(found.get(&second), Some(&true));
+        let found_types = tokio::time::timeout(Duration::from_secs(3), types)
+            .await
+            .expect("type probe completes after install")
+            .expect("type task")
+            .expect("type probe succeeds");
+        assert_eq!(found_types.get(&second), Some(&ObjectType::Blob));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(hash_kind)]
+    async fn batch_probes_use_healthy_alternate_before_waiting_for_primary_install() {
+        use std::os::fd::AsRawFd;
+
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary stores");
+        let primary_path = dir.path().join("primary");
+        let alternate_path = dir.path().join("alternate");
+        let mut primary = LocalStorage::new(primary_path.clone());
+        let alternate = LocalStorage::new(alternate_path);
+        let payload = b"alternate-only object";
+        let hash = ObjectHash::from_type_and_data(ObjectType::Blob, payload);
+        alternate
+            .put(&hash, payload, ObjectType::Blob)
+            .await
+            .expect("write alternate blob");
+        primary.alternates.push(Arc::new(alternate));
+
+        let pack_dir = primary_path.join("pack");
+        fs::create_dir(&pack_dir).expect("create primary pack directory");
+        let installing = pack_dir.join("pack-installing.pack");
+        let lock = fs::File::create(installing.with_extension("install.lock"))
+            .expect("create primary install lock");
+        // SAFETY: this descriptor remains owned through both probes.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/small-sha1.pack"),
+            &installing,
+        )
+        .expect("publish primary pack without its index");
+
+        let present =
+            tokio::time::timeout(Duration::from_secs(2), primary.exist_checked_batch(&[hash]))
+                .await
+                .expect("healthy alternate bypasses unrelated primary install")
+                .expect("alternate presence probe succeeds");
+        assert_eq!(present.get(&hash), Some(&true));
+        let types = tokio::time::timeout(
+            Duration::from_secs(2),
+            primary.object_types_bounded_probe(&[hash]),
+        )
+        .await
+        .expect("alternate type bypasses unrelated primary install")
+        .expect("alternate type probe succeeds");
+        assert_eq!(types.get(&hash), Some(&ObjectType::Blob));
+        drop(lock);
+    }
+
     /// `put` writes loose objects through `write_atomic` (lore.md §7.7): the
     /// object round-trips, and the shard directory holds only the final object
     /// with no leftover temp file.
@@ -1312,6 +2867,14 @@ mod tests {
             !pack.with_extension("idx").exists(),
             "read-only size probe must not build a pack index"
         );
+        let error = storage
+            .exist_checked_here(&object)
+            .expect_err("a pack without an index is not a confirmed absence");
+        assert!(
+            error.to_string().contains("has no complete index"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("libra index-pack"), "{error}");
     }
 
     #[tokio::test]
@@ -1413,5 +2976,240 @@ mod tests {
             !cache.contains(&delta_key) && !cache.contains(&base_key),
             "bounded reads must not retain the delta or its base in the 200 MiB global pack cache"
         );
+    }
+
+    #[tokio::test]
+    async fn checked_batch_reports_loose_pack_and_missing_objects() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("create object directory");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let pack = pack_dir.join("fixture.pack");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        fs::copy(&fixture, &pack).expect("copy pack fixture");
+        let index = pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            pack.to_str().expect("UTF-8 pack path"),
+            index.to_str().expect("UTF-8 index path"),
+        )
+        .expect("build fixture index");
+
+        let loose = ObjectHash::Sha1([0x22; 20]);
+        storage
+            .put(&loose, b"loose", ObjectType::Blob)
+            .await
+            .expect("store loose object");
+        let packed_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse packed delta hash");
+        let packed_base = ObjectHash::from_str("b1a36d7748643b07e2bd006211e9e6a492f6bb8b")
+            .expect("parse packed base hash");
+        let missing = ObjectHash::Sha1([0x33; 20]);
+        let result = storage
+            .exist_checked_batch(&[loose, packed_delta, missing, packed_base, packed_delta])
+            .await
+            .expect("probe local batch");
+        assert_eq!(result.len(), 4, "duplicate OID should have one result");
+        assert_eq!(result.get(&loose), Some(&true));
+        assert_eq!(result.get(&packed_delta), Some(&true));
+        assert_eq!(result.get(&packed_base), Some(&true));
+        assert_eq!(result.get(&missing), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn checked_batch_handles_many_packs_and_unresolved_hashes() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("create object directory");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let seed_pack = pack_dir.join("fixture-00.pack");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        fs::copy(&fixture, &seed_pack).expect("copy pack fixture");
+        let seed_index = seed_pack.with_extension("idx");
+        command::index_pack::build_index_v1(
+            seed_pack.to_str().expect("UTF-8 pack path"),
+            seed_index.to_str().expect("UTF-8 index path"),
+        )
+        .expect("build fixture index");
+        for number in 1..24 {
+            let pack = pack_dir.join(format!("fixture-{number:02}.pack"));
+            fs::copy(&seed_pack, &pack).expect("copy another pack");
+            fs::copy(&seed_index, pack.with_extension("idx")).expect("copy another index");
+        }
+
+        let packed = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse packed object ID");
+        let missing_a = ObjectHash::Sha1([0x33; 20]);
+        let missing_b = ObjectHash::Sha1([0x44; 20]);
+        let result = storage
+            .exist_checked_batch(&[missing_a, packed, missing_b, missing_a])
+            .await
+            .expect("probe a batch across more than 16 pack indexes");
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.get(&packed), Some(&true));
+        assert_eq!(result.get(&missing_a), Some(&false));
+        assert_eq!(result.get(&missing_b), Some(&false));
+    }
+
+    #[test]
+    fn checked_batch_binary_index_finds_bucket_edges_and_misses() {
+        fn oid(kind: HashKind, first: u8, second: u8) -> ObjectHash {
+            match kind {
+                HashKind::Sha1 => {
+                    let mut bytes = [0; 20];
+                    bytes[0] = first;
+                    bytes[1] = second;
+                    ObjectHash::Sha1(bytes)
+                }
+                HashKind::Sha256 => {
+                    let mut bytes = [0; 32];
+                    bytes[0] = first;
+                    bytes[1] = second;
+                    ObjectHash::Sha256(bytes)
+                }
+                HashKind::Blake3 => {
+                    let mut bytes = [0; 32];
+                    bytes[0] = first;
+                    bytes[1] = second;
+                    ObjectHash::Blake3(bytes)
+                }
+            }
+        }
+
+        for (kind, version) in [
+            (HashKind::Sha1, IdxVersion::V1),
+            (HashKind::Sha1, IdxVersion::V2),
+            (HashKind::Sha256, IdxVersion::V2),
+            (HashKind::Blake3, IdxVersion::V2),
+        ] {
+            let _kind = git_internal::hash::set_hash_kind_for_test(kind);
+            let dir = tempfile::tempdir().expect("temporary index directory");
+            let index_path = dir.path().join("fixture.idx");
+            let hashes = [
+                oid(kind, 0x2a, 0x00),
+                oid(kind, 0x2a, 0x80),
+                oid(kind, 0x2a, 0xff),
+            ];
+            let mut bytes = Vec::new();
+            if version == IdxVersion::V2 {
+                bytes.extend_from_slice(&IDX_MAGIC);
+                bytes.extend_from_slice(&2u32.to_be_bytes());
+            }
+            for bucket in 0..=u8::MAX {
+                let count = if bucket < 0x2a { 0u32 } else { 3u32 };
+                bytes.extend_from_slice(&count.to_be_bytes());
+            }
+            match version {
+                IdxVersion::V1 => {
+                    for (index, hash) in hashes.iter().enumerate() {
+                        bytes.extend_from_slice(&(index as u32 + 1).to_be_bytes());
+                        bytes.extend_from_slice(hash.as_ref());
+                    }
+                }
+                IdxVersion::V2 => {
+                    for hash in &hashes {
+                        bytes.extend_from_slice(hash.as_ref());
+                    }
+                    bytes.extend_from_slice(&[0; 12]); // CRC table
+                    for index in 0..hashes.len() {
+                        bytes.extend_from_slice(&(index as u32 + 1).to_be_bytes());
+                    }
+                }
+            }
+            fs::write(&index_path, bytes).expect("write synthetic pack index");
+            let mut index_file = fs::File::open(&index_path).expect("open index");
+            let (parsed_version, fanout) =
+                LocalStorage::read_idx_fanout_from_open(&mut index_file).expect("read fanout");
+            assert_eq!(parsed_version, version);
+            for (index, hash) in hashes.iter().enumerate() {
+                assert_eq!(
+                    LocalStorage::read_idx_from_open_binary(
+                        &mut index_file,
+                        version,
+                        &fanout,
+                        hash,
+                    )
+                    .expect("find indexed object"),
+                    Some(index as u64 + 1)
+                );
+            }
+            for missing in [
+                oid(kind, 0x2a, 0x40),
+                oid(kind, 0x2a, 0xfe),
+                oid(kind, 0x29, 0xff),
+                oid(kind, 0x2b, 0x00),
+            ] {
+                assert_eq!(
+                    LocalStorage::read_idx_from_open_binary(
+                        &mut index_file,
+                        version,
+                        &fanout,
+                        &missing,
+                    )
+                    .expect("search missing object"),
+                    None
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_batch_rejects_pack_without_index() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("create object directory");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir(&pack_dir).expect("create pack directory");
+        let pack = pack_dir.join("unindexed.pack");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        fs::copy(&fixture, &pack).expect("copy pack fixture");
+
+        let object = ObjectHash::Sha1([0x44; 20]);
+        let error = storage
+            .exist_checked_batch(&[object])
+            .await
+            .expect_err("an unindexed pack is not a confirmed object miss");
+        assert!(
+            error.to_string().contains("has no complete index"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("libra index-pack"), "{error}");
+        assert!(error.to_string().contains(&object.to_string()), "{error}");
+        assert!(!pack.with_extension("idx").exists());
+    }
+
+    #[tokio::test]
+    async fn checked_batch_verifies_alternate_payload_bytes() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let primary_dir = tempfile::tempdir().expect("create primary object directory");
+        let alternate_dir = tempfile::tempdir().expect("create alternate object directory");
+        let alternate = LocalStorage::new(alternate_dir.path().to_path_buf());
+        let payload = b"verified borrowed payload";
+        let object = ObjectHash::from_type_and_data(ObjectType::Blob, payload);
+        alternate
+            .put(&object, payload, ObjectType::Blob)
+            .await
+            .expect("store alternate object");
+        let mut primary = LocalStorage::new(primary_dir.path().to_path_buf());
+        primary.alternates.push(Arc::new(alternate.clone()));
+        let result = primary
+            .exist_checked_batch(&[object])
+            .await
+            .expect("verify borrowed object");
+        assert_eq!(result.get(&object), Some(&true));
+
+        let tampered = LocalStorage::compress_zlib(b"blob 8\0tampered")
+            .expect("compress tampered alternate object");
+        fs::write(alternate.get_obj_path(&object), tampered)
+            .expect("replace alternate payload at original OID");
+        let error = primary
+            .exist_checked_batch(&[object])
+            .await
+            .expect_err("borrowed object contents must match requested OID");
+        assert!(error.to_string().contains(&object.to_string()), "{error}");
     }
 }

@@ -18,7 +18,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument::WithSubscriber;
 
 use super::{
-    DiscoveryResult, FetchStream, generate_upload_pack_content, parse_discovered_references,
+    DiscoveryResult, FetchStream, generate_upload_pack_content_with_capabilities,
+    is_missing_shallow_capability, is_shallow_advertisement_changed, parse_discovered_references,
+    verify_shallow_advertisement_unchanged,
 };
 use crate::git_protocol::{
     PktLineError, ServiceType, decode_pkt_line_header, is_pkt_line_io_error, pkt_frame_payload_len,
@@ -612,6 +614,18 @@ impl SshClient {
         shallow: &[String],
         depth: Option<usize>,
     ) -> Result<FetchStream, IoError> {
+        self.fetch_objects_with_expected_shallow_boundaries(have, want, shallow, depth, None)
+            .await
+    }
+
+    pub(crate) async fn fetch_objects_with_expected_shallow_boundaries(
+        &self,
+        have: &[String],
+        want: &[String],
+        shallow: &[String],
+        depth: Option<usize>,
+        expected_boundaries: Option<&[String]>,
+    ) -> Result<FetchStream, IoError> {
         let mut child = self.spawn_service(ServiceType::UploadPack).await?;
         let advertisement = {
             let stdout = child
@@ -622,14 +636,53 @@ impl SshClient {
             self.read_advertisement(stdout, &mut child.stdout_observed)
                 .await
         };
-        if let Err(read_err) = advertisement {
+        let advertisement = match advertisement {
+            Ok(bytes) => bytes,
+            Err(read_err) => {
+                return Err(finish_ssh_read_error(
+                    child,
+                    read_err,
+                    "SSH advertisement read failed",
+                )
+                .await);
+            }
+        };
+        let discovery = match parse_discovered_references(advertisement, ServiceType::UploadPack) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                let source = IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid SSH upload-pack advertisement: {error}"),
+                );
+                return Err(
+                    finish_ssh_read_error(child, source, "SSH advertisement parse failed").await,
+                );
+            }
+        };
+        if let Some(expected) = expected_boundaries
+            && let Err(error) =
+                verify_shallow_advertisement_unchanged(expected, &discovery.shallow_boundaries)
+        {
             return Err(
-                finish_ssh_read_error(child, read_err, "SSH advertisement read failed").await,
+                finish_ssh_read_error(child, error, "SSH shallow advertisement changed").await,
             );
         }
 
         // Send the upload-pack request
-        let body = generate_upload_pack_content(have, want, shallow, depth);
+        let body = match generate_upload_pack_content_with_capabilities(
+            have,
+            want,
+            shallow,
+            depth,
+            &discovery.capabilities,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                return Err(
+                    finish_ssh_read_error(child, error, "SSH shallow negotiation failed").await,
+                );
+            }
+        };
         let mut stdin = child
             .stdin
             .take()
@@ -904,6 +957,10 @@ fn wrap_ssh_read_error(
         }
         return read_error;
     }
+    if is_missing_shallow_capability(&read_error) || is_shallow_advertisement_changed(&read_error) {
+        // Keep the typed negotiation cause for the CLI's protocol mapping.
+        return read_error;
+    }
     match output {
         None => IoError::other(format!("{context}: {read_error}")),
         Some(Ok(output)) => IoError::other(format!(
@@ -978,12 +1035,14 @@ fn finish_ssh_read_result(
     let error = wrap_ssh_read_error(read_error, context, Some(output));
     if let Some(cleanup_error) = cleanup_error
         && !is_pkt_line_io_error(&error)
+        && !is_missing_shallow_capability(&error)
+        && !is_shallow_advertisement_changed(&error)
         && !error
             .get_ref()
             .is_some_and(|inner| inner.is::<SshHostKeyUnconfirmed>())
     {
-        // Preserve typed protocol and host-trust primary errors. An ordinary
-        // failure still includes the collected status and local cleanup warning.
+        // Preserve typed protocol, shallow-negotiation, and host-trust errors.
+        // An ordinary failure includes collected status and the cleanup warning.
         return IoError::other(format!("{error}; SSH cleanup warning: {cleanup_error}"));
     }
     error
@@ -2162,6 +2221,64 @@ pub(crate) mod tests {
         pkt12_assert_wrapper("SSH advertisement read failed");
     }
 
+    #[test]
+    fn missing_shallow_capability_survives_ssh_cleanup_context() {
+        let missing_capability = || {
+            generate_upload_pack_content_with_capabilities(
+                &[],
+                &["1".repeat(40)],
+                &[],
+                Some(1),
+                &[],
+            )
+            .expect_err("depth requires the remote shallow capability")
+        };
+        let wrapped = wrap_ssh_read_error(
+            missing_capability(),
+            "SSH shallow negotiation failed",
+            Some(Ok(pkt12_output())),
+        );
+        assert!(is_missing_shallow_capability(&wrapped));
+        assert!(
+            wrapped
+                .to_string()
+                .contains("use a server with shallow support")
+        );
+
+        let after_cleanup = finish_ssh_read_result(
+            missing_capability(),
+            "SSH shallow negotiation failed",
+            Ok(pkt12_output()),
+            Some(IoError::other("cleanup fixture failed")),
+        );
+        assert!(is_missing_shallow_capability(&after_cleanup));
+        assert_eq!(after_cleanup.to_string(), wrapped.to_string());
+    }
+
+    #[test]
+    fn changed_shallow_advertisement_survives_ssh_cleanup_context() {
+        let changed = || {
+            verify_shallow_advertisement_unchanged(&["1".repeat(40)], &["2".repeat(40)])
+                .expect_err("second SSH upload-pack advertisement must match discovery")
+        };
+        let wrapped = wrap_ssh_read_error(
+            changed(),
+            "SSH shallow advertisement changed",
+            Some(Ok(pkt12_output())),
+        );
+        assert!(is_shallow_advertisement_changed(&wrapped));
+        assert!(wrapped.to_string().contains("retry the operation"));
+
+        let after_cleanup = finish_ssh_read_result(
+            changed(),
+            "SSH shallow advertisement changed",
+            Ok(pkt12_output()),
+            Some(IoError::other("cleanup fixture failed")),
+        );
+        assert!(is_shallow_advertisement_changed(&after_cleanup));
+        assert_eq!(after_cleanup.to_string(), wrapped.to_string());
+    }
+
     #[tokio::test]
     async fn pkt_line_client_non_marker_wrapped_regression() {
         let ordinary = || IoError::new(ErrorKind::ConnectionReset, "connection reset fixture");
@@ -2311,12 +2428,7 @@ pub(crate) mod tests {
         assert_eq!(production.matches("fn wrap_ssh_read_error(").count(), 1);
         assert_eq!(production.matches("fn finish_ssh_read_error(").count(), 1);
         assert_eq!(production.matches("wrap_ssh_read_error(").count(), 4);
-        assert_eq!(
-            production
-                .matches("finish_ssh_read_error(child, read_err,")
-                .count(),
-            3
-        );
+        assert_eq!(production.matches("finish_ssh_read_error(").count(), 7);
     }
 
     #[cfg(unix)]

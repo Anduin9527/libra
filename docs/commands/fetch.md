@@ -119,7 +119,7 @@ libra config remote.origin.prune false  # but never for origin
 | `<repository>` | Remote name or URL to fetch from. When omitted, uses the current branch's upstream remote. | `libra fetch origin` |
 | `<refspec>` | Source ref or exact `<src>:<dst>` mapping. Requires `<repository>`. When omitted, `remote.<name>.fetch` mappings are used, falling back to all remote branches. | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | Fetch from every configured remote. Conflicts with `<repository>`. | `libra fetch --all` |
-| `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Supported for Git remotes that advertise shallow boundaries. Local Libra remotes fail closed with `LBR-REPO-002` — the accepted end state (decision D20), since that transport cannot advertise shallow metadata. | `libra fetch origin --depth 1` |
+| `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Network Git (`git://`), HTTP(S), and SSH servers must advertise the `shallow` capability; an in-process local Git path supports `--depth` without such an advertisement. Local Libra remotes fail closed with `LBR-REPO-002` — the accepted end state (decision D20), since that transport cannot provide shallow metadata. | `libra fetch origin --depth 1` |
 | `--tags` | Fetch every tag from the remote into the local `refs/tags/*` (overrides the default auto-follow and `remote.<name>.tagOpt`). | `libra fetch origin --tags` |
 | `--no-tags` | Fetch no tags at all, not even tags reachable from fetched commits (overrides the default auto-follow). | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | Do not run a repacking/gc pass after fetching. Accepted no-op for Git parity: Libra's fetch never triggers an automatic gc, so there is nothing to disable. | `libra fetch origin --no-auto-gc` |
@@ -196,6 +196,37 @@ boundary metadata. Local Git repositories and network Git remotes can do this.
 A local Git remote uses the same shortest-distance union as clone: a commit is
 a shallow boundary when a parent was not sent, or when a root sits exactly on
 the depth cutoff (issues/474 CL-04).
+Git servers reached through `git://`, HTTP(S), or SSH can also advertise existing
+`shallow <oid>` boundaries without `--depth`. Fetch records an advertised
+boundary in `.libra/shallow` only when that commit exists locally and a parent
+is missing. Git-protocol clients request `shallow` only if the server advertises
+the capability; one advertisement may contain at most 4,096 distinct boundaries.
+An upload-pack response separately accepts at most 4,096 distinct OIDs across
+its `shallow` and `unshallow` boundary lines.
+Those response lines are capped at 8,192 in total, including duplicates; OIDs
+are checked against the server's object format, with violations returning
+`LBR-NET-002`.
+Inspecting advertised boundary commits is limited to 4 MiB of decoded payload
+per commit, 64 MiB of decoded commit payload per fetch, and 262,144 parent IDs
+in total. Exceeding a limit aborts the fetch; aggregate-limit errors suggest
+fetching fewer refs or asking the remote owner to reduce its shallow boundaries.
+Network Git (`git://`), HTTP(S), and SSH fetches verify wanted objects and
+fetched commit-parent links against final shallow boundaries before updating
+refs; an unmarked missing parent fails the fetch. These checks cap the temporary
+parent-edge spool at 1 GiB and the pack's temporary commit-ID buffer at 64 MiB
+(currently up to 2,097,152 commits) per fetch. Either resource limit can reject
+an otherwise valid large pack before refs are updated; it does not imply pack
+corruption.
+When depth-response shallow markers need further validation, at most 16,384
+requested objects or tag targets are inspected. The shallow-marker ancestry
+walk separately caps visited commits and parent edges at 262,144 each. Remote
+type probes and inspected tags share a 256 MiB decoded object-payload budget
+across each shallow response validation. If a limit is exceeded, split the
+fetch or reduce the selected refs.
+Smart HTTP additionally checks the advertisement again after the upload-pack
+POST; if the boundaries changed, it reports a `NetworkProtocol` error asking you
+to retry before writing the pack or refs.
+
 Local Libra repositories cannot (the accepted end state — decision D20 in the
 development compatibility register), so `libra fetch <local-libra-remote>
 --depth <N>` fails before downloading objects or writing `.libra/shallow`,
@@ -351,18 +382,19 @@ for some time; C3 surfaces it on the CLI and binds the contract:
 - `--depth N` limits fetching to the latest `N` commits per remote branch.
 - It composes with `--all`: a shallow fetch across all configured remotes is
   `libra fetch --all --depth N`.
-- A full-history fetch followed by `fetch --depth N` is idempotent.
-- Re-fetching an already-shallow repository at the same depth is also
-  idempotent: Libra persists server-advertised shallow boundaries in
-  `.libra/shallow` and sends them during later upload-pack negotiation.
+- `fetch --depth N` can add shallow boundaries to a complete repository.
+  Repeating it at the same depth against unchanged remote refs is idempotent:
+  Libra persists server-advertised boundaries in `.libra/shallow` and sends
+  them during later upload-pack negotiation.
 - Sparse checkout (`clone --sparse`) is **not** part of this contract — see
   [`docs/development/commands/_compatibility.md`](../development/commands/_compatibility.md)
   for why sparse-checkout is intentionally deferred.
 
 Shallow fetch does introduce the usual Git "shallow boundary" caveats (blame,
 log, merge-base computation may not see commits beyond the boundary). That
-trade-off is a user-visible knob, not a default — full-history fetch remains
-the default and the recommended posture for monorepo and AI-agent workflows.
+trade-off can be requested with `--depth`; without it, fetch requests all history
+available from the source, which may itself be shallow. Full history remains
+the recommended posture for monorepo and AI-agent workflows.
 Tiered cloud storage (S3/R2 + LRU caching) remains the bandwidth solution for
 the cases where full history is wanted.
 

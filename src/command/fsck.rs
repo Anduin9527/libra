@@ -232,7 +232,7 @@ where
 {
     let mut set = HashSet::new();
     for oid in oids {
-        let Some(hash) = parse_object_hash(oid) else {
+        let Ok(hash) = ObjectHash::from_hex_for_kind(get_hash_kind(), oid) else {
             return Err(CliError::fatal(format!(
                 "shallow metadata cannot be trusted: invalid object id '{oid}'"
             ))
@@ -2851,7 +2851,10 @@ fn validate_index_entry(
 mod tests {
     use std::{collections::HashSet, str::FromStr};
 
-    use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
+    use git_internal::{
+        hash::{HashKind, ObjectHash, set_hash_kind_for_test},
+        internal::object::types::ObjectType,
+    };
 
     use super::{
         FsckMsgId, object_type_name, parents_to_check, parse_shallow_oids, tag_parse_error_msg_id,
@@ -2891,6 +2894,7 @@ mod tests {
 
     #[test]
     fn parse_shallow_oids_accepts_hex_and_rejects_garbage() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
         let ok =
             parse_shallow_oids(["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]).expect("valid oid");
         assert_eq!(ok.len(), 1);
@@ -2901,6 +2905,19 @@ mod tests {
         assert!(
             parse_shallow_oids(["zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"]).is_err(),
             "non-hex must fail-closed"
+        );
+    }
+
+    #[test]
+    fn parse_shallow_oids_preserves_blake3_hash_kind() {
+        let _kind = set_hash_kind_for_test(HashKind::Blake3);
+        let oid = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let shallow = parse_shallow_oids([oid]).expect("valid BLAKE3 boundary");
+        let hash = ObjectHash::from_hex_for_kind(HashKind::Blake3, oid).expect("BLAKE3 hash");
+        assert!(shallow.contains(&hash));
+        assert_eq!(
+            shallow.iter().next().map(ObjectHash::kind),
+            Some(HashKind::Blake3)
         );
     }
 

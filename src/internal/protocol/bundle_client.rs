@@ -102,6 +102,7 @@ impl BundleClient {
         Ok(DiscoveryResult {
             refs,
             capabilities: vec![format!("object-format={format}")],
+            shallow_boundaries: Vec::new(),
             hash_kind,
         })
     }

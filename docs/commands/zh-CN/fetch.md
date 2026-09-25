@@ -49,7 +49,7 @@ libra config set --add remote.origin.fetch \
 | `<repository>` | 要从中 fetch 的远程名称或 URL。省略时使用当前分支的 upstream 远程。 | `libra fetch origin` |
 | `<refspec>` | 源引用或精确 `<src>:<dst>` 映射。需要 `<repository>`。省略时使用 `remote.<name>.fetch`，再回退为所有远程分支。 | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | 从每个已配置远程获取。与 `<repository>` 冲突。 | `libra fetch --all` |
-| `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。支持能通告 shallow boundary 的 Git 远程；本地 Libra 远程以 `LBR-REPO-002` fail-closed（已决终态，D20）。 | `libra fetch origin --depth 1` |
+| `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。网络 Git（`git://`）、HTTP(S) 和 SSH 服务端须通告 `shallow` 能力；进程内本地 Git 路径无需能力通告也支持 `--depth`。本地 Libra 远程以 `LBR-REPO-002` fail-closed（已决终态，D20）。 | `libra fetch origin --depth 1` |
 | `--tags` | 从远程获取每个标签到本地 `refs/tags/*`（覆盖默认的 auto-follow 和 `remote.<name>.tagOpt`）。 | `libra fetch origin --tags` |
 | `--no-tags` | 完全不获取标签，连从已获取提交可达的标签也不获取（覆盖默认的 auto-follow）。 | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | fetch 后不运行 repack/gc。为对齐 Git 而接受的 no-op：Libra 的 fetch 从不触发自动 gc，故无可禁用。 | `libra fetch origin --no-auto-gc` |
@@ -117,7 +117,15 @@ LIBRA_FETCH_IDLE_TIMEOUT_MS=120000 libra fetch origin
 
 ## 浅 fetch 完整性
 
-`--depth <N>` 只有在所选传输能返回 shallow boundary 元数据时才被接受。本地 Git 仓库和网络 Git 远程可以做到这一点。本地 Git 远程与 clone 使用同一套最短距离并集：父提交未被发送，或根提交恰好落在深度截止上时，该提交是 shallow 边界（issues/474 CL-04）。本地 Libra 仓库不能（维持 fail-closed 为已决终态，D20），因此 `libra fetch <本地 Libra 远程> --depth <N>` 会在下载对象或写入 `.libra/shallow` 之前失败，归类为 `LBR-REPO-002`。该 fail-closed 行为避免 remote-tracking ref 指向一个父提交缺失且没有 shallow 标记的提交。
+`--depth <N>` 只有在所选传输能返回 shallow boundary 元数据时才被接受。本地 Git 仓库和网络 Git 远程可以做到这一点。本地 Git 远程与 clone 使用同一套最短距离并集：父提交未被发送，或根提交恰好落在深度截止上时，该提交是 shallow 边界（issues/474 CL-04）。
+
+通过 `git://`、HTTP(S) 或 SSH 访问的 Git 服务端即使在未指定 `--depth` 时，也可能通告已有的 `shallow <oid>` 边界。只有该提交已在本地、且其父提交缺失时，fetch 才将通告的边界写入 `.libra/shallow`。Git 协议客户端仅在服务端通告 `shallow` 能力时请求该能力；一次通告最多接受 4,096 个不同的边界。upload-pack 响应中的 `shallow` 与 `unshallow` 行合计去重后，最多接受 4,096 个不同的对象 ID。这些响应行（含重复）总数最多为 8,192，每个 ID 均按服务端对象格式校验；超限或格式错误返回 `LBR-NET-002`。检查通告的边界提交时，每个提交的解码后对象 payload 最多 4 MiB，单次 fetch 累计读取的解码后提交 payload 最多 64 MiB，累计最多处理 262,144 个父提交 ID。超限会中止 fetch；累计上限错误会建议减少获取的引用，或请远端所有者减少浅边界。
+
+网络 Git（`git://`）、HTTP(S) 和 SSH fetch 会在更新引用前，对照最终浅边界校验目标对象与新获取提交的父边；未标记的缺失父提交会使 fetch 失败。校验使用的临时父边文件每次最多 1 GiB，本次 pack 的提交 ID 临时缓冲最多 64 MiB（目前最多约 2,097,152 个提交）。有效但很大的 pack 也可能触及这两项资源上限；fetch 会在更新引用前报错，并不代表 pack 损坏。若深度响应的浅边界还需进一步校验，最多检查 16,384 个请求对象或标签目标。浅边界祖先遍历另分别最多访问 262,144 个不同提交和 262,144 条父边。远端对象类型探测与读取的标签数据共用每次浅响应校验 256 MiB 的解码后对象 payload 额度。任一项超限时，可分次获取或减少选取的引用。
+
+智能 HTTP 还会在 upload-pack POST 后重新获取通告；若边界已变化，则在写入 pack 或引用之前报告 `NetworkProtocol` 错误并提示重试。
+
+本地 Libra 仓库不能（维持 fail-closed 为已决终态，D20），因此 `libra fetch <本地 Libra 远程> --depth <N>` 会在下载对象或写入 `.libra/shallow` 之前失败，归类为 `LBR-REPO-002`。该 fail-closed 行为避免 remote-tracking ref 指向一个父提交缺失且没有 shallow 标记的提交。
 
 ## FETCH_HEAD
 
@@ -244,11 +252,10 @@ Git 的出厂默认同样是 `fetch.prune = false`，只是开启它是一个常
 
 - `--depth N` 将获取限制为每个远程分支的最新 `N` 个提交。
 - 它可与 `--all` 组合：跨所有已配置远程的 shallow fetch 是 `libra fetch --all --depth N`。
-- 完整历史 fetch 后再执行 `fetch --depth N` 是幂等的。
-- 对已经 shallow 的仓库以相同深度再次 fetch 也是幂等的：Libra 将服务器通告的 shallow 边界持久化在 `.libra/shallow` 中，并在后续 upload-pack 协商期间发送它们。
+- `fetch --depth N` 可以给原本完整的仓库增加浅边界。远端引用不变时，以相同深度重复 fetch 是幂等的：Libra 将服务器通告的浅边界持久化在 `.libra/shallow` 中，并在后续 upload-pack 协商期间发送它们。
 - Sparse checkout（`clone --sparse`）**不**属于此契约；见 [`docs/development/commands/_compatibility.md`](../../development/commands/_compatibility.md)，了解为什么有意延后 sparse-checkout。
 
-Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame、log、merge-base 计算可能看不到边界之外的提交）。这个取舍是用户可见旋钮，而不是默认值；完整历史 fetch 仍是默认行为，也是 monorepo 和 AI 代理工作流的推荐姿态。对于确实需要完整历史的场景，分层云存储（S3/R2 + LRU caching）仍是带宽解决方案。
+Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame、log、merge-base 计算可能看不到边界之外的提交）。用户可用 `--depth` 请求额外的深度限制；不带此选项时，fetch 会请求源中可用的全部历史，但源本身可能已浅。完整历史仍是 monorepo 和 AI 代理工作流的推荐姿态。对于确实需要完整历史的场景，分层云存储（S3/R2 + LRU caching）仍是带宽解决方案。
 
 ### 为什么 JSON 进度在 stderr 上？
 

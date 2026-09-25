@@ -13,10 +13,9 @@ use std::{
     collections::{BTreeSet, HashSet},
     fs, io,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
-use git_internal::hash::ObjectHash;
+use git_internal::hash::{HashKind, ObjectHash, get_hash_kind};
 use thiserror::Error;
 
 use crate::utils::util;
@@ -69,12 +68,19 @@ impl ShallowSet {
     ///
     /// A missing file is an empty set.
     pub fn load() -> Result<Self, ShallowError> {
-        load_at(&shallow_file_path()?)
+        Self::load_at(&shallow_file_path()?)
     }
 
     /// Load an explicit shallow file. A missing file is an empty set.
+    /// The entries use the current repository's object format.
     pub fn load_at(path: &Path) -> Result<Self, ShallowError> {
-        load_at(path)
+        Self::load_at_for_kind(path, get_hash_kind())
+    }
+
+    /// Load an explicit shallow file with a known object format. Use SHA-1
+    /// when reading a Git source's `.git/shallow` from a Libra repository.
+    pub fn load_at_for_kind(path: &Path, kind: HashKind) -> Result<Self, ShallowError> {
+        load_at_for_kind(path, kind)
     }
 
     /// Empty set: complete history.
@@ -132,7 +138,7 @@ fn shallow_file_path() -> Result<PathBuf, ShallowError> {
         .map_err(|source| ShallowError::Locate { source })
 }
 
-fn load_at(path: &Path) -> Result<ShallowSet, ShallowError> {
+fn load_at_for_kind(path: &Path, kind: HashKind) -> Result<ShallowSet, ShallowError> {
     let path = path.to_path_buf();
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
@@ -150,11 +156,13 @@ fn load_at(path: &Path) -> Result<ShallowSet, ShallowError> {
         if oid.is_empty() {
             continue;
         }
-        let hash = ObjectHash::from_str(oid).map_err(|source| ShallowError::InvalidOid {
-            path: path.clone(),
-            line: line_no + 1,
-            oid: oid.to_string(),
-            reason: source.to_string(),
+        let hash = ObjectHash::from_hex_for_kind(kind, oid).map_err(|source| {
+            ShallowError::InvalidOid {
+                path: path.clone(),
+                line: line_no + 1,
+                oid: oid.to_string(),
+                reason: source.to_string(),
+            }
         })?;
         boundaries.insert(hash);
     }
@@ -169,9 +177,11 @@ mod tests {
 
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PARENT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const BLAKE3_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BLAKE3_PARENT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn parse_oid(hex: &str) -> ObjectHash {
-        ObjectHash::from_str(hex).expect("test oid")
+        ObjectHash::from_hex_for_kind(HashKind::Sha1, hex).expect("test oid")
     }
 
     #[test]
@@ -205,6 +215,42 @@ mod tests {
             matches!(error, ShallowError::InvalidOid { line: 1, .. }),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn load_at_preserves_blake3_boundary_identity() {
+        let _kind = set_hash_kind_for_test(HashKind::Blake3);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shallow");
+        fs::write(&path, format!("{BLAKE3_HEAD}\n")).expect("write shallow");
+
+        let set = ShallowSet::load_at(&path).expect("valid BLAKE3 file");
+        let head = ObjectHash::from_hex_for_kind(HashKind::Blake3, BLAKE3_HEAD).expect("head oid");
+        let parent =
+            ObjectHash::from_hex_for_kind(HashKind::Blake3, BLAKE3_PARENT).expect("parent oid");
+        let recorded = [parent];
+        assert!(set.is_boundary(&head));
+        assert!(set.parents_for_walk(&head, &recorded).is_empty());
+        assert_eq!(set.oids_hex(), BTreeSet::from([BLAKE3_HEAD.to_string()]));
+        assert_eq!(
+            set.oids().iter().next().map(ObjectHash::kind),
+            Some(HashKind::Blake3)
+        );
+    }
+
+    #[test]
+    fn load_at_for_kind_keeps_git_shallow_sha1() {
+        let _kind = set_hash_kind_for_test(HashKind::Blake3);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shallow");
+        fs::write(&path, format!("{HEAD}\n")).expect("write shallow");
+
+        let set = ShallowSet::load_at_for_kind(&path, HashKind::Sha1).expect("valid Git file");
+        assert!(set.is_boundary(&parse_oid(HEAD)));
+        assert!(matches!(
+            ShallowSet::load_at_for_kind(&path, HashKind::Blake3),
+            Err(ShallowError::InvalidOid { line: 1, .. })
+        ));
     }
 
     #[test]

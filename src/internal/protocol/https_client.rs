@@ -8,7 +8,7 @@ use reqwest::{RequestBuilder, Response, StatusCode, header::CONTENT_TYPE};
 use url::Url;
 
 use super::{
-    DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content,
+    DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content_with_capabilities,
     parse_discovered_references,
 };
 use crate::{
@@ -418,13 +418,39 @@ impl HttpsClient {
         shallow: &[String],
         depth: Option<usize>,
     ) -> Result<FetchStream, IoError> {
+        let discovery = self
+            .discovery_reference(ServiceType::UploadPack)
+            .await
+            .map_err(|error| {
+                IoError::other(format!(
+                    "failed to discover HTTPS upload-pack capabilities: {error}"
+                ))
+            })?;
+        self.fetch_objects_with_capabilities(have, want, shallow, depth, &discovery.capabilities)
+            .await
+    }
+
+    pub(crate) async fn fetch_objects_with_capabilities(
+        &self,
+        have: &[String],
+        want: &[String],
+        shallow: &[String],
+        depth: Option<usize>,
+        advertised_capabilities: &[String],
+    ) -> Result<FetchStream, IoError> {
         // POST $GIT_URL/git-upload-pack HTTP/1.0
         // INVARIANT: "git-upload-pack" is a valid relative URL onto self.url.
         let url = self
             .url
             .join("git-upload-pack")
             .expect("'git-upload-pack' is a valid relative URL");
-        let body = generate_upload_pack_content(have, want, shallow, depth);
+        let body = generate_upload_pack_content_with_capabilities(
+            have,
+            want,
+            shallow,
+            depth,
+            advertised_capabilities,
+        )?;
         tracing::debug!("fetch_objects with body: {:?}", body);
 
         let res = BasicAuth::send(|| async {

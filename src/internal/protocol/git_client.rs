@@ -1,6 +1,9 @@
 //! Git protocol (git://) client that connects over TCP, advertises refs, and streams pack data.
 
-use std::{io::Error as IoError, time::Duration};
+use std::{
+    io::{Error as IoError, ErrorKind},
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, StreamExt};
@@ -12,8 +15,8 @@ use tokio::{
 use url::Url;
 
 use super::{
-    DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content,
-    parse_discovered_references,
+    DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content_with_capabilities,
+    parse_discovered_references, verify_shallow_advertisement_unchanged,
 };
 use crate::git_protocol::{
     PktLineError, ServiceType, add_pkt_line_string, decode_pkt_line_header, is_pkt_line_io_error,
@@ -203,12 +206,40 @@ impl GitClient {
         shallow: &[String],
         depth: Option<usize>,
     ) -> Result<FetchStream, IoError> {
+        self.fetch_objects_with_expected_shallow_boundaries(have, want, shallow, depth, None)
+            .await
+    }
+
+    pub(crate) async fn fetch_objects_with_expected_shallow_boundaries(
+        &self,
+        have: &[String],
+        want: &[String],
+        shallow: &[String],
+        depth: Option<usize>,
+        expected_boundaries: Option<&[String]>,
+    ) -> Result<FetchStream, IoError> {
         let mut stream = self.open_stream().await?;
         let request = self.build_service_request(ServiceType::UploadPack);
         self.write_all_idle(&mut stream, &request).await?;
-        self.read_advertisement(&mut stream).await?;
+        let advertisement = self.read_advertisement(&mut stream).await?;
+        let discovery = parse_discovered_references(advertisement, ServiceType::UploadPack)
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid git:// upload-pack advertisement: {error}"),
+                )
+            })?;
+        if let Some(expected) = expected_boundaries {
+            verify_shallow_advertisement_unchanged(expected, &discovery.shallow_boundaries)?;
+        }
 
-        let body = generate_upload_pack_content(have, want, shallow, depth);
+        let body = generate_upload_pack_content_with_capabilities(
+            have,
+            want,
+            shallow,
+            depth,
+            &discovery.capabilities,
+        )?;
         self.write_all_idle(&mut stream, &body).await?;
 
         // Read the pack with a per-read IDLE bound (the timer resets whenever
