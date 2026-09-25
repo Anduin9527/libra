@@ -1,3 +1,0 @@
-8bdec2b908b28d6d35824244088c7f6aedda12636a6ed6530cdeda5eed8185cb  docs/development/plan/plan-20260819.md
-6f758b33625652a555a6a43d933341b0491789735298d5fe3a52b04694a78594  docs/development/plan/plan-status.md
-29fef286db6064b15773864e5dfb70f5253aa844ed9bd3dd737d2011e3ebab68  docs/development/plan/plan-template.md

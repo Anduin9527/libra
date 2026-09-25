@@ -48,7 +48,7 @@
 | [`plan-20260824.md`](plan-20260824.md) | B（历史：RT-01 延后项收口） | **已收口** | **历史完成/封存**：DF-01..09 全部 `done/complete`、v0.22.0 已发布；其 Code 产品面与专属 DEFER 已随 plan-20260920 拆除/墓碑化 |
 | [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03 Operation Log v2） | 实施中（PR #503 收口） | OL-01..13、CH-01..04 `done/complete`；OL-14 **已取消**（`web/` 拆除，2026-09-20）；OL-15A `done/complete`，OL-15 `done/remote-pending`（等待 compat-offline-core） |
 | [`plan-20260821.md`](plan-20260821.md) | A（UP-01） | **已收口** | 客户端与 CI 全部落地；closeout `00bc815`；DEFER-02..06 残留 |
-| [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02 Memory） | 实施中（R30 重设计） | **R30 起点：M2-16A**；M2-16A..E/D1 与 M2-01..M2-15 全部 `pending`（M2-01 在 M2-16A 移植复核前不再为 `in-progress`）；R30 双评审 r01 兩方 `FAIL`（Codex 0×P0/11×P1、Claude 4×P0/13×P1/9×P2）、r02 兩方 `FAIL`（Codex 0×P0/7×P1、Claude 1×P0/7×P1/12×P2）、r03 兩方 `FAIL`（Codex 0×P0/9×P1/4×P2、Claude 1×P0/10×P1/13×P2）；已按 `fix-checklist-r01..r04.md` 修訂；r04 兩方 `FAIL`（Codex 0×P0/6×P1/3×P2、Claude 0×P0/2×P1/13×P2）、r05 兩方 `FAIL`（Codex 0×P0/5×P1、Claude 0×P0/3×P1/12×P2）、r06 兩方 `FAIL`（Codex 0×P0/4×P1/2×P2、Claude 0×P0/2×P1/11×P2）、r07 兩方 `FAIL`（Codex 0×P0/2×P1/5×P2、Claude 0×P0/2×P1/12×P2）、r08 兩方 `FAIL`、r09 兩方 `FAIL`、r10 兩方 `FAIL`、r11 兩方 `FAIL`、r12 兩方 `FAIL`、r13 兩方 `FAIL`、r14 兩方 `FAIL`、r15 兩方 `FAIL`、r16 兩方 `FAIL`（Codex 0×P0/6×P1/1×P2、Claude 0×P0/4×P1/5×P2）、r17 兩方 `FAIL`、r18 兩方 `FAIL`（Codex 0×P0/4×P1/2×P2、Claude 0×P0/6×P1/9×P2）、r19 兩方 `FAIL`（Codex 0×P0/2×P1/2×P2、Claude 0×P0/3×P1/7×P2）、r20 兩方 `FAIL`（Codex 0×P0/2×P1/2×P2、Claude 0×P0/2×P1/9×P2）；r21 兩方 `FAIL`（Codex 0×P0/1×P1/3×P2、Claude 0×P0/2×P1/7×P2）；r22 兩方 `FAIL`（Codex 0×P0/3×P1/2×P2、Claude 0×P0/6×P1/8×P2）；r23 兩方 `FAIL`（Codex 0×P0/2×P1/4×P2、Claude 0×P0/3×P1/5×P2）；r24 兩方 `FAIL`（Codex 0×P0/2×P1/5×P2、Claude 0×P0/3×P1/8×P2）；r25 兩方 `FAIL`（Codex 0×P0/2×P1、Claude 0×P0/4×P1/6×P2）；r26 兩方 `FAIL`（Codex 0×P0/1×P1/2×P2、Claude 0×P0/4×P1/10×P2）；r27 兩方 `FAIL`（Codex 0×P0/1×P1/1×P2、Claude 0×P0/3×P1/7×P2）；r28 兩方 `FAIL`（Codex 0×P0/2×P1/1×P2、Claude 0×P0/4×P1/3×P2）；r29 兩方 `FAIL`（Codex 0×P0/1×P1/1×P2、Claude 0×P0/1×P1/4×P2）；r30 兩方 `FAIL`（Codex 0×P0/1×P1/1×P2、Claude 0×P0/3×P1/5×P2）；r31 Codex **PASS**（0×P0/0×P1/2×P2）、Claude `FAIL`（0×P0/2×P1/5×P2）；r32 兩方 `FAIL`（Codex 0×P0/2×P1/3×P2、Claude 0×P0/2×P1/5×P2）；r33 兩方 `FAIL`（Codex 0×P0/1×P1/2×P2、Claude 0×P0/4×P1/5×P2）；r34 兩方 `FAIL`（審計 scope 格）；r35 Codex `FAIL`（協議會話隔離）/**Claude `PASS`**；r36 Codex `FAIL`（plan-status 合併行）、**Claude `PASS`**；r37 雙 PASS（見下）；PR #456 由 R30 计划承接（ADR-M2-15） |
+| [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02 Memory，R30 历史方案） | 未启动（待 DM-00 登记退役） | R30 r37 于 2026-09-22 对冻结版 sha256 `4fbaf4bd…` 取得 Codex/Claude 同版双 PASS；25 张 M2 卡仍为 `pending`，未实施。MEM-01/02 已由 [`plan-20260926.md`](plan-20260926.md) 承接，旧卡待 DM-00 正式登记退役。历轮评审结论已整理到原计划正文；旧版 PASS 不代表新计划的评审门通过。 |
 | [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | **已收口** | LB-01..07 全部 `done/complete`；protocol v1 20-method 全实现 |
 | [`plan-20260729.md`](plan-20260729.md) | A（CT-01） | 实施中（收尾） | CT4-01 发布卡已执行（v0.21.21）；**CT3-07 `blocked`/已延后**；完成判据未全部勾选 |
 | [`plan-20260715.md`](plan-20260715.md) | B（历史：RT-01 Code Web-only） | **已收口** | **历史完成/封存**：W0..W6 + W5-01/WIO 完成证据保留；Code 产品面由 plan-20260920 拆除，DEFER-01..08 已关闭/墓碑化，DEFER-09/10 已完成关闭 |
@@ -113,7 +113,7 @@
 
 ---
 
-## 三、实施中的计划与当前卡
+## 三、实施中的计划、待退役的历史方案与当前卡
 
 按执行窗口排序；当前唯一在跑的卡见「四、当前执行指针」。
 
@@ -143,9 +143,9 @@
 
 > 2026-09-22 说明：ER-13 全量收口门已实跑并**全绿**（`fmt --check` / `clippy -D warnings` / `cargo nextest run --all --no-fail-fast --retries 2` → 7836/7836 passed, 0 failed, 3 skipped / `cargo doc` 链接门 exit 0）；期间两轮非绿全部归因执行环境（开发机 `umask 0002`、真实用户 global 配置携带未登记 receipt、隔离 home 目录权限），已登记为 `ENV-GCX-01`，无 `FIX-*`。本轮按操作者指示**不调用 Codex review**，故计划「完成判据」中的 review 门与「所有卡 `done/complete`」两项保持未满足；版本 bump（三处版本面）与 D 组发布（tag / `gh release` / CDN）属对外不可逆动作，等待操作者显式指示。DEP-GCX-01（`../libra-backend`）与 DEP-GCX-03（`.env.test`/`.env.live-test`）在本机均不满足，前者只阻塞网站页同步。
 
-### 3.3 plan-20260819（Memory M2，R30 重设计）
+### 3.3 plan-20260819（Memory M2，R30 历史方案）
 
-2026-09-21 R30 重设计：按 0.23.x 拆除后的 main 重写架构 seam（ADR-M2-05/07/10 改写，新增 ADR-M2-12..15），整份迁到模板 v2.8（ER-08 逐卡发布 + ER-14 nextest + 版本面集合以 `compat_version_surface_sync` 为权威），新增 M2-16A..E 接口融合卡与 M2-16D1（自 M2-16D 条件性拆出），并把 PR #456 改为正向移植源（禁止 merge）。R30 双评审通过前禁止开工。整份遷到模板 v2.8（版本面集合以 `compat_version_surface_sync` 為權威；當前 `Cargo.toml`/`install.sh`/`install.ps1` 三處）。
+2026-09-21 R30 重设计：按 0.23.x 拆除后的 main 重写架构 seam（ADR-M2-05/07/10 改写，新增 ADR-M2-12..15），整份迁到模板 v2.8（ER-08 逐卡发布 + ER-14 nextest + 版本面集合以 `compat_version_surface_sync` 为权威），新增 M2-16A..E 接口融合卡与 M2-16D1（自 M2-16D 条件性拆出），并把 PR #456 改为正向移植源（禁止 merge）。R30 r37 于 2026-09-22 对冻结版 `4fbaf4bd…` 取得 Codex/Claude 同版双 PASS，但全部 M2 卡仍为 `pending`，未实施。使用者随后要求独立重设计；MEM-01/02 现由 [`plan-20260926.md`](plan-20260926.md) 承接，旧 M2 卡待该计划 DM-00 正式登记退役。本节保留 R30 历史状态，不构成当前开工许可。
 
 | 卡 | 状态 |
 |---|---|
@@ -247,7 +247,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 - **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿）。
 - **SCAP-01 与 B3-00：** SCAP-01 已收口，`runtime.rs` 写集互斥结束；B3-00 继续在 `main` 上推进。
 - **下一步：** `issues/474` 已收口（DEP-CL-07 完成，#474 CLOSED）。B3-00 另轨。
-- **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
+- **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡待推进。MEM-01/02 由 `plan-20260926` 承接，该计划评审门未过，禁止开工。
 
 ---
 
@@ -258,7 +258,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | 计划 | 入口卡 | 卡要做什么（简述） | 内部前置 | 计划级 review 门 | 外部/跨计划门控 | 可立即开工 |
 |---|---|---|---|---|---|---|
 | [`plan-20260822`](plan-20260822.md) | （PR #503 收口；OL-14 已取消、OL-15 `remote-pending`） | — | — | — | — | ⏳ 等待 compat-offline-core 远端门禁 |
-| [`plan-20260819`](plan-20260819.md) | M2-16A | #456 memory 模块正向移植到 R30 seam（审计已排除已删 Code SCC） | 无 | **未过**（r01–r37：**r37 同版雙 PASS 達成（2026-09-22，凍結 sha256 `4fbaf4bd…`）** — Codex P0/P1/P2=0、Claude P0/P1=0；實現門已開啟。殘餘 P2（不阻塞）：review log 輪次回填、`EX-M2-07` minor 重複計數（41→39）、`tests/INDEX.md` 20→22 描述刷新、未協商 minor 收斂規則 — 於 M2-16C 卡片修訂時一併處理） | **DEP-M2-ENV-01**：需已初始化 Libra checkout（`.libra/`）與 `.env.test`/`.env.live-test`；缺任一项即 `blocked` | ❌ 禁止开工（等双 PASS） |
+| [`plan-20260926`](plan-20260926.md) | DM-00 | 冻结 #456 事实基线、编制取材清单并登记 R30 退役 | 无 | **未过**（Codex r01–r07 均 `FAIL`，尚无字面 `VERDICT: PASS`） | **DEP-DM-03**：须核实 #456 的只读取材来源；**DEP-DM-05**：DM-00 登记旧计划退役 | ❌ 禁止开工（等本计划评审 PASS） |
 | [`plan-20260919`](plan-20260919.md) | GCX-02 | legacy 全局 config DB 首次使用自动迁移（锁+快照+校验+原子提交） | GCX-01（已 `done/complete`） | **本轮按操作者指示未评审** | DEP-GCX-02：与 plan-20260918 串行写 `COMPATIBILITY.md`/网站页（0918 未开工，写集 clean） | ✅ 已实现并本地验收（`locally-accepted`，未发布） |
 | [`plan-20260919`](plan-20260919.md) | GCX-04 | 用户级 hooks 文件路径对齐 XDG（macOS 只读回退，实现泛化到任何原生配置目录不同的平台） | GCX-01（已 `done`） | **本轮按操作者指示未评审** | DEP-GCX-01 不满足（本机无 `../libra-backend`），仅阻塞网站页；发布队列 GCX-02→GCX-03→GCX-04 | ✅ 已实现并本地验收（`locally-accepted`，未发布） |
 | [`plan-20260912`](plan-20260912.md) | MB-01 | 有界 mega2 tree transport 与 wire validation | 无 | **双评审已 PASS**（Codex R7 / Claude R5） | DEP-MB-01：mega2 `a1293686` tree API pin 现场重核（2026-09-21 已前推） | ✅ `done/complete`：v0.23.37（84f6bd8）；codeql + release.yml 8/8 jobs 全绿；CDN 产物 HTTP 200 |

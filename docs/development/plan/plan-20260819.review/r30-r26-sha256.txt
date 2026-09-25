@@ -1,3 +1,0 @@
-181fdf52b07ad31d19f72d1551536eea5e603e53ce01486b2ff5750f7121e5cc  docs/development/plan/plan-20260819.md
-0fc183e2b65ff5322f68b0fc80a27d511dacf1f5a7281c817c54a0a4b1264c66  docs/development/plan/plan-status.md
-3485bd9fe5330e8980398b2326764d80c4c753e76f72fe5f09533ac92fc80030  docs/development/plan/plan-template.md
