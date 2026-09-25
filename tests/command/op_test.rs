@@ -263,6 +263,58 @@ fn test_op_restore_refuses_branch_checked_out_in_another_worktree() {
     );
 }
 
+#[tokio::test]
+#[serial(cwd)]
+/// Operation snapshots omit the repository-local Memory authority, and a
+/// later restore must preserve the Memory head that advanced afterwards.
+async fn test_op_restore_preserves_memory_ref_advanced_after_snapshot() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    let base_commit = Head::current_commit()
+        .await
+        .expect("base commit")
+        .to_string();
+    Branch::update_branch("libra/memory/repo", &base_commit, None)
+        .await
+        .expect("seed Memory ref");
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "snapshot-anchor"], p),
+        "record operation snapshot",
+    );
+    let target_op = latest_operation_id(p);
+
+    std::fs::write(p.join("tracked.txt"), "tracked\nnew memory source\n")
+        .expect("update tracked file");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "advance memory source", "--no-verify"], p),
+        "commit memory source",
+    );
+    let advanced_commit = Head::current_commit()
+        .await
+        .expect("advanced commit")
+        .to_string();
+    Branch::update_branch("libra/memory/repo", &advanced_commit, None)
+        .await
+        .expect("advance Memory ref");
+
+    let restore = run_json_op(p, &["restore", &target_op, "--force"]);
+    assert_eq!(restore["data"]["action"], "restore");
+    assert_eq!(restore["data"]["skipped_owned_refs"], serde_json::json!([]));
+
+    let memory = Branch::find_branch_result("libra/memory/repo", None)
+        .await
+        .expect("Memory branch lookup")
+        .expect("Memory branch remains present");
+    assert_eq!(memory.commit.to_string(), advanced_commit);
+}
+
 #[test]
 /// `op restore --dry-run` previews the branches it would prune but performs no
 /// writes — the branch absent from the target view must still exist afterward.

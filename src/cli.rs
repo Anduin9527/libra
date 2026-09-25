@@ -61,7 +61,7 @@ Command Groups:
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, mergetool, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, credential, bundle, auth, login, logout, whoami, mega2
-  AI And Automation       automation, sandbox, agent, review, investigate, service
+  AI And Automation       automation, sandbox, agent, memory, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
@@ -736,6 +736,8 @@ enum Commands {
 
     #[command(about = "Manage AI automation rules and history")]
     Automation(command::automation::AutomationArgs),
+    #[command(about = "Search and diagnose repository Agent Memory")]
+    Memory(command::memory::MemoryArgs),
     #[command(about = "Inspect AI sandbox diagnostics")]
     Sandbox(command::sandbox::SandboxArgs),
     #[command(about = "Manage external-agent capture (Claude Code, Gemini, …)")]
@@ -1651,6 +1653,13 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
             )),
             Err(_) => Ok(CommandPreflight::sha1_without_repo()),
         },
+        // Memory owns schema inspection so read-only diagnostics and rebuild
+        // previews never trigger the generic migration preflight.
+        Commands::Memory(_) => {
+            let storage = utils::util::try_get_storage_path(None)
+                .map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(storage))
+        }
         // `grep --no-index` searches the filesystem directly and works outside a
         // repository, so it needs no storage/hash-kind preflight.
         Commands::Grep(args) if args.no_index => Ok(CommandPreflight::none()),
@@ -1845,6 +1854,13 @@ fn command_scope(command: &Commands) -> CommandScope {
                 Worktree
             }
         }
+        Commands::Memory(args) => {
+            if args.mutates_repository() {
+                Repository
+            } else {
+                ReadOnly
+            }
+        }
         // The write form moves this worktree's HEAD directly.
         Commands::SymbolicRef(args) => {
             if args.target.is_some() {
@@ -2037,6 +2053,13 @@ async fn operation_class_for_command(
     if matches!(command, Commands::Merge(args) if args.dry_run) {
         return MutationClass::ReadOnly;
     }
+    // Memory owns schema inspection and projection writes. Wrapping it in the
+    // generic operation boundary would open/migrate the repository database
+    // before Memory can return its stable future-schema diagnostic; projection
+    // rebuilds are derived-state maintenance rather than user history edits.
+    if matches!(command, Commands::Memory(_)) {
+        return MutationClass::ReadOnly;
+    }
     if matches!(command_scope(command), CommandScope::ReadOnly) {
         return MutationClass::ReadOnly;
     }
@@ -2169,10 +2192,17 @@ async fn operation_metadata_for_command(
         Commands::Stash(Stash::Pop { .. }) => "stash pop mutation".to_string(),
         _ => format!("{command_name} mutation"),
     };
+    let actor = if matches!(command, Commands::Memory(_)) {
+        // Avoid the generic ConfigKv lookup opening/migrating the database
+        // before Memory's own compatibility inspection has run.
+        "libra-memory".to_string()
+    } else {
+        operation_actor_for_metadata().await
+    };
     crate::internal::operation::OperationMetaV2 {
         command_name: Some(command_name),
         description: Some(description),
-        actor: Some(operation_actor_for_metadata().await),
+        actor: Some(actor),
         ..Default::default()
     }
 }
@@ -3409,6 +3439,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::Automation(cmd_args) => {
                 command::automation::execute_safe(cmd_args, &output).await?
             }
+            Commands::Memory(cmd_args) => command::memory::execute_safe(cmd_args, &output).await?,
             Commands::Sandbox(cmd_args) => {
                 command::sandbox::execute_safe(cmd_args, &output).await?
             }

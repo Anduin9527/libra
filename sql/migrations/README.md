@@ -188,6 +188,9 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026090803` | `change_identity_prefix_index_repair` | `2026090803_change_identity_prefix_index_repair.sql` (CH-02 compatibility repair: adds the repository-scoped Change ID prefix index for databases that already recorded 0802 before that index was shipped; forward-only.) |
 | `2026091801` | `operation_v1_retirement` | `2026091801_operation_v1_retirement.sql` (OL-15 forward-only retirement of the isolated legacy operation namespace after the v2 runtime cutover.) |
 | `2026091802` | `operation_v2_dedup_index` | `2026091802_operation_v2_dedup_index.sql` (OL-15 follow-up repair for the v2 five-second duplicate-operation lookup.) |
+| `2026092501` | `memory_core` | `2026092501_memory_core{,_down}.sql` (M2-02: rebuildable Memory projections plus bounded per-root compiler job and source-observer state; FTS5 and receipt storage land in later migrations.) |
+| `2026092502` | `memory_fts_search` | `2026092502_memory_fts_search{,_down}.sql` (M2-02F: rebuildable Episode search document plus external-content FTS5 using the fixed `unicode61 remove_diacritics 2` tokenizer; non-empty rollback is refused.) |
+| `2026092503` | `context_selection_receipt` | `2026092503_context_selection_receipt{,_down}.sql` (M2-02R: shared local-only context selection receipt ledger with per-repository 30-day/10,000-row retention metadata; non-empty rollback is refused.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

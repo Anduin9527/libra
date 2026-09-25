@@ -62,7 +62,10 @@ use super::{
     WorkspaceSnapshotter, WorkspaceStatePointer,
 };
 use crate::{
-    internal::{config::ConfigKv, db::get_db_conn_instance_for_path, workspace::RepoIdentity},
+    internal::{
+        ai::linear_ref::operation_snapshot_includes_branch, config::ConfigKv,
+        db::get_db_conn_instance_for_path, workspace::RepoIdentity,
+    },
     utils::{
         client_storage::ClientStorage,
         error::{CliError, StableErrorCode},
@@ -946,12 +949,29 @@ async fn capture_reference_state(
         .map_err(|error| OperationError::Storage(error.to_string()))?;
     let mut references = Vec::with_capacity(rows.len());
     for row in rows {
+        let name = row
+            .try_get_by_index::<Option<String>>(1)
+            .map_err(|error| OperationError::Storage(error.to_string()))?;
+        let kind = row
+            .try_get_by_index::<String>(2)
+            .map_err(|error| OperationError::Storage(error.to_string()))?;
+        let remote = row
+            .try_get_by_index::<Option<String>>(4)
+            .map_err(|error| OperationError::Storage(error.to_string()))?;
+        if kind == "Branch"
+            && remote.is_none()
+            && name
+                .as_deref()
+                .is_some_and(|name| !operation_snapshot_includes_branch(name))
+        {
+            continue;
+        }
         references.push(json!({
             "id": row.try_get_by_index::<i64>(0).map_err(|error| OperationError::Storage(error.to_string()))?,
-            "name": row.try_get_by_index::<Option<String>>(1).map_err(|error| OperationError::Storage(error.to_string()))?,
-            "kind": row.try_get_by_index::<String>(2).map_err(|error| OperationError::Storage(error.to_string()))?,
+            "name": name,
+            "kind": kind,
             "commit": row.try_get_by_index::<Option<String>>(3).map_err(|error| OperationError::Storage(error.to_string()))?,
-            "remote": row.try_get_by_index::<Option<String>>(4).map_err(|error| OperationError::Storage(error.to_string()))?,
+            "remote": remote,
             "worktree_id": row.try_get_by_index::<Option<String>>(5).map_err(|error| OperationError::Storage(error.to_string()))?,
         }));
     }

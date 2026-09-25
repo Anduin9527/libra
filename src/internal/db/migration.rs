@@ -1866,6 +1866,28 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             ),
             down: None,
         },
+        // M2-02/M2-03: repository Memory storage, FTS projection, and
+        // context-selection receipts. These migrations were renumbered when
+        // rebasing the unpublished Memory branch so installations already at
+        // the upstream 2026091901 schema cannot skip them.
+        sql_migration(
+            2026092501,
+            "memory_core",
+            include_str!("../../../sql/migrations/2026092501_memory_core.sql"),
+            include_str!("../../../sql/migrations/2026092501_memory_core_down.sql"),
+        ),
+        sql_migration(
+            2026092502,
+            "memory_fts_search",
+            include_str!("../../../sql/migrations/2026092502_memory_fts_search.sql"),
+            include_str!("../../../sql/migrations/2026092502_memory_fts_search_down.sql"),
+        ),
+        sql_migration(
+            2026092503,
+            "context_selection_receipt",
+            include_str!("../../../sql/migrations/2026092503_context_selection_receipt.sql"),
+            include_str!("../../../sql/migrations/2026092503_context_selection_receipt_down.sql"),
+        ),
     ]
 }
 
@@ -2326,9 +2348,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 65);
+        assert_eq!(runner.len(), 68);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026091901));
+        assert_eq!(runner.max_registered_version(), Some(2026092503));
     }
 
     #[test]

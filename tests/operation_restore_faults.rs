@@ -170,6 +170,7 @@ fn dry_run_receipt_is_machine_stable() {
         dry_run: true,
         restored_facets: vec!["working_copy".to_string()],
         changed_paths: 3,
+        skipped_owned_refs: Vec::new(),
     };
     let value = serde_json::to_value(&receipt).expect("receipt serializes");
     assert_eq!(value["target_op_id"], "target-op");
@@ -208,6 +209,7 @@ fn receipt_does_not_embed_worktree_paths_or_secrets() {
         dry_run: false,
         restored_facets: vec!["working_copy".to_string()],
         changed_paths: 1,
+        skipped_owned_refs: Vec::new(),
     };
     let encoded = serde_json::to_string(&receipt).expect("receipt serializes");
     assert!(!encoded.contains(".libra"));

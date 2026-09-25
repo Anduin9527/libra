@@ -307,6 +307,10 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
 /// namespaces and fails when a new one is missing here.
 pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
     (
+        "REPOSITORY_KEYED_DIGEST_CACHE",
+        "keyed by canonical repository database path plus immutable repository id; bounded to 64 entries",
+    ),
+    (
         "CLEANUP_HELPER_REAPER",
         "process-lifetime reaper thread handle; holds no repository state",
     ),

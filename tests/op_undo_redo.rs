@@ -83,6 +83,7 @@ fn transition_receipt_is_machine_stable_and_dry_run_safe() {
         dry_run: true,
         restored_facets: vec!["working_copy".to_string(), "head".to_string()],
         changed_paths: 2,
+        skipped_owned_refs: Vec::new(),
     };
     let value = serde_json::to_value(receipt).expect("receipt serializes");
     assert_eq!(value["dry_run"], true);

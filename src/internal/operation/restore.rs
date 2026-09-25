@@ -37,6 +37,7 @@ use super::{
 };
 use crate::{
     internal::{
+        ai::linear_ref::operation_snapshot_includes_branch,
         branch::is_locked_branch,
         config::ConfigKv,
         db::begin_write_transaction,
@@ -105,6 +106,10 @@ pub struct RestoreReceipt {
     pub dry_run: bool,
     pub restored_facets: Vec<String>,
     pub changed_paths: usize,
+    /// Libra-owned local refs present in a legacy snapshot but deliberately
+    /// omitted from restoration under their current ownership policy.
+    #[serde(default)]
+    pub skipped_owned_refs: Vec<String>,
 }
 
 /// v2 restore coordinator for one pinned worktree.
@@ -126,6 +131,33 @@ struct DryRunSnapshot {
     snapshot: WorkspaceSnapshotV2,
     storage: ClientStorage,
     _scratch: tempfile::TempDir,
+}
+
+fn operation_snapshot_excludes_reference(reference: &serde_json::Value) -> bool {
+    reference.get("kind").and_then(serde_json::Value::as_str) == Some("Branch")
+        && reference
+            .get("remote")
+            .is_none_or(serde_json::Value::is_null)
+        && reference
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| !operation_snapshot_includes_branch(name))
+}
+
+fn skipped_operation_owned_refs(references: &[serde_json::Value]) -> Vec<String> {
+    let mut skipped: Vec<String> = references
+        .iter()
+        .filter(|reference| operation_snapshot_excludes_reference(reference))
+        .filter_map(|reference| {
+            reference
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    skipped.sort();
+    skipped.dedup();
+    skipped
 }
 
 struct ValidatedRestoreTarget {
@@ -331,6 +363,11 @@ impl RestoreEngine {
             workspace_id,
         } = target;
         let selected = selected_facets(what);
+        let skipped_owned_refs = if what == RestoreWhat::All {
+            self.skipped_owned_refs(&view)?
+        } else {
+            Vec::new()
+        };
         let changed_paths = if dry_run {
             let current = self.capture_current_snapshot(0).await?;
             count_changed_paths(
@@ -352,6 +389,7 @@ impl RestoreEngine {
             dry_run,
             restored_facets: selected.iter().map(|name| name.to_string()).collect(),
             changed_paths,
+            skipped_owned_refs,
         };
         if dry_run {
             return Ok(receipt);
@@ -910,16 +948,49 @@ impl RestoreEngine {
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
         let mut references = Vec::with_capacity(rows.len());
         for row in rows {
+            let name = row
+                .try_get_by_index::<Option<String>>(1)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            let kind = row
+                .try_get_by_index::<String>(2)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            let remote = row
+                .try_get_by_index::<Option<String>>(4)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            if kind == "Branch"
+                && remote.is_none()
+                && name
+                    .as_deref()
+                    .is_some_and(|name| !operation_snapshot_includes_branch(name))
+            {
+                continue;
+            }
             references.push(serde_json::json!({
                 "id": row.try_get_by_index::<i64>(0).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "name": row.try_get_by_index::<Option<String>>(1).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "kind": row.try_get_by_index::<String>(2).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                "name": name,
+                "kind": kind,
                 "commit": row.try_get_by_index::<Option<String>>(3).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "remote": row.try_get_by_index::<Option<String>>(4).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                "remote": remote,
                 "worktree_id": row.try_get_by_index::<Option<String>>(5).map_err(|error| RestoreError::Storage(error.to_string()))?,
             }));
         }
         Ok(serde_json::Value::Array(references))
+    }
+
+    fn skipped_owned_refs(&self, view: &RepoViewV2) -> Result<Vec<String>, RestoreError> {
+        let bytes = self
+            .store
+            .load_object(&view.refs_facet_oid)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let references = value
+            .get("references")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                RestoreError::Storage("refs facet has no references array".to_string())
+            })?;
+        Ok(skipped_operation_owned_refs(references))
     }
 
     async fn fail_and_rollback(
@@ -1166,14 +1237,41 @@ impl RestoreEngine {
                 "refs facet has unsupported schema_version".to_string(),
             ));
         }
-        let references = value
+        let snapshot_references = value
             .get("references")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| {
                 RestoreError::Storage("refs facet has no references array".to_string())
             })?;
+        let mut references: Vec<serde_json::Value> = snapshot_references
+            .iter()
+            .filter(|reference| !operation_snapshot_excludes_reference(reference))
+            .cloned()
+            .collect();
+        let current_rows = self
+            .store
+            .db()
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, name, kind, `commit`, remote, worktree_id FROM reference ORDER BY id",
+            ))
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        for row in current_rows {
+            let reference = serde_json::json!({
+                "id": row.try_get_by_index::<i64>(0).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                "name": row.try_get_by_index::<Option<String>>(1).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                "kind": row.try_get_by_index::<String>(2).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                "commit": row.try_get_by_index::<Option<String>>(3).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                "remote": row.try_get_by_index::<Option<String>>(4).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                "worktree_id": row.try_get_by_index::<Option<String>>(5).map_err(|error| RestoreError::Storage(error.to_string()))?,
+            });
+            if operation_snapshot_excludes_reference(&reference) {
+                references.push(reference);
+            }
+        }
         let mut ids = BTreeSet::new();
-        for reference in references {
+        for reference in &references {
             let id = reference
                 .get("id")
                 .and_then(serde_json::Value::as_i64)
@@ -1271,7 +1369,7 @@ impl RestoreEngine {
                 }
             }
         }
-        self.protect_linked_worktree_heads(references).await?;
+        self.protect_linked_worktree_heads(&references).await?;
 
         // Same write-lock-first rule as `restore_symbolic_head_branch_tip`:
         // keep the reference rewrite from racing the background index consumer
@@ -1279,14 +1377,14 @@ impl RestoreEngine {
         let txn = begin_write_transaction(self.store.db())
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        self.protect_changed_branch_refs(&txn, references).await?;
+        self.protect_changed_branch_refs(&txn, &references).await?;
         txn.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "DELETE FROM reference",
         ))
         .await
         .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        for reference in references {
+        for reference in &references {
             let id = reference
                 .get("id")
                 .and_then(serde_json::Value::as_i64)
@@ -2619,6 +2717,34 @@ mod tests {
                 FacetName::from("sparse"),
                 FacetName::from("head")
             ]
+        );
+    }
+
+    #[test]
+    fn legacy_memory_refs_are_reported_and_excluded_from_restore() {
+        let memory = serde_json::json!({
+            "id": 7,
+            "name": "libra/memory/repo",
+            "kind": "Branch",
+            "commit": "1111111111111111111111111111111111111111",
+            "remote": null,
+            "worktree_id": null,
+        });
+        let lookalike = serde_json::json!({
+            "id": 8,
+            "name": "libra/memory/repo-user",
+            "kind": "Branch",
+            "commit": "2222222222222222222222222222222222222222",
+            "remote": null,
+            "worktree_id": null,
+        });
+        let references = vec![memory.clone(), lookalike.clone()];
+
+        assert!(operation_snapshot_excludes_reference(&memory));
+        assert!(!operation_snapshot_excludes_reference(&lookalike));
+        assert_eq!(
+            skipped_operation_owned_refs(&references),
+            vec!["libra/memory/repo".to_string()]
         );
     }
 

@@ -20,6 +20,8 @@ use sea_orm::DatabaseTransaction;
 use serde::Serialize;
 
 use super::fetch::{self, RemoteSpecErrorKind};
+#[cfg(test)]
+use crate::internal::ai::linear_ref::OwnedRefSpec;
 use crate::{
     command::{
         self,
@@ -1835,6 +1837,14 @@ async fn normalize_mirror_refs(remote_name: &str) -> Result<(), CloneError> {
             .name
             .strip_prefix(&tracking_prefix)
             .unwrap_or(&branch.name);
+        if OwnedRefSpec::for_storage_name(short_name)
+            .is_some_and(|spec| !spec.policy().operation_snapshot)
+        {
+            Branch::delete_branch_result_with_conn(&db, &branch.name, Some(remote_name))
+                .await
+                .map_err(|source| CloneError::LocalBranchState { source })?;
+            continue;
+        }
         // Promote every fetched tracking ref to a verbatim local branch
         // (idempotent: the default branch already exists from setup_repository
         // and is simply re-affirmed). We promote ALL tracking rows rather than
@@ -2414,6 +2424,14 @@ mod tests {
         Branch::update_branch_with_conn(&db, "refs/remotes/origin/feature", &hash, Some("origin"))
             .await
             .expect("seed tracking feature");
+        Branch::update_branch_with_conn(
+            &db,
+            "refs/remotes/origin/libra/memory/repo",
+            &hash,
+            Some("origin"),
+        )
+        .await
+        .expect("seed legacy tracking Memory ref");
         Head::update_with_conn(&db, Head::Branch("main".to_string()), Some("origin")).await;
         assert!(
             Head::remote_current_with_conn(&db, "origin")
@@ -2440,6 +2458,10 @@ mod tests {
         assert!(
             local.iter().any(|n| n == "feature"),
             "feature promoted: {local:?}"
+        );
+        assert!(
+            !local.iter().any(|n| n == "libra/memory/repo"),
+            "local-only Memory ref must not be promoted: {local:?}"
         );
 
         // No remote-tracking branches and no cached remote HEAD remain.

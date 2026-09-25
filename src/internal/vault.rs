@@ -33,6 +33,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use libvault::{RustyVault, core::SealConfig, storage::sql::sqlite::SqliteBackend};
+use sea_orm::ConnectionTrait;
 use serde_json::Value;
 
 use crate::utils::util::try_get_storage_path;
@@ -761,18 +762,56 @@ pub async fn load_unseal_key_for_scope(scope: &str) -> Option<Vec<u8>> {
 /// This is used when callers need to resolve local secrets for an explicit
 /// repository target instead of the current working directory repository.
 pub async fn load_unseal_key_for_db_path(db_path: &Path) -> Option<Vec<u8>> {
-    if let Ok(repo_id) = repo_id_for_db_path(db_path).await
-        && let Some(hex_key) = load_unseal_key_from_home_for_repo_id(&repo_id).await
-    {
-        return hex::decode(hex_key).ok();
+    use crate::internal::db::get_db_conn_instance_for_path;
+    let conn = get_db_conn_instance_for_path(db_path).await.ok()?;
+    load_unseal_key_for_db_path_with_conn(db_path, &conn)
+        .await
+        .ok()
+}
+
+/// Load a repository vault key without acquiring another database connection.
+pub(crate) async fn load_unseal_key_for_db_path_with_conn<C: ConnectionTrait>(
+    db_path: &Path,
+    db: &C,
+) -> Result<Vec<u8>> {
+    use crate::internal::config::ConfigKv;
+
+    let repo_ids = ConfigKv::get_all_with_conn(db, "libra.repoid")
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read repository identity from '{}'",
+                db_path.display()
+            )
+        })?;
+    if repo_ids.len() > 1 {
+        return Err(anyhow!("multiple libra.repoid values are present"));
+    }
+    if let Some(repo_id) = repo_ids.first() {
+        if repo_id.encrypted || repo_id.value.trim().is_empty() {
+            return Err(anyhow!("libra.repoid is invalid"));
+        }
+        if let Some(hex_key) = load_unseal_key_from_home_for_repo_id(repo_id.value.trim()).await {
+            return decode_unseal_key(&hex_key);
+        }
     }
 
-    use crate::internal::{config::ConfigKv, db::get_db_conn_instance_for_path};
-    let conn = get_db_conn_instance_for_path(db_path).await.ok()?;
-    let entry = ConfigKv::get_with_conn(&conn, "vault.unsealkey")
+    let legacy = ConfigKv::get_all_with_conn(db, "vault.unsealkey")
         .await
-        .ok()??;
-    hex::decode(entry.value).ok()
+        .context("failed to read legacy repository vault key")?;
+    let [entry] = legacy.as_slice() else {
+        return Err(anyhow!("repository vault key is missing or ambiguous"));
+    };
+    if entry.encrypted {
+        return Err(anyhow!(
+            "legacy repository vault key cannot be self-encrypted"
+        ));
+    }
+    decode_unseal_key(&entry.value)
+}
+
+fn decode_unseal_key(encoded: &str) -> Result<Vec<u8>> {
+    hex::decode(encoded.trim()).context("repository vault key is not valid hex")
 }
 
 /// File name of the global unseal key in both the new and the legacy layout.
@@ -1133,17 +1172,6 @@ async fn unseal_key_path() -> Result<std::path::PathBuf> {
 async fn current_repo_id() -> Result<String> {
     use crate::internal::config::ConfigKv;
     ConfigKv::get("libra.repoid")
-        .await?
-        .map(|e| e.value)
-        .ok_or_else(|| anyhow!("libra.repoid not set — was the repo initialized?"))
-}
-
-async fn repo_id_for_db_path(db_path: &Path) -> Result<String> {
-    use crate::internal::{config::ConfigKv, db::get_db_conn_instance_for_path};
-    let conn = get_db_conn_instance_for_path(db_path)
-        .await
-        .context("failed to open repository config database")?;
-    ConfigKv::get_with_conn(&conn, "libra.repoid")
         .await?
         .map(|e| e.value)
         .ok_or_else(|| anyhow!("libra.repoid not set — was the repo initialized?"))

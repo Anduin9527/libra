@@ -36,8 +36,15 @@ use crate::{
     command::{load_object, log::get_reachable_commits},
     git_protocol::ServiceType,
     internal::{
-        branch::Branch, config::ConfigKv, db::get_db_conn_instance_for_path, head::Head,
-        protocol::DiscRef, reflog, shallow::ShallowSet, tag,
+        ai::linear_ref::{OwnedRefSpec, OwnedRefTransportPolicy},
+        branch::Branch,
+        config::ConfigKv,
+        db::get_db_conn_instance_for_path,
+        head::Head,
+        protocol::DiscRef,
+        reflog,
+        shallow::ShallowSet,
+        tag,
     },
     utils::{
         client_storage::ClientStorage,
@@ -421,7 +428,10 @@ impl LocalClient {
 
                     let local_branches = Branch::list_branches_result(None)
                         .await
-                        .map_err(|error| GitError::CustomError(error.to_string()))?;
+                        .map_err(|error| GitError::CustomError(error.to_string()))?
+                        .into_iter()
+                        .filter(|branch| ordinary_transport_branch(&branch.name))
+                        .collect::<Vec<_>>();
 
                     let remote_configs = ConfigKv::all_remote_configs()
                         .await
@@ -431,7 +441,9 @@ impl LocalClient {
                         remote_branches.extend(
                             Branch::list_branches_result(Some(&remote.name))
                                 .await
-                                .map_err(|error| GitError::CustomError(error.to_string()))?,
+                                .map_err(|error| GitError::CustomError(error.to_string()))?
+                                .into_iter()
+                                .filter(|branch| ordinary_transport_branch(&branch.name)),
                         );
                     }
                     let head_commit = Head::current_commit_result()
@@ -622,6 +634,11 @@ impl LocalClient {
             }
         }
     }
+}
+
+fn ordinary_transport_branch(name: &str) -> bool {
+    OwnedRefSpec::for_transport_ref(name)
+        .is_none_or(|spec| spec.transport_policy() != OwnedRefTransportPolicy::LocalOnly)
 }
 
 /// Read `objectformat` from a foreign Git repository's `config`, defaulting to

@@ -184,6 +184,8 @@ pub enum OpOutput {
         new_op_id: String,
         /// Human-readable restore confirmation.
         message: String,
+        /// Libra-owned local refs ignored from a legacy operation snapshot.
+        skipped_owned_refs: Vec<String>,
     },
     #[serde(rename = "restore_v2")]
     RestoreV2 { receipt: RestoreReceipt },
@@ -521,6 +523,9 @@ fn emit_transition_output(
             println!("New operation recorded: {}", &op_id[..8.min(op_id.len())]);
         } else {
             println!("Dry run: no operation was published.");
+        }
+        for name in &receipt.skipped_owned_refs {
+            println!("Skipped Libra-owned local ref: {name}");
         }
     };
     if output.is_json() {
@@ -985,6 +990,7 @@ async fn handle_v2_restore(
                     target_op_id: receipt.target_op_id,
                     new_op_id,
                     message: format!("Restored to operation {target_short}"),
+                    skipped_owned_refs: receipt.skipped_owned_refs,
                 },
                 output,
             )?;
@@ -1005,6 +1011,9 @@ async fn handle_v2_restore(
                     "New operation recorded: {}",
                     &new_op_id[..8.min(new_op_id.len())]
                 );
+            }
+            for name in &receipt.skipped_owned_refs {
+                println!("Skipped Libra-owned local ref: {name}");
             }
         }
     }
@@ -1075,8 +1084,29 @@ async fn render_restore_preview(
         .get("references")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| CliError::fatal("restore preview refs have no references array"))?;
+    let is_skipped_owned_ref = |reference: &serde_json::Value| {
+        reference.get("kind").and_then(serde_json::Value::as_str) == Some("Branch")
+            && reference
+                .get("remote")
+                .is_none_or(serde_json::Value::is_null)
+            && reference
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| {
+                    crate::internal::ai::linear_ref::OwnedRefSpec::for_storage_name(name)
+                        .is_some_and(|spec| !spec.policy().operation_snapshot)
+                })
+    };
+    let skipped_owned_refs = references
+        .iter()
+        .filter(|reference| is_skipped_owned_ref(reference))
+        .filter_map(|reference| reference.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
     println!("Refs that would be restored:");
     for reference in references {
+        if is_skipped_owned_ref(reference) {
+            continue;
+        }
         let Some(kind) = reference.get("kind").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -1095,6 +1125,9 @@ async fn render_restore_preview(
             println!("  {ref_name}");
         }
     }
+    for name in skipped_owned_refs {
+        println!("  Skipping Libra-owned local ref: {name}");
+    }
 
     let keep = references
         .iter()
@@ -1103,6 +1136,7 @@ async fn render_restore_preview(
                 && reference
                     .get("remote")
                     .is_none_or(serde_json::Value::is_null)
+                && !is_skipped_owned_ref(reference)
         })
         .filter_map(|reference| {
             reference

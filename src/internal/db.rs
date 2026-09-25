@@ -547,7 +547,7 @@ pub async fn upgrade_database_schema(db_path: &Path) -> io::Result<SchemaUpgrade
     upgrade_database_schema_for_role(db_path, DatabaseRole::Repository).await
 }
 
-async fn inspect_database_schema_for_connection(
+pub(crate) async fn inspect_database_schema_for_connection(
     conn: &DatabaseConnection,
 ) -> io::Result<SchemaCompatibility> {
     schema::inspect_schema_for_connection(conn, DatabaseRole::Repository).await

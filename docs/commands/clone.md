@@ -142,7 +142,8 @@ Set up a mirror of the source repository (like `git clone --mirror`). Implies
 `refs/notes/*`, `refs/mr/*`, and other legal `refs/*` names), keeps no
 `refs/remotes/*` tracking refs, and records `remote.<name>.mirror=true` plus
 `remote.<name>.fetch=+refs/*:refs/*`. Useful for serving or backing up a
-repository.
+repository. The repository-local Memory authority is never fetched or
+promoted into the mirror.
 
 ```bash
 libra clone --mirror git@github.com:user/repo.git repo-mirror.git

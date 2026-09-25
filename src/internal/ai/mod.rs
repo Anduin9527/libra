@@ -22,6 +22,10 @@ pub mod capture_scope;
 pub mod checkpoint_input;
 // Completion-model trait and request/response types.
 pub mod completion;
+// Minimal HTTP/provider and context-budget seams used by repository Memory.
+pub mod client;
+pub mod context_budget;
+pub mod providers;
 // Per-turn coverage claim gate for external-agent checkpoint writers.
 pub mod coverage_gate;
 // Append-only event trait (plan-20260920 RC-01).
@@ -30,6 +34,10 @@ pub mod event;
 pub mod export_job;
 // Conversation history datastructures (compaction, persistence, replay).
 pub mod history;
+// Repository-keyed digests, CAS-owned refs, and versioned Agent Memory.
+pub(crate) mod keyed_digest;
+pub(crate) mod linear_ref;
+pub(crate) mod memory;
 // `refs/libra/traces` persistence API (plan-20260920 RC-02).
 pub mod traces;
 // Isolated workspace helper (plan-20260920 RC-03 / RC-23).

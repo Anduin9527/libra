@@ -21,11 +21,7 @@ async fn ctx() -> BridgeContext {
     run_builtin_migrations(&conn)
         .await
         .expect("apply migrations");
-    BridgeContext {
-        conn,
-        repository_id: "repo-1".into(),
-        worktree_id: None,
-    }
+    BridgeContext::new(conn, "repo-1", None)
 }
 
 /// Unknown / low-level / SQL / shell methods are never in the allowlist, so
@@ -161,11 +157,7 @@ async fn symlink_and_repository_identity_are_rejected() {
     .expect("seed");
 
     // (a) A relative path must be rejected, even with a MATCHING repo context.
-    let good = BridgeContext {
-        conn: conn.clone(),
-        repository_id: "repo-real".into(),
-        worktree_id: None,
-    };
+    let good = BridgeContext::new(conn.clone(), "repo-real", None);
     ingress_dispatch(
         &good,
         &parse_request_line(
@@ -185,11 +177,7 @@ async fn symlink_and_repository_identity_are_rejected() {
     // (b) A repository-identity mismatch is fail-closed: a context that claims
     // a DIFFERENT repo than the store's `libra.repoid` cannot acquire a
     // workspace (the adapter cross-checks the canonical identity).
-    let spoofed = BridgeContext {
-        conn: conn.clone(),
-        repository_id: "repo-spoofed".into(),
-        worktree_id: None,
-    };
+    let spoofed = BridgeContext::new(conn.clone(), "repo-spoofed", None);
     ingress_dispatch(
         &spoofed,
         &parse_request_line(
